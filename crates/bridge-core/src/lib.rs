@@ -18,13 +18,17 @@
 //! and are intentionally absent here. Storage callers pass an
 //! already-authenticated publisher identity.
 
+pub mod service;
 pub mod storage;
 pub mod types;
 
-pub use storage::{CustodyReceipt, Limits, PublishOutcome, Storage};
+pub use service::{
+    Config, GrantConfig, PublishBody, Request, Response, Running, start as start_service,
+};
+pub use storage::{CustodyReceipt, EventState, Limits, PublishOutcome, Storage};
 pub use types::{
-    CoreError, Envelope, EnvelopeHash, EventId, ExpiresAt, Harness, Kind, Metadata, Mode,
-    NativeAddress, Payload, Policy, PublisherId, SCHEMA_VERSION, StreamId,
+    CoreError, Envelope, EnvelopeHash, EventId, ExpiresAt, Harness, Kind, MAX_SQLITE_INT, Metadata,
+    Mode, NativeAddress, Payload, Policy, PublisherId, SCHEMA_VERSION, StreamId, validate_metadata,
 };
 
 /// Byte bound applied to every bounded UTF-8 string field in the envelope.

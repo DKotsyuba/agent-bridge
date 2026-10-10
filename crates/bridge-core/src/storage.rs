@@ -12,21 +12,24 @@
 use std::path::Path;
 
 use rusqlite::{Connection, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
 
 use crate::types::{CoreError, Envelope, EnvelopeHash, Policy};
 
 /// Storage schema version fenced by [`Storage::open`].
 ///
 /// A database whose version differs is refused rather than migrated
-/// implicitly; migration is a deliberate later-task operation.
-const STORAGE_SCHEMA_VERSION: u32 = 1;
+/// implicitly; migration is a deliberate later-task operation. Version 2
+/// scopes latest-stream watermarks by publisher, recipient, kind, mode,
+/// project/task and stream instead of one global stream key.
+const STORAGE_SCHEMA_VERSION: u32 = 2;
 
 /// Operational limits applied at admission.
 ///
 /// Bounds are explicit errors, never silent truncation or eviction. The hard
 /// cap counts admitted (non-terminal) events: when it is reached, new
 /// admission is refused explicitly rather than evicting dedup history.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Limits {
     /// Maximum number of admitted, not-yet-terminal events.
     pub max_admitted_events: usize,
@@ -46,7 +49,8 @@ impl Limits {
 /// Delivery-state transitions (reserved, invoking, native evidence tiers)
 /// extend this vocabulary in the dispatch task; this layer only owns the
 /// admission-time and retention dispositions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EventState {
     /// Accepted and awaiting dispatch.
     Pending,
@@ -74,7 +78,7 @@ impl EventState {
 /// A committed receipt means the immutable event, its hash and its
 /// disposition are durable. For a replay the fields describe the original
 /// acceptance, and [`CustodyReceipt::replayed`] is `true`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CustodyReceipt {
     /// Publisher whose event was accepted.
     pub publisher: String,
@@ -167,8 +171,15 @@ impl Storage {
              );
              INSERT OR IGNORE INTO counters (name, value) VALUES ('acceptance_seq', 0);
              CREATE TABLE IF NOT EXISTS watermarks (
-                 stream_id TEXT PRIMARY KEY,
-                 revision INTEGER NOT NULL
+                 publisher_id TEXT NOT NULL,
+                 recipient TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 mode TEXT NOT NULL,
+                 project TEXT NOT NULL,
+                 task TEXT NOT NULL,
+                 stream_id TEXT NOT NULL,
+                 revision INTEGER NOT NULL,
+                 PRIMARY KEY (publisher_id, recipient, kind, mode, project, task, stream_id)
              );",
         )?;
         let stored: Option<String> = tx
@@ -221,6 +232,28 @@ impl Storage {
         now_ms: u64,
     ) -> Result<PublishOutcome, CoreError> {
         envelope.validate()?;
+        if now_ms > crate::types::MAX_SQLITE_INT {
+            return Err(CoreError::InvalidEnvelope(format!(
+                "now_ms {now_ms} exceeds the supported bound"
+            )));
+        }
+        if let Policy::Latest { revision, .. } = &envelope.policy
+            && *revision > crate::types::MAX_SQLITE_INT
+        {
+            return Err(CoreError::InvalidEnvelope(format!(
+                "latest revision {revision} exceeds the supported bound {}",
+                crate::types::MAX_SQLITE_INT
+            )));
+        }
+        if let Some(expiry) = envelope.expires_at
+            && expiry.unix_millis() > crate::types::MAX_SQLITE_INT
+        {
+            return Err(CoreError::InvalidEnvelope(format!(
+                "expires_at {} exceeds the supported bound {}",
+                expiry.unix_millis(),
+                crate::types::MAX_SQLITE_INT
+            )));
+        }
         let hash = envelope.envelope_hash();
         let tx = self
             .connection
@@ -283,12 +316,28 @@ impl Storage {
             ],
         )?;
 
-        if let Policy::Latest { stream, revision } = &envelope.policy {
+        if let Policy::Latest {
+            stream: _,
+            revision,
+        } = &envelope.policy
+        {
+            let scope = CoalescingScope::of(envelope);
             tx.execute(
-                "INSERT INTO watermarks (stream_id, revision) VALUES (?1, ?2)
-                 ON CONFLICT (stream_id) DO UPDATE
-                 SET revision = MAX(revision, excluded.revision)",
-                params![stream.as_str(), *revision as i64],
+                "INSERT INTO watermarks
+                     (publisher_id, recipient, kind, mode, project, task, stream_id, revision)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT (publisher_id, recipient, kind, mode, project, task, stream_id)
+                 DO UPDATE SET revision = MAX(revision, excluded.revision)",
+                params![
+                    scope.publisher,
+                    scope.recipient,
+                    scope.kind,
+                    scope.mode,
+                    scope.project,
+                    scope.task,
+                    scope.stream,
+                    *revision as i64,
+                ],
             )?;
         }
 
@@ -333,8 +382,14 @@ impl Storage {
     /// pending event past its absolute expiry becomes `expired`, an explicit
     /// disposition — never a claim that a possible native effect was
     /// recalled. Reserved/invoking/accepted states are never touched by this
-    /// method; uncertain outcomes belong to the reconciler.
+    /// method; uncertain outcomes belong to the reconciler. `now_ms` above
+    /// the SQLite-safe bound is rejected rather than cast.
     pub fn expire_due(&self, now_ms: u64) -> Result<usize, CoreError> {
+        if now_ms > crate::types::MAX_SQLITE_INT {
+            return Err(CoreError::InvalidEnvelope(format!(
+                "now_ms {now_ms} exceeds the supported bound"
+            )));
+        }
         let changed = self.connection.execute(
             "UPDATE events SET state = 'expired'
              WHERE state = 'pending' AND expires_at_ms IS NOT NULL AND expires_at_ms <= ?1",
@@ -345,8 +400,12 @@ impl Storage {
 
     /// Decides the admission state for a new event from its policy.
     ///
-    /// For `latest` snapshots: an equal revision with different content is a
-    /// conflict; a revision older than the durable watermark is admitted as
+    /// For `latest` snapshots the durable watermark is scoped by the full
+    /// coalescing group — publisher, exact recipient, kind, requested mode,
+    /// declared project/task metadata and stream — so independent
+    /// publishers, recipients or scopes never inherit each other's
+    /// watermark. Within one scope: an equal revision with different content
+    /// is a conflict; a revision older than the watermark is admitted as
     /// `superseded` so the dedup entry exists but the stale snapshot can
     /// never revive. All other policies admit as `pending`.
     fn snapshot_state(
@@ -357,10 +416,21 @@ impl Storage {
         let Policy::Latest { stream, revision } = &envelope.policy else {
             return Ok(EventState::Pending);
         };
+        let scope = CoalescingScope::of(envelope);
         let watermark: Option<i64> = tx
             .query_row(
-                "SELECT revision FROM watermarks WHERE stream_id = ?1",
-                params![stream.as_str()],
+                "SELECT revision FROM watermarks
+                 WHERE publisher_id = ?1 AND recipient = ?2 AND kind = ?3
+                   AND mode = ?4 AND project = ?5 AND task = ?6 AND stream_id = ?7",
+                params![
+                    scope.publisher,
+                    scope.recipient,
+                    scope.kind,
+                    scope.mode,
+                    scope.project,
+                    scope.task,
+                    stream.as_str(),
+                ],
                 |row| row.get(0),
             )
             .map(Some)
@@ -382,6 +452,9 @@ impl Storage {
     /// Reads a stored row by key, if present.
     ///
     /// Shared by publish (dedup lookup) and lookup (status); read-only.
+    /// Every stored value is strictly validated before it is cast or used:
+    /// an unknown state text or a negative counter/timestamp is a storage
+    /// error, never a silently wrapped value.
     fn load_row(
         connection: &Connection,
         key: (&str, &str),
@@ -399,9 +472,9 @@ impl Storage {
             None => Ok(None),
             Some(row) => Ok(Some(StoredRow {
                 hash: row.get(0).map_err(CoreError::from)?,
-                state: parse_state(row.get(1).map_err(CoreError::from)?),
-                acceptance_seq: row.get::<_, i64>(2).map_err(CoreError::from)? as u64,
-                accepted_at_ms: row.get::<_, i64>(3).map_err(CoreError::from)? as u64,
+                state: parse_state(&row.get::<_, String>(1).map_err(CoreError::from)?)?,
+                acceptance_seq: positive_u64(row.get::<_, i64>(2).map_err(CoreError::from)?)?,
+                accepted_at_ms: positive_u64(row.get::<_, i64>(3).map_err(CoreError::from)?)?,
             })),
         }
     }
@@ -446,13 +519,80 @@ struct StoredRow {
 
 /// Parses the storage text form of an event state.
 ///
-/// Unknown values map to [`EventState::Pending`]; the schema fence plus this
-/// layer being the only writer makes unknown values unreachable in practice.
-fn parse_state(value: String) -> EventState {
-    match value.as_str() {
-        "superseded" => EventState::Superseded,
-        "expired" => EventState::Expired,
-        _ => EventState::Pending,
+/// Strict: only the three texts this layer writes are accepted; anything
+/// else (a foreign or corrupted row) is a storage error rather than a
+/// defaulted state.
+fn parse_state(value: &str) -> Result<EventState, CoreError> {
+    match value {
+        "pending" => Ok(EventState::Pending),
+        "superseded" => Ok(EventState::Superseded),
+        "expired" => Ok(EventState::Expired),
+        other => Err(CoreError::Storage(rusqlite::Error::InvalidParameterName(
+            format!("unknown stored event state {other:?}"),
+        ))),
+    }
+}
+
+/// Converts a stored signed integer to u64, refusing negatives.
+///
+/// Every durable counter and timestamp is written non-negative by this
+/// layer; a negative read means corruption or a foreign writer and must not
+/// wrap into a huge unsigned value.
+fn positive_u64(value: i64) -> Result<u64, CoreError> {
+    if value < 0 {
+        return Err(CoreError::Storage(rusqlite::Error::InvalidParameterName(
+            format!("stored value {value} is negative and cannot be an unsigned id or timestamp"),
+        )));
+    }
+    Ok(value as u64)
+}
+
+/// The full coalescing-group scope of a `latest` snapshot.
+///
+/// Watermarks are keyed by this scope, never by a bare stream name: the
+/// technical plan groups coalescing by exact recipient, authenticated
+/// source/stream, project/task scope, kind, logical entity, delivery mode
+/// and policy revision. Project and task are read from the corresponding
+/// metadata keys and are empty when not declared.
+struct CoalescingScope {
+    /// Authenticated publisher id.
+    publisher: String,
+    /// Canonical recipient address text (losslessly encoded).
+    recipient: String,
+    /// Declared event kind.
+    kind: String,
+    /// Requested delivery mode name.
+    mode: String,
+    /// Declared project metadata value, or empty.
+    project: String,
+    /// Declared task metadata value, or empty.
+    task: String,
+    /// Authoritative stream id.
+    stream: String,
+}
+
+impl CoalescingScope {
+    /// Derives the scope of a validated envelope.
+    ///
+    /// Borrows from the envelope's own strings; cheap and allocation-light
+    /// except for the recipient's canonical encoding.
+    fn of(envelope: &Envelope) -> CoalescingScope {
+        CoalescingScope {
+            publisher: envelope.publisher.as_str().to_string(),
+            recipient: envelope.recipient.to_canonical_string(),
+            kind: envelope.kind.as_str().to_string(),
+            mode: envelope.mode.as_str().to_string(),
+            project: envelope
+                .metadata
+                .get("project")
+                .cloned()
+                .unwrap_or_default(),
+            task: envelope.metadata.get("task").cloned().unwrap_or_default(),
+            stream: match &envelope.policy {
+                Policy::Latest { stream, .. } => stream.as_str().to_string(),
+                _ => String::new(),
+            },
+        }
     }
 }
 
@@ -472,10 +612,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn state_text_roundtrip() {
+    fn state_text_roundtrip_is_strict() {
         assert_eq!(EventState::Pending.as_str(), "pending");
-        assert_eq!(parse_state("superseded".into()), EventState::Superseded);
-        assert_eq!(parse_state("expired".into()), EventState::Expired);
+        assert_eq!(parse_state("superseded").unwrap(), EventState::Superseded);
+        assert_eq!(parse_state("expired").unwrap(), EventState::Expired);
+        assert!(parse_state("pending").is_ok());
+        assert!(
+            parse_state("foreign").is_err(),
+            "unknown stored state must be refused, never defaulted"
+        );
+        assert_eq!(positive_u64(0).unwrap(), 0);
+        assert!(positive_u64(-1).is_err());
     }
 
     #[test]

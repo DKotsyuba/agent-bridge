@@ -22,6 +22,14 @@ use crate::{MAX_FIELD_BYTES, MAX_METADATA_ENTRIES, MAX_PAYLOAD_BYTES};
 /// explicitly instead of reinterpreting them.
 pub const SCHEMA_VERSION: u16 = 1;
 
+/// Largest unsigned value safely representable in SQLite's signed INTEGER.
+///
+/// `latest` revisions, absolute expiry milliseconds and any other u64 that
+/// reaches durable storage must not exceed this bound; values above it are
+/// rejected explicitly at validation (never silently wrapped by a signed
+/// cast, which would turn a newer revision into an apparently stale one).
+pub const MAX_SQLITE_INT: u64 = i64::MAX as u64;
+
 /// Validates a bounded identifier-like UTF-8 string field.
 ///
 /// Accepts any non-empty string up to `max` bytes that contains no Unicode
@@ -146,25 +154,31 @@ impl NativeAddress {
         Ok(())
     }
 
-    /// Canonical text form used in logs and status output.
+    /// Canonical text form used in logs, status output and storage keys.
     ///
-    /// Slash-separated, harness as its canonical wire name. Round-trips
-    /// through [`NativeAddress::parse`]; not used for hashing (the envelope
-    /// serialization is).
+    /// Four slash-separated components, harness as its canonical wire name.
+    /// Component text may itself contain slashes (path namespaces, slash-
+    /// bearing native session ids), so each component is percent-encoded
+    /// (`/` as `%2F`, `%` as `%25`) first: the encoding is injective and
+    /// lossless, and distinct component tuples always produce distinct text.
+    /// Round-trips through [`NativeAddress::parse`]; not used for hashing
+    /// (the envelope serialization is).
     pub fn to_canonical_string(&self) -> String {
         format!(
             "{}/{}/{}/{}",
-            self.host_id,
+            encode_component(&self.host_id),
             self.harness.as_str(),
-            self.native_store_namespace,
-            self.native_session_id
+            encode_component(&self.native_store_namespace),
+            encode_component(&self.native_session_id),
         )
     }
 
     /// Parses the canonical text form produced by
     /// [`NativeAddress::to_canonical_string`].
     ///
-    /// Refuses extra segments, empty components and unknown harness names.
+    /// Refuses anything that is not exactly four encoded components with a
+    /// known harness name, malformed percent escapes, and components that
+    /// fail validation.
     pub fn parse(value: &str) -> Result<Self, CoreError> {
         let parts: Vec<&str> = value.split('/').collect();
         if parts.len() != 4 {
@@ -172,8 +186,59 @@ impl NativeAddress {
                 "address must have four slash-separated components".into(),
             ));
         }
-        NativeAddress::new(parts[0], Harness::parse(parts[1])?, parts[2], parts[3])
+        NativeAddress::new(
+            decode_component(parts[0])?,
+            Harness::parse(parts[1])?,
+            decode_component(parts[2])?,
+            decode_component(parts[3])?,
+        )
     }
+}
+
+/// Percent-encodes one address component losslessly.
+///
+/// Only the two bytes that would break the four-separator structure are
+/// escaped (`%` and `/`); everything else (already validated free of
+/// control characters) passes through unchanged.
+fn encode_component(component: &str) -> String {
+    component.replace('%', "%25").replace('/', "%2F")
+}
+
+/// Strictly percent-decodes one address component.
+///
+/// Every `%` must be followed by exactly two uppercase or lowercase hex
+/// digits; anything else is [`CoreError::InvalidEnvelope`]. Decoding works
+/// on raw bytes so multi-byte UTF-8 passes through unchanged, and the
+/// result must be valid UTF-8; the decoded text is re-validated by
+/// [`NativeAddress::new`].
+fn decode_component(component: &str) -> Result<String, CoreError> {
+    let bytes = component.as_bytes();
+    let mut decoded = Vec::with_capacity(component.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => {
+                let hex = bytes
+                    .get(index + 1..index + 3)
+                    .and_then(|slice| std::str::from_utf8(slice).ok())
+                    .and_then(|text| u8::from_str_radix(text, 16).ok());
+                let byte = hex.ok_or_else(|| {
+                    CoreError::InvalidEnvelope(format!(
+                        "malformed percent escape in address component at byte {index}"
+                    ))
+                })?;
+                decoded.push(byte);
+                index += 3;
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| {
+        CoreError::InvalidEnvelope("address component is not valid UTF-8 after decoding".into())
+    })
 }
 
 /// A validated, bounded producer-side event identifier.
@@ -190,6 +255,12 @@ impl EventId {
         let value = value.into();
         validate_field("event_id", &value, MAX_FIELD_BYTES)?;
         Ok(EventId(value))
+    }
+
+    /// Re-checks the id rules on a value that did not pass through
+    /// [`EventId::new`] (for example one produced by deserialization).
+    pub fn validate(&self) -> Result<(), CoreError> {
+        validate_field("event_id", &self.0, MAX_FIELD_BYTES)
     }
 
     /// The id text, validated at construction.
@@ -213,6 +284,12 @@ impl PublisherId {
         Ok(PublisherId(value))
     }
 
+    /// Re-checks the id rules on a value that did not pass through
+    /// [`PublisherId::new`] (for example one produced by deserialization).
+    pub fn validate(&self) -> Result<(), CoreError> {
+        validate_field("publisher_id", &self.0, MAX_FIELD_BYTES)
+    }
+
     /// The id text, validated at construction.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -234,6 +311,12 @@ impl Kind {
         Ok(Kind(value))
     }
 
+    /// Re-checks the kind rules on a value that did not pass through
+    /// [`Kind::new`] (for example one produced by deserialization).
+    pub fn validate(&self) -> Result<(), CoreError> {
+        validate_field("kind", &self.0, 64)
+    }
+
     /// The kind text, validated at construction.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -250,6 +333,12 @@ impl StreamId {
         let value = value.into();
         validate_field("stream_id", &value, MAX_FIELD_BYTES)?;
         Ok(StreamId(value))
+    }
+
+    /// Re-checks the stream rules on a value that did not pass through
+    /// [`StreamId::new`] (for example one produced by deserialization).
+    pub fn validate(&self) -> Result<(), CoreError> {
+        validate_field("stream_id", &self.0, MAX_FIELD_BYTES)
     }
 
     /// The stream id text, validated at construction.
@@ -271,6 +360,34 @@ pub enum Mode {
     Message,
     /// Select inject or message from the recipient's current state.
     Auto,
+}
+
+impl Mode {
+    /// Canonical storage/wire name of this requested mode.
+    ///
+    /// Part of the coalescing scope key and of grant allowlists; never
+    /// display-derived.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Mode::Inject => "inject",
+            Mode::Message => "message",
+            Mode::Auto => "auto",
+        }
+    }
+
+    /// Parses a mode from its canonical wire name.
+    ///
+    /// Refuses any other spelling; there is no default mode.
+    pub fn parse(value: &str) -> Result<Self, CoreError> {
+        match value {
+            "inject" => Ok(Mode::Inject),
+            "message" => Ok(Mode::Message),
+            "auto" => Ok(Mode::Auto),
+            other => Err(CoreError::InvalidEnvelope(format!(
+                "unknown mode {other:?}"
+            ))),
+        }
+    }
 }
 
 /// Coalescing policy attached to an event.
@@ -300,15 +417,25 @@ pub enum Policy {
 impl Policy {
     /// Validates the policy's own fields (stream/group shape and bounds).
     ///
-    /// Struct constructors already validate [`StreamId`]; this checks the
-    /// batch group text. Returns [`CoreError::InvalidEnvelope`] on failure.
+    /// For `Latest` this re-checks the stream id (covering deserialized
+    /// values). The revision itself is an unbounded u64 at the type level:
+    /// values above [`MAX_SQLITE_INT`] are refused explicitly at the
+    /// storage cast site, never wrapped. For `Batch` the group text is
+    /// checked. Returns [`CoreError::InvalidEnvelope`] on failure.
     pub fn validate(&self) -> Result<(), CoreError> {
         match self {
             Policy::KeepAll => Ok(()),
-            Policy::Latest { stream, .. } => {
-                validate_field("stream_id", stream.as_str(), MAX_FIELD_BYTES)
-            }
+            Policy::Latest { stream, .. } => stream.validate(),
             Policy::Batch { group } => validate_field("group", group, MAX_FIELD_BYTES),
+        }
+    }
+
+    /// The policy's canonical name for grant allowlists.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Policy::KeepAll => "keep_all",
+            Policy::Latest { .. } => "latest",
+            Policy::Batch { .. } => "batch",
         }
     }
 }
@@ -326,7 +453,9 @@ impl ExpiresAt {
     /// Wraps an absolute Unix-epoch-milliseconds expiry.
     ///
     /// Refuses zero (an unset expiry is represented by `None` on the
-    /// envelope, not by a sentinel value).
+    /// envelope, not by a sentinel value). Values above
+    /// [`MAX_SQLITE_INT`] are an unbounded u64 at the type level and are
+    /// refused explicitly at the storage cast site.
     pub fn from_unix_millis(millis: u64) -> Result<Self, CoreError> {
         if millis == 0 {
             return Err(CoreError::InvalidEnvelope(
@@ -336,10 +465,17 @@ impl ExpiresAt {
         Ok(ExpiresAt(millis))
     }
 
+    /// Re-checks the expiry rules on a value that did not pass through
+    /// [`ExpiresAt::from_unix_millis`] (for example one produced by
+    /// deserialization).
+    pub fn validate(self) -> Result<(), CoreError> {
+        ExpiresAt::from_unix_millis(self.0).map(|_| ())
+    }
+
     /// Normalizes a relative TTL once: `now_ms + ttl_ms`.
     ///
     /// `ttl_ms` may be zero (expire immediately); the result is the absolute
-    /// value the envelope will freeze.
+    /// value the envelope will freeze, bounded as above.
     pub fn relative(ttl_ms: u64, now_ms: u64) -> Result<Self, CoreError> {
         let millis = now_ms
             .checked_add(ttl_ms)
@@ -368,13 +504,20 @@ impl Payload {
     /// characters are accepted here — payloads are producer content; the
     /// framing layer rejects forbidden controls at render time.
     pub fn new(value: impl Into<String>) -> Result<Self, CoreError> {
-        let value = value.into();
-        if value.len() > MAX_PAYLOAD_BYTES {
+        let payload = Payload(value.into());
+        payload.validate()?;
+        Ok(payload)
+    }
+
+    /// Re-checks the payload bounds on a value that did not pass through
+    /// [`Payload::new`] (for example one produced by deserialization).
+    pub fn validate(&self) -> Result<(), CoreError> {
+        if self.0.len() > MAX_PAYLOAD_BYTES {
             return Err(CoreError::InvalidEnvelope(format!(
                 "payload exceeds {MAX_PAYLOAD_BYTES} bytes"
             )));
         }
-        Ok(Payload(value))
+        Ok(())
     }
 
     /// The payload text, bounded at construction.
@@ -457,10 +600,7 @@ impl Envelope {
         metadata: Metadata,
         expires_at: Option<ExpiresAt>,
     ) -> Result<Self, CoreError> {
-        recipient.validate()?;
-        policy.validate()?;
-        validate_metadata(&metadata)?;
-        Ok(Envelope {
+        let envelope = Envelope {
             schema_version: SCHEMA_VERSION,
             publisher,
             event_id,
@@ -471,19 +611,32 @@ impl Envelope {
             payload,
             metadata,
             expires_at,
-        })
+        };
+        envelope.validate()?;
+        Ok(envelope)
     }
 
     /// Validates an envelope received through storage or IPC.
     ///
-    /// Same rules as [`Envelope::new`]; use for deserialized values whose
-    /// construction path is not trusted.
+    /// This is the one shared trust-boundary check: it applies exactly the
+    /// constructor rules to every component — including values that reached
+    /// this struct through `Deserialize`, which bypasses the newtype
+    /// constructors. Malformed publisher, event id, kind, stream, payload,
+    /// expiry, address, policy or metadata makes the whole envelope invalid
+    /// before it can be hashed, stored, acknowledged or disclosed.
     pub fn validate(&self) -> Result<(), CoreError> {
         if self.schema_version != SCHEMA_VERSION {
             return Err(CoreError::InvalidEnvelope(format!(
                 "unsupported schema_version {}",
                 self.schema_version
             )));
+        }
+        self.publisher.validate()?;
+        self.event_id.validate()?;
+        self.kind.validate()?;
+        self.payload.validate()?;
+        if let Some(expiry) = self.expires_at {
+            expiry.validate()?;
         }
         self.recipient.validate()?;
         self.policy.validate()?;
