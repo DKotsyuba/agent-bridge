@@ -10,13 +10,18 @@
 //! Module layout:
 //! - [`types`]: canonical address, envelope, policy and expiry types with
 //!   validation and canonical hashing.
+//! - [`storage`]: transactional custody storage with idempotent publication,
+//!   conflict detection, stream watermarks and admission caps.
 //!
 //! Boundary note: authentication and authorization of publishers, the IPC
 //! protocol and dispatch state machinery live in later tasks of this Module
-//! and are intentionally absent here.
+//! and are intentionally absent here. Storage callers pass an
+//! already-authenticated publisher identity.
 
+pub mod storage;
 pub mod types;
 
+pub use storage::{CustodyReceipt, Limits, PublishOutcome, Storage};
 pub use types::{
     CoreError, Envelope, EnvelopeHash, EventId, ExpiresAt, Harness, Kind, Metadata, Mode,
     NativeAddress, Payload, Policy, PublisherId, SCHEMA_VERSION, StreamId,
