@@ -1,0 +1,14 @@
+[package]
+name = "bridge-client"
+description = "Shared typed publisher client for Agent Bridge family producers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+bridge-core.workspace = true
+
+[lints]
+workspace = true
