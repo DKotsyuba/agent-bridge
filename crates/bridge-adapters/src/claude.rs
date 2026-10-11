@@ -1,6 +1,6 @@
 //! Claude `message` carrier: authenticated native peer send with
-//! `priority = "later"`, a stable daemon callback, and positive closure of
-//! written-without-receipt hand-offs.
+//! `priority = "later"`, a callback socket unique to each attempt, and
+//! positive closure of written-without-receipt hand-offs.
 //!
 //! The recipient is the exact harness process incarnation of the binding:
 //! its session descriptor (`<store>/sessions/*.json`) must name the
@@ -15,13 +15,27 @@
 //! runtime disablement (a restricted Claude session ignores
 //! `--messaging-socket-path`), so the message capability is withdrawn and
 //! recorded in core before any further acceptance; a descriptor not yet
-//! written is only a transient hold.
+//! written is only a transient hold. An inbox that appears later in the
+//! same incarnation restores the message capability only when the loaded
+//! profile qualified it (never a promotion). Every such change is recorded
+//! in core first and applied to the registry only after that succeeded,
+//! and only to the exact binding (epoch and incarnation) it was observed
+//! under; withdrawn but qualified bindings are re-checked every 2 s even
+//! with no work pending, since publications refuse meanwhile.
 //!
-//! Receipts: the user frame names a long-lived callback socket this daemon
-//! keeps in the inbox's directory (the native reply-address rule). A
-//! receipt is correlated by the attempt's unguessable message id (known
-//! only to the recipient process through its authenticated inbox and to
-//! this daemon) *and* by the sender's kernel identity, read first thing
+//! Receipts: the user frame names a callback socket this daemon binds in
+//! the inbox's directory (the native reply-address rule) for this one
+//! attempt only: its name derives from the attempt's message id, it is
+//! unlinked when the attempt settles or expires, and at most
+//! [`ClaudeTiming::max_callbacks`] exist at once (with all in use the
+//! recipient is held at attestation, before core reserves an attempt). Earlier versions shared one callback per
+//! daemon and inbox directory, so a historical peer entry of the same
+//! session and manifest could settle a later attempt after a manual retry;
+//! the per-attempt origin is what makes evidence per attempt. A receipt
+//! on a callback is accepted only for that callback's own message id
+//! (unguessable, known only to the recipient process through its
+//! authenticated inbox and to this daemon) *and* only from the sender's
+//! kernel identity, read first thing
 //! after accept: it must be this user and the attested recipient PID. A
 //! sender whose identity can no longer be read (it closed before the
 //! daemon asked; the kernel stops reporting a closed peer's PID) is
@@ -34,13 +48,15 @@
 //! into core: release after hold is acceptance; any negative after a hold
 //! is an unknown outcome (no proof the loaded native classification means
 //! no context acceptance). A written-without-receipt hand-off is
-//! reconciled against the addressed session's own native transcript: an
-//! `enqueue` of the exact manifest is native acceptance, and a peer-origin
-//! user entry naming this hand-off's callback and containing the exact
-//! manifest is context evidence (shapes observed on Claude 2.1.296; no
-//! message id is assumed in the transcript). Absent evidence never retries. A daemon
-//! restart forgets callbacks: core's recheck deadlines turn those attempts
-//! into retained incidents, never replays.
+//! reconciled against the addressed session's own native transcript: only
+//! a peer-origin user entry of that session naming this attempt's own
+//! callback (`origin.from`) and containing the exact manifest is evidence
+//! (context observed). A `queue-operation` `enqueue` carries no attempt
+//! identity (the same manifest is re-sent on a retry), so it is not
+//! evidence. Shapes observed on Claude 2.1.296; no message id is assumed in
+//! the transcript. Absent evidence never retries. A daemon restart forgets
+//! callbacks: core's recheck deadlines turn those attempts into retained
+//! incidents, never replays.
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -58,7 +74,7 @@ use bridge_core::{Harness, NativeAddress};
 use serde_json::{Value, json};
 
 use crate::os;
-use crate::registry::Registry;
+use crate::registry::{RecipientBinding, Registry};
 use crate::server::{Custody, lock_registry, with_custody};
 
 /// Largest manifest the native inbox accepts in one message, in bytes.
@@ -73,6 +89,10 @@ const MAX_DESCRIPTORS: usize = 512;
 /// Largest receipt frame, in bytes.
 const MAX_RECEIPT_BYTES: u64 = 4096;
 
+/// Default bound of per-attempt callback sockets live at once (see
+/// [`ClaudeTiming::max_callbacks`]).
+const MAX_CALLBACKS: usize = 64;
+
 /// Largest transcript tail searched for a closure marker, in bytes.
 const MAX_TRANSCRIPT_TAIL: u64 = 8 << 20;
 
@@ -86,15 +106,25 @@ pub struct ClaudeTiming {
     /// Deadline for positive closure of a written-without-receipt
     /// hand-off, in milliseconds.
     pub receipt_deadline_ms: u64,
+    /// Most per-attempt callback sockets (unsettled hand-offs) live at
+    /// once. While all are in use, attestation holds the recipient
+    /// visibly, so no attempt is reserved or consumed until a slot frees.
+    pub max_callbacks: usize,
+    /// Period of the background pass (transcript closure, expiry and the
+    /// withdrawn-capability re-check).
+    pub close_interval: Duration,
 }
 
 impl Default for ClaudeTiming {
-    /// 1.5 s first-receipt window, 10 min held recheck, 5 min closure.
+    /// 1.5 s first-receipt window, 10 min held recheck, 5 min closure, 64
+    /// callback slots, 2 s background pass.
     fn default() -> Self {
         ClaudeTiming {
             receipt_wait: Duration::from_millis(1_500),
             held_recheck_ms: 10 * 60_000,
             receipt_deadline_ms: 5 * 60_000,
+            max_callbacks: MAX_CALLBACKS,
+            close_interval: Duration::from_secs(2),
         }
     }
 }
@@ -104,8 +134,13 @@ impl Default for ClaudeTiming {
 enum Waiting {
     /// `send` is inside its receipt window.
     First(Sender<String>),
-    /// Held natively; a later release or drop is expected.
-    Held,
+    /// Held natively; a later release or drop is expected until the
+    /// recheck horizon `until_ms` (Unix epoch ms), after which the hub
+    /// forgets it (core raises the overdue incident).
+    Held {
+        /// Recheck horizon.
+        until_ms: u64,
+    },
     /// Written without a receipt; closure by late receipt or transcript.
     NoReceipt {
         /// The exact manifest text.
@@ -114,15 +149,13 @@ enum Waiting {
         transcript: Option<PathBuf>,
         /// The addressed native session id (transcript entries must match).
         session: String,
-        /// This hand-off's `from` value (`uds:<callback>`); a peer entry
-        /// must name it to count as this daemon's delivery.
+        /// This hand-off's own `from` value (`uds:<per-attempt callback>`);
+        /// a peer entry must name it to count as this attempt's delivery.
         from: String,
         /// One member `(publisher, event_id)` of the frozen manifest, the
         /// handle core evidence is recorded against (it applies to the
         /// whole manifest).
         member: (String, String),
-        /// Whether native queue acceptance was already recorded.
-        enqueued: bool,
         /// Closure deadline (Unix epoch ms).
         deadline_ms: u64,
     },
@@ -149,9 +182,17 @@ struct Hub {
     custody: Arc<dyn Custody>,
     /// In-flight hand-offs by message id.
     pending: Mutex<HashMap<String, Pending>>,
-    /// Callback socket path and its bound inode `(dev, ino)` per inbox
-    /// directory; the inode lets drop remove only sockets this hub bound.
-    listeners: Mutex<HashMap<PathBuf, BoundCallback>>,
+    /// Per-attempt callback socket path and its bound inode `(dev, ino)`,
+    /// keyed by the attempt's message id; the inode lets cleanup remove
+    /// only sockets this hub bound. Bounded by `max_callbacks`.
+    callbacks: Mutex<HashMap<String, BoundCallback>>,
+    /// Bound of `callbacks` ([`ClaudeTiming::max_callbacks`]).
+    max_callbacks: usize,
+    /// Serializes message capability changes (dispatch attestation and the
+    /// periodic sweep), so an observation and its core record and registry
+    /// commit are never interleaved with another change. Taken before, and
+    /// never while holding, the registry or custody lock.
+    sync: Mutex<()>,
     /// This user's uid.
     uid: u32,
     /// Random per-process secret (from the OS) that makes message ids and
@@ -172,7 +213,7 @@ struct Frame<'a> {
     session: &'a str,
     /// Attempt message id.
     msg_id: &'a str,
-    /// Stable callback socket.
+    /// This attempt's own callback socket.
     from: &'a Path,
     /// Exact manifest text.
     manifest: &'a str,
@@ -235,25 +276,45 @@ pub enum InboxState {
 
 /// Reads the inbox state of `session` owned by exactly `pid` from the
 /// store's session registry (owned, regular, bounded files only).
+///
+/// Claude 2.1.296 writes one descriptor per process at
+/// `<store>/sessions/<pid>.json`; that exact file is read first, so the
+/// supported layout costs one bounded file read and is never starved by
+/// other descriptors in a wide store. Only when it is missing, or does not
+/// name exactly this session and PID, does the bounded legacy scan look for
+/// a descriptor under another name (at most `MAX_DESCRIPTORS` JSON files
+/// in sorted order). Nothing found is [`InboxState::Absent`].
 pub fn inbox_state(store: &Path, session: &str, pid: u32, uid: u32) -> InboxState {
+    let direct = store.join("sessions").join(format!("{pid}.json"));
+    if let Some(state) = descriptor_state(&direct, session, pid, uid) {
+        return state;
+    }
     registry_entries(store)
         .into_iter()
-        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json") && *path != direct)
         .take(MAX_DESCRIPTORS)
-        .find_map(|path| {
-            let map = owned_json(&path, uid)?;
-            let matches = map.get("sessionId").and_then(Value::as_str) == Some(session)
-                && map.get("pid").and_then(Value::as_u64) == Some(u64::from(pid));
-            matches.then(|| match map.get("messagingSocketPath") {
-                Some(Value::String(socket)) if Path::new(socket).is_absolute() => {
-                    InboxState::Socket(PathBuf::from(socket))
-                }
-                None | Some(Value::Null) => InboxState::Disabled,
-                // A malformed value is not a positive disablement.
-                Some(_) => InboxState::Absent,
-            })
-        })
+        .find_map(|path| descriptor_state(&path, session, pid, uid))
         .unwrap_or(InboxState::Absent)
+}
+
+/// The inbox state one descriptor file gives for `session` and `pid`.
+///
+/// Returns `None` when the file is not an owned (`uid`), regular, bounded
+/// JSON object naming exactly that session and PID. A named absolute
+/// `messagingSocketPath` is [`InboxState::Socket`]; a missing or null one
+/// is positive disablement; any other value is malformed and only
+/// [`InboxState::Absent`] (never a disablement).
+fn descriptor_state(path: &Path, session: &str, pid: u32, uid: u32) -> Option<InboxState> {
+    let map = owned_json(path, uid)?;
+    let matches = map.get("sessionId").and_then(Value::as_str) == Some(session)
+        && map.get("pid").and_then(Value::as_u64) == Some(u64::from(pid));
+    matches.then(|| match map.get("messagingSocketPath") {
+        Some(Value::String(socket)) if Path::new(socket).is_absolute() => {
+            InboxState::Socket(PathBuf::from(socket))
+        }
+        None | Some(Value::Null) => InboxState::Disabled,
+        Some(_) => InboxState::Absent,
+    })
 }
 
 /// Reads the recipient process's own peer token (never logged).
@@ -298,46 +359,275 @@ fn receipt(line: &str) -> Option<(String, String)> {
 }
 
 impl Hub {
-    /// Returns this directory's stable callback socket, binding it and
-    /// starting its listener on first use.
-    fn callback_for(self: &Arc<Self>, directory: &Path) -> std::io::Result<PathBuf> {
-        let mut listeners = self.listeners.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((path, _)) = listeners.get(directory)
-            && std::fs::symlink_metadata(path).is_ok()
-        {
-            return Ok(path.clone());
+    /// Binds this hand-off's own callback socket in the inbox directory and
+    /// starts its listener.
+    ///
+    /// One socket per attempt (named from this hub's secret and the
+    /// attempt's message id) makes the native peer origin
+    /// (`from = "uds:<path>"`) an attempt identity: transcript entries from
+    /// any other attempt, including an earlier attempt of the same event
+    /// with the same manifest, can never match this one. The listener only
+    /// routes receipts naming this attempt's message id and stops once the
+    /// attempt is released. At most `max_callbacks` are live at once;
+    /// attestation holds before that bound is reached
+    /// ([`Hub::callback_capacity`]), so the error here is only a defence.
+    fn callback_for_attempt(
+        self: &Arc<Self>,
+        directory: &Path,
+        msg_id: &str,
+    ) -> std::io::Result<PathBuf> {
+        let mut callbacks = self.callbacks.lock().unwrap_or_else(|p| p.into_inner());
+        if callbacks.len() >= self.max_callbacks {
+            return Err(std::io::Error::other("callback capacity reached"));
         }
-        let name = format!(
-            "{}.sock",
-            &self.derive(&format!("callback:{}", directory.display()))[..12]
-        );
+        let name = format!("{}.sock", &self.derive(&format!("callback:{msg_id}"))[..12]);
         let path = directory.join(name);
         let listener = UnixListener::bind(&path)?;
+        listener.set_nonblocking(true)?;
         let bound = std::fs::symlink_metadata(&path)?;
-        let identity = (bound.dev(), bound.ino());
-        let hub = Arc::clone(self);
+        callbacks.insert(
+            msg_id.to_string(),
+            (path.clone(), (bound.dev(), bound.ino())),
+        );
+        drop(callbacks);
+        let hub = Arc::downgrade(self);
+        let expected = msg_id.to_string();
         std::thread::Builder::new()
             .name("bridge-claude-callback".into())
             .spawn(move || {
-                for stream in listener.incoming() {
-                    let Ok(stream) = stream else { continue };
-                    hub.accept_receipt(stream);
+                while let Some(hub) = hub.upgrade() {
+                    if !hub
+                        .callbacks
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .contains_key(&expected)
+                    {
+                        break;
+                    }
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let _ = stream.set_nonblocking(false);
+                            hub.accept_receipt(stream, &expected);
+                        }
+                        Err(_) => {
+                            drop(hub);
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                    }
                 }
             })?;
-        listeners.insert(directory.to_path_buf(), (path.clone(), identity));
         Ok(path)
     }
 
-    /// Removes every callback socket this hub bound, only while the path is
-    /// still the exact inode it bound (a replacement is never touched).
-    fn remove_callbacks(&self) {
-        let listeners = self.listeners.lock().unwrap_or_else(|p| p.into_inner());
-        for (path, identity) in listeners.values() {
-            if std::fs::symlink_metadata(path)
-                .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == *identity)
-            {
-                let _ = std::fs::remove_file(path);
+    /// Unlinks one bound callback socket, only while the path is still the
+    /// exact inode it bound (a replacement is never touched).
+    fn unlink(bound: &BoundCallback) {
+        let (path, identity) = bound;
+        if std::fs::symlink_metadata(path)
+            .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == *identity)
+        {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// Forgets one hand-off: its pending entry and its callback socket (the
+    /// listener stops on its next poll). Must not be called while holding
+    /// the pending or callbacks lock.
+    ///
+    /// Returns whether this call removed the pending entry, so of two
+    /// concurrent closers only one records the hand-off's outcome.
+    fn release(&self, msg_id: &str) -> bool {
+        let removed = self
+            .pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(msg_id)
+            .is_some();
+        let bound = self
+            .callbacks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(msg_id);
+        if let Some(bound) = bound {
+            Hub::unlink(&bound);
+        }
+        removed
+    }
+
+    /// Whether a callback slot is free for the next hand-off; when all
+    /// `max_callbacks` are in use, first releases held hand-offs past their
+    /// recheck horizon ([`Hub::expire`]: memory only, no transcript or other
+    /// file read, so
+    /// this check stays cheap on every attestation; positive transcript
+    /// closure stays with the background pass).
+    ///
+    /// Only the dispatching carrier binds callbacks, after its own
+    /// attestation, and every other path only releases them, so a slot free
+    /// here is still free at the following `send`.
+    ///
+    /// # Errors
+    ///
+    /// Every slot is held by an unsettled hand-off: a transient
+    /// attestation hold (core records it visibly; no attempt is reserved or
+    /// consumed, the payload stays pending).
+    fn callback_capacity(&self) -> Result<(), String> {
+        let full = || {
+            self.callbacks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .len()
+                >= self.max_callbacks
+        };
+        if full() {
+            self.expire(current_unix_millis());
+        }
+        if full() {
+            return Err(format!(
+                "all {} native callback slots are held by unsettled hand-offs (transient; no attempt consumed)",
+                self.max_callbacks
+            ));
+        }
+        Ok(())
+    }
+
+    /// Releases, in memory only, the held hand-offs past their recheck
+    /// horizon at `now` (Unix epoch ms); core keeps their recheck deadlines
+    /// and raises the incidents. Reads no file.
+    ///
+    /// Written-without-receipt hand-offs are deliberately left to the
+    /// background pass ([`Hub::close_pass`]), which reads the transcript
+    /// before releasing one past its deadline, so evidence appended after
+    /// the previous pass, even across the deadline, is still recorded. Their
+    /// slots therefore free at most one [`ClaudeTiming::close_interval`]
+    /// (2 s by default) after the deadline; meanwhile the recipient stays
+    /// held at attestation with no attempt reserved.
+    fn expire(&self, now: u64) {
+        let expired: Vec<String> = self
+            .pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter_map(|(id, entry)| match &entry.waiting {
+                Waiting::Held { until_ms } if now > *until_ms => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        for id in expired {
+            self.release(&id);
+        }
+    }
+
+    /// Records an attestation with a changed capability in core; returns
+    /// whether core stored it (a refusal or unattached custody is logged).
+    fn observe(&self, attestation: &Attestation) -> bool {
+        let observed = with_custody(self.custody.as_ref(), |storage| {
+            storage.observe_binding(attestation, current_unix_millis())
+        });
+        let stored = matches!(observed, Some(Ok(())));
+        if !stored {
+            log_event("warn", "claude_capability_change_unrecorded", &[]);
+        }
+        stored
+    }
+
+    /// Brings the message capability of `recipient` in line with what its
+    /// attested harness process's session descriptor says now, under the
+    /// registry snapshot `snapshot`.
+    ///
+    /// A positively disabled inbox withdraws message; an inbox advertised
+    /// later by the same session and incarnation (native late binding)
+    /// restores it, never beyond the loaded build's qualification. A change
+    /// is recorded in core first and applied to the registry only after
+    /// that succeeded, so registry and core never disagree in the granting
+    /// direction and a failed core write is simply retried by the next
+    /// check (dispatch attestation or [`Hub::refresh_withdrawn`]). The
+    /// registry commit re-checks the snapshot's epoch and incarnation, so
+    /// an observation of a replaced incarnation never changes the renewed
+    /// binding. Serialized by `sync`; the registry and custody locks are
+    /// never held together.
+    ///
+    /// Returns the changed attestation, or `None` when nothing changed.
+    ///
+    /// # Errors
+    ///
+    /// Transient holds, never a capability verdict: no descriptor of this
+    /// session and PID yet (or a malformed one), the change could not be
+    /// recorded in core yet, or the binding was renewed or retired since
+    /// the snapshot.
+    fn sync_message(
+        &self,
+        registry: &Mutex<Registry>,
+        recipient: &NativeAddress,
+        snapshot: &RecipientBinding,
+    ) -> Result<Option<Attestation>, String> {
+        let _serial = self.sync.lock().unwrap_or_else(|p| p.into_inner());
+        let message = match inbox_state(
+            &snapshot.store,
+            &recipient.native_session_id,
+            snapshot.harness.0,
+            self.uid,
+        ) {
+            InboxState::Socket(_) => true,
+            InboxState::Disabled => false,
+            InboxState::Absent => {
+                return Err(
+                    "the recipient has not advertised its native inbox yet (transient, not inactive)"
+                        .into(),
+                );
             }
+        };
+        let change = lock_registry(registry).message_change(recipient, snapshot, message)?;
+        let Some(change) = change else {
+            return Ok(None);
+        };
+        if !self.observe(&change) {
+            return Err(
+                "the message capability change could not be recorded in core yet (transient; retried)"
+                    .into(),
+            );
+        }
+        lock_registry(registry).commit_message(recipient, snapshot, message)?;
+        log_event(
+            "info",
+            if message {
+                "claude_message_restored"
+            } else {
+                "claude_message_withdrawn"
+            },
+            &[("recipient", &recipient.to_canonical_string())],
+        );
+        Ok(Some(change))
+    }
+
+    /// Re-checks every live Claude binding whose message capability was
+    /// withdrawn although its build is qualified, independent of pending
+    /// work: while message is withdrawn, publications refuse before
+    /// acceptance, so no dispatch would ever re-attest the recipient. A late
+    /// inbox restores message here (recorded in core first); a still
+    /// disabled or absent inbox, a gone process or a failed core write
+    /// leaves the binding for the next pass.
+    fn refresh_withdrawn(&self, registry: &Mutex<Registry>) {
+        let withdrawn = lock_registry(registry).message_withdrawn(Harness::ClaudeCode);
+        for address in withdrawn {
+            let attested = lock_registry(registry).attest_recipient(&address);
+            if let Ok((_, snapshot)) = attested {
+                let _ = self.sync_message(registry, &address, &snapshot);
+            }
+        }
+    }
+
+    /// Removes every callback socket this hub bound (exact inodes only) and
+    /// stops their listeners.
+    fn remove_callbacks(&self) {
+        let drained: Vec<BoundCallback> = self
+            .callbacks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .drain()
+            .map(|(_, bound)| bound)
+            .collect();
+        for bound in &drained {
+            Hub::unlink(bound);
         }
     }
 
@@ -348,13 +638,14 @@ impl Hub {
         crate::server::sha256_hex(&material)
     }
 
-    /// Reads one bounded receipt connection and routes it.
+    /// Reads one bounded receipt connection on the callback of `expected`
+    /// (one attempt's message id) and routes it.
     ///
     /// The sender's kernel identity is read before anything else. A sender
     /// whose identity is unreadable (already closed) or of another user is
     /// ignored without reading: a receipt never counts without the
-    /// recipient PID, whatever message id it names.
-    fn accept_receipt(&self, stream: UnixStream) {
+    /// recipient PID. Receipts naming any other message id are ignored.
+    fn accept_receipt(&self, stream: UnixStream, expected: &str) {
         let peer = match os::peer_identity(&stream) {
             Ok(peer) if peer.uid == self.uid => peer,
             Ok(_) => return,
@@ -378,7 +669,9 @@ impl Hub {
             return;
         }
         for line in text.lines() {
-            if let Some((msg_id, status)) = receipt(line) {
+            if let Some((msg_id, status)) = receipt(line)
+                && msg_id == expected
+            {
                 self.route(&msg_id, &status, peer.pid);
             }
         }
@@ -399,15 +692,16 @@ impl Hub {
                 let _ = sender.send(status.to_string());
                 return;
             }
-            Waiting::Held | Waiting::NoReceipt { .. } => match status {
+            Waiting::Held { .. } | Waiting::NoReceipt { .. } => match status {
                 "delivered" => Outcome::NativeAccepted {
                     evidence: format!("late native receipt delivered for {msg_id}"),
                 },
                 "held" if matches!(entry.waiting, Waiting::NoReceipt { .. }) => {
-                    entry.waiting = Waiting::Held;
-                    Outcome::NativeHeld {
-                        recheck_ms: current_unix_millis().saturating_add(10 * 60_000),
-                    }
+                    let recheck_ms = current_unix_millis().saturating_add(10 * 60_000);
+                    entry.waiting = Waiting::Held {
+                        until_ms: recheck_ms,
+                    };
+                    Outcome::NativeHeld { recheck_ms }
                 }
                 "held" => return,
                 other => Outcome::OutcomeUnknown {
@@ -418,10 +712,11 @@ impl Hub {
             },
         };
         let fence = entry.fence.clone();
-        if !matches!(late, Outcome::NativeHeld { .. }) {
-            pending.remove(msg_id);
-        }
+        let settled = !matches!(late, Outcome::NativeHeld { .. });
         drop(pending);
+        if settled {
+            self.release(msg_id);
+        }
         self.record(&fence, late);
     }
 
@@ -466,20 +761,25 @@ impl Hub {
         }
     }
 
-    /// One reconciliation pass over written-without-receipt hand-offs against
-    /// the addressed session's own native transcript.
+    /// One reconciliation pass over this hub's hand-offs.
     ///
-    /// A user entry of that session whose native peer origin names this
-    /// hand-off's `from` and whose content contains the exact manifest is
-    /// context evidence (the manifest entered the conversation); it settles
-    /// the attempt. A queue `enqueue` of that session whose content is the
-    /// exact manifest is native acceptance; it is recorded once and the
-    /// pass keeps looking for context until the deadline. Past the deadline
-    /// the entry is forgotten (core holds the recheck and raises the
-    /// incident). No message id is assumed to appear in the transcript, and
-    /// absence never causes a resend.
+    /// A written-without-receipt hand-off settles as context evidence when
+    /// the addressed session's own transcript holds a user entry whose
+    /// native peer origin is *this attempt's* callback and whose content
+    /// contains the exact manifest. The native inbox `enqueue` entry is not
+    /// used: it carries only the manifest, which an earlier attempt of the
+    /// same event shares. Past its deadline a hand-off is forgotten (core
+    /// holds the recheck and raises the incident), as is a held hand-off
+    /// past its recheck horizon. Absence never causes a resend.
     fn close_pass(&self) {
         let now = current_unix_millis();
+        /// One written-without-receipt hand-off copied out of the pending
+        /// map, so transcripts are read without holding its lock: message
+        /// id, attempt fence, exact manifest, transcript path (if reported),
+        /// addressed session id, this attempt's own `from`
+        /// (`uds:<callback>`), the core member `(publisher, event_id)` that
+        /// evidence is recorded against, and the closure deadline (Unix
+        /// epoch ms).
         type Candidate = (
             String,
             AttemptFence,
@@ -488,9 +788,9 @@ impl Hub {
             String,
             String,
             (String, String),
-            bool,
             u64,
         );
+        let mut expired = Vec::new();
         let candidates: Vec<Candidate> = {
             let pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
             pending
@@ -502,7 +802,6 @@ impl Hub {
                         session,
                         from,
                         member,
-                        enqueued,
                         deadline_ms,
                     } => Some((
                         id.clone(),
@@ -512,98 +811,63 @@ impl Hub {
                         session.clone(),
                         from.clone(),
                         member.clone(),
-                        *enqueued,
                         *deadline_ms,
                     )),
+                    Waiting::Held { until_ms } if now > *until_ms => {
+                        expired.push(id.clone());
+                        None
+                    }
                     _ => None,
                 })
                 .collect()
         };
-        for (id, fence, manifest, transcript, session, from, member, enqueued, deadline) in
-            candidates
-        {
-            let found = transcript
-                .as_deref()
-                .map(|path| transcript_evidence(path, &manifest, self.uid, &session, &from))
-                .unwrap_or_default();
-            if found.context {
-                self.pending
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .remove(&id);
+        for id in expired {
+            self.release(&id);
+        }
+        for (id, fence, manifest, transcript, session, from, member, deadline) in candidates {
+            let found = transcript.as_deref().is_some_and(|path| {
+                transcript_has_handoff(path, &manifest, self.uid, &session, &from)
+            });
+            if found && self.release(&id) {
                 self.evidence(
                     &fence,
                     &member,
                     EvidenceTier::ContextObserved,
-                    "native transcript of the attested session holds this daemon's peer message (origin from its callback) containing the exact manifest as conversation input",
-                );
-            } else if found.enqueued && !enqueued {
-                if let Some(Pending {
-                    waiting: Waiting::NoReceipt { enqueued, .. },
-                    ..
-                }) = self
-                    .pending
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .get_mut(&id)
-                {
-                    *enqueued = true;
-                }
-                self.evidence(
-                    &fence,
-                    &member,
-                    EvidenceTier::NativeAccepted,
-                    "native transcript of the attested session records an inbox enqueue of the exact manifest",
+                    "native transcript of the attested session holds this attempt's peer message (origin from its own callback) containing the exact manifest as conversation input",
                 );
             } else if now > deadline {
-                self.pending
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .remove(&id);
+                self.release(&id);
             }
         }
     }
 }
 
-/// Positive transcript evidence for one hand-off.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct TranscriptEvidence {
-    /// A peer-origin user entry from this hand-off's callback contains the
-    /// exact manifest (the manifest entered the conversation).
-    pub context: bool,
-    /// A queue `enqueue` entry carries exactly the manifest (native inbox
-    /// acceptance).
-    pub enqueued: bool,
-}
-
-/// Scans the bounded tail of an owned transcript file for positive evidence
-/// of one hand-off, using the entry shapes Claude 2.1.296 writes.
+/// Whether the bounded tail of an owned transcript file holds positive
+/// evidence of one hand-off, using the entry shape Claude 2.1.296 writes for
+/// a delivered peer message.
 ///
-/// Context: `type == "user"`, `sessionId == session`,
-/// `origin == {kind: "peer", from}` with this hand-off's `from`, and message
-/// content (a string or text parts) containing the exact manifest (the
-/// native inbox wraps it in its own peer framing). Enqueued:
-/// `type == "queue-operation"`, `operation == "enqueue"`,
-/// `sessionId == session`, content equal to the manifest (trailing
-/// whitespace ignored). Anything else, including a matching text without
-/// the peer origin, is no evidence. Unreadable, foreign-owned or non-regular
-/// files yield none.
-pub fn transcript_evidence(
+/// Matches a `type == "user"` entry with `sessionId == session`,
+/// `origin == {kind: "peer", from}` where `from` is this attempt's own
+/// callback (`uds:<path>`), and message content (a string or text parts)
+/// containing the exact manifest (the native inbox wraps it in its own peer
+/// framing). Entries of other sessions, other senders or other attempts,
+/// and entries without a peer origin, are no evidence. Unreadable,
+/// foreign-owned or non-regular files yield none.
+pub fn transcript_has_handoff(
     path: &Path,
     manifest: &str,
     uid: u32,
     session: &str,
     from: &str,
-) -> TranscriptEvidence {
-    let mut found = TranscriptEvidence::default();
+) -> bool {
     let Ok(metadata) = std::fs::symlink_metadata(path) else {
-        return found;
+        return false;
     };
     if !metadata.is_file() || metadata.uid() != uid || manifest.is_empty() {
-        return found;
+        return false;
     }
     let Ok(mut file) = std::fs::File::open(path) else {
-        return found;
+        return false;
     };
     let start = metadata.len().saturating_sub(MAX_TRANSCRIPT_TAIL);
     let mut text = String::new();
@@ -613,52 +877,42 @@ pub fn transcript_evidence(
             .read_to_string(&mut text)
             .is_err()
     {
-        return found;
+        return false;
     }
-    for line in text.lines() {
+    text.lines().any(|line| {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
-            continue;
+            return false;
         };
-        if entry.get("sessionId").and_then(Value::as_str) != Some(session) {
-            continue;
+        if entry.get("type").and_then(Value::as_str) != Some("user")
+            || entry.get("sessionId").and_then(Value::as_str) != Some(session)
+        {
+            return false;
         }
-        match entry.get("type").and_then(Value::as_str) {
-            Some("user") => {
-                let origin = &entry["origin"];
-                if origin.get("kind").and_then(Value::as_str) != Some("peer")
-                    || origin.get("from").and_then(Value::as_str) != Some(from)
-                {
-                    continue;
-                }
-                let content = &entry["message"]["content"];
-                let contains = match content {
-                    Value::String(text) => text.contains(manifest),
-                    Value::Array(parts) => parts.iter().any(|part| {
-                        part.get("text")
-                            .and_then(Value::as_str)
-                            .is_some_and(|text| text.contains(manifest))
-                    }),
-                    _ => false,
-                };
-                found.context |= contains;
-            }
-            Some("queue-operation") => {
-                found.enqueued |= entry.get("operation").and_then(Value::as_str) == Some("enqueue")
-                    && entry
-                        .get("content")
-                        .and_then(Value::as_str)
-                        .is_some_and(|content| content.trim_end() == manifest.trim_end());
-            }
-            _ => {}
+        let origin = &entry["origin"];
+        if origin.get("kind").and_then(Value::as_str) != Some("peer")
+            || origin.get("from").and_then(Value::as_str) != Some(from)
+        {
+            return false;
         }
-    }
-    found
+        match &entry["message"]["content"] {
+            Value::String(text) => text.contains(manifest),
+            Value::Array(parts) => parts.iter().any(|part| {
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains(manifest))
+            }),
+            _ => false,
+        }
+    })
 }
 
 impl ClaudeLaterCarrier {
     /// A carrier over `registry` whose late outcomes go to `custody`.
     ///
-    /// Starts one closure thread that lives as long as the process.
+    /// Starts one background thread that, every
+    /// [`ClaudeTiming::close_interval`] (2 s by default) while the carrier
+    /// lives, closes written-without-receipt and expired hand-offs and
+    /// re-checks withdrawn message capabilities (`Hub::refresh_withdrawn`).
     pub fn new(
         registry: Arc<Mutex<Registry>>,
         custody: Arc<dyn Custody>,
@@ -670,18 +924,23 @@ impl ClaudeLaterCarrier {
         let hub = Arc::new(Hub {
             custody,
             pending: Mutex::new(HashMap::new()),
-            listeners: Mutex::new(HashMap::new()),
+            callbacks: Mutex::new(HashMap::new()),
+            max_callbacks: timing.max_callbacks,
+            sync: Mutex::new(()),
             uid,
             secret: os::random_bytes()?,
         });
         let closer = Arc::downgrade(&hub);
+        let swept = Arc::clone(&registry);
+        let interval = timing.close_interval;
         std::thread::Builder::new()
             .name("bridge-claude-closure".into())
             .spawn(move || {
                 while let Some(hub) = closer.upgrade() {
                     hub.close_pass();
+                    hub.refresh_withdrawn(&swept);
                     drop(hub);
-                    std::thread::sleep(Duration::from_secs(2));
+                    std::thread::sleep(interval);
                 }
             })?;
         Ok(ClaudeLaterCarrier {
@@ -751,42 +1010,26 @@ impl DispatchCarrier for ClaudeLaterCarrier {
     /// Attests Claude recipients from the registry; anything else is not
     /// this carrier's.
     ///
-    /// The attested process's session descriptor decides the message path:
-    /// a positively disabled inbox withdraws the message capability (also
-    /// recorded in core, so later message publications refuse before
-    /// acceptance) and is returned as such, so core holds visibly instead of
-    /// treating the path as supported; a descriptor not yet written (absent)
+    /// The attested process's session descriptor decides the message path
+    /// (`Hub::sync_message`): a positively disabled inbox withdraws the
+    /// message capability (recorded in core first, so later message
+    /// publications refuse before acceptance) and is returned as such, so
+    /// core holds visibly instead of treating the path as supported; an
+    /// inbox advertised later by the same session and incarnation (native
+    /// late binding) restores message, only if the loaded build is
+    /// qualified for it; a descriptor not yet written, or a malformed one,
     /// is a transient condition reported as an attestation error (a hold),
-    /// never as disabled or inactive.
+    /// never as disabled, enabled or inactive. While every callback slot is
+    /// held by an unsettled hand-off the recipient is held too
+    /// (`Hub::callback_capacity`), before core reserves an attempt.
     fn attest(&mut self, recipient: &NativeAddress) -> Result<Attestation, String> {
         if recipient.harness != Harness::ClaudeCode {
             return Err("not a Claude recipient".into());
         }
         let (attestation, binding) = lock_registry(&self.registry).attest_recipient(recipient)?;
-        match inbox_state(
-            &binding.store,
-            &recipient.native_session_id,
-            binding.harness.0,
-            self.hub.uid,
-        ) {
-            InboxState::Socket(_) => Ok(attestation),
-            InboxState::Absent => Err(
-                "the recipient has not advertised its native inbox yet (transient, not inactive)"
-                    .into(),
-            ),
-            InboxState::Disabled => {
-                let disabled = lock_registry(&self.registry)
-                    .disable_message_for(recipient)
-                    .ok_or_else(|| "recipient binding vanished".to_string())?;
-                let observed = with_custody(self.hub.custody.as_ref(), |storage| {
-                    storage.observe_binding(&disabled, current_unix_millis())
-                });
-                if !matches!(observed, Some(Ok(()))) {
-                    log_event("warn", "claude_inbox_disablement_unrecorded", &[]);
-                }
-                Ok(disabled)
-            }
-        }
+        let changed = self.hub.sync_message(&self.registry, recipient, &binding)?;
+        self.hub.callback_capacity()?;
+        Ok(changed.unwrap_or(attestation))
     }
 
     /// One `later` hand-off of the frozen manifest.
@@ -828,10 +1071,6 @@ impl DispatchCarrier for ClaudeLaterCarrier {
         let Some(directory) = socket.parent() else {
             return unsent("inbox socket has no directory".into());
         };
-        let callback = match self.hub.callback_for(directory) {
-            Ok(path) => path,
-            Err(error) => return unsent(format!("callback socket unavailable: {}", error.kind())),
-        };
         let msg_id = format!(
             "bridge_{}_{}",
             attempt.fence.attempt_seq,
@@ -840,6 +1079,10 @@ impl DispatchCarrier for ClaudeLaterCarrier {
                 attempt.fence.attempt_seq, attempt.fence.manifest_hash
             ))[..32]
         );
+        let callback = match self.hub.callback_for_attempt(directory, &msg_id) {
+            Ok(path) => path,
+            Err(error) => return unsent(format!("callback socket unavailable: {error}")),
+        };
         let (sender, first): (Sender<String>, Receiver<String>) = mpsc::channel();
         self.hub
             .pending
@@ -863,43 +1106,46 @@ impl DispatchCarrier for ClaudeLaterCarrier {
             manifest: &attempt.manifest,
         };
         if let Err(outcome) = self.write_frames(&frame) {
-            self.hub
-                .pending
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&msg_id);
+            self.hub.release(&msg_id);
             return outcome;
         }
         let status = first.recv_timeout(self.timing.receipt_wait).ok();
         let now = current_unix_millis();
         let mut pending = self.hub.pending.lock().unwrap_or_else(|p| p.into_inner());
+        let settled = |pending: std::sync::MutexGuard<'_, HashMap<String, Pending>>,
+                       outcome: Outcome| {
+            drop(pending);
+            self.hub.release(&msg_id);
+            outcome
+        };
         match status.as_deref() {
             Some("held") => {
+                let recheck_ms = now.saturating_add(self.timing.held_recheck_ms);
                 if let Some(entry) = pending.get_mut(&msg_id) {
-                    entry.waiting = Waiting::Held;
+                    entry.waiting = Waiting::Held {
+                        until_ms: recheck_ms,
+                    };
                 }
-                Outcome::NativeHeld {
-                    recheck_ms: now.saturating_add(self.timing.held_recheck_ms),
-                }
+                Outcome::NativeHeld { recheck_ms }
             }
-            Some("delivered") => {
-                pending.remove(&msg_id);
+            Some("delivered") => settled(
+                pending,
                 Outcome::NativeAccepted {
                     evidence: format!("native receipt delivered for {msg_id}"),
-                }
-            }
-            Some("dropped") => {
-                pending.remove(&msg_id);
+                },
+            ),
+            Some("dropped") => settled(
+                pending,
                 Outcome::OutcomeUnknown {
                     reason: "native dropped receipt; context acceptance not excluded".into(),
-                }
-            }
-            Some(other) => {
-                pending.remove(&msg_id);
+                },
+            ),
+            Some(other) => settled(
+                pending,
                 Outcome::KnownUnsent {
                     evidence: format!("native inbox {other} the message before any hold"),
-                }
-            }
+                },
+            ),
             None => {
                 let deadline_ms = now.saturating_add(self.timing.receipt_deadline_ms);
                 if let Some(entry) = pending.get_mut(&msg_id) {
@@ -913,7 +1159,6 @@ impl DispatchCarrier for ClaudeLaterCarrier {
                             .first()
                             .map(|member| (member.publisher.clone(), member.event_id.clone()))
                             .unwrap_or_default(),
-                        enqueued: false,
                         deadline_ms,
                     };
                 }
@@ -958,7 +1203,9 @@ mod tests {
         let hub = Hub {
             custody,
             pending: Mutex::new(pending),
-            listeners: Mutex::new(HashMap::new()),
+            callbacks: Mutex::new(HashMap::new()),
+            max_callbacks: MAX_CALLBACKS,
+            sync: Mutex::new(()),
             uid: os::process_facts(std::process::id()).unwrap().uid.unwrap(),
             secret: [7; 32],
         };
@@ -992,13 +1239,26 @@ mod tests {
         (server, kept)
     }
 
+    /// A receipt arriving on one attempt's own callback but naming another
+    /// attempt's message id is ignored, even from the recipient PID.
+    #[test]
+    fn receipt_for_another_attempt_on_this_callback_is_ignored() {
+        let (hub, receiver) = hub_waiting(std::process::id());
+        let (server, _kept) = receipt_stream(false);
+        hub.accept_receipt(server, "msg-other-attempt");
+        assert!(
+            receiver.try_recv().is_err(),
+            "a foreign attempt's receipt was routed"
+        );
+    }
+
     /// A sender that closed before its identity was read is ignored even
     /// with the known message id and the right uid.
     #[test]
     fn disconnected_sender_with_known_id_is_ignored() {
         let (hub, receiver) = hub_waiting(std::process::id());
         let (server, _) = receipt_stream(true);
-        hub.accept_receipt(server);
+        hub.accept_receipt(server, "msg-known");
         assert!(
             receiver.try_recv().is_err(),
             "an unverifiable receipt was routed"
@@ -1011,11 +1271,11 @@ mod tests {
     fn connected_sender_must_be_the_recipient_pid() {
         let (hub, receiver) = hub_waiting(std::process::id() + 1);
         let (server, _kept) = receipt_stream(false);
-        hub.accept_receipt(server);
+        hub.accept_receipt(server, "msg-known");
         assert!(receiver.try_recv().is_err(), "a foreign PID was routed");
         let (hub, receiver) = hub_waiting(std::process::id());
         let (server, _kept) = receipt_stream(false);
-        hub.accept_receipt(server);
+        hub.accept_receipt(server, "msg-known");
         assert_eq!(receiver.try_recv().unwrap(), "delivered");
     }
 }

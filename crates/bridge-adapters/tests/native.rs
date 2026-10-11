@@ -8,7 +8,8 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bridge_adapters::RegistryAttestor;
@@ -17,7 +18,7 @@ use bridge_adapters::codex::CodexQueueCarrier;
 use bridge_adapters::registry::{CallerAttestor, PresentedMeta, SealedProof, Unattested};
 use bridge_adapters::server::Custody;
 use bridge_core::dispatch::{AttemptState, DispatchReport, DispatchTiming, dispatch_message};
-use bridge_core::{Harness, Mode};
+use bridge_core::{Harness, Mode, Storage};
 use common::*;
 use serde_json::json;
 
@@ -513,12 +514,12 @@ fn claude_later_held_release_receipts_and_transcript_closure() {
         lab.attempt("evt-quiet").unwrap().state,
         AttemptState::WrittenNoReceipt
     );
-    // The native enqueue of the exact manifest is native acceptance; the
-    // peer-origin entry from this hand-off's callback is context.
+    // The native enqueue carries no attempt identity, so it settles nothing;
+    // only the peer-origin entry from this attempt's own callback is context.
     let enqueue = json!({"type": "queue-operation", "operation": "enqueue", "sessionId": "sess-8", "content": manifest});
     std::fs::write(&transcript, format!("{text}{enqueue}\n")).unwrap();
-    assert!(eventually(6_000, || tiers("evt-quiet")
-        .contains(&"native_accepted".to_string())));
+    std::thread::sleep(Duration::from_millis(1_500));
+    assert!(!tiers("evt-quiet").contains(&"native_accepted".to_string()));
     assert!(!tiers("evt-quiet").contains(&"context_observed".to_string()));
     let peer = json!({"type": "user", "sessionId": "sess-8", "isMeta": true, "origin": {"kind": "peer", "from": from}, "message": {"role": "user", "content": wrapped}});
     std::fs::write(&transcript, format!("{text}{enqueue}\n{peer}\n")).unwrap();
@@ -588,6 +589,704 @@ fn disabled_inbox_refuses_before_acceptance_and_absent_inbox_only_holds() {
     // inject stays supported.
     lab.try_publish("evt-inject-ok", &address, Mode::Inject)
         .unwrap();
+
+    // Native late binding: the same session and incarnation now advertises
+    // its inbox. Message is restored (the build is qualified for it), the
+    // held events go out exactly once each, and new publications are
+    // accepted again.
+    harness.cmd(json!({"cmd": "inbox", "session_id": "sess-di", "behavior": "delivered"}));
+    let mut sent = 0;
+    for _ in 0..4 {
+        match dispatch_message(
+            &lab.storage,
+            &mut carrier,
+            &address,
+            &now,
+            &DispatchTiming::default(),
+        )
+        .unwrap()
+        {
+            DispatchReport::Sent {
+                state: AttemptState::NativeAccepted,
+                events,
+            } => sent += events,
+            DispatchReport::Idle => break,
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(sent, 2, "evt-absent and evt-still-accepted, once each");
+    lab.try_publish("evt-after-restore", &address, Mode::Message)
+        .unwrap();
+    let report = dispatch_message(
+        &lab.storage,
+        &mut carrier,
+        &address,
+        &now,
+        &DispatchTiming::default(),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            report,
+            DispatchReport::Sent {
+                state: AttemptState::NativeAccepted,
+                ..
+            }
+        ),
+        "{report:?}"
+    );
+    let frames = harness.cmd(json!({"cmd": "frames"}));
+    assert_eq!(
+        frames["frames"].as_array().unwrap().len(),
+        3,
+        "no duplicate hand-off"
+    );
+    harness.stop();
+}
+
+/// A build not qualified for message stays without it even when its inbox
+/// is advertised: a late inbox never promotes beyond the qualified profile.
+#[test]
+fn late_inbox_never_promotes_an_unqualified_message_capability() {
+    let lab = Lab::new("np");
+    lab.registry
+        .lock()
+        .unwrap()
+        .disable_message(Harness::ClaudeCode);
+    let address = lab.claude_address("sess-np");
+    let custody = Arc::clone(&lab.storage) as Arc<dyn Custody>;
+    let mut carrier =
+        ClaudeLaterCarrier::new(Arc::clone(&lab.registry), custody, ClaudeTiming::default())
+            .unwrap();
+    let mut harness = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    harness.cmd(json!({"cmd": "inbox", "session_id": "sess-np", "behavior": "delivered"}));
+    harness.hook(
+        &lab.socket,
+        Harness::ClaudeCode,
+        hook("SessionStart", "sess-np"),
+    );
+    harness.hook(&lab.socket, Harness::ClaudeCode, hook("Stop", "sess-np"));
+    assert!(
+        lab.try_publish("evt-np-1", &address, Mode::Message)
+            .is_err()
+    );
+    let report = dispatch_message(
+        &lab.storage,
+        &mut carrier,
+        &address,
+        &now,
+        &DispatchTiming::default(),
+    )
+    .unwrap();
+    assert_eq!(report, DispatchReport::Idle);
+    assert!(
+        lab.try_publish("evt-np-2", &address, Mode::Message)
+            .is_err()
+    );
+    assert!(
+        harness.cmd(json!({"cmd": "frames"}))["frames"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    harness.stop();
+}
+
+/// Custody that does not run the next `failures` actions (as an unattached
+/// or failing store would), then runs every action on the lab's store.
+struct FlakyCustody {
+    /// The lab's store.
+    inner: Arc<Mutex<Storage>>,
+    /// Actions still to refuse.
+    failures: AtomicUsize,
+    /// Actions refused so far.
+    refused: AtomicUsize,
+}
+
+impl Custody for FlakyCustody {
+    /// Refuses (returns `false` without running `action`) while
+    /// `failures` is positive, decrementing it; otherwise runs `action` on
+    /// the lab's store.
+    fn run(&self, action: &mut dyn FnMut(&mut Storage)) -> bool {
+        if self
+            .failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            self.refused.fetch_add(1, Ordering::SeqCst);
+            return false;
+        }
+        self.inner.run(action)
+    }
+}
+
+/// A message capability withdrawn by a disabled inbox comes back when the
+/// same session and incarnation later advertises its inbox although no
+/// event is pending (the withdrawal-triggering event was disposed, and
+/// publications refuse meanwhile, so no dispatch would re-attest) and no
+/// hook arrives; a one-shot failed core write of the restore is retried
+/// rather than leaving the registry and core apart. The next publication
+/// is then accepted and handed off once.
+#[test]
+fn withdrawn_message_recovers_from_a_late_inbox_without_pending_work() {
+    let lab = Lab::new("wr");
+    let address = lab.claude_address("sess-wr");
+    let custody = Arc::new(FlakyCustody {
+        inner: Arc::clone(&lab.storage),
+        failures: AtomicUsize::new(0),
+        refused: AtomicUsize::new(0),
+    });
+    let mut carrier = ClaudeLaterCarrier::new(
+        Arc::clone(&lab.registry),
+        Arc::clone(&custody) as Arc<dyn Custody>,
+        ClaudeTiming::default(),
+    )
+    .unwrap();
+    let mut harness = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    harness.hook(
+        &lab.socket,
+        Harness::ClaudeCode,
+        hook("SessionStart", "sess-wr"),
+    );
+    harness.hook(&lab.socket, Harness::ClaudeCode, hook("Stop", "sess-wr"));
+    harness.cmd(json!({"cmd": "descriptor_disabled", "session_id": "sess-wr"}));
+    lab.publish("evt-trigger", &address, Mode::Message, "trigger payload");
+    let report = dispatch_message(
+        &lab.storage,
+        &mut carrier,
+        &address,
+        &now,
+        &DispatchTiming::default(),
+    )
+    .unwrap();
+    assert!(
+        matches!(report, DispatchReport::Held(ref reason) if reason.contains("capability")),
+        "{report:?}"
+    );
+    // The waiter that triggered the withdrawal goes away: nothing pending.
+    lab.storage
+        .lock()
+        .unwrap()
+        .dispose_event(
+            PUBLISHER,
+            "evt-trigger",
+            "operator",
+            "regression: no pending work",
+            now(),
+        )
+        .unwrap();
+    assert!(
+        lab.try_publish("evt-refused", &address, Mode::Message)
+            .is_err()
+    );
+    // Late inbox, no hook, no work; the first core write of the restore
+    // fails once.
+    custody.failures.store(1, Ordering::SeqCst);
+    harness.cmd(json!({"cmd": "inbox", "session_id": "sess-wr", "behavior": "delivered"}));
+    let mut tries = 0;
+    assert!(eventually(10_000, || {
+        tries += 1;
+        lab.try_publish(&format!("evt-late-{tries}"), &address, Mode::Message)
+            .is_ok()
+    }));
+    assert_eq!(
+        custody.refused.load(Ordering::SeqCst),
+        1,
+        "the failed restore write was retried"
+    );
+    let report = dispatch_message(
+        &lab.storage,
+        &mut carrier,
+        &address,
+        &now,
+        &DispatchTiming::default(),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            report,
+            DispatchReport::Sent {
+                state: AttemptState::NativeAccepted,
+                events: 1
+            }
+        ),
+        "{report:?}"
+    );
+    assert_eq!(
+        harness.cmd(json!({"cmd": "frames"}))["frames"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    harness.stop();
+}
+
+/// An observation taken under an old incarnation's snapshot never changes
+/// the renewed binding of the same session: the old process's disabled
+/// inbox cannot withdraw message from the new, qualified incarnation,
+/// which keeps receiving.
+#[test]
+fn an_old_incarnation_snapshot_never_changes_a_renewed_binding() {
+    let lab = Lab::new("os");
+    let address = lab.claude_address("sess-os");
+    let custody = Arc::clone(&lab.storage) as Arc<dyn Custody>;
+    let mut carrier =
+        ClaudeLaterCarrier::new(Arc::clone(&lab.registry), custody, ClaudeTiming::default())
+            .unwrap();
+    let mut first = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    first.cmd(json!({"cmd": "descriptor_disabled", "session_id": "sess-os"}));
+    first.hook(
+        &lab.socket,
+        Harness::ClaudeCode,
+        hook("SessionStart", "sess-os"),
+    );
+    let (_, old) = lab
+        .registry
+        .lock()
+        .unwrap()
+        .attest_recipient(&address)
+        .unwrap();
+    first.stop();
+    let mut second = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    second.cmd(json!({"cmd": "inbox", "session_id": "sess-os", "behavior": "delivered"}));
+    second.hook(
+        &lab.socket,
+        Harness::ClaudeCode,
+        hook("SessionStart", "sess-os"),
+    );
+    second.hook(&lab.socket, Harness::ClaudeCode, hook("Stop", "sess-os"));
+    {
+        let mut registry = lab.registry.lock().unwrap();
+        assert!(registry.message_change(&address, &old, false).is_err());
+        assert!(registry.commit_message(&address, &old, false).is_err());
+    }
+    lab.publish(
+        "evt-new",
+        &address,
+        Mode::Message,
+        "new incarnation payload",
+    );
+    let report = dispatch_message(
+        &lab.storage,
+        &mut carrier,
+        &address,
+        &now,
+        &DispatchTiming::default(),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            report,
+            DispatchReport::Sent {
+                state: AttemptState::NativeAccepted,
+                ..
+            }
+        ),
+        "{report:?}"
+    );
+    second.stop();
+}
+
+/// When every callback slot is held by an unsettled hand-off, the next
+/// message is held visibly before any attempt: no attempt is reserved or
+/// consumed and its payload stays pending, however often dispatch runs.
+/// Once a slot frees (the earlier hand-off settles) it is handed off once.
+#[test]
+fn full_callback_slots_hold_without_consuming_attempts() {
+    let lab = Lab::new("cs");
+    let address = lab.claude_address("sess-cs");
+    let custody = Arc::clone(&lab.storage) as Arc<dyn Custody>;
+    let timing = ClaudeTiming {
+        receipt_wait: Duration::from_millis(100),
+        max_callbacks: 2,
+        ..ClaudeTiming::default()
+    };
+    let mut carrier = ClaudeLaterCarrier::new(Arc::clone(&lab.registry), custody, timing).unwrap();
+    let mut harness = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    harness.cmd(json!({"cmd": "inbox", "session_id": "sess-cs", "behavior": "none"}));
+    let transcript = lab.claude_store.join("projects").join("cs.jsonl");
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    std::fs::write(&transcript, "").unwrap();
+    let mut start = hook("SessionStart", "sess-cs");
+    start["transcript_path"] = json!(transcript);
+    harness.hook(&lab.socket, Harness::ClaudeCode, start);
+    harness.hook(&lab.socket, Harness::ClaudeCode, hook("Stop", "sess-cs"));
+    let dispatch = |carrier: &mut ClaudeLaterCarrier| {
+        dispatch_message(
+            &lab.storage,
+            carrier,
+            &address,
+            &now,
+            &DispatchTiming::default(),
+        )
+        .unwrap()
+    };
+    for event in ["evt-1", "evt-2"] {
+        lab.publish(event, &address, Mode::Message, event);
+        let report = dispatch(&mut carrier);
+        assert!(
+            matches!(
+                report,
+                DispatchReport::Sent {
+                    state: AttemptState::WrittenNoReceipt,
+                    ..
+                }
+            ),
+            "{report:?}"
+        );
+    }
+    lab.publish("evt-3", &address, Mode::Message, "evt-3");
+    for _ in 0..4 {
+        let report = dispatch(&mut carrier);
+        assert!(
+            matches!(report, DispatchReport::Held(ref reason) if reason.contains("callback slots")),
+            "{report:?}"
+        );
+        assert!(lab.attempt("evt-3").is_none(), "no attempt consumed");
+    }
+    let frames = harness.cmd(json!({"cmd": "frames"}));
+    assert_eq!(frames["frames"].as_array().unwrap().len(), 2);
+    // The first hand-off settles through its own transcript entry.
+    let from = frames["frames"][0]["from"].as_str().unwrap().to_string();
+    let manifest = lab.attempt("evt-1").unwrap().manifest;
+    let entry = json!({"type": "user", "sessionId": "sess-cs", "origin": {"kind": "peer", "from": from}, "message": {"role": "user", "content": manifest}});
+    std::fs::write(&transcript, format!("{entry}\n")).unwrap();
+    assert!(eventually(10_000, || matches!(
+        dispatch(&mut carrier),
+        DispatchReport::Sent {
+            state: AttemptState::WrittenNoReceipt,
+            ..
+        }
+    )));
+    assert_eq!(lab.attempt("evt-3").unwrap().fence.attempt_seq, 3);
+    assert_eq!(
+        harness.cmd(json!({"cmd": "frames"}))["frames"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3,
+        "handed off once"
+    );
+    harness.stop();
+}
+
+/// Under full callback slots the attestation-time capacity check reads no
+/// transcript and frees only held hand-offs past their recheck horizon;
+/// written-without-receipt slots are left to the background pass, which
+/// reads the transcript before releasing one past its deadline. Positive
+/// evidence that appears after a hand-off's closure deadline but before the
+/// next background pass is therefore still recorded as context; its slot
+/// then frees and the waiting message is handed off once, never earlier
+/// (no attempt meanwhile).
+#[test]
+fn capacity_check_reads_no_transcript_and_keeps_late_evidence() {
+    let lab = Lab::new("ce");
+    let address = lab.claude_address("sess-ce");
+    let mut harness = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    harness.cmd(json!({"cmd": "inbox", "session_id": "sess-ce", "behavior": "none"}));
+    let transcript = lab.claude_store.join("projects").join("ce.jsonl");
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    std::fs::write(&transcript, "").unwrap();
+    let mut start = hook("SessionStart", "sess-ce");
+    start["transcript_path"] = json!(transcript);
+    harness.hook(&lab.socket, Harness::ClaudeCode, start);
+    harness.hook(&lab.socket, Harness::ClaudeCode, hook("Stop", "sess-ce"));
+    let custody = Arc::clone(&lab.storage) as Arc<dyn Custody>;
+    let interval = Duration::from_secs(5);
+    let timing = ClaudeTiming {
+        receipt_wait: Duration::from_millis(100),
+        receipt_deadline_ms: 1_000,
+        max_callbacks: 2,
+        close_interval: interval,
+        ..ClaudeTiming::default()
+    };
+    // The background pass runs once now, then every `interval`.
+    let mut carrier = ClaudeLaterCarrier::new(Arc::clone(&lab.registry), custody, timing).unwrap();
+    let next_pass = std::time::Instant::now() + interval;
+    let dispatch = |carrier: &mut ClaudeLaterCarrier| {
+        dispatch_message(
+            &lab.storage,
+            carrier,
+            &address,
+            &now,
+            &DispatchTiming::default(),
+        )
+        .unwrap()
+    };
+    let context = |event: &str| {
+        lab.storage
+            .lock()
+            .unwrap()
+            .delivery_evidence(PUBLISHER, event)
+            .unwrap()
+            .unwrap()
+            .tiers
+            .iter()
+            .any(|tier| tier.tier.as_str() == "context_observed")
+    };
+    for event in ["evt-1", "evt-2"] {
+        lab.publish(event, &address, Mode::Message, event);
+        assert!(matches!(
+            dispatch(&mut carrier),
+            DispatchReport::Sent {
+                state: AttemptState::WrittenNoReceipt,
+                ..
+            }
+        ));
+    }
+    let past_deadline = std::time::Instant::now() + Duration::from_millis(1_300);
+    lab.publish("evt-3", &address, Mode::Message, "evt-3");
+    std::thread::sleep(past_deadline.saturating_duration_since(std::time::Instant::now()));
+    // Positive evidence for the first hand-off appears after its deadline,
+    // before the next background pass.
+    let frames = harness.cmd(json!({"cmd": "frames"}));
+    let from = frames["frames"][0]["from"].as_str().unwrap().to_string();
+    let manifest = lab.attempt("evt-1").unwrap().manifest;
+    let entry = json!({"type": "user", "sessionId": "sess-ce", "origin": {"kind": "peer", "from": from}, "message": {"role": "user", "content": manifest}});
+    std::fs::write(&transcript, format!("{entry}\n")).unwrap();
+    let held = dispatch(&mut carrier);
+    let no_attempt = lab.attempt("evt-3").is_none();
+    let context_before_pass = context("evt-1");
+    assert!(
+        std::time::Instant::now() + Duration::from_millis(500) < next_pass,
+        "setup outran the background-pass window; the control would not discriminate"
+    );
+    // The background pass reads the transcript before releasing the slot.
+    assert!(
+        eventually(10_000, || context("evt-1")),
+        "positive evidence that appeared across the deadline was lost"
+    );
+    assert!(
+        matches!(held, DispatchReport::Held(ref reason) if reason.contains("callback slots")),
+        "dispatched before the background pass: {held:?}"
+    );
+    assert!(no_attempt, "no attempt consumed while the slots were full");
+    assert!(!context_before_pass, "the capacity check read a transcript");
+    assert!(eventually(10_000, || matches!(
+        dispatch(&mut carrier),
+        DispatchReport::Sent {
+            state: AttemptState::WrittenNoReceipt,
+            ..
+        }
+    )));
+    assert_eq!(lab.attempt("evt-3").unwrap().fence.attempt_seq, 3);
+    assert_eq!(
+        harness.cmd(json!({"cmd": "frames"}))["frames"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3,
+        "handed off once"
+    );
+    harness.stop();
+}
+
+/// The exact per-process descriptor `sessions/<pid>.json` is found even
+/// when more than the legacy scan bound of other owned descriptors sort
+/// before it in a wide store.
+#[test]
+fn direct_pid_descriptor_is_not_starved_by_a_wide_store() {
+    let lab = Lab::new("wd");
+    let address = lab.claude_address("sess-wd");
+    let custody = Arc::clone(&lab.storage) as Arc<dyn Custody>;
+    let mut carrier =
+        ClaudeLaterCarrier::new(Arc::clone(&lab.registry), custody, ClaudeTiming::default())
+            .unwrap();
+    let sessions = lab.claude_store.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    for index in 0..600 {
+        std::fs::write(
+            sessions.join(format!("0000{index:04}.json")),
+            json!({"sessionId": format!("other-{index}"), "pid": 1, "messagingSocketPath": null})
+                .to_string(),
+        )
+        .unwrap();
+    }
+    let mut harness = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    harness.cmd(json!({"cmd": "inbox", "session_id": "sess-wd", "behavior": "delivered"}));
+    harness.hook(
+        &lab.socket,
+        Harness::ClaudeCode,
+        hook("SessionStart", "sess-wd"),
+    );
+    harness.hook(&lab.socket, Harness::ClaudeCode, hook("Stop", "sess-wd"));
+    lab.publish("evt-wd", &address, Mode::Message, "wide store payload");
+    let report = dispatch_message(
+        &lab.storage,
+        &mut carrier,
+        &address,
+        &now,
+        &DispatchTiming::default(),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            report,
+            DispatchReport::Sent {
+                state: AttemptState::NativeAccepted,
+                ..
+            }
+        ),
+        "{report:?}"
+    );
+    harness.stop();
+}
+
+/// Evidence is per attempt: after an audited manual retry of the same event
+/// (same session, same manifest), the earlier attempt's peer entry — whether
+/// already in the transcript or appended late — cannot settle the new
+/// attempt, because each attempt has its own callback origin; the new
+/// attempt's own entry does.
+#[test]
+fn earlier_attempt_evidence_cannot_settle_a_retried_attempt() {
+    let lab = Lab::new("ra");
+    let address = lab.claude_address("sess-ra");
+    let custody = Arc::clone(&lab.storage) as Arc<dyn Custody>;
+    let mut carrier =
+        ClaudeLaterCarrier::new(Arc::clone(&lab.registry), custody, ClaudeTiming::default())
+            .unwrap();
+    let mut harness = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    harness.cmd(json!({"cmd": "inbox", "session_id": "sess-ra", "behavior": "none"}));
+    let transcript = lab.claude_store.join("projects").join("ra.jsonl");
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    std::fs::write(&transcript, "").unwrap();
+    let mut start = hook("SessionStart", "sess-ra");
+    start["transcript_path"] = json!(transcript);
+    harness.hook(&lab.socket, Harness::ClaudeCode, start);
+    harness.hook(&lab.socket, Harness::ClaudeCode, hook("Stop", "sess-ra"));
+    lab.publish("evt-retry", &address, Mode::Message, "retry payload");
+    let first = dispatch_message(
+        &lab.storage,
+        &mut carrier,
+        &address,
+        &now,
+        &DispatchTiming::default(),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            first,
+            DispatchReport::Sent {
+                state: AttemptState::WrittenNoReceipt,
+                ..
+            }
+        ),
+        "{first:?}"
+    );
+    let attempt_one = lab.attempt("evt-retry").unwrap();
+    lab.storage
+        .lock()
+        .unwrap()
+        .authorize_manual_retry(
+            PUBLISHER,
+            "evt-retry",
+            "operator",
+            "regression: audited retry",
+            now(),
+        )
+        .unwrap();
+    let second = dispatch_message(
+        &lab.storage,
+        &mut carrier,
+        &address,
+        &now,
+        &DispatchTiming::default(),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            second,
+            DispatchReport::Sent {
+                state: AttemptState::WrittenNoReceipt,
+                ..
+            }
+        ),
+        "{second:?}"
+    );
+    let attempt_two = lab.attempt("evt-retry").unwrap();
+    assert_ne!(attempt_one.fence.attempt_seq, attempt_two.fence.attempt_seq);
+    assert_eq!(
+        attempt_one.manifest, attempt_two.manifest,
+        "same event, same manifest"
+    );
+    let frames = harness.cmd(json!({"cmd": "frames"}));
+    let from_one = frames["frames"][0]["from"].as_str().unwrap().to_string();
+    let from_two = frames["frames"][1]["from"].as_str().unwrap().to_string();
+    assert_ne!(
+        from_one, from_two,
+        "each attempt has its own callback origin"
+    );
+    let entry = |from: &str| {
+        json!({"type": "user", "sessionId": "sess-ra", "origin": {"kind": "peer", "from": from},
+               "message": {"role": "user", "content": format!("Another Claude session sent a message:
+{}
+", attempt_two.manifest)}})
+    };
+    let context_for = |seq: u64| {
+        let evidence = lab
+            .storage
+            .lock()
+            .unwrap()
+            .delivery_evidence(PUBLISHER, "evt-retry")
+            .unwrap()
+            .unwrap();
+        evidence
+            .tiers
+            .iter()
+            .any(|tier| tier.attempt_seq == seq && tier.tier.as_str() == "context_observed")
+    };
+    // Historical entry of the first attempt.
+    std::fs::write(
+        &transcript,
+        format!(
+            "{}
+",
+            entry(&from_one)
+        ),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(2_500));
+    // A delayed copy of the first attempt's entry appended after the retry.
+    std::fs::write(
+        &transcript,
+        format!(
+            "{}
+{}
+",
+            entry(&from_one),
+            entry(&from_one)
+        ),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(2_500));
+    assert!(
+        !context_for(attempt_two.fence.attempt_seq),
+        "old evidence settled the retried attempt"
+    );
+    assert_eq!(
+        lab.attempt("evt-retry").unwrap().state,
+        AttemptState::WrittenNoReceipt
+    );
+    // The retried attempt's own entry settles it.
+    std::fs::write(
+        &transcript,
+        format!(
+            "{}
+{}
+{}
+",
+            entry(&from_one),
+            entry(&from_one),
+            entry(&from_two)
+        ),
+    )
+    .unwrap();
+    assert!(eventually(6_000, || context_for(
+        attempt_two.fence.attempt_seq
+    )));
     harness.stop();
 }
 
@@ -1247,6 +1946,33 @@ message = true
         records
             .iter()
             .any(|r| r["tool"] == "bridge_unlisted" && r["unlisted_called"] == true)
+    );
+    // A probe's tool subset: only the named tools are listed, and a call to
+    // any other one is refused without running or recording anything.
+    let before = std::fs::read_to_string(&evidence).unwrap().lines().count();
+    let subset = harness.cmd(json!({
+        "cmd": "mcp_server",
+        "args": [channel, core, token_file, evidence, "bridge_probe"],
+        "requests": [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "bridge_unlisted", "arguments": {}}},
+            {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "bridge_me", "arguments": {}}}
+        ]
+    }));
+    let listed: Vec<&str> = subset["responses"][1]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(listed, ["bridge_probe"], "{subset}");
+    assert!(subset["responses"][2]["error"].is_object(), "{subset}");
+    assert!(subset["responses"][3]["error"].is_object(), "{subset}");
+    assert_eq!(
+        std::fs::read_to_string(&evidence).unwrap().lines().count(),
+        before,
+        "a tool outside the subset never runs"
     );
     let event = record["event_id"].as_str().unwrap();
     let status = std::process::Command::new(fixture_exe())

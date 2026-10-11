@@ -45,8 +45,29 @@
  *    `isolation_unavailable` before phase 1.
  *    The `HookStateToml { enabled, trusted_hash }` keys were read from the
  *    0.162.0-alpha.17.2 binary; the second listing is the proof.
- * 3. The same gate reads the effective config (`config/read`) and keeps
- *    only this probe's own server subtree: `enabled_tools` must be exactly
+ * 3. The same gate reads the effective config (`config/read`). Every gate
+ *    App Server stdout line is projected *before* it is logged or parsed
+ *    (`gateRead`; the user config and hook commands may hold credentials,
+ *    and the root r6 run logged both raw): `hooks/list` keeps per hook only
+ *    `key`, `source`, `eventName`, `enabled`, `trustStatus`,
+ *    `currentHash` and an `own` flag computed from the exact own command
+ *    (no command, arguments or other field); `config/read` keeps only this
+ *    probe's own server subtree; other responses keep only their id (or
+ *    error code), notifications only their method, and unparsable lines
+ *    are dropped. The gate's stderr never reaches a file: it is piped and
+ *    reduced in memory to its size and whether it reported an override as
+ *    ignored (`Probe.spawn` `stderrMatch`), so a signal, a thrown error or
+ *    a gate process that keeps writing leaves no raw stderr behind. Model phases, queue sessions and the
+ *    queue helper log their stdout/stderr unfiltered; those channels are not
+ *    claimed free of configuration diagnostics. The response
+ *    shape (`result.config.mcp_servers.bridge_probe`) is the one this
+ *    probe expects, not one proven against the build: an absent subtree
+ *    fails the gate. `--self-test-config` checks the projection against a
+ *    fake App Server that plants fake credentials in a foreign hook
+ *    command, the config tree, a notification, an unparsable line and
+ *    stderr, in a completed gate, a gate interrupted by SIGTERM and a gate
+ *    whose server ignores SIGTERM and keeps writing.
+ *    `enabled_tools` must be exactly
  *    `["bridge_me","bridge_unlisted"]`, only `bridge_me` may carry a
  *    per-launch `approval_mode` (ME_APPROVAL) and no server-wide default may
  *    be set (`approval_config_effective`), else `approval_config_unavailable`
@@ -62,6 +83,10 @@
  * unapproved `bridge_unlisted`; the host must refuse it with an approval
  * error (`unlisted_refused_by_host`) and the fixture server must never see
  * it (`unlisted_not_executed`). A missing attempt is a failure, not a pass.
+ * Together these prove the caller, the host approval boundary and the
+ * parsed config, NOT that the `approve` value itself caused the
+ * behavior (no control runs `bridge_me` without it). The fixture server
+ * exposes only `bridge_me` and `bridge_unlisted`.
  *
  * Phase 3 queues one item with the product helper, then reads the queue
  * back natively. A registered cleanup removes exactly this probe's item
@@ -71,7 +96,8 @@
  * (`queue_cleanup`), never green. The original event is never replayed.
  *
  * Usage: `cargo +1.98.1 build --offline -p bridge-adapters --bins`, then
- * `node qualification/codex-native-probe.cjs`. Environment:
+ * `node qualification/codex-native-probe.cjs` (or `--self-test-config`:
+ * the synthetic config control, no Codex and no model). Environment:
  * `BRIDGE_BIN_DIR`, `CODEX_EXE` (default: the Desktop-bundled build),
  * `CODEX_PROBE_GATE_ONLY=1` to stop right after the isolation gate (no
  * model call; the run then ends with `gate_only_run` and missing model
@@ -107,8 +133,56 @@ const REQUIRED = ['versions_recorded', 'model_in_catalog', 'hooks_isolated', 'ap
 const ME_APPROVAL = 'approve';
 /** Hook events the probe installs. */
 const EVENTS = ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop'];
+/** The own hook command the config control's fake App Server lists. */
+const CONTROL_OWN_COMMAND = 'control-own-hook';
 
-run('m2xp', 20 * 60_000, REQUIRED, async probe => {
+/** Source of the config control's fake App Server. `$CODEX_HOME/mode`
+ * selects its behavior: `normal` answers as below; `hang` writes its
+ * stderr and never answers; `late` answers as below but ignores SIGTERM
+ * and keeps writing the planted values to stderr every 200 ms until
+ * killed, and never writes the ignored-override warning (so only the
+ * gate's fail-closed non-exit check can reject it). It reads two planted
+ * fake credentials from `$CODEX_HOME/planted-hook` and
+ * `$CODEX_HOME/planted-config` (inside the deleted credentials directory,
+ * so only its output can carry them into evidence) and puts them where a
+ * real App Server could: a foreign hook's command and extra fields in the
+ * `hooks/list` answer (beside one own hook whose command is
+ * `CONTROL_OWN_COMMAND`), foreign entries of the `config/read` answer
+ * (beside the probe's own subtree), a notification, an unparsable stdout
+ * line and stderr (with an "is ignored" override warning). */
+const FAKE_APP_SERVER = `'use strict';
+const fs = require('node:fs');
+const hookSecret = fs.readFileSync(process.env.CODEX_HOME + '/planted-hook', 'utf8');
+const configSecret = fs.readFileSync(process.env.CODEX_HOME + '/planted-config', 'utf8');
+const mode = fs.readFileSync(process.env.CODEX_HOME + '/mode', 'utf8');
+if (mode === 'late') {
+  process.on('SIGTERM', () => {});
+  setInterval(() => process.stderr.write('late diagnostic ' + hookSecret + ' ' + configSecret + '\\n'), 200);
+}
+const out = value => process.stdout.write((typeof value === 'string' ? value : JSON.stringify(value)) + '\\n');
+if (mode !== 'late') process.stderr.write('warning: hooks.state.' + hookSecret + ' is ignored; config ' + configSecret + '\\n');
+require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
+  const message = JSON.parse(line);
+  if (message.id === undefined || mode === 'hang') return;
+  out({ method: 'config/warning', params: { detail: configSecret } });
+  out('not json ' + hookSecret);
+  const result = message.method === 'hooks/list'
+    ? { data: [{ cwd: '/private', hooks: [
+        { key: 'own-key', source: 'sessionFlags', eventName: 'Stop', command: '${CONTROL_OWN_COMMAND}', enabled: true, trustStatus: 'untrusted', currentHash: 'own-hash' },
+        { key: 'foreign-key', source: 'user', eventName: 'Stop', command: 'curl -H "Authorization: Bearer ' + hookSecret + '"', enabled: true, trustStatus: 'trusted', currentHash: 'foreign-hash', env: { TOKEN: hookSecret } }] }] }
+    : message.method === 'config/read'
+      ? { config: { model_providers: { foreign: { experimental_bearer_token: configSecret } },
+          mcp_servers: { foreign: { env: { TOKEN: configSecret } },
+            bridge_probe: { enabled_tools: ['bridge_me', 'bridge_unlisted'], tools: { bridge_me: { approval_mode: '${ME_APPROVAL}' } } } } },
+        origins: { 'mcp_servers.foreign.env.TOKEN': { name: { type: 'user', file: configSecret } } } }
+      : { userAgent: configSecret };
+  out({ id: message.id, result });
+});
+`;
+
+if (process.argv[2] === '--self-test-config') configControls();
+else if (process.argv[2] === '--config-control-case') configControl(process.argv[3]);
+else run('m2xp', 20 * 60_000, REQUIRED, async probe => {
   const codex = fs.realpathSync(process.env.CODEX_EXE || '/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex');
   const fixture = path.join(bin, 'bridge-fixture');
   const store = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
@@ -134,7 +208,7 @@ run('m2xp', 20 * 60_000, REQUIRED, async probe => {
   const hook = `[{matcher="",hooks=[{type="command",command="${hookCommand}",timeout=5}]}]`;
   const own = [
     '-c', `mcp_servers.bridge_probe.command=${JSON.stringify(fixture)}`,
-    '-c', `mcp_servers.bridge_probe.args=${JSON.stringify(['mcp-server', channel, core, publisher.file, evidence])}`,
+    '-c', `mcp_servers.bridge_probe.args=${JSON.stringify(['mcp-server', channel, core, publisher.file, evidence, 'bridge_me,bridge_unlisted'])}`,
     '-c', 'mcp_servers.bridge_probe.enabled_tools=["bridge_me","bridge_unlisted"]',
     '-c', `mcp_servers.bridge_probe.tools.bridge_me.approval_mode="${ME_APPROVAL}"`,
     ...EVENTS.flatMap(e => ['-c', `hooks.${e}=${hook}`]),
@@ -142,34 +216,35 @@ run('m2xp', 20 * 60_000, REQUIRED, async probe => {
 
   // Isolation gate (before any model call): list, derive per-launch state
   // overrides, re-list and verify.
-  let effective = null;
+  let effective = null, rejected = true;
+  /** Runs one gate listing (`gateRead`) with the probe's own hook/MCP
+   * overrides plus `extra`, keeping its own server subtree in `effective`
+   * and its stderr verdict in `rejected`.
+   * @param {string} label Log label of the gate session.
+   * @param {string[]} extra Extra App Server flags (the state override for the second listing).
+   * @returns {Promise<{key: string|null, source: string|null, eventName: string|null, enabled: boolean|null, trustStatus: string|null, currentHash: string|null, own: boolean}[]|null>} Projected hooks, or null when not answered.
+   */
   const list = async (label, extra) => {
-    const [answer, config] = await appServer(probe, codex, store, label, [...DISABLED, '--enable', 'hooks', ...own, ...extra],
-      [['hooks/list', { cwds: [probe.dir] }], ['config/read', { cwd: probe.dir }]]);
-    // Only this probe's own server subtree is kept (the user config may hold secrets).
-    effective = config && config.result && config.result.config && config.result.config.mcp_servers
-      ? config.result.config.mcp_servers.bridge_probe || null : null;
-    return answer && answer.result ? answer.result.data.flatMap(e => e.hooks || []) : null;
+    const read = await gateRead(probe, codex, store, label, [...DISABLED, '--enable', 'hooks', ...own, ...extra], hookCommand);
+    effective = read.effective;
+    rejected = read.overrideRejected;
+    return read.hooks;
   };
-  const isOwn = h => h.source === 'sessionFlags' && String(h.command || '') === hookCommand;
   const first = await list('hooks-gate-1', []);
-  // One whole-map value: hook keys contain dots (".codex/hooks.json",
-  // "config.toml"), so per-leaf dotted -c paths are split and ignored by
-  // the loaded build. Inside one TOML inline table every key stays quoted.
-  const entries = (first || []).map(h => isOwn(h)
-    ? `${JSON.stringify(h.key)}={trusted_hash=${JSON.stringify(h.currentHash)}}`
-    : `${JSON.stringify(h.key)}={enabled=false}`);
-  const state = entries.length ? ['-c', `hooks.state={${entries.join(',')}}`] : [];
+  const state = stateOverride(first || []);
   const second = first ? await list('hooks-gate-2', state) : null;
-  const summary = hooks => (hooks || []).map(h => ({ source: h.source, event: h.eventName, enabled: h.enabled, trust: h.trustStatus, own: isOwn(h) }));
+  /** Result-safe view of projected hooks (no key or hash).
+   * @param {{source: string|null, eventName: string|null, enabled: boolean|null, trustStatus: string|null, own: boolean}[]|null} hooks Projected hooks, or null.
+   * @returns {{source: string|null, event: string|null, enabled: boolean|null, trust: string|null, own: boolean}[]} One entry per hook; empty for null.
+   */
+  const summary = hooks => (hooks || []).map(h => ({ source: h.source, event: h.eventName, enabled: h.enabled, trust: h.trustStatus, own: h.own }));
   probe.checks.hooks_before = summary(first);
   probe.checks.hooks_after = summary(second);
-  const ownAfter = (second || []).filter(isOwn);
+  const ownAfter = (second || []).filter(h => h.own);
   // The loaded build must not report the override as ignored.
-  const gateStderr = fs.readFileSync(path.join(probe.dir, 'hooks-gate-2.stderr'), 'utf8');
-  probe.checks.gate_overrides_accepted = Boolean(second) && !/is ignored|unrecognized configuration/.test(gateStderr);
+  probe.checks.gate_overrides_accepted = Boolean(second) && !rejected;
   probe.checks.hooks_isolated = Boolean(probe.checks.gate_overrides_accepted && second
-    && second.filter(h => !isOwn(h)).every(h => !h.enabled)
+    && second.filter(h => !h.own).every(h => !h.enabled)
     && ownAfter.length === EVENTS.length
     && ownAfter.every(h => h.enabled && h.trustStatus === 'trusted'));
   // The loaded build must parse the exact-tool approval as given.
@@ -178,11 +253,7 @@ run('m2xp', 20 * 60_000, REQUIRED, async probe => {
     tools: effective.tools || null,
     default_tools_approval_mode: effective.default_tools_approval_mode || null,
   } : null;
-  probe.checks.approval_config_effective = Boolean(effective && probe.checks.gate_overrides_accepted
-    && JSON.stringify(effective.enabled_tools) === JSON.stringify(['bridge_me', 'bridge_unlisted'])
-    && effective.tools && effective.tools.bridge_me && effective.tools.bridge_me.approval_mode === ME_APPROVAL
-    && !(effective.tools.bridge_unlisted && effective.tools.bridge_unlisted.approval_mode)
-    && !effective.default_tools_approval_mode);
+  probe.checks.approval_config_effective = Boolean(probe.checks.gate_overrides_accepted && ownApprovalParsed(effective));
   if (!probe.checks.hooks_isolated) { probe.fail('isolation_unavailable'); return; }
   if (!probe.checks.approval_config_effective) { probe.fail('approval_config_unavailable'); return; }
   if (process.env.CODEX_PROBE_GATE_ONLY === '1') { probe.fail('gate_only_run'); return; }
@@ -288,6 +359,229 @@ run('m2xp', 20 * 60_000, REQUIRED, async probe => {
   probe.checks.queue_readback = Boolean(probe.checks.queue_native_accepted && item && JSON.stringify(item.input).includes(client));
 });
 
+/** Whether the kept own server subtree is exactly the per-launch approval
+ * config: both tools enabled, only `bridge_me` with `ME_APPROVAL`, no
+ * server-wide default.
+ * @param {object|null} effective The kept `bridge_probe` subtree.
+ * @returns {boolean}
+ */
+function ownApprovalParsed(effective) {
+  return Boolean(effective
+    && JSON.stringify(effective.enabled_tools) === JSON.stringify(['bridge_me', 'bridge_unlisted'])
+    && effective.tools && effective.tools.bridge_me && effective.tools.bridge_me.approval_mode === ME_APPROVAL
+    && !(effective.tools.bridge_unlisted && effective.tools.bridge_unlisted.approval_mode)
+    && !effective.default_tools_approval_mode);
+}
+
+/** The per-launch `hooks.state` override for a gate listing: every own
+ * hook trusted by its listed `currentHash`, every other hook disabled, in
+ * ONE whole-map value (hook keys contain dots, such as ".codex/hooks.json"
+ * or "config.toml", so per-leaf dotted `-c` paths are split and ignored by
+ * the loaded build; inside one TOML inline table every key stays quoted).
+ * @param {{key: string, own: boolean, currentHash: string|null}[]} hooks Projected hooks from `gateRead`.
+ * @returns {string[]} `['-c', 'hooks.state={...}']`, or `[]` for no hooks.
+ */
+function stateOverride(hooks) {
+  const entries = hooks.map(h => h.own
+    ? `${JSON.stringify(h.key)}={trusted_hash=${JSON.stringify(h.currentHash)}}`
+    : `${JSON.stringify(h.key)}={enabled=false}`);
+  return entries.length ? ['-c', `hooks.state={${entries.join(',')}}`] : [];
+}
+
+/** Lists hooks and reads the effective config in one confined App Server
+ * session, keeping only what the gate needs.
+ *
+ * Every stdout line is projected by `keep` before it is logged or parsed,
+ * so no other part of it is written or retained: the `hooks/list` answer
+ * (request id 1) to the minimal hook fields plus `own`, the `config/read`
+ * answer (id 2) to `result.config.mcp_servers.bridge_probe`, any other
+ * answer to its id (or error code), a notification or server request to
+ * its method name; an unparsable line is dropped. Stderr is never written:
+ * it is reduced in memory while it streams (`Probe.spawn` `stderrMatch`),
+ * and after the session only `{stderr_bytes, override_rejected}` is written
+ * to `<label>.stderr-summary.json`, where `override_rejected` means it
+ * reported a setting as ignored or unrecognized, or the session did not
+ * exit or close its output within its bounds (fails closed).
+ * @param {import('./probe-lib.cjs').Probe} probe The probe.
+ * @param {string} codex Codex executable.
+ * @param {string} store `CODEX_HOME`.
+ * @param {string} label Log label.
+ * @param {string[]} flags App Server flags.
+ * @param {string} ownCommand The exact command of this probe's own hooks; a `sessionFlags` hook with exactly this command is `own`.
+ * @returns {Promise<{hooks: {key: string|null, source: string|null, eventName: string|null, enabled: boolean|null, trustStatus: string|null, currentHash: string|null, own: boolean}[]|null, effective: object|null, overrideRejected: boolean}>}
+ *   Projected hooks (null when not answered), the own server subtree (null when absent) and the stderr verdict.
+ */
+async function gateRead(probe, codex, store, label, flags, ownCommand) {
+  /** A JSON scalar or null (no object or array survives).
+   * @param {unknown} value Field value.
+   * @returns {string|number|boolean|null}
+   */
+  const scalar = value => ['string', 'number', 'boolean'].includes(typeof value) ? value : null;
+  /** Projects one raw stdout line before it is logged or parsed (the
+   * `Probe.spawn` `keep` contract); the raw line is never retained.
+   * @param {string} line One raw stdout line of the App Server.
+   * @returns {string|null} The projected JSON line, or null to drop it.
+   */
+  const keep = line => {
+    let message;
+    try { message = JSON.parse(line); } catch { return null; }
+    if (!message || typeof message !== 'object') return null;
+    if (message.method !== undefined) return JSON.stringify({ method: String(scalar(message.method)).slice(0, 64) });
+    const id = scalar(message.id);
+    if (message.error) return JSON.stringify({ id, error: { code: scalar(message.error.code) } });
+    const result = message.result || {};
+    if (id === 1) {
+      const listed = Array.isArray(result.data) ? result.data.flatMap(e => e && Array.isArray(e.hooks) ? e.hooks : []) : [];
+      const hooks = listed.filter(h => h && typeof h === 'object').map(h => ({
+        key: scalar(h.key), source: scalar(h.source), eventName: scalar(h.eventName), enabled: scalar(h.enabled),
+        trustStatus: scalar(h.trustStatus), currentHash: scalar(h.currentHash),
+        own: h.source === 'sessionFlags' && h.command === ownCommand,
+      }));
+      return JSON.stringify({ id, result: { data: [{ hooks }] } });
+    }
+    if (id === 2) {
+      const servers = result.config && result.config.mcp_servers;
+      return JSON.stringify({ id, result: { config: { mcp_servers: { bridge_probe: (servers && servers.bridge_probe) || null } } } });
+    }
+    return JSON.stringify({ id, result: {} });
+  };
+  const [answer, config] = await appServer(probe, codex, store, label, flags,
+    [['hooks/list', { cwds: [probe.dir] }], ['config/read', { cwd: probe.dir }]], false, keep, /is ignored|unrecognized configuration/);
+  const entry = probe.children.find(c => c.name === label);
+  let timer;
+  const settled = await Promise.race([entry.closed, new Promise(r => { timer = setTimeout(() => r(false), 2000); })]);
+  clearTimeout(timer);
+  const reduced = entry.child.stderrSummary;
+  const overrideRejected = !probe.checks[`${label}_exit`] || settled !== true || !reduced || reduced.matched;
+  fs.writeFileSync(path.join(probe.dir, `${label}.stderr-summary.json`),
+    JSON.stringify({ stderr_bytes: reduced ? reduced.stderr_bytes : null, override_rejected: overrideRejected }) + '\n');
+  return {
+    hooks: answer && answer.result ? answer.result.data[0].hooks : null,
+    effective: config && config.result ? config.result.config.mcp_servers.bridge_probe : null,
+    overrideRejected,
+  };
+}
+
+/** One case of the synthetic `gateRead` control (no Codex, no model, no
+ * real configuration), run as its own process by `configControls` against
+ * `FAKE_APP_SERVER`. The planted fake credentials come from the 0600 files
+ * in `$CONFIG_CONTROL_PLANTED` and are deliberately NOT registered as probe
+ * secrets, so `finish` cannot redact a leak: the parent finds it.
+ *
+ * - `normal`: requires the own config subtree, own-hook recognition (and
+ *   only it), the state override and the detected stderr override warning;
+ *   after `finish` also checks that the kept `hooks/list` entries carry only
+ *   the minimal fields, the kept `config/read` line is the own subtree and
+ *   notifications keep only their method.
+ * - `signal`: the server writes its stderr and never answers; the probe
+ *   sends itself SIGTERM mid-gate, so cleanup runs before any gate result.
+ * - `late`: the server answers, ignores SIGTERM and keeps writing stderr
+ *   without any ignored-override warning; the gate must still reject
+ *   (`config_late_rejected`) because the session neither exited nor
+ *   closed within its bounds.
+ * @param {string} mode `normal`, `signal` or `late`.
+ * @returns {void}
+ */
+function configControl(mode) {
+  const required = { normal: ['config_own_survives', 'config_hooks_classified', 'config_state_override', 'config_override_rejection_detected'],
+    signal: ['config_gate_completed'], late: ['config_late_rejected'] }[mode];
+  if (!required) throw new Error(`unknown control case ${mode}`);
+  run('m2xc', 60_000, required, async probe => {
+    const store = path.join(probe.creds, 'store');
+    fs.mkdirSync(store, { mode: 0o700 });
+    for (const name of ['planted-hook', 'planted-config']) {
+      fs.copyFileSync(path.join(process.env.CONFIG_CONTROL_PLANTED, name), path.join(store, name));
+    }
+    fs.writeFileSync(path.join(store, 'mode'), mode === 'signal' ? 'hang' : mode, { mode: 0o600 });
+    const fake = path.join(probe.dir, 'fake-app-server');
+    fs.writeFileSync(fake, `#!${process.execPath}\n${FAKE_APP_SERVER}`, { mode: 0o700 });
+    if (mode === 'signal') {
+      gateRead(probe, fake, store, 'hooks-gate-c', [], CONTROL_OWN_COMMAND).then(() => { probe.checks.config_gate_completed = true; });
+      await new Promise(r => setTimeout(r, 1500));
+      process.kill(process.pid, 'SIGTERM');
+      await new Promise(r => setTimeout(r, 30_000));
+      return;
+    }
+    const { hooks, effective, overrideRejected } = await gateRead(probe, fake, store, 'hooks-gate-c', [], CONTROL_OWN_COMMAND);
+    if (mode === 'late') { probe.checks.config_late_rejected = overrideRejected === true; return; }
+    probe.checks.config_own_survives = ownApprovalParsed(effective);
+    probe.checks.config_hooks_classified = Boolean(hooks && hooks.length === 2
+      && hooks.some(h => h.key === 'own-key' && h.own === true && h.currentHash === 'own-hash')
+      && hooks.some(h => h.key === 'foreign-key' && h.own === false)
+      && hooks.every(h => !('command' in h) && !('env' in h)));
+    probe.checks.config_state_override = JSON.stringify(stateOverride(hooks || []))
+      === JSON.stringify(['-c', 'hooks.state={"own-key"={trusted_hash="own-hash"},"foreign-key"={enabled=false}}']);
+    probe.checks.config_override_rejection_detected = overrideRejected === true;
+  }).then(probe => {
+    if (mode !== 'normal') return;
+    const log = fs.readFileSync(path.join(probe.dir, 'hooks-gate-c.stdout'), 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
+    const hooksLine = log.find(l => l.id === 1);
+    const hooksMinimal = Boolean(hooksLine) && hooksLine.result.data[0].hooks.every(h => JSON.stringify(Object.keys(h))
+      === JSON.stringify(['key', 'source', 'eventName', 'enabled', 'trustStatus', 'currentHash', 'own']));
+    const configKept = log.filter(l => l.id === 2).map(l => JSON.stringify(l));
+    const configOwnOnly = configKept.length === 1
+      && configKept[0] === JSON.stringify({ id: 2, result: { config: { mcp_servers: { bridge_probe: { enabled_tools: ['bridge_me', 'bridge_unlisted'], tools: { bridge_me: { approval_mode: ME_APPROVAL } } } } } } });
+    const notificationsMethodOnly = log.filter(l => l.method !== undefined).every(l => JSON.stringify(Object.keys(l)) === '["method"]');
+    const pass = probe.failures.length === 0 && hooksMinimal && configOwnOnly && notificationsMethodOnly;
+    console.log(JSON.stringify({ config_case: 'normal', pass, hooksMinimal, configOwnOnly, notificationsMethodOnly }));
+    if (!pass) process.exitCode = 1;
+  });
+}
+
+/** Runs the three `configControl` cases as separate processes and judges
+ * what they retained, from outside (no model, no Codex).
+ *
+ * It plants two fresh fake credentials in a private 0700 directory (0600
+ * files, deleted afterwards), runs each case with a 90 s bound and checks,
+ * in this order: no file under the case's evidence directory and none of
+ * its console output contains either planted value (a leak fails the case
+ * before anything else is judged); no surviving process names the case's
+ * directory; then the case verdict (`normal`: exit 0 and its own checks
+ * passed; `signal`: `signal:SIGTERM` recorded and the gate never
+ * completed; `late`: exit 0 with the late gate rejected). Prints one JSON
+ * line `{config_control: PASS|FAIL, cases}` and sets the exit code.
+ * @returns {void}
+ */
+function configControls() {
+  const { spawnSync, execFileSync } = require('node:child_process');
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'm2xcp-'));
+  fs.chmodSync(work, 0o700);
+  const planted = ['planted-hook', 'planted-config'].map(name => {
+    const value = `FAKE_FOREIGN_CREDENTIAL_${name.toUpperCase().replace('-', '_')}_${crypto.randomBytes(12).toString('hex')}`;
+    fs.writeFileSync(path.join(work, name), value, { mode: 0o600 });
+    return value;
+  });
+  /** Every regular file under `dir`, recursively.
+   * @param {string} dir Directory.
+   * @returns {string[]} Absolute file paths.
+   */
+  const files = dir => fs.readdirSync(dir, { withFileTypes: true }).flatMap(e => e.isDirectory()
+    ? files(path.join(dir, e.name)) : e.isFile() ? [path.join(dir, e.name)] : []);
+  const cases = {};
+  for (const mode of ['normal', 'signal', 'late']) {
+    const ran = spawnSync(process.execPath, [__filename, '--config-control-case', mode],
+      { env: { ...process.env, CONFIG_CONTROL_PLANTED: work }, encoding: 'utf8', timeout: 90_000 });
+    const output = `${ran.stdout || ''}${ran.stderr || ''}`;
+    let result = null;
+    try { result = JSON.parse(output.split('\n').find(l => l.startsWith('{"dir"'))); } catch {}
+    const dir = result && result.dir;
+    const leaked = planted.some(value => output.includes(value))
+      || (dir ? files(dir).some(f => planted.some(value => fs.readFileSync(f, 'latin1').includes(value))) : false);
+    const survivors = dir ? execFileSync('/bin/ps', ['-A', '-o', 'command='], { encoding: 'utf8' }).split('\n').filter(l => l.includes(dir)).length : -1;
+    const checks = dir && fs.existsSync(path.join(dir, 'checks.json')) ? JSON.parse(fs.readFileSync(path.join(dir, 'checks.json'), 'utf8')) : null;
+    const failures = result ? result.failures : null;
+    const verdict = !dir ? false
+      : mode === 'normal' ? ran.status === 0
+      : mode === 'signal' ? failures.includes('signal:SIGTERM') && !(checks && checks.checks.config_gate_completed)
+      : ran.status === 0 && Boolean(checks && checks.checks.config_late_rejected === true);
+    cases[mode] = { pass: Boolean(dir) && !leaked && survivors === 0 && verdict, leaked, survivors, status: ran.status, signal: ran.signal, failures };
+  }
+  fs.rmSync(work, { recursive: true, force: true });
+  const pass = Object.values(cases).every(c => c.pass);
+  console.log(JSON.stringify({ config_control: pass ? 'PASS' : 'FAIL', cases }));
+  process.exitCode = pass ? 0 : 1;
+}
+
 /** Lists one thread's native queue through a confined App Server.
  * @param {import('./probe-lib.cjs').Probe} probe The probe.
  * @param {string} codex Codex executable.
@@ -311,12 +605,14 @@ async function queueItems(probe, codex, store, label, thread, cleanup = false) {
  * @param {string[]} flags Extra App Server flags (`-c`, `--enable`, `--disable`).
  * @param {[string, object][]} requests Requests after `initialize`.
  * @param {boolean} [cleanup] Whether called from the registered cleanup action (allowed past the lifecycle fence).
+ * @param {(line: string) => string|null} [keep] Pre-write rewrite of each output line (see `Probe.spawn`).
+ * @param {RegExp} [stderrMatch] Reduce stderr in memory instead of logging it (see `Probe.spawn`).
  * @returns {Promise<(object|undefined)[]>} Responses of `requests` in order (undefined when missing).
  */
-async function appServer(probe, codex, store, label, flags, requests, cleanup = false) {
+async function appServer(probe, codex, store, label, flags, requests, cleanup = false, keep = undefined, stderrMatch = undefined) {
   const lines = [];
   const child = probe.spawn(label, '/usr/bin/sandbox-exec', ['-p', POLICY, codex, 'app-server', ...flags, '--listen', 'stdio://'],
-    { stdin: true, cleanup, env: { PATH: '/usr/bin:/bin', HOME: os.homedir(), CODEX_HOME: store } }, line => { try { lines.push(JSON.parse(line)); } catch {} });
+    { stdin: true, cleanup, keep, stderrMatch, env: { PATH: '/usr/bin:/bin', HOME: os.homedir(), CODEX_HOME: store } }, line => { try { lines.push(JSON.parse(line)); } catch {} });
   const send = (id, method, params) => child.stdin.write(JSON.stringify({ id, method, params }) + '\n');
   const answer = async id => { await probe.until(() => lines.some(l => l.id === id && !l.method), 20000); return lines.find(l => l.id === id && !l.method); };
   send(0, 'initialize', { clientInfo: { name: 'agent_bridge_probe', version: '0' }, capabilities: { experimentalApi: true } });

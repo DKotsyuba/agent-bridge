@@ -117,33 +117,56 @@ class Probe {
    * stderr to files in the evidence directory.
    *
    * The stderr file descriptor is closed in this process right after the
-   * spawn (the child keeps its own copy). `closed` resolves only when the
+   * spawn (the child keeps its own copy). With `stderrMatch`, stderr is
+   * never written anywhere instead: it is read through a pipe and reduced
+   * in memory to `child.stderrSummary` = `{stderr_bytes, matched}`
+   * (`matched`: `stderrMatch` matched the stream, checked across chunk
+   * boundaries over a 256-character carry), so no file holds raw stderr on
+   * any path, including a signal, a thrown error or a child that keeps
+   * writing after it should have exited. `closed` resolves only when the
    * child exited *and* all its stdio ended (or the spawn failed), so every
    * stdout line, including a final line without newline, is logged before
    * the log is ended. A spawn failure records `spawn_error:<name>`.
    * @param {string} name Label (log file prefix).
    * @param {string} file Executable.
    * @param {string[]} args Arguments (never secrets).
-   * @param {{cwd?: string, env?: NodeJS.ProcessEnv, stdin?: boolean, cleanup?: boolean}} [options] Extra spawn options; `cleanup` marks a registered cleanup action's own process.
-   * @param {(line: string) => void} [onLine] Called for each stdout line.
+   * @param {{cwd?: string, env?: NodeJS.ProcessEnv, stdin?: boolean, cleanup?: boolean, keep?: (line: string) => string|null, stderrMatch?: RegExp}} [options] Extra spawn options; `cleanup` marks a registered cleanup action's own process; `keep` maps each stdout line *before* it is logged or handed to `onLine` (null drops it), so a line it rewrites is never written or retained anywhere; `stderrMatch` (a non-global RegExp) replaces the stderr file by the in-memory summary above.
+   * @param {(line: string) => void} [onLine] Called for each kept stdout line.
    * @returns {import('node:child_process').ChildProcess} The child.
    */
   spawn(name, file, args, options = {}, onLine) {
     this.fence(name, options.cleanup === true);
     if (args.some(arg => this.secrets.some(secret => arg.includes(secret)))) throw new Error('secret in argv');
-    const fd = fs.openSync(path.join(this.dir, `${name}.stderr`), 'w');
+    const reduce = options.stderrMatch instanceof RegExp;
+    const fd = reduce ? null : fs.openSync(path.join(this.dir, `${name}.stderr`), 'w');
     let child;
     try {
       child = spawn(file, args, {
         cwd: options.cwd || this.dir,
         env: options.env || process.env,
         detached: true,
-        stdio: [options.stdin ? 'pipe' : 'ignore', 'pipe', fd],
+        stdio: [options.stdin ? 'pipe' : 'ignore', 'pipe', reduce ? 'pipe' : fd],
       });
-    } finally { fs.closeSync(fd); }
+    } finally { if (fd !== null) fs.closeSync(fd); }
+    if (reduce) {
+      const summary = { stderr_bytes: 0, matched: false };
+      let carry = '';
+      child.stderr.on('data', chunk => {
+        summary.stderr_bytes += chunk.length;
+        const text = carry + chunk.toString('latin1');
+        if (options.stderrMatch.test(text)) summary.matched = true;
+        carry = text.slice(-256);
+      });
+      child.stderrSummary = summary;
+    }
     const log = fs.createWriteStream(path.join(this.dir, `${name}.stdout`));
     const lines = readline.createInterface({ input: child.stdout });
-    lines.on('line', line => { log.write(line + '\n'); if (onLine) onLine(line); });
+    lines.on('line', raw => {
+      const line = options.keep ? options.keep(raw) : raw;
+      if (line === null) return;
+      log.write(line + '\n');
+      if (onLine) onLine(line);
+    });
     const exit = new Promise(resolve => {
       child.once('error', error => { this.fail(`spawn_error:${name}`); resolve({ error: error.code || String(error) }); });
       child.once('exit', (code, signal) => resolve({ code, signal }));
@@ -248,7 +271,12 @@ class Probe {
     for (const entry of this.children) {
       const closed = await Promise.race([entry.closed, new Promise(r => setTimeout(() => r(false), 3000))]);
       const exit = await Promise.race([entry.exit, new Promise(r => setTimeout(() => r(null), 100))]);
-      if (!closed) { this.fail(`unclosed:${entry.name}`); if (entry.child.stdout) entry.child.stdout.destroy(); entry.lines.close(); }
+      if (!closed) {
+        this.fail(`unclosed:${entry.name}`);
+        if (entry.child.stdout) entry.child.stdout.destroy();
+        if (entry.child.stderr) entry.child.stderr.destroy();
+        entry.lines.close();
+      }
       if (!exit) this.fail(`unreaped:${entry.name}`);
       exits[entry.name] = exit || { unreaped: true };
       await new Promise(r => entry.log.end(r));

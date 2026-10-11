@@ -44,9 +44,10 @@
 //! - `bridge-fixture queue-add <sandbox> <codex> <store> <thread>
 //!   <client-id> <text-file>`: one product `Helper::queue_add`, printing
 //!   its classified outcome (root-run Codex queue qualification).
-//! - `bridge-fixture mcp-server <channel> <core> <token-file> <evidence>`: a
-//!   minimal MCP stdio server with one `bridge_probe` tool for root-run
-//!   native probes (see `qualification/`).
+//! - `bridge-fixture mcp-server <channel> <core> <token-file> <evidence>
+//!   [<tools>]`: a minimal MCP stdio server with the probe tools for
+//!   root-run native probes (see `qualification/`); `<tools>` is a
+//!   comma-separated subset to expose (default: all).
 //! - `bridge-fixture app-server ...`: a fake Codex App Server speaking the
 //!   queue-only subset; records `thread/queue/add` params to
 //!   `$CODEX_HOME/queue.jsonl`. `$CODEX_HOME/behavior` = `refuse` answers
@@ -561,6 +562,9 @@ fn status(core: &str, token: &str, event_id: &str) -> Value {
     )
 }
 
+/// Every tool `mcp-server` can expose, in listing order.
+const PROBE_TOOLS: [&str; 3] = ["bridge_probe", "bridge_me", "bridge_unlisted"];
+
 /// A minimal MCP stdio server for root-run native probes, with three tools:
 ///
 /// - `bridge_probe` (not read-only: it publishes): attests its caller from
@@ -575,10 +579,14 @@ fn status(core: &str, token: &str, event_id: &str) -> Value {
 ///   `unlisted_called`; a probe that expects the host to refuse it fails if
 ///   that record ever appears.
 ///
+/// Only the tools named in `exposed` are listed; a call to any other
+/// name is answered with an error and never runs or records anything, so a
+/// probe's closed tool inventory holds without host-side filtering.
+///
 /// Every call appends one JSON line with the tool name to `evidence`. A
 /// marker is written only there, never into the tool result. Model
 /// arguments are recorded but never used as identity.
-fn mcp_server(channel: &str, core: &str, token: &str, evidence: &str) {
+fn mcp_server(channel: &str, core: &str, token: &str, evidence: &str, exposed: &[&str]) {
     let attestor = RegistryAttestor::new(Path::new(channel), Duration::from_secs(5), 600_000);
     let mut log = std::fs::OpenOptions::new()
         .create(true)
@@ -599,7 +607,8 @@ fn mcp_server(channel: &str, core: &str, token: &str, evidence: &str) {
                 "serverInfo": {"name": "bridge-probe", "version": env!("CARGO_PKG_VERSION")}
             }),
             "ping" => json!({}),
-            "tools/list" => json!({"tools": [
+            "tools/list" => {
+                let tools = json!([
                 {
                     "name": "bridge_probe",
                     "description": "Agent Bridge native qualification probe. Call with an empty object.",
@@ -618,7 +627,28 @@ fn mcp_server(channel: &str, core: &str, token: &str, evidence: &str) {
                     "inputSchema": {"type": "object", "properties": {}},
                     "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": false}
                 }
-            ]}),
+                ]);
+                let listed: Vec<&Value> = tools
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|tool| exposed.iter().any(|name| tool["name"] == *name))
+                    .collect();
+                json!({"tools": listed})
+            }
+            "tools/call"
+                if !exposed
+                    .iter()
+                    .any(|name| message["params"]["name"] == *name) =>
+            {
+                let _ = writeln!(
+                    stdout,
+                    "{}",
+                    json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32602, "message": "unknown tool"}})
+                );
+                let _ = stdout.flush();
+                continue;
+            }
             "tools/call" if message["params"]["name"] == "bridge_unlisted" => {
                 let record = json!({"at": bridge_core::service::current_unix_millis(), "tool": "bridge_unlisted", "unlisted_called": true});
                 let _ = writeln!(log, "{record}");
@@ -793,15 +823,25 @@ fn main() {
                 pause(&args[2], &credential(&args[3]), &args[4], args[5] == "on")
             );
         }
-        Some("mcp-server") if args.len() == 6 => {
-            mcp_server(&args[2], &args[3], &credential(&args[4]), &args[5]);
+        Some("mcp-server") if args.len() == 6 || args.len() == 7 => {
+            let exposed: Vec<&str> = match args.get(6) {
+                Some(list) => list.split(',').collect(),
+                None => PROBE_TOOLS.to_vec(),
+            };
+            mcp_server(
+                &args[2],
+                &args[3],
+                &credential(&args[4]),
+                &args[5],
+                &exposed,
+            );
         }
         Some("queue-add") if args.len() == 8 => {
             queue_add(&args[2], &args[3], &args[4], &args[5], &args[6], &args[7]);
         }
         _ => {
             eprintln!(
-                "usage: bridge-fixture harness | mcp <socket> | relay <socket> | app-server | publish <core> <token-file> <recipient> <mode> <event> <payload> | status <core> <token-file> <event> | pause <core> <admin-token-file> <recipient> on|off | mcp-server <channel> <core> <token-file> <evidence> | queue-add <sandbox> <codex> <store> <thread> <client-id> <text-file>"
+                "usage: bridge-fixture harness | mcp <socket> | relay <socket> | app-server | publish <core> <token-file> <recipient> <mode> <event> <payload> | status <core> <token-file> <event> | pause <core> <admin-token-file> <recipient> on|off | mcp-server <channel> <core> <token-file> <evidence> [<tools>] | queue-add <sandbox> <codex> <store> <thread> <client-id> <text-file>"
             );
             std::process::exit(2);
         }

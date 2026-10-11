@@ -13,7 +13,9 @@
  * coexisting no-op hook), `--strict-mcp-config` with only the probe MCP
  * server, only the probe's agent, slash commands disabled, cwd in the
  * private directory, only the Agent tool (native name `Task`) plus the fixture MCP tool, checked
- * against the native `system/init` inventory (`native_tool_inventory_closed`)
+ * against the native `system/init` inventory (`native_tool_inventory_closed`;
+ * the fixture server is started with the `bridge_probe` subset only, since
+ * the root 2.1.296 run listed every tool the server offers)
  * with manual/default permissions (`native_permissions_manual`),
  * `--no-chrome`, `--permission-prompts none` (anything not pre-allowed is
  * denied, never prompted) and an explicit private `--messaging-socket-path`.
@@ -34,7 +36,10 @@
  * the background, so after the child turn the probe waits for the native
  * `task_notification` of the task started in that turn and for any
  * follow-up turn it triggers, then for a quiet interval (`TurnTracker`),
- * before the message and pause steps. The pause window counts any turn
+ * before the message and pause steps. An open first-turn scope stops the
+ * probe right after the first turn, and a gone receiver (or a turn without
+ * result) stops it before the next step: no later child, message, pause or
+ * resume step runs and their checks stay missing. The pause window counts any turn
  * start or result as a failure while the receiver is alive with budget.
  * The message step requires actor-bound positive evidence from the
  * daemon's transcript reconciliation (`message_positive_evidence`).
@@ -108,7 +113,7 @@ run('m2cp', 15 * 60_000, REQUIRED, async probe => {
   const coexisting = { type: 'command', command: '/usr/bin/true', timeout: 5 };
   const events = ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'PermissionRequest', 'Notification', 'Stop', 'SubagentStop', 'SessionEnd'];
   fs.writeFileSync(path.join(probe.dir, 'settings.json'), JSON.stringify({ hooks: Object.fromEntries(events.map(e => [e, [{ hooks: [hook, coexisting] }]])) }));
-  const mcp = { mcpServers: { bridge_probe: { command: fixture, args: ['mcp-server', channel, core, publisher.file, evidence] } } };
+  const mcp = { mcpServers: { bridge_probe: { command: fixture, args: ['mcp-server', channel, core, publisher.file, evidence, 'bridge_probe'] } } };
   const agents = { bridge_probe_child: { description: 'Calls the Bridge probe once.', prompt: 'Call mcp__bridge_probe__bridge_probe exactly once with {} and then reply CHILD_DONE. Use no other tool.', tools: ['mcp__bridge_probe__bridge_probe'] } };
 
   const results = [];
@@ -146,14 +151,36 @@ run('m2cp', 15 * 60_000, REQUIRED, async probe => {
       }
     } catch {}
   });
+  /** Whether the receiver process has neither exited nor been killed.
+   * @returns {boolean}
+   */
   const alive = () => receiver.exitCode === null && receiver.signalCode === null;
-  /** Sends one prompted turn; returns its result or null (and records why). */
+  /** Guards one probe step on a live receiver: when the receiver process
+   * has exited or been killed, records `receiver_gone_before:<step>` and
+   * throws, so `run` goes straight to cleanup and no later step (child,
+   * message, pause, resume) runs; their checks stay missing, which
+   * `finish` reports as failures. Returns nothing when the receiver lives.
+   * @param {string} step Label of the step about to run (`inject`, `child`, `message`, `pause`, `resume`).
+   * @returns {void}
+   * @throws {Error} The receiver is gone.
+   */
+  const ensureAlive = step => {
+    if (!alive()) { probe.fail(`receiver_gone_before:${step}`); throw new Error(`receiver gone before ${step}; later steps not run`); }
+  };
+  /** Sends one prompted turn and returns its result. A provider error in
+   * the result is recorded as `provider_error:<label>:<subtype>` but still
+   * returned.
+   * @param {string} label Step label for failure categories.
+   * @param {string} text User message text sent on the receiver stdin.
+   * @returns {Promise<{text: string, error: boolean, subtype: string, usage: object|null, cost: number|undefined}>} The turn result.
+   * @throws {Error} The receiver is gone (`receiver_gone_before:<label>`), its spend is near the cap (`budget_near_cap_before:<label>`) or no result arrived within 180 s (`no_result:<label>`); later steps then never run.
+   */
   const turn = async (label, text) => {
-    if (!alive()) { probe.fail(`receiver_gone_before:${label}`); return null; }
-    if (spent >= MAX_USD * 0.9) { probe.fail(`budget_near_cap_before:${label}`); return null; }
+    ensureAlive(label);
+    if (spent >= MAX_USD * 0.9) { probe.fail(`budget_near_cap_before:${label}`); throw new Error(`budget near cap before ${label}`); }
     const before = results.length;
     receiver.stdin.write(JSON.stringify({ type: 'user', message: { role: 'user', content: text } }) + '\n');
-    if (!await probe.until(() => results.length > before || !alive(), 180000) || results.length === before) { probe.fail(`no_result:${label}`); return null; }
+    if (!await probe.until(() => results.length > before || !alive(), 180000) || results.length === before) { probe.fail(`no_result:${label}`); throw new Error(`no result for ${label}; later steps not run`); }
     const result = results[results.length - 1];
     if (result.error) probe.fail(`provider_error:${label}:${result.subtype}`);
     return result;
@@ -173,6 +200,9 @@ run('m2cp', 15 * 60_000, REQUIRED, async probe => {
   probe.checks.inject_marker_in_reply = Boolean(root && root.marker && first && !first.error && first.text.includes(root.marker));
   // Meaningful only alongside the positive marker in the same reply.
   probe.checks.memory_canary_absent = Boolean(probe.checks.inject_marker_in_reply && !first.text.includes(canary));
+  // Nothing more runs outside the verified scope or without a receiver.
+  if (probe.checks.native_tool_inventory_closed !== true || probe.checks.native_permissions_manual !== true) throw new Error('first-turn scope not verified; later steps not run');
+  ensureAlive('child');
 
   const tasksBefore = new Set(tracker.tasks.keys());
   await turn('child', 'Use the bridge_probe_child agent exactly once. Then reply DONE.');
@@ -190,6 +220,7 @@ run('m2cp', 15 * 60_000, REQUIRED, async probe => {
   probe.checks.refusals = records().filter(r => r.refused).map(r => r.refused);
 
   // A message after the turn ended (Stop: idle) must start a distinct turn.
+  ensureAlive('message');
   const message = 'BRIDGE_MSG_' + crypto.randomBytes(6).toString('hex');
   probe.checks.message_publish = request(['publish', core, publisher.file, recipient, 'message', 'probe-message-1', `Synthetic Bridge qualification message ${message}. Quote it.`]);
   const later = await unprompted(120000);
@@ -211,6 +242,7 @@ run('m2cp', 15 * 60_000, REQUIRED, async probe => {
 
   // Pause: authenticated success, then a held event with zero attempts and
   // no turn while the receiver stays alive with budget left.
+  ensureAlive('pause');
   const pause = request(['pause', core, admin.file, recipient, 'on']);
   probe.checks.pause_applied = pause === 'Done' || (pause && pause.Done !== undefined) || JSON.stringify(pause) === '"Done"';
   const paused = 'BRIDGE_MSG_' + crypto.randomBytes(6).toString('hex');
@@ -226,6 +258,7 @@ run('m2cp', 15 * 60_000, REQUIRED, async probe => {
   probe.checks.paused_no_turn_while_alive = quiet === null && probe.checks.idle_before_pause === true
     && probe.checks.pause_window_turn_events.started === 0 && probe.checks.pause_window_turn_events.finished === 0
     && probe.checks.receiver_alive_through_pause;
+  ensureAlive('resume');
   probe.checks.resume = request(['pause', core, admin.file, recipient, 'off']);
   const resumed = await unprompted(120000);
   probe.checks.resumed_marker_in_distinct_turn = Boolean(resumed && !resumed.error && resumed.text.includes(paused));
