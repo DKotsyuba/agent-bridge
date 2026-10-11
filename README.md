@@ -30,8 +30,9 @@ automatically repeated after a possible handoff.
     original receipt, changed identity-content conflicts, monotonic
     acceptance order, latest-stream watermarks scoped by the full coalescing
     group, supersession of older *pending* snapshots only, admission quotas
-    (non-terminal cap, per-publisher, per-recipient snapshot reserve with
-    keep_all exempt, and a hard cap on retained dedup history that is never
+    (non-terminal cap with at least one slot, a quarter for larger caps, reserved
+    for keep_all, per-publisher,
+    per-recipient snapshot reserve with keep_all exempt, and a hard cap on retained dedup history that is never
     evicted), pending-only expiry, payload compaction that keeps dedup
     identity, and producer-lineage authority: one authenticated producer
     owns each `latest` lineage (the coalescing scope without the
@@ -56,8 +57,10 @@ automatically repeated after a possible handoff.
     retained events and watermarks; a lineage with several historical
     producers migrates as *ambiguous* and fences publication and dispatch
     until an operator resolves it), a version-3 attempt that may have
-    reached a carrier becomes a `review` event with an incident, and
-    unknown/newer/foreign databases are refused untouched.
+    reached a carrier becomes a `review` event with a live
+    `migrated_unverified` incident (open version-3 incident rows stay in
+    `incidents_v3` as history), and unknown/newer/foreign databases are
+    refused untouched.
   - `framing`: allowlisted source-tag wrappers with escaped, bounded
     manifests, a separate source block per member, forbidden-control
     rejection and the fixed external-data/no-authority statement. An event
@@ -134,8 +137,10 @@ deadlines and overdue incidents; only an audited operator decision
 forever, `dispose_event`, `waive_predecessor`) or positive evidence resolves an
 incident. Dependents declared with `predecessor` metadata are accepted even if
 the predecessor has not arrived, and wait for positive predecessor evidence, a
-superseding snapshot or an audited disposition/waiver — never for time;
-cycles are refused. Selection is keep_all first with age-based anti-starvation
+superseding snapshot or an audited disposition/waiver — never for time; a
+predecessor that expired raises a `predecessor_expired` incident on the
+dependent, which stays blocked until a waiver or disposition; cycles are
+refused. Selection is keep_all first with age-based anti-starvation
 of snapshots, independent traffic is never blocked behind a dependent, batch
 siblings are frozen together in acceptance order only inside one scope
 (publisher, recipient, kind, mode, project, task, group), and an in-flight
@@ -167,7 +172,11 @@ connections are capped, idle/stalled readers and non-reading writers time out;
 stopping fences new work under the custody lock (nothing is accepted after the
 stop returned), wakes and drains in-flight connections, and is bounded even
 with a hung carrier. SIGTERM/SIGINT stop the daemon cleanly (a second signal
-exits immediately); the maintenance loop survives panics.
+exits immediately); the maintenance loop survives panics, a carrier whose
+attestation panics only holds its own recipient, and each dispatch pass takes a
+rotating window of recipients, so idle or blocked recipients with unchanging
+work cannot pin the window (no exact coverage bound is promised while the
+workload keeps changing).
 
 Logging is JSON lines on stderr without tokens, payloads or config text.
 

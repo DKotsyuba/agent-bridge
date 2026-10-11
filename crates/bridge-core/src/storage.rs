@@ -125,12 +125,19 @@ pub(crate) fn count(
 /// quota and the per-recipient replaceable-snapshot quota implement
 /// admission fairness: keep_all events are exempt from the snapshot quota so
 /// a diagnostics flood cannot fill storage before independent completions.
+/// The top quarter of the global cap (at least one slot, for every valid cap)
+/// is additionally reserved for keep_all: `latest` and `batch` events are
+/// refused once the cap minus that reserve is reached, so many recipients or
+/// publishers together cannot exhaust it. A cap of one therefore admits no
+/// `latest` or `batch` event at all; the configured cap is never exceeded.
 /// `max_retained_events` bounds the dedup history itself, which is never
 /// evicted: at that cap new admission is refused. The connection fields
 /// bound the local service's threads and per-connection waiting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Limits {
-    /// Maximum number of admitted, not-yet-terminal events.
+    /// Maximum number of admitted, not-yet-terminal events; the last
+    /// `max(1, cap / 4)` slots admit keep_all events only (so cap 1 admits
+    /// only keep_all, cap 2 one snapshot, cap 3 two).
     pub max_admitted_events: usize,
     /// Maximum pending events per publisher (item quota).
     #[serde(default = "default_max_per_publisher")]
@@ -779,12 +786,28 @@ fn check_supported(tx: &Connection, envelope: &Envelope) -> Result<(), CoreError
     Ok(())
 }
 
+/// Share of the global admission cap, as a divisor, reserved for keep_all.
+const KEEP_ALL_RESERVE_DIVISOR: usize = 4;
+
+/// Number of admission slots at the top of the global cap that only
+/// keep_all events may take: `max_admitted_events / 4` rounded down but never
+/// below one, so every valid cap (at least one) keeps a critical slot. The
+/// result never exceeds the cap, so `cap - reserve` cannot underflow.
+fn keep_all_reserve(limits: &Limits) -> usize {
+    (limits.max_admitted_events / KEEP_ALL_RESERVE_DIVISOR).max(1)
+}
+
 /// Applies the admission caps for a new pending event.
 ///
 /// Counts only events that are not yet terminal, so delivered events do not
 /// consume admission capacity (they remain as dedup tombstones under the
 /// retained cap). Snapshot quota applies to `latest` only; keep_all is
-/// exempt.
+/// exempt. The top slots of the global cap (see [`keep_all_reserve`]; at
+/// least one) are reserved: only keep_all may take them, so replaceable or
+/// batchable traffic from any number of recipients and publishers can never
+/// leave keep_all with no admission capacity. With a cap of one no
+/// non-keep_all event is admitted: it gets [`CoreError::Capacity`] before
+/// acceptance. Nothing already admitted is evicted to make room.
 fn check_admission(tx: &Connection, envelope: &Envelope, limits: &Limits) -> Result<(), CoreError> {
     let non_terminal = delivery::NON_TERMINAL;
     let admitted = count(
@@ -797,6 +820,17 @@ fn check_admission(tx: &Connection, envelope: &Envelope, limits: &Limits) -> Res
     if admitted >= limits.max_admitted_events as u64 {
         return Err(CoreError::Capacity {
             limit: format!("max_admitted_events {}", limits.max_admitted_events),
+        });
+    }
+    let reserve = keep_all_reserve(limits);
+    if !matches!(envelope.policy, Policy::KeepAll)
+        && admitted >= (limits.max_admitted_events - reserve) as u64
+    {
+        return Err(CoreError::Capacity {
+            limit: format!(
+                "max_admitted_events {} (last {reserve} reserved for keep_all)",
+                limits.max_admitted_events
+            ),
         });
     }
     let per_publisher = count(

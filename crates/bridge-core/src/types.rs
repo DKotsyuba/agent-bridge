@@ -880,6 +880,7 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 ///
 /// Used only for hash digests; not a general formatting utility.
 fn hex_encode(bytes: &[u8]) -> String {
+    /// Lowercase hexadecimal digit alphabet indexed by nibble value.
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {

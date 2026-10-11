@@ -17,8 +17,11 @@ use common::{TempDir, short_socket};
 
 /// A fixed synthetic grant token; test fixture data only.
 const GRANT_TOKEN: &str = "6f6f-test-grant-token-0001";
+/// A fixed synthetic operator-realm token; test fixture data only.
 const ADMIN_TOKEN: &str = "6f6f-admin-grant-token-0001";
+/// A well-formed synthetic token that no configured grant holds; test fixture data only.
 const OTHER_TOKEN: &str = "6f6f-other-grant-token-0002";
+/// A fixed synthetic token of a second publisher; test fixture data only.
 const SECOND_TOKEN: &str = "6f6f-second-publisher-token-0003";
 
 /// The canonical recipient the grant allows.

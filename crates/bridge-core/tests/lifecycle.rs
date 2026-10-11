@@ -1077,3 +1077,131 @@ fn credentials_never_appear_in_debug_output_or_error_details() {
     running.shutdown();
     running.join();
 }
+
+/// A canonical Codex address for the multi-recipient service checks.
+fn thread(name: &str) -> NativeAddress {
+    NativeAddress::new("host-1", Harness::Codex, "default", name).unwrap()
+}
+
+/// Waits until `event` reports `native_accepted` or the budget runs out.
+fn wait_accepted(client: &mut BridgeClient, event: &str, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        let (_, delivery) = client.status(RUN_TOKEN, event).unwrap();
+        if delivery.is_some_and(|d| d.attempt_state == "native_accepted") {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// Recipients whose pending work the message path can never take (here
+/// inject-only events) must not occupy the bounded dispatch listing
+/// forever: a seventeenth, younger recipient with real message work is
+/// still served by the service loop.
+#[test]
+fn quiet_inject_only_recipients_cannot_starve_a_later_message_recipient() {
+    let dir = TempDir::new("life-fair");
+    let quiet: Vec<NativeAddress> = (0..16)
+        .map(|index| thread(&format!("quiet-{index:02}")))
+        .collect();
+    let busy = thread("zz-busy");
+    let mut cfg = config(&dir, "fair");
+    cfg.grants[0].recipients = quiet
+        .iter()
+        .chain([&busy])
+        .map(NativeAddress::to_canonical_string)
+        .collect();
+    let script = Arc::new(Mutex::new(ScriptedCarrier::new(
+        Lifecycle::Inactive,
+        ScriptedCarrier::accepted(),
+    )));
+    let running =
+        service::start_with_carriers(cfg, vec![Box::new(Shared(Arc::clone(&script)))]).unwrap();
+    let mut client = BridgeClient::connect(running.socket_path()).unwrap();
+    for (index, address) in quiet.iter().enumerate() {
+        let mut inject = body(&format!("evt-quiet-{index:02}"));
+        inject.recipient = address.clone();
+        inject.mode = Mode::Inject;
+        client.publish(RUN_TOKEN, &inject).unwrap();
+        std::thread::sleep(Duration::from_millis(3));
+    }
+    let mut work = body("evt-busy");
+    work.recipient = busy;
+    client.publish(RUN_TOKEN, &work).unwrap();
+
+    assert!(
+        wait_accepted(&mut client, "evt-busy", Duration::from_secs(10)),
+        "the younger message recipient starved behind quiet inject-only recipients"
+    );
+    assert_eq!(script.lock().unwrap().sends.len(), 1);
+    running.shutdown();
+    running.join();
+}
+
+/// A carrier whose attestation panics for one recipient on every call.
+struct Poisoned {
+    /// The recipient whose attestation always panics.
+    bad: NativeAddress,
+    /// The well-behaved carrier used for every other recipient.
+    inner: ScriptedCarrier,
+}
+
+impl DispatchCarrier for Poisoned {
+    /// Panics for the poisoned recipient; otherwise attests normally.
+    fn attest(&mut self, recipient: &NativeAddress) -> Result<Attestation, String> {
+        assert!(
+            *recipient != self.bad,
+            "scripted persistent attestation panic"
+        );
+        self.inner.attest(recipient)
+    }
+
+    /// Applies this fixture's scripted outcome to the frozen attempt.
+    fn send(&mut self, attempt: &AttemptRecord) -> Outcome {
+        self.inner.send(attempt)
+    }
+}
+
+/// A carrier attestation that panics on every pass for one recipient is
+/// isolated to that recipient: the recipient shows a visible hold and its
+/// event stays unaccepted, while another recipient still gets delivered.
+#[test]
+fn a_persistently_panicking_attestation_is_isolated_to_its_recipient() {
+    let dir = TempDir::new("life-poison");
+    let (bad, good) = (thread("a-bad"), thread("b-good"));
+    let mut cfg = config(&dir, "poison");
+    cfg.grants[0].recipients = vec![bad.to_canonical_string(), good.to_canonical_string()];
+    let running = service::start_with_carriers(
+        cfg,
+        vec![Box::new(Poisoned {
+            bad: bad.clone(),
+            inner: ScriptedCarrier::new(Lifecycle::Inactive, ScriptedCarrier::accepted()),
+        })],
+    )
+    .unwrap();
+    let mut client = BridgeClient::connect(running.socket_path()).unwrap();
+    let mut first = body("evt-bad");
+    first.recipient = bad;
+    client.publish(RUN_TOKEN, &first).unwrap();
+    std::thread::sleep(Duration::from_millis(3));
+    let mut second = body("evt-good");
+    second.recipient = good;
+    client.publish(RUN_TOKEN, &second).unwrap();
+
+    assert!(
+        wait_accepted(&mut client, "evt-good", Duration::from_secs(10)),
+        "a persistent attestation panic for one recipient stopped other deliveries"
+    );
+    let (_, bad_status) = client.status(RUN_TOKEN, "evt-bad").unwrap();
+    assert!(
+        bad_status.is_none_or(|d| d.attempt_state != "native_accepted"),
+        "a panicking attestation must never fabricate native acceptance"
+    );
+    let holds = client.holds(OPS_TOKEN, None).unwrap();
+    assert_eq!(holds.len(), 1, "the poisoned recipient is visibly held");
+    assert!(holds[0].reason.contains("panicked"), "{}", holds[0].reason);
+    running.shutdown();
+    running.join();
+}

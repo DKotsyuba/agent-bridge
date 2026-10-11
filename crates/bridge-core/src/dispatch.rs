@@ -844,6 +844,11 @@ pub(crate) fn load_attempt(
     connection: &Connection,
     attempt_seq: u64,
 ) -> Result<Option<AttemptRecord>, CoreError> {
+    /// One `attempts` row in `SELECT` order: state, requested mode, effective
+    /// mode, recipient, actor, endpoint epoch, granted capabilities, manifest,
+    /// manifest hash, lease expiry, deadline, recheck, duplicate-risk flag,
+    /// created, updated, note and proof reference. Text columns are parsed
+    /// into typed values afterwards; a malformed one is a corrupt-store error.
     type Row = (
         String,
         String,
@@ -1453,7 +1458,10 @@ impl Storage {
     ///
     /// A late outcome for an `outcome_unknown` attempt may only be positive
     /// (accepted, hook submitted, known-unsent with proof, refusal): it
-    /// resolves the incident without another send. A held or unreceipted
+    /// resolves that attempt's own incident without another send. If an audited
+    /// retry has since given the events to a newer attempt, the late outcome is
+    /// kept as evidence only: it never closes, opens or changes the newer
+    /// attempt's incidents or delivery state. A held or unreceipted
     /// outcome is rechecked by `recheck_ms`, clamped to a day.
     pub fn record_outcome(
         &mut self,
@@ -1526,31 +1534,54 @@ impl Storage {
     }
 
     /// Lists recipients that currently have eligible unhanded work for the
-    /// dispatch loop (bounded by `limit`).
+    /// dispatch loop (bounded by `limit`), as one window of a rotation.
     ///
-    /// Healthy recipients come first, oldest waiting event first; recipients
-    /// under a visible hold follow, least recently rechecked first, so a
-    /// crowd of held recipients can neither starve healthy ones nor be
-    /// starved by them.
+    /// The full order is: healthy recipients first, oldest waiting event
+    /// first; recipients under a visible hold follow, least recently
+    /// rechecked first. The window starts just after `after` (the last
+    /// recipient of the previous window, or `None` for the start) and
+    /// wraps around to the start of the order. Recipients whose work the
+    /// message path cannot take right now (inject-only, active auto,
+    /// predecessor-blocked, paused) keep unchanged sort keys, so for a
+    /// stable set of recipients consecutive windows advance through the whole
+    /// order and cannot stay pinned to the same `limit` recipients (tested
+    /// with `ceil(n / limit)` windows for a static set). The sort keys move
+    /// as work progresses (a recheck refreshes a hold, handling the oldest
+    /// event ages a recipient), which can reorder recipients between
+    /// windows, so no exact coverage bound is promised for a changing
+    /// workload. An `after` that no longer has work restarts from the
+    /// beginning.
     pub fn recipients_with_work(
         &self,
         now_ms: u64,
         limit: usize,
+        after: Option<&NativeAddress>,
     ) -> Result<Vec<NativeAddress>, CoreError> {
         let mut statement = self.connection.prepare(
-            "SELECT e.recipient FROM events e
-             LEFT JOIN recipient_holds h ON h.recipient = e.recipient
-             WHERE e.state = 'pending' AND e.delivery = 'unhanded' AND e.not_before_ms <= ?1
-               AND (e.expires_at_ms IS NULL OR e.expires_at_ms > ?1)
-             GROUP BY e.recipient
-             ORDER BY (h.recipient IS NOT NULL),
-                      COALESCE(h.updated_ms, MIN(e.accepted_at_ms))
+            "WITH work AS (
+                 SELECT e.recipient AS recipient, h.recipient IS NOT NULL AS held,
+                        COALESCE(h.updated_ms, MIN(e.accepted_at_ms)) AS waiting_since
+                 FROM events e
+                 LEFT JOIN recipient_holds h ON h.recipient = e.recipient
+                 WHERE e.state = 'pending' AND e.delivery = 'unhanded' AND e.not_before_ms <= ?1
+                   AND (e.expires_at_ms IS NULL OR e.expires_at_ms > ?1)
+                 GROUP BY e.recipient)
+             SELECT recipient FROM work
+             ORDER BY ((held, waiting_since, recipient) <=
+                       (SELECT c.held, c.waiting_since, c.recipient FROM work c
+                        WHERE c.recipient = ?3)),
+                      held, waiting_since, recipient
              LIMIT ?2",
         )?;
         let texts: Vec<String> = statement
-            .query_map(params![to_sql(now_ms)?, to_sql(limit as u64)?], |row| {
-                row.get(0)
-            })?
+            .query_map(
+                params![
+                    to_sql(now_ms)?,
+                    to_sql(limit as u64)?,
+                    after.map(NativeAddress::to_canonical_string)
+                ],
+                |row| row.get(0),
+            )?
             .collect::<Result<_, _>>()?;
         texts
             .iter()
@@ -1594,6 +1625,12 @@ impl Storage {
 
 /// Applies an outcome to an attempt and its members inside the caller's
 /// transaction.
+///
+/// `late` marks an outcome for an attempt that was already
+/// `outcome_unknown`; such an outcome changes member delivery state and
+/// raises incidents only while the attempt still owns its events, and only
+/// closes incidents that this attempt raised. The attempt row and its
+/// evidence tier are always recorded.
 pub(crate) fn apply_outcome(
     tx: &Transaction<'_>,
     record: &AttemptRecord,
@@ -1723,7 +1760,8 @@ pub(crate) fn apply_outcome(
             }
         }
         AttemptState::PermanentRefusal => {
-            if !late || owned(tx)? {
+            let owns = !late || owned(tx)?;
+            if owns {
                 set_member_delivery(tx, seq, delivery::REFUSED, false)?;
             }
             resolve_attempt_incidents(
@@ -1732,7 +1770,9 @@ pub(crate) fn apply_outcome(
                 "positive evidence: refused before acceptance",
                 now_ms,
             )?;
-            for member in &record.members {
+            // A refusal of an attempt that no longer owns its events is
+            // evidence only; it must not raise an incident on the newer one.
+            for member in record.members.iter().filter(|_| owns) {
                 open_incident_in(
                     tx,
                     &member.publisher,
@@ -1765,8 +1805,13 @@ fn clamp_recheck(requested_ms: u64, now_ms: u64) -> u64 {
     )
 }
 
-/// Closes open incidents of an attempt's members with a positive
-/// resolution, for outcomes that settle the uncertainty.
+/// Closes the open incidents that belong to one attempt's members with a
+/// positive resolution, for outcomes that settle the uncertainty.
+///
+/// Only incidents raised by this attempt (or unattributed ones, such as a
+/// `migrated_unverified` incident that predates attempt numbering) close; a
+/// newer attempt's incident on the same event stays open, so a late outcome
+/// for an older attempt can never hide the newer attempt's uncertainty.
 fn resolve_attempt_incidents(
     tx: &Connection,
     record: &AttemptRecord,
@@ -1778,13 +1823,15 @@ fn resolve_attempt_incidents(
             "UPDATE incidents SET state = 'resolved', resolution = ?1, updated_ms = ?2,
                  resolved_ms = ?2
              WHERE publisher_id = ?3 AND event_id = ?4 AND state = 'open'
+               AND (attempt_seq IS NULL OR attempt_seq = ?5)
                AND kind IN ('unknown_handoff', 'held_overdue', 'receipt_overdue',
                             'migrated_unverified')",
             params![
                 resolution,
                 to_sql(now_ms)?,
                 member.publisher,
-                member.event_id
+                member.event_id,
+                to_sql(record.fence.attempt_seq)?
             ],
         )?;
     }
@@ -1855,6 +1902,22 @@ fn return_unsent(
     Ok(())
 }
 
+/// Attests a recipient through a carrier, converting a carrier panic into
+/// an attestation failure.
+///
+/// A panicking `attest` is contained to this recipient: the caller treats
+/// the returned error exactly like any other failed attestation (a visible
+/// hold, or a released reservation), so one carrier defect can neither end
+/// the pass for other recipients nor be mistaken for an inactive or
+/// accepting endpoint. The panic payload is not copied into the reason.
+pub(crate) fn attest_guarded(
+    carrier: &mut dyn DispatchCarrier,
+    recipient: &NativeAddress,
+) -> Result<Attestation, String> {
+    catch_unwind(AssertUnwindSafe(|| carrier.attest(recipient)))
+        .unwrap_or_else(|_| Err("the carrier panicked during attestation".to_string()))
+}
+
 /// Drives one message-path dispatch for a recipient through a carrier.
 ///
 /// Sequence: attest -> reserve (fenced, lease-bound, frozen manifest) ->
@@ -1862,8 +1925,9 @@ fn return_unsent(
 /// -> record the evidence tier. The storage lock is held only inside each
 /// storage step, never across carrier calls. An attestation failure, a
 /// pause, an unknown or disconnected recipient and a pending approval are
-/// visible holds that invoke nothing; a carrier panic is recorded as an
-/// unknown outcome. `clock` supplies Unix epoch milliseconds and is read
+/// visible holds that invoke nothing; an attestation panic counts as an
+/// attestation failure (the panic is contained, never propagated); a panic during the hand-off
+/// is recorded as an unknown outcome. `clock` supplies Unix epoch milliseconds and is read
 /// before each step.
 pub fn dispatch_message(
     storage: &Mutex<Storage>,
@@ -1872,7 +1936,7 @@ pub fn dispatch_message(
     clock: &dyn Fn() -> u64,
     timing: &DispatchTiming,
 ) -> Result<DispatchReport, CoreError> {
-    let attestation = match carrier.attest(recipient) {
+    let attestation = match attest_guarded(carrier, recipient) {
         Ok(attestation) => attestation,
         Err(reason) => {
             let reason = format!("endpoint attestation failed: {reason}");
@@ -1896,7 +1960,7 @@ pub fn dispatch_message(
         Selection::Held(reason) => return Ok(DispatchReport::Held(reason)),
         Selection::Attempt(record) => record,
     };
-    let fresh = match carrier.attest(recipient) {
+    let fresh = match attest_guarded(carrier, recipient) {
         Ok(fresh) => fresh,
         Err(reason) => {
             let reason = format!("endpoint attestation failed before invocation: {reason}");

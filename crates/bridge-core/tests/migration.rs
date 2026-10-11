@@ -790,3 +790,80 @@ fn version_four_single_legacy_owner_fences_a_new_producer_immediately() {
     owner.mode = Mode::Auto;
     storage.publish(&owner, 2_100).unwrap();
 }
+
+/// An open version 3 `unknown_handoff` incident is never lost to the
+/// migration: its event stays in review under a live `migrated_unverified`
+/// incident (so operators still see and must resolve it), while the original
+/// row and its detail stay in `incidents_v3` as historical custody, and new
+/// incident numbers continue after the old ones.
+#[test]
+fn an_open_version_three_incident_stays_visible_as_a_live_incident_with_history_kept() {
+    let dir = TempDir::new("migrate-v3-incident");
+    let path = dir.path("bridge.db");
+    let recipient = codex("thread-v3-incident");
+    {
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(V3_DDL).unwrap();
+        connection
+            .execute("INSERT INTO schema_meta VALUES ('schema_version', '3')", [])
+            .unwrap();
+        connection
+            .execute("INSERT INTO counters VALUES ('acceptance_seq', 1)", [])
+            .unwrap();
+        connection
+            .execute("INSERT INTO counters VALUES ('attempt_seq', 1)", [])
+            .unwrap();
+        connection
+            .execute("INSERT INTO counters VALUES ('incident_seq', 7)", [])
+            .unwrap();
+        let envelope = keep_all("agent-run", "evt-lost", &recipient, Mode::Message);
+        insert_event(&connection, &envelope, 1, 1_000, true);
+        connection
+            .execute(
+                "INSERT INTO attempts (attempt_seq, publisher_id, event_id, state,
+                     effective_mode, manifest_hash, lease_expires_ms, created_ms, updated_ms)
+                 VALUES (1, 'agent-run', 'evt-lost', 'outcome_unknown', 'message', 'h', NULL,
+                         1000, 2000)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO incidents (incident_seq, publisher_id, event_id, kind, reason,
+                     state, created_ms, updated_ms, next_check_ms, review_deadline_ms)
+                 VALUES (7, 'agent-run', 'evt-lost', 'unknown_handoff', 'old reason', 'open',
+                         2000, 2000, 2000, 9000)",
+                [],
+            )
+            .unwrap();
+    }
+    let storage = Storage::open(&path, Limits::new(100)).unwrap();
+    let open = storage.open_incidents(5_000, 10).unwrap();
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].event_id, "evt-lost");
+    assert_eq!(open[0].kind, "migrated_unverified");
+    assert!(
+        open[0].incident_seq > 7,
+        "new numbers continue after old ones"
+    );
+    assert_eq!(
+        storage
+            .delivery_evidence("agent-run", "evt-lost")
+            .unwrap()
+            .unwrap()
+            .delivery,
+        DeliveryState::Review
+    );
+    let (kind, reason): (String, String) = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT kind, reason FROM incidents_v3 WHERE incident_seq = 7",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (kind.as_str(), reason.as_str()),
+        ("unknown_handoff", "old reason")
+    );
+}

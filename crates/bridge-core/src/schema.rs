@@ -20,7 +20,9 @@ use crate::types::{CoreError, Envelope};
 /// manifest with recipient, actor, endpoint epoch and granted capabilities
 /// per attempt, adds the per-event delivery state, coalescing scope,
 /// predecessor ordering, evidence, bindings, holds, source tags and the
-/// operator audit log.
+/// operator audit log. Version 5 adds the per-event stream `lineage_key` and
+/// the `stream_lineages` authority table (one producer owns each `latest`
+/// lineage).
 pub const SCHEMA_VERSION: u32 = 5;
 
 /// Backfills each migrated `latest` event's lineage key.
@@ -270,8 +272,9 @@ CREATE INDEX IF NOT EXISTS incidents_by_state
 /// Creates or migrates the schema inside the caller's transaction.
 ///
 /// A database with no `schema_meta` table must also have no other table
-/// (anything else is a foreign file and is refused untouched). Version 2 and
-/// 3 databases are migrated; the current version only has its idempotent DDL
+/// (anything else is a foreign file and is refused untouched). Version 2, 3
+/// and 4 databases are migrated forward (4 only gains the lineage column,
+/// table and backfill); the current version only has its idempotent DDL
 /// re-applied; every other version is refused with
 /// [`CoreError::Integrity`].
 pub fn ensure(tx: &Transaction<'_>) -> Result<(), CoreError> {
@@ -342,7 +345,8 @@ pub fn ensure(tx: &Transaction<'_>) -> Result<(), CoreError> {
     }
 }
 
-/// Migrates a version 2 or 3 database to the current version.
+/// Migrates a version 2 or 3 database to the current version (version 4 has
+/// its own additive step in [`ensure`]).
 ///
 /// Event rows keep their bytes, hash, identifiers, state, acceptance order
 /// and timestamps; only the new columns are added and backfilled from the
@@ -351,6 +355,9 @@ pub fn ensure(tx: &Transaction<'_>) -> Result<(), CoreError> {
 /// attempt may have reached a carrier is marked `review` with an open
 /// incident, an event whose attempt positively finished keeps that delivery
 /// tier, and only a never-invoked or known-unsent event becomes dispatchable.
+/// The version 3 `incidents` table is renamed to `incidents_v3` and kept as
+/// historical custody; see [`migrate_v3_attempts`] for how open uncertainty
+/// stays visible.
 fn migrate(tx: &Transaction<'_>, from: u32) -> Result<(), CoreError> {
     if from == 3 {
         tx.execute_batch(
@@ -460,7 +467,16 @@ fn backfill_events(tx: &Transaction<'_>) -> Result<(), CoreError> {
 }
 
 /// Maps each event's newest version 3 attempt onto the version 4 delivery
-/// state and carries open incidents over.
+/// state and keeps unresolved uncertainty visible.
+///
+/// Open version 3 incidents are not copied row by row: version 3 only
+/// raised `unknown_handoff` incidents, always for an event whose newest
+/// attempt is unresolved. Every such event (and every other event whose
+/// newest attempt may have reached a carrier) is put in `review` with one
+/// new live `migrated_unverified` incident that needs a reviewed
+/// disposition. The old incident rows, with their original reason and
+/// dates, remain in `incidents_v3`, and the incident counter is advanced
+/// past them so numbers are never reused.
 fn migrate_v3_attempts(tx: &Transaction<'_>) -> Result<(), CoreError> {
     // Newest attempt state per event.
     let mut select = tx.prepare(
