@@ -188,6 +188,10 @@ Build first: `cargo +1.98.1 build --offline -p bridge-adapters --bins`.
 | Q3 config control | no (fake App Server) | `node qualification/codex-native-probe.cjs --self-test-config` | `config_control: PASS`: the own `bridge_probe` subtree survives the pre-write projection, the own hook is recognized and the state override trusts it and disables the foreign one, the stderr override warning is detected, kept `hooks/list` entries carry only the minimal fields, and fake credentials planted in a foreign hook command, the config tree, a notification, an unparsable line and stderr are in no retained file or console output of a completed gate, a gate interrupted by SIGTERM, or a gate whose server ignores SIGTERM and keeps writing without any override warning (which must still be rejected, by the non-exit check alone), with no surviving process |
 | Q3 Codex gate only | no | `CODEX_PROBE_GATE_ONLY=1 node qualification/codex-native-probe.cjs` | `hooks_isolated` and `approval_config_effective` true (ends with `gate_only_run` by design) |
 | Q3 Codex hooks, caller, inject, child, queue | gpt-6-luna, low | `node qualification/codex-native-probe.cjs` | `checks.json` with no failures: model in the build catalog, hooks isolated, exact-tool approval effective, the read-only `bridge_me` root join succeeded (shows callId = tool_use_id for that build), the externally published marker in the reply, the unapproved `bridge_unlisted` refused by the host and never executed (this proves the caller, the host approval boundary and the parsed config, not that the `approve` value itself caused `bridge_me` to run), child attested on its own thread, the helper's correlated `native_accepted` with native readback on the persisted thread, and the probe's own queue item removed and verified gone |
+| Q4 Codex owned-frontend mechanism | no model (network-denied; native turns recorded) | `BRIDGE_Q4_ROLLOUT=<probe-owned rollout> BRIDGE_Q4_THREAD=<its thread id> [CODEX_EXE=<codex>] node qualification/frontend-lifecycle-probe.cjs` (`--self-test` for the pure validators) | `checks.json` with no failures, **loaded-frontend mechanism evidence only — it launches no Bridge component**. The operator supplies one probe-owned rollout explicitly (no default, nothing enumerated; the path must be absolute, normalized, `rollout-*.jsonl` naming the id; it is validated, then copied into a fresh private `CODEX_HOME` under a confined `sessions/...` path; its `meta.id == session_id == expected id` is an identity-consistency check, not ownership). Every native session runs under `sandbox-exec` with network denied, witnessed by a PAIRED loopback control (`lifecycle-lib.cjs`: an own listener accepts an unconfined connect and the same connect under the policy is denied with `EPERM`/`EACCES`; no external address is contacted). Recorded for the loaded build: path/sha256/version, its own exported schema (lifecycle methods present, no clear RPC), a real `thread/start` producing a distinct idle thread (empty preview, no fork lineage) whose turn list and queue are asked in the SAME owner process: the queue must list no row, and the turn list must be empty, refused with `no rollout found for thread id <id>`, or refused with the build's explicit before-first-user-message state (error -32600, exactly `thread <id> is not materialized yet; thread/turns/list is unavailable before first user message`, accepted only with the verified fresh idle constructor and that empty queue; a later process's `notLoaded` and any other error are not accepted as empty), resume/fork creating no turn (complete bounded turn-id pagination), a fork while an own queue item is pending (item stays on the original, absent on the fork), the archive round-trip and the item's disposition by exact marker, an own-item readback before disconnect, and a client restart where the item is still pending with no new turn **or** consumed as exactly the one new turn carrying its marker (any other new turn fails). Native turns this build creates are real (they exist as `interrupted`/non-completed turns with no model output) and are listed with id, status and marker; this is native turn creation, not external model inference. All own queue items are deleted at cleanup and verified gone. `case_map` keeps `bridge_composition_codex` and the working-GUI cases `pending_model`/`unsupported_in_scope` |
+| Q4 Claude lifecycle, unpaid | no (zero inference: remote-IP network denied) | `node qualification/claude-lifecycle-probe.cjs` (`--self-test` for the pure validators) | **Bridge-composition evidence, not yet run by the root at the time of writing.** One stock 2.1.296 stream-json receiver, closed before launch (`--setting-sources ''`, own settings with the product hook beside a no-op hook, `--strict-mcp-config` with no server, `--tools ''`, manual permissions, no prompts, private cwd, parent-harness `CLAUDE_CODE_*`/`CLAUDECODE` variables removed and store/auth variables untouched) and confined by `sandbox-exec`, witnessed before launch by the paired loopback control (own listener: unconfined connect succeeds, the same connect under the policy is denied with `EPERM`/`EACCES`). Required: init inventory closed and `clear` among the loaded slash commands; a Core `bindings` row (read-only `sqlite3` of the probe's OWN fresh database — the daemon logs only refusals and the row holds recipient, epoch and capabilities only) for the exact session address with an epoch not older than the launch, plus the receiver's own `SessionStart` hook frame and zero `hook_refused`/`binding_fence_refused`/`caller_refused`/`drain_refused`; a paused `later` message held with zero attempts; a streamed `/clear` with a client uuid answered by a `conversation_reset` (`trigger: clear`, `user_message_uuid` equal to it); the old/new identity decided by the post-clear SessionStart hook frames and binding rows (never assumed equal or different); the held event staying on its old recipient with no attempt anywhere; after the receiver exits and the pause is released, a fresh message and the older one held by the dead-incarnation reason (session ended / harness process gone, never the no-wake text) with no hand-off; and no model effect (confined, every result frame zero turns/cost/nested usage). With `BRIDGE_Q4_PAID=1` the paid phase refuses to start unless EVERY unpaid required check is exactly `true` |
+| Q4 Claude lifecycle, paid fork | haiku, low, TOTAL 0.50 USD (caps 0.30 original + 0.10 fork, shared running sum) | `BRIDGE_Q4_PAID=1 node qualification/claude-lifecycle-probe.cjs` (root only; includes the unpaid phase) | **Pending the root's run.** One prompted turn on an unconfined closed original receiver (own messaging socket), then a `later` message held by a Core pause while `claude --resume <original> --fork-session --session-id <fresh uuid>` starts under the SAME closed launch: the fork must bind its own new address (original binding epoch unchanged), the event must stay on the original recipient with no attempt for either, and after unpause the original must answer it in a distinct turn quoting its marker (positive `context_observed`/`native_accepted`, attempt actor and proof reference naming the original process id) while the fork never sees the marker; the shared cost must stay within 0.50 USD (15 minute budget plus bounded cleanup) |
+| Q4 Codex Bridge composition | gpt-6-luna, low, at most 3 short turns, tokens measured (no dollar claim) | `BRIDGE_Q4_PAID=1 [CODEX_EXE=<codex>] BRIDGE_BIN_DIR=<target>/debug node qualification/codex-lifecycle-probe.cjs` (root only; refuses without the flag; `--self-test` for the pure validators) | **Pending the root's run; source-only, validated here only against a local double of the App Server subset with the real daemon, hook and fixture (not a Codex pass).** The Q3 isolation gate is reused unchanged (own hooks trusted by hash, every other hook disabled per launch, exact-tool approval parsed back) plus every foreign MCP server of the user configuration disabled per launch and read back as disabled. One unconfined `codex app-server` backend A creates thread T1 before the daemon starts (its grant names T1); turn 1 must give the exact binding row equal to the `bridge_me` root caller's epoch, the frontend's own `hook/completed` records and the host-refused, never-executed `bridge_unlisted`. T1 is archived with an `inject` event pending (no attempt, no tier, same recipient/envelope hash, no pause policy anywhere). A is killed: a `message` event published meanwhile must be held fail-closed with no attempt and no pause (the real daemon reports the generic carrier-chain text `no carrier attests this endpoint: ...` for a dead Codex harness, so the reason is recorded exactly and the causal link rests on ordering, verified exit and the frozen old epoch), then it is closed by an audited operator disposition so it can never become a native queue turn. A NEW backend B resumes T1; T1 is forked to T2 while the inject event is pending and turn 2 runs on T2: its caller is T2 on its own address, the inject event stays on T1 (no attempt for either recipient, T1's epoch unchanged, marker absent from the fork's reply). Turn 3 on T1 (B) must renew the epoch strictly (E2 > E1), join the caller at E2 and hand the inject event out through T1's own natural hook (attempt actor T1, epoch E2, proof reference naming B's process id, delivery `hook_submitted`) with the marker in T1's reply. Native `sessionId` equality or difference is recorded, never used as a role signal. Own threads are archived at cleanup. Usage is counted per turn as the increment of that turn's own correlated token snapshots (final cumulative total minus `first.total - first.last`; inherited fork history is not counted, unavailable or invalid usage forbids a further paid turn); the 150000-token ceiling is checked before each turn. **Daemon build requirement:** the registry hashes the harness executable on the first admitted hook, under its lock; an unoptimized `sha2` needs 27-35 s for the 246 MB Codex build as measured with the registry's own `file_sha256` (about 12 s elapsed between the first hook and the refusal in the root's native run; 1.6 s with `--config 'profile.dev.package.sha2.opt-level=3'`), longer than the 5 s hook timeout, which is consistent with (not proven by) the root's native timeline of two timed-out first hooks and one `hook_refused: not_evidence`; build the daemon with that flag or in release. A timed-out hook is never waived (`t1_hooks_observed`, `t1_resumed_user_prompt_hook_positive`; failures kept in `t1_hook_failures`, daemon warnings in `daemon_warnings`) |
 
 Shared lifecycle (`qualification/probe-lib.cjs`): one absolute total budget
 (a local command is refused once it is spent); a lifecycle fence refuses any
@@ -252,28 +256,57 @@ did once; they are not release qualification.
 
 ## Not yet established
 
-- No real Claude Code or Codex session has run these hooks or carriers:
-  hook installation, timeouts, output visibility (Codex `additionalContext`
-  in particular) and coexistence with other hooks are unqualified.
-- Claude's acceptance of a per-attempt callback name as the frame's reply
-  address, and the matching `origin.from`, are not re-qualified on a real
-  build; the root's Q2 run decides it.
+Verified since the R10 root runs (evidence: `m2cp-XRv61Z`, `m2cp-AM6xUY`,
+`m2xp-9hkYAB`, all `failures: []`): real *owned* Claude 2.1.296 and Codex
+0.162.0-alpha.17.2 sessions ran these hooks and carriers end to end —
+root/child caller joins (`_meta.callId` = the same call's `PreToolUse`
+`tool_use_id` on the Codex build), the hook-injected marker quoted in the
+model reply, a `later` message answered in a distinct unprompted turn with
+actor-bound `native_accepted`/`context_observed` evidence (the per-attempt
+callback name and its `origin.from` accepted by the real inbox), the paused
+window with zero attempts and turns, and the confined queue helper's
+correlated native acceptance with readback on the persisted thread.
+
+Still not established, retained honestly:
+
+- No *working* Claude Code or Codex application, chat or global
+  configuration has been touched (D-003): hook installation into working
+  apps, coexistence with their existing hooks there, Codex
+  `additionalContext` visibility in the real frontend, the GUI's own
+  /clear, and full working-app restart are unqualified (A-003 scope).
+- A22/T008 lifecycle (clear, resume, fork, restart) is NOT established by
+  source preparation. The Q4 drivers above are supported *owned-frontend*
+  qualification, separate from any working-GUI deployment, and until the
+  root runs them every native case is pending: the Claude `/clear` seam and
+  dead-incarnation negative (unpaid driver), the Claude fork-while-`later`-
+  pending custody (paid driver) and the Codex mechanism run. The Codex
+  Bridge-composition seam (protected hook binding, a new incarnation's epoch
+  after a restart, stale-binding fail-closed, fork custody) needs turns, hence a
+  model: `codex-lifecycle-probe.cjs` is its driver, written but never run
+  against a real Codex build; the mechanism probe keeps it `pending_model`. A stream-json `/clear` that
+  the build does not dispatch (or after which the receiver ends before a
+  post-clear SessionStart) fails the unpaid driver; it is never promoted to a
+  pass, and a PTY frontend would be the next step.
+- The network-denial control is PAIRED (`lifecycle-lib.cjs`): an own loopback
+  listener accepts an unconfined connect and the same connect under the
+  policy must be denied with `EPERM`/`EACCES`; no external address is
+  contacted. It shows the policy denies network connects for the processes it
+  wraps and says nothing about what the CLI itself reads with its own
+  protected authentication (the probes never extract, copy or write
+  credentials).
+- Source v1 of the Claude Q4 driver (the unpaid and guarded-paid phases) was
+  reported by the root as passing at the sealed f2 with an unpaired remote-IP
+  control; this source (v2: paired loopback witness, unpaid pre-gate for the
+  paid phase) has not been run natively, and no v2 native result is claimed
+  here.
 - Codex `approval_mode = "approve"` semantics: Q3 shows the parsed value and
   the host boundary, not that this value is what allows `bridge_me`.
-- Codex caller join assumes `_meta.callId` equals the same call's
-  `PreToolUse` `tool_use_id`; the `_meta` keys themselves (`threadId`,
-  `callId`, `x-codex-turn-metadata`) were captured from Codex
-  0.162.0-alpha.17.2, the equality was not.
-- The real Claude inbox's receipt behaviour for `later` (held/release/drop
-  timing, and whether it stays connected long enough for its PID to be read)
-  is not re-qualified. If it closes first, every receipt is ignored by
+- The full held/release/drop timing window against the real Claude inbox
+  beyond the verified receipt and transcript closure remains model-gated;
+  if a sender closes before its PID is readable, receipts are ignored by
   design and those hand-offs rely on transcript closure or the overdue
-  incident; that would make held-release unsupported, never silently
+  incident — held-release would become unsupported, never silently
   accepted.
-- Codex queue acceptance on a real build is not established. The root's Q1
-  run on Codex 0.162.0-alpha.17.2 (source 0210a732) got native -32603 "no
-  rollout found" for a model-less owned thread: a thread needs a persisted
-  rollout, so positive acceptance is checked in Q3 phase 3. That error is
-  a plausible pre-effect failure but is not qualified as no-acceptance, so
-  it is classified unknown. Linux has no confinement launcher, so Codex
-  message is unsupported there.
+- Q1's model-less `-32603 "no rollout found"` is classified unknown, not
+  no-acceptance (a thread needs a persisted rollout). Linux has no
+  confinement launcher, so Codex message is unsupported there.
