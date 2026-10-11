@@ -226,6 +226,7 @@ impl ScriptedCarrier {
 }
 
 impl DispatchCarrier for ScriptedCarrier {
+    /// Returns this fixture's attestation for the recipient.
     fn attest(&mut self, recipient: &NativeAddress) -> Result<Attestation, String> {
         if let Some(reason) = &self.attest_error {
             return Err(reason.clone());
@@ -233,6 +234,7 @@ impl DispatchCarrier for ScriptedCarrier {
         Ok(attest(recipient, self.lifecycle, self.epoch))
     }
 
+    /// Applies this fixture's scripted outcome to the frozen attempt.
     fn send(&mut self, attempt: &AttemptRecord) -> Outcome {
         self.sends.push(attempt.clone());
         assert!(!self.panic_on_send, "scripted carrier panic");

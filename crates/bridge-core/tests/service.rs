@@ -104,6 +104,9 @@ fn wait_listening(socket: &std::path::Path, budget: Duration) -> bool {
     false
 }
 
+/// Publish over the daemon socket returns a stamped custody receipt;
+/// an identical resend replays the original receipt and changed content
+/// conflicts, exactly like the storage-level semantics.
 #[test]
 fn publish_and_identical_replay_over_ipc() {
     let dir = TempDir::new("svc-replay");
@@ -133,6 +136,9 @@ fn publish_and_identical_replay_over_ipc() {
     running.join();
 }
 
+/// Wrong tokens are refused before any custody write or status
+/// disclosure, no row appears in storage, and non-admin grants cannot
+/// stop the daemon.
 #[test]
 fn authentication_precedes_custody_and_disclosure() {
     let dir = TempDir::new("svc-auth");
@@ -169,6 +175,9 @@ fn authentication_precedes_custody_and_disclosure() {
     running.join();
 }
 
+/// Recipient, kind, mode and policy outside the grant are refused
+/// before acceptance, leaving no custody rows; invalid content is a
+/// distinct `invalid` refusal.
 #[test]
 fn grant_allowlists_are_enforced_before_acceptance() {
     let dir = TempDir::new("svc-grants");
@@ -244,6 +253,9 @@ fn grant_allowlists_are_enforced_before_acceptance() {
     running.join();
 }
 
+/// Status returns only the caller's own events: another publisher's
+/// token never sees them, delivery evidence is absent until an attempt
+/// exists, and unknown ids are simply absent.
 #[test]
 fn status_discloses_only_the_callers_own_events() {
     let dir = TempDir::new("svc-status");
@@ -288,6 +300,8 @@ fn status_discloses_only_the_callers_own_events() {
     running.join();
 }
 
+/// Unparseable lines and unknown operations are refused as unsupported
+/// without touching custody.
 #[test]
 fn malformed_and_unknown_requests_are_refused() {
     let dir = TempDir::new("svc-malformed");
@@ -314,6 +328,8 @@ fn malformed_and_unknown_requests_are_refused() {
     running.join();
 }
 
+/// A protocol shutdown completes within a bounded time even with open
+/// idle clients, and removes only this instance's socket file.
 #[test]
 fn shutdown_is_bounded_and_cleans_the_socket() {
     let dir = TempDir::new("svc-shutdown");
@@ -334,6 +350,9 @@ fn shutdown_is_bounded_and_cleans_the_socket() {
     assert!(!socket.exists(), "socket file must be removed on stop");
 }
 
+/// The real daemon binary becomes reachable within a bounded startup,
+/// serves a publish, and exits 0 after a drained shutdown, leaving no
+/// socket behind.
 #[test]
 fn daemon_binary_serves_and_stops_cleanly() {
     let dir = TempDir::new("svc-binary");
@@ -367,6 +386,9 @@ fn daemon_binary_serves_and_stops_cleanly() {
     assert!(!socket.exists());
 }
 
+/// `latest` snapshots published over the wire follow the scoped
+/// watermark rules: the newer revision is pending and the stale one is
+/// explicitly superseded.
 #[test]
 fn latest_snapshots_flow_through_the_service_with_scoped_watermarks() {
     let dir = TempDir::new("svc-latest");
@@ -411,6 +433,8 @@ fn malformed_grant_refuses_startup() {
 
 /// Expiry still flows through IPC and pending-only expiry holds after
 /// service-mediated publication.
+/// An absolute expiry accepted over the wire still marks only the
+/// pending event after service-mediated publication.
 #[test]
 fn expiry_flows_through_the_service() {
     let dir = TempDir::new("svc-expiry");

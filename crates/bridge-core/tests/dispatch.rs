@@ -46,6 +46,9 @@ fn drive(
     dispatch_message(storage, carrier, recipient, &|| now, &timing()).unwrap()
 }
 
+/// A reservation freezes the recipient, actor, endpoint epoch, framing
+/// path, manifest bytes and deadline; nothing else can claim the event
+/// meanwhile.
 #[test]
 fn reserved_attempt_freezes_recipient_actor_epoch_path_manifest_and_deadline() {
     let mut storage = store();
@@ -102,6 +105,8 @@ fn reserved_attempt_freezes_recipient_actor_epoch_path_manifest_and_deadline() {
     );
 }
 
+/// `auto` resolves to exactly one effective path from the observed
+/// lifecycle and the attempt records it; the other path is never taken.
 #[test]
 fn auto_resolves_from_lifecycle_and_never_takes_both_paths() {
     assert_eq!(
@@ -191,6 +196,9 @@ fn auto_resolves_from_lifecycle_and_never_takes_both_paths() {
     assert_eq!(message.members[0].event_id, "auto-2");
 }
 
+/// Unknown, awaiting or unloaded recipients hold visibly with a
+/// retained incident and no carrier invocation: none of them counts as
+/// inactive.
 #[test]
 fn unknown_awaiting_or_unloaded_recipients_hold_visibly_without_invoking() {
     let shared = Mutex::new(store());
@@ -265,6 +273,9 @@ fn unknown_awaiting_or_unloaded_recipients_hold_visibly_without_invoking() {
     ));
 }
 
+/// The `invoking` state is committed before the carrier acts — proven
+/// by a second connection reading the attempt state during the hand-off —
+/// and the manifest bytes match the frozen reservation.
 #[test]
 fn invoking_is_durable_before_the_carrier_can_act_and_carries_the_frozen_bytes() {
     // A second connection reads the attempt DURING the carrier call: it must
@@ -287,9 +298,11 @@ fn invoking_is_durable_before_the_carrier_can_act_and_carries_the_frozen_bytes()
         seen: Arc<Mutex<Option<(String, String)>>>,
     }
     impl DispatchCarrier for Probing {
+        /// Returns this fixture's attestation for the recipient.
         fn attest(&mut self, recipient: &NativeAddress) -> Result<Attestation, String> {
             Ok(attest(recipient, Lifecycle::Inactive, 1))
         }
+        /// Applies this fixture's scripted outcome to the frozen attempt.
         fn send(&mut self, attempt: &bridge_core::dispatch::AttemptRecord) -> Outcome {
             let connection = rusqlite::Connection::open(&self.db).unwrap();
             let row: (String, String) = connection
@@ -324,6 +337,8 @@ fn invoking_is_durable_before_the_carrier_can_act_and_carries_the_frozen_bytes()
     );
 }
 
+/// A hook drain commits `invoking` before any payload is returned, and
+/// an attestation for a different actor cannot drain root-held data.
 #[test]
 fn hook_drain_commits_invoking_before_payload_and_other_actors_cannot_drain() {
     let dir = TempDir::new("hook-drain");
@@ -395,6 +410,9 @@ fn hook_drain_commits_invoking_before_payload_and_other_actors_cannot_drain() {
     assert_eq!(incidents[0].kind, "unknown_handoff");
 }
 
+/// A hook acknowledgement after a full flush is recorded as hook-tier
+/// evidence only, never as native queue acceptance or model-context
+/// proof.
 #[test]
 fn hook_submission_after_flush_is_hook_tier_evidence_only() {
     let mut storage = store();
@@ -436,6 +454,9 @@ fn hook_submission_after_flush_is_hook_tier_evidence_only() {
     );
 }
 
+/// A possibly-handed-off attempt becomes `outcome_unknown` with a
+/// retained incident; further dispatch is refused until an audited
+/// manual authorization records the duplicate risk.
 #[test]
 fn unknown_outcome_is_retained_and_never_auto_retried_until_audited_authorization() {
     let shared = Mutex::new(store());
@@ -519,6 +540,8 @@ fn unknown_outcome_is_retained_and_never_auto_retried_until_audited_authorizatio
     assert!(all[0].resolution.as_deref().unwrap().contains("ops-1"));
 }
 
+/// Positively known-unsent closes its attempt and a bounded retry
+/// budget admits later attempts, never an unbounded resend loop.
 #[test]
 fn known_unsent_closes_the_attempt_then_retries_with_a_bounded_budget() {
     let shared = Mutex::new(store());
@@ -595,6 +618,8 @@ fn known_unsent_closes_the_attempt_then_retries_with_a_bounded_budget() {
     );
 }
 
+/// Known-unsent classification requires positive proof; silence never
+/// implies non-delivery.
 #[test]
 fn known_unsent_requires_positive_proof() {
     let mut storage = store();
@@ -644,6 +669,9 @@ fn known_unsent_requires_positive_proof() {
     );
 }
 
+/// An expired reservation that never invoked is reclaimed; an expired
+/// `invoking` lease becomes `outcome_unknown` with an incident and stays
+/// non-redispatchable.
 #[test]
 fn leases_reclaim_only_uninvoked_reservations_and_invoking_expires_to_unknown() {
     let mut storage = store();
@@ -732,6 +760,8 @@ fn leases_reclaim_only_uninvoked_reservations_and_invoking_expires_to_unknown() 
     );
 }
 
+/// Stale, forged or fabricated fences refuse the transition without
+/// invoking anything.
 #[test]
 fn stale_and_forged_fences_refuse_without_new_invocation() {
     let mut storage = store();
@@ -801,6 +831,8 @@ fn stale_and_forged_fences_refuse_without_new_invocation() {
     ));
 }
 
+/// A stale endpoint epoch or changed conditions release the reservation
+/// untouched: nothing was invoked, so reclaiming it is safe.
 #[test]
 fn stale_endpoint_epochs_and_changed_conditions_release_the_reservation_untouched() {
     let mut storage = store();
@@ -889,6 +921,9 @@ fn stale_endpoint_epochs_and_changed_conditions_release_the_reservation_untouche
     );
 }
 
+/// The durable no-wake policy blocks the message path at reservation and
+/// invocation while a natural hook drain stays available; already
+/// possible effects are never undone.
 #[test]
 fn no_wake_policy_blocks_the_message_path_but_not_a_hook_drain() {
     let mut storage = store();
@@ -965,6 +1000,8 @@ fn no_wake_policy_blocks_the_message_path_but_not_a_hook_drain() {
     assert_eq!(message.effective_mode, EffectiveMode::Message);
 }
 
+/// keep_all events of similar age win the dispatch head, while aged
+/// replaceable snapshots are not starved indefinitely.
 #[test]
 fn keep_all_wins_among_similar_age_but_aged_snapshots_are_not_starved() {
     let recipient = codex("thread-q");
@@ -1010,6 +1047,8 @@ fn keep_all_wins_among_similar_age_but_aged_snapshots_are_not_starved() {
     assert_eq!(first.members[0].event_id, "view-old");
 }
 
+/// The per-recipient snapshot quota reserves admission capacity so a
+/// diagnostics flood cannot crowd out keep_all traffic.
 #[test]
 fn snapshot_quota_reserves_admission_capacity_for_keep_all() {
     let mut limits = Limits::new(100);
@@ -1057,6 +1096,8 @@ fn snapshot_quota_reserves_admission_capacity_for_keep_all() {
     assert_eq!(queue.len(), 4);
 }
 
+/// Events declaring a predecessor wait for its evidence tier or an
+/// audited disposition, while unrelated traffic keeps progressing.
 #[test]
 fn dependents_wait_for_predecessor_evidence_and_unrelated_traffic_progresses() {
     let mut storage = store();
@@ -1161,6 +1202,8 @@ fn dependents_wait_for_predecessor_evidence_and_unrelated_traffic_progresses() {
     assert_eq!(released.members[0].event_id, "cmd-2");
 }
 
+/// An audited disposition or an operator waiver releases blocked
+/// dependents, and dependency cycles are refused rather than deadlocked.
 #[test]
 fn audited_disposition_or_waiver_releases_dependents_and_cycles_are_refused() {
     let mut storage = store();
@@ -1238,6 +1281,8 @@ fn audited_disposition_or_waiver_releases_dependents_and_cycles_are_refused() {
     ));
 }
 
+/// Batch manifests keep member order, ids and content losslessly with
+/// per-member wrappers, and unrelated scopes stay isolated.
 #[test]
 fn batch_manifests_are_ordered_lossless_and_scopes_stay_isolated() {
     let mut storage = store();
@@ -1291,6 +1336,8 @@ fn batch_manifests_are_ordered_lossless_and_scopes_stay_isolated() {
     assert_eq!(remaining, ["g2-1", "ide-1", "proj-1"]);
 }
 
+/// Supersession replaces only pending snapshots; reserved or beyond,
+/// the frozen manifest keeps its bytes.
 #[test]
 fn latest_supersedes_only_pending_snapshots_and_inflight_manifests_are_immutable() {
     let mut storage = store();
@@ -1361,6 +1408,8 @@ fn latest_supersedes_only_pending_snapshots_and_inflight_manifests_are_immutable
     assert_eq!(next.members[0].event_id, "v3");
 }
 
+/// A stale revision arriving after a newer one stays superseded across a
+/// restart: the watermark is durable.
 #[test]
 fn stale_revision_never_revives_across_restart() {
     let dir = TempDir::new("latest-restart");
@@ -1383,6 +1432,8 @@ fn stale_revision_never_revives_across_restart() {
     ));
 }
 
+/// Expiry marks only never-handed-off events; an attempt that may have
+/// reached a carrier is never expired into a delivery claim.
 #[test]
 fn expiry_applies_only_before_hand_off() {
     let mut storage = store();
@@ -1433,6 +1484,9 @@ fn expiry_applies_only_before_hand_off() {
     assert_eq!(storage.expire_due(50_000).unwrap(), 0);
 }
 
+/// Held and written-no-receipt hand-offs are non-terminal tiers with
+/// overdue escalation to incidents and positive closure, never silent
+/// losses.
 #[test]
 fn held_and_unreceipted_hand_offs_are_nonterminal_with_overdue_incidents_and_positive_closure() {
     let shared = Mutex::new(store());
@@ -1549,6 +1603,8 @@ fn held_and_unreceipted_hand_offs_are_nonterminal_with_overdue_incidents_and_pos
     );
 }
 
+/// Late positive evidence resolves an unknown outcome without any
+/// resend and never rewrites a newer attempt's state.
 #[test]
 fn late_evidence_resolves_unknown_without_resend_and_never_rewrites_a_newer_attempt() {
     let shared = Mutex::new(store());
@@ -1671,6 +1727,8 @@ fn late_evidence_resolves_unknown_without_resend_and_never_rewrites_a_newer_atte
     }));
 }
 
+/// Positive late evidence settles the uncertain attempt exactly once,
+/// with no second send of the original event.
 #[test]
 fn late_positive_evidence_settles_an_unknown_without_any_second_send() {
     let shared = Mutex::new(store());
@@ -1732,6 +1790,8 @@ fn late_positive_evidence_settles_an_unknown_without_any_second_send() {
     );
 }
 
+/// A carrier panic during the hand-off is recorded as an unknown
+/// outcome with retained evidence, never as a silent failure or resend.
 #[test]
 fn a_panicking_carrier_is_recorded_as_an_unknown_outcome() {
     let shared = Mutex::new(store());
@@ -1764,6 +1824,8 @@ fn a_panicking_carrier_is_recorded_as_an_unknown_outcome() {
     );
 }
 
+/// A permanent refusal blocks the event's dependents until an audited
+/// disposition decides their fate.
 #[test]
 fn a_permanent_refusal_blocks_dependents_until_an_audited_disposition() {
     let shared = Mutex::new(store());
@@ -1829,6 +1891,8 @@ fn a_permanent_refusal_blocks_dependents_until_an_audited_disposition() {
     assert_eq!(next.sends[0].members[0].event_id, "ref-2");
 }
 
+/// Corrupted stored bytes quarantine their event while other traffic
+/// keeps progressing; the damage never spreads silently.
 #[test]
 fn corrupted_stored_bytes_are_quarantined_and_other_traffic_progresses() {
     let dir = TempDir::new("corrupt");
@@ -1904,6 +1968,8 @@ fn corrupted_stored_bytes_are_quarantined_and_other_traffic_progresses() {
     assert!(!next.manifest.contains("FORGED"));
 }
 
+/// An event whose publisher has no registered source tag holds instead
+/// of guessing a wrapper; framing authority is never invented.
 #[test]
 fn unregistered_source_tag_holds_instead_of_guessing_a_wrapper() {
     let mut storage = Storage::open_in_memory(Limits::new(10)).unwrap();
@@ -1937,6 +2003,8 @@ fn unregistered_source_tag_holds_instead_of_guessing_a_wrapper() {
     );
 }
 
+/// A hold past its escalation deadline becomes a visible incident and
+/// clears only when the hold itself clears.
 #[test]
 fn long_holds_escalate_to_an_incident_that_clears_with_the_hold() {
     let mut storage = store();
@@ -1999,6 +2067,9 @@ fn long_holds_escalate_to_an_incident_that_clears_with_the_hold() {
     assert!(storage.open_incidents(700_001, 10).unwrap().is_empty());
 }
 
+/// Modes the recipient is known not to support are refused before
+/// acceptance, while an unknown recipient is accepted pending
+/// attestation.
 #[test]
 fn unsupported_modes_are_refused_before_acceptance_but_unknown_recipients_are_accepted() {
     let mut storage = store();
@@ -2057,6 +2128,8 @@ fn unsupported_modes_are_refused_before_acceptance_but_unknown_recipients_are_ac
     );
 }
 
+/// Two racing reservations for one recipient resolve to exactly one
+/// winner; the loser is refused without invocation.
 #[test]
 fn exactly_one_of_two_racing_reservations_wins() {
     let dir = TempDir::new("race");
@@ -2103,6 +2176,9 @@ fn exactly_one_of_two_racing_reservations_wins() {
     );
 }
 
+/// A restart resumes held and uncertain state exactly as it was, with
+/// reconciliation converting expired invoking leases to retained
+/// unknowns and never replaying them.
 #[test]
 fn restart_resumes_held_and_uncertain_state_without_replay() {
     let dir = TempDir::new("dispatch-restart");
@@ -2157,6 +2233,8 @@ fn restart_resumes_held_and_uncertain_state_without_replay() {
     assert!(replay.receipt.replayed);
 }
 
+/// Payload compaction keeps dedup identity and original receipts while
+/// never touching delivered or uncertain events.
 #[test]
 fn compaction_keeps_dedup_identity_and_never_touches_delivered_or_uncertain_events() {
     let mut storage = store();
@@ -2188,6 +2266,8 @@ fn compaction_keeps_dedup_identity_and_never_touches_delivered_or_uncertain_even
     ));
 }
 
+/// A held recipient cannot starve healthy ones: the dispatch listing
+/// keeps serving other recipients.
 #[test]
 fn held_recipients_cannot_starve_healthy_ones_in_the_dispatch_listing() {
     let mut storage = store();
@@ -2230,6 +2310,8 @@ fn held_recipients_cannot_starve_healthy_ones_in_the_dispatch_listing() {
     assert_eq!(listed.len(), 5, "the listing is bounded");
 }
 
+/// Concurrent publishers and dispatch drives on one database lose no
+/// events and produce no torn state.
 #[test]
 fn concurrent_publishers_and_dispatch_share_one_database_without_losing_events() {
     let dir = TempDir::new("dispatch-concurrent");

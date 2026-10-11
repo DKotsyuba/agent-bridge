@@ -1144,6 +1144,8 @@ mod tests {
 
     use super::*;
 
+    /// Stored state text parses round-trip strictly: unknown values are
+    /// errors, never defaults.
     #[test]
     fn state_text_roundtrip_is_strict() {
         assert_eq!(EventState::Pending.as_str(), "pending");
@@ -1160,6 +1162,7 @@ mod tests {
     }
 
     #[test]
+    /// Limits are validated on construction: non-zero caps only.
     fn limits_are_validated() {
         assert!(Limits::new(7).validate().is_ok());
         assert!(Limits::new(0).validate().is_err());

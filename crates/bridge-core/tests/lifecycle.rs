@@ -135,6 +135,9 @@ fn drive_to(running: &service::Running, event: &str, outcome: Outcome, now: u64)
     })
 }
 
+/// The operator realm is disjoint from publisher grants and serves the
+/// core's own incident state over the wire: publishers cannot read or
+/// mutate recovery, and operators see real incidents only.
 #[test]
 fn operator_realm_is_disjoint_and_serves_the_cores_own_incident_state() {
     let dir = TempDir::new("life-operator");
@@ -284,15 +287,19 @@ fn operator_realm_is_disjoint_and_serves_the_cores_own_incident_state() {
 struct Shared(Arc<Mutex<ScriptedCarrier>>);
 
 impl DispatchCarrier for Shared {
+    /// Returns this fixture's attestation for the recipient.
     fn attest(&mut self, recipient: &NativeAddress) -> Result<Attestation, String> {
         self.0.lock().unwrap().attest(recipient)
     }
 
+    /// Applies this fixture's scripted outcome to the frozen attempt.
     fn send(&mut self, attempt: &AttemptRecord) -> Outcome {
         self.0.lock().unwrap().send(attempt)
     }
 }
 
+/// Registered synthetic carriers deliver over the message path and the
+/// durable pause policy is respected end to end through the service.
 #[test]
 fn registered_carriers_deliver_over_the_message_path_and_respect_pause() {
     let dir = TempDir::new("life-carrier");
@@ -358,6 +365,7 @@ struct Flaky {
 }
 
 impl DispatchCarrier for Flaky {
+    /// Returns this fixture's attestation for the recipient.
     fn attest(&mut self, recipient: &NativeAddress) -> Result<Attestation, String> {
         if self.panics_left > 0 {
             self.panics_left -= 1;
@@ -366,11 +374,14 @@ impl DispatchCarrier for Flaky {
         self.inner.attest(recipient)
     }
 
+    /// Applies this fixture's scripted outcome to the frozen attempt.
     fn send(&mut self, attempt: &AttemptRecord) -> Outcome {
         self.inner.send(attempt)
     }
 }
 
+/// A panicking carrier attestation is contained: the recovery loop
+/// continues and the event stays retained.
 #[test]
 fn a_panicking_carrier_attestation_does_not_end_the_recovery_loop() {
     let dir = TempDir::new("life-panic");
@@ -407,16 +418,20 @@ struct Hanging {
 }
 
 impl DispatchCarrier for Hanging {
+    /// Returns this fixture's attestation for the recipient.
     fn attest(&mut self, recipient: &NativeAddress) -> Result<Attestation, String> {
         Ok(attest(recipient, Lifecycle::Inactive, 1))
     }
 
+    /// Applies this fixture's scripted outcome (attempt ignored).
     fn send(&mut self, _attempt: &AttemptRecord) -> Outcome {
         let _ = self.release.recv();
         ScriptedCarrier::accepted()
     }
 }
 
+/// A carrier that never returns cannot make the stop unbounded; the
+/// event stays retained for review.
 #[test]
 fn a_hanging_carrier_cannot_make_the_stop_unbounded_and_stays_retained() {
     let dir = TempDir::new("life-hang");
@@ -470,6 +485,9 @@ fn fake_daemon(path: &Path, answer: Vec<u8>) -> std::thread::JoinHandle<()> {
 /// Valid custody receipts acknowledge only the exact requested identity and bytes.
 /// Own fake endpoints return real storage receipts; a matching receipt passes,
 /// while unrelated publication or status receipts cannot release sender intent.
+/// Client custody acknowledgements bind to the exact requested event
+/// bytes: a wrong-event acknowledgement reports the mismatch, never a
+/// false success.
 #[test]
 fn client_acknowledgements_are_bound_to_requested_event_bytes() {
     let request = body("requested-event");
@@ -528,6 +546,8 @@ fn client_acknowledgements_are_bound_to_requested_event_bytes() {
     );
 }
 
+/// The client distrusts invalid, oversized or malformed responses
+/// instead of misreading them as success.
 #[test]
 fn the_client_distrusts_invalid_oversized_and_malformed_responses() {
     // An incident listing with a number no storage could have produced.
@@ -578,6 +598,8 @@ fn the_client_distrusts_invalid_oversized_and_malformed_responses() {
     let _ = std::fs::remove_file(&socket);
 }
 
+/// Unsupported modes are refused over the wire before acceptance, with
+/// no custody row created.
 #[test]
 fn unsupported_modes_are_refused_over_the_wire_before_acceptance() {
     let dir = TempDir::new("life-unsupported");
@@ -618,6 +640,8 @@ fn unsupported_modes_are_refused_over_the_wire_before_acceptance() {
     );
 }
 
+/// After the stop request, new work is fenced while every acknowledged
+/// publish remains durable in storage.
 #[test]
 fn shutdown_fences_new_work_and_every_acknowledged_publish_is_durable() {
     let dir = TempDir::new("life-fence");
@@ -674,6 +698,8 @@ fn shutdown_fences_new_work_and_every_acknowledged_publish_is_durable() {
     }
 }
 
+/// Idle and stalled connections are closed within their timeouts and
+/// ordinary clients reconnect cleanly.
 #[test]
 fn idle_and_stalled_connections_are_closed_and_clients_reconnect() {
     let dir = TempDir::new("life-timeouts");
@@ -713,6 +739,8 @@ fn idle_and_stalled_connections_are_closed_and_clients_reconnect() {
     running.join();
 }
 
+/// Concurrent connections beyond the configured cap are refused
+/// admission while earlier clients keep working.
 #[test]
 fn connection_admission_is_bounded_by_the_configured_cap() {
     let dir = TempDir::new("life-cap");
@@ -774,6 +802,9 @@ fn connection_admission_is_bounded_by_the_configured_cap() {
     running.join();
 }
 
+/// Socket ownership preserves foreign paths (regular files, symlinks,
+/// directories) and the stop removes only the inode this instance
+/// bound.
 #[test]
 fn socket_ownership_preserves_foreign_paths_and_only_removes_its_own_inode() {
     let dir = TempDir::new("life-owner");
@@ -836,6 +867,8 @@ fn socket_ownership_preserves_foreign_paths_and_only_removes_its_own_inode() {
     std::fs::remove_file(&socket).unwrap();
 }
 
+/// Two racing starts on one endpoint never replace a live daemon: the
+/// second refuses and the first keeps its socket.
 #[test]
 fn racing_starts_on_one_endpoint_never_replace_a_live_daemon() {
     for stale in [false, true] {
@@ -890,6 +923,8 @@ fn racing_starts_on_one_endpoint_never_replace_a_live_daemon() {
     }
 }
 
+/// The daemon exits 0 on SIGTERM after a drained stop and never logs
+/// configuration secrets, including on parse failure.
 #[test]
 fn daemon_exits_cleanly_on_sigterm_and_never_logs_config_secrets() {
     let dir = TempDir::new("life-daemon");
@@ -959,6 +994,7 @@ fn daemon_exits_cleanly_on_sigterm_and_never_logs_config_secrets() {
     assert!(!log.contains("1234567890123456789"), "{log}");
 }
 
+/// Malformed grants refuse startup before any request is served.
 #[test]
 fn grant_configuration_is_validated_before_anything_is_served() {
     let dir = TempDir::new("life-grants");
@@ -983,6 +1019,8 @@ fn grant_configuration_is_validated_before_anything_is_served() {
     reject(&|c| c.limits.idle_timeout_ms = 0);
 }
 
+/// Both TOML grant table spellings parse and missing limits take their
+/// documented defaults.
 #[test]
 fn both_toml_grant_table_names_parse_and_limits_default_sensibly() {
     let grant = "token = \"0123456789abcdef-token\"\npublisher = \"agent-run\"\n\
@@ -999,6 +1037,7 @@ fn both_toml_grant_table_names_parse_and_limits_default_sensibly() {
     }
 }
 
+/// Token credentials never appear in debug output or error details.
 #[test]
 fn credentials_never_appear_in_debug_output_or_error_details() {
     let secret = "CANARY-TOKEN-0123456789ABCDEF";

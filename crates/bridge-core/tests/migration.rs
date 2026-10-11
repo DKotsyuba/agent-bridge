@@ -123,6 +123,10 @@ fn version(path: &std::path::Path) -> String {
         .unwrap()
 }
 
+/// A version 2 database migrates to the current schema without touching
+/// accepted bytes, hashes, identifiers, acceptance order or timestamps;
+/// only new columns are added and backfilled from the stored canonical
+/// envelope, and normal publication/replay semantics hold afterwards.
 #[test]
 fn version_two_databases_migrate_without_touching_accepted_bytes_or_identity() {
     let dir = TempDir::new("migrate-v2");
@@ -215,6 +219,10 @@ fn version_two_databases_migrate_without_touching_accepted_bytes_or_identity() {
     assert_eq!(record.members[0].event_id, "old-keep");
 }
 
+/// Migrating version 3 attempts keeps possible-carrier hand-offs in
+/// review with retained incidents instead of redispatching them: only
+/// never-invoked or positively known-unsent work becomes dispatchable,
+/// and finished attempts keep their delivery tier.
 #[test]
 fn version_three_attempts_that_may_have_reached_a_carrier_are_never_redispatched() {
     let dir = TempDir::new("migrate-v3");
@@ -304,6 +312,9 @@ fn version_three_attempts_that_may_have_reached_a_carrier_are_never_redispatched
     assert_eq!(audit, 5);
 }
 
+/// Databases with unknown schema versions, garbage version rows or
+/// foreign shapes are refused untouched: no byte of the file is changed
+/// and the stored version stays readable after the refusal.
 #[test]
 fn unknown_versions_and_foreign_files_are_refused_untouched() {
     let dir = TempDir::new("migrate-refuse");
@@ -346,6 +357,9 @@ fn unknown_versions_and_foreign_files_are_refused_untouched() {
     assert_eq!(notes, "keep me");
 }
 
+/// A migration that fails partway leaves no partial schema: the whole
+/// upgrade rolls back, the stored version is unchanged, and the events
+/// remain exactly as they were.
 #[test]
 fn a_failing_migration_rolls_back_completely() {
     let dir = TempDir::new("migrate-rollback");
@@ -385,6 +399,9 @@ fn a_failing_migration_rolls_back_completely() {
     assert_eq!(columns, 0, "no partial schema change survived");
 }
 
+/// A concurrently locked database surfaces as an explicit retryable
+/// busy error rather than data damage or a silent success; the stored
+/// rows are unchanged after the refusal.
 #[test]
 fn a_busy_database_reports_a_retryable_error_and_changes_nothing() {
     let dir = TempDir::new("busy");
@@ -418,6 +435,9 @@ fn a_busy_database_reports_a_retryable_error_and_changes_nothing() {
     assert!(storage.publish(&envelope, 2_001).unwrap().receipt.replayed);
 }
 
+/// The retained-history hard cap refuses new admission explicitly
+/// instead of evicting dedup history: identical replays of retained
+/// events still return their original receipts at the cap.
 #[test]
 fn retained_history_hard_cap_refuses_admission_without_evicting_dedup() {
     let mut limits = Limits::new(2);
