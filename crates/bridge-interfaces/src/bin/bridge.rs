@@ -4,6 +4,9 @@
 //! bridge version
 //! bridge operator <config> incidents [--all] [--limit N]
 //! bridge operator <config> holds [--limit N]
+//! bridge operator <config> counts
+//! bridge operator <config> transfer-lineage --recipient ADDR --kind K --mode M --project P --task T
+//!     --stream S --new-publisher ID --note TEXT     (project/task "" when undeclared)
 //! bridge operator <config> retry <publisher> <event> --note TEXT --accept-duplicate-risk
 //! bridge operator <config> dispose|waive <publisher> <event> --note TEXT
 //! bridge operator <config> evidence <publisher> <event> <attempt> <tier> --detail TEXT
@@ -29,9 +32,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use bridge_client::{BridgeClient, NativeAddress};
+use bridge_client::{BridgeClient, LineageScope, NativeAddress};
 use bridge_interfaces::config::{InterfacesConfig, read_secret};
-use bridge_interfaces::operator::{Decision, apply, parse_tier, report};
+use bridge_interfaces::operator::{
+    Decision, apply, check, check_scope, failure_text, parse_tier, read_failure_text, report,
+};
 use bridge_interfaces::{doctor, install, lifecycle, notify, telegram};
 use serde_json::{Value, json};
 
@@ -209,25 +214,42 @@ fn dispatch(args: &Args) -> Result<(Value, u8), Failure> {
     }
 }
 
+/// A read-only operator query.
+enum Query {
+    /// Retained incidents (optionally including closed ones).
+    Incidents,
+    /// Visible recipient holds.
+    Holds,
+    /// The core's complete delivery counts.
+    Counts,
+}
+
+/// One parsed operator action.
+enum Action {
+    /// A read-only query.
+    Query(Query),
+    /// An audited decision.
+    Decision(Decision),
+}
+
 /// `bridge operator <config> <action> …`.
+///
+/// Arguments are parsed first; a decision then passes [`check`] (blank
+/// notes and reasons, retry risk acceptance, lineage scope validators)
+/// *before* the connection is opened, and [`apply`] repeats that check
+/// before anything is written to the wire. The core validates the final
+/// operator text itself before any mutation. Each decision is sent once;
+/// a lost answer is reported as an unknown outcome ([`failure_text`]),
+/// never resent. A failed read-only query reports unknown current data
+/// ([`read_failure_text`]).
 fn operator(args: &Args) -> Result<Value, Failure> {
-    let config = InterfacesConfig::load(&PathBuf::from(
-        args.at(1, "configuration").map_err(Failure::Usage)?,
-    ))?;
-    let operator = config
-        .operator
-        .as_ref()
-        .ok_or_else(|| "the configuration has no [operator] section".to_string())?;
-    let token = read_secret(&operator.token_file)?;
-    let mut client = BridgeClient::connect(&config.core_socket)
-        .map_err(|error| format!("core unreachable: {error}"))?;
+    let config_path = PathBuf::from(args.at(1, "configuration").map_err(Failure::Usage)?);
     let action = args.at(2, "operator action").map_err(Failure::Usage)?;
     let limit = args
         .optional("--limit")
         .map(|limit| limit.parse::<usize>())
         .transpose()
         .map_err(|_| Failure::Usage("--limit must be a number".into()))?;
-    let failed = |error: bridge_client::ProtocolError| Failure::Failed(error.to_string());
     let note = || args.value("--note").map_err(Failure::Usage);
     let event = || -> Result<(String, String), Failure> {
         Ok((
@@ -239,47 +261,38 @@ fn operator(args: &Args) -> Result<Value, Failure> {
         NativeAddress::parse(&args.at(3, "recipient").map_err(Failure::Usage)?)
             .map_err(|error| Failure::Usage(error.to_string()))
     };
-    let decision = match action.as_str() {
-        "incidents" => {
-            let incidents = client
-                .incidents(&token, args.switch("--all"), limit)
-                .map_err(failed)?;
-            return Ok(json!({
-                "incidents": report(incidents),
-                "note": "routine written_no_receipt hand-offs within their deadline are not incidents and are not listed",
-            }));
-        }
-        "holds" => {
-            return Ok(json!({"holds": client.holds(&token, limit).map_err(failed)?}));
-        }
+    let request = match action.as_str() {
+        "incidents" => Action::Query(Query::Incidents),
+        "holds" => Action::Query(Query::Holds),
+        "counts" => Action::Query(Query::Counts),
         "retry" => {
             let (publisher, event_id) = event()?;
-            Decision::Retry {
+            Action::Decision(Decision::Retry {
                 publisher,
                 event_id,
                 note: note()?,
                 accept_duplicate_risk: args.switch("--accept-duplicate-risk"),
-            }
+            })
         }
         "dispose" => {
             let (publisher, event_id) = event()?;
-            Decision::Dispose {
+            Action::Decision(Decision::Dispose {
                 publisher,
                 event_id,
                 note: note()?,
-            }
+            })
         }
         "waive" => {
             let (publisher, event_id) = event()?;
-            Decision::Waive {
+            Action::Decision(Decision::Waive {
                 publisher,
                 event_id,
                 note: note()?,
-            }
+            })
         }
         "evidence" => {
             let (publisher, event_id) = event()?;
-            Decision::Evidence {
+            Action::Decision(Decision::Evidence {
                 publisher,
                 event_id,
                 attempt_seq: args
@@ -290,18 +303,68 @@ fn operator(args: &Args) -> Result<Value, Failure> {
                 tier: parse_tier(&args.at(6, "tier").map_err(Failure::Usage)?)
                     .ok_or_else(|| Failure::Usage("unknown evidence tier".into()))?,
                 detail: args.value("--detail").map_err(Failure::Usage)?,
-            }
+            })
         }
-        "pause" => Decision::Pause {
+        "pause" => Action::Decision(Decision::Pause {
             recipient: recipient()?,
             reason: args.value("--reason").map_err(Failure::Usage)?,
-        },
-        "resume" => Decision::Resume {
+        }),
+        "resume" => Action::Decision(Decision::Resume {
             recipient: recipient()?,
-        },
-        "shutdown" => Decision::Shutdown,
+        }),
+        "shutdown" => Action::Decision(Decision::Shutdown),
+        "transfer-lineage" => {
+            let flag = |name: &str| args.value(name).map_err(Failure::Usage);
+            let scope = LineageScope {
+                recipient: flag("--recipient")?,
+                kind: flag("--kind")?,
+                mode: flag("--mode")?,
+                project: flag("--project")?,
+                task: flag("--task")?,
+                stream: flag("--stream")?,
+            };
+            let new_publisher = flag("--new-publisher")?;
+            check_scope(&scope, &new_publisher).map_err(Failure::Usage)?;
+            Action::Decision(Decision::TransferLineage {
+                scope,
+                new_publisher,
+                note: note()?,
+            })
+        }
         other => return Err(Failure::Usage(format!("unknown operator action {other:?}"))),
     };
+    let config = InterfacesConfig::load(&config_path)?;
+    let operator = config
+        .operator
+        .as_ref()
+        .ok_or_else(|| "the configuration has no [operator] section".to_string())?;
+    let token = read_secret(&operator.token_file)?;
+    let failed = |error: bridge_client::ProtocolError| Failure::Failed(failure_text(&error));
+    let decision = match request {
+        Action::Decision(decision) => decision,
+        Action::Query(query) => {
+            let read_failed =
+                |error: bridge_client::ProtocolError| Failure::Failed(read_failure_text(&error));
+            let mut client = BridgeClient::connect(&config.core_socket)
+                .map_err(|error| format!("core unreachable: {error}"))?;
+            return Ok(match query {
+                Query::Incidents => json!({
+                    "incidents": report(client.incidents(&token, args.switch("--all"), limit).map_err(read_failed)?),
+                    "note": "a listing bounded by --limit (default 100, at most 200); use counts for totals. Routine written_no_receipt hand-offs within their deadline are not incidents.",
+                }),
+                Query::Holds => json!({"holds": client.holds(&token, limit).map_err(read_failed)?}),
+                Query::Counts => json!({
+                    "counts": client.counts(&token).map_err(read_failed)?,
+                    "coverage": "complete totals computed by the core at one instant; not a sample",
+                }),
+            });
+        }
+    };
+    // Local rules run before the connection is opened, so a refused
+    // decision never contacts the core at all.
+    check(&decision).map_err(failed)?;
+    let mut client = BridgeClient::connect(&config.core_socket)
+        .map_err(|error| format!("core unreachable: {error}"))?;
     apply(&mut client, &token, &decision).map_err(failed)?;
     Ok(json!({"applied": action, "audited_by": "core operator grant"}))
 }

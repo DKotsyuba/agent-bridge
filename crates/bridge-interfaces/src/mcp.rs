@@ -300,6 +300,7 @@ mod tests {
         handle_line(line, seal, Path::new("/nonexistent/relay.sock")).unwrap()
     }
 
+    /// Pins the independently specified three-tool root surface and refuses operator or acknowledgement tools before attestation.
     #[test]
     fn lists_exactly_three_closed_tools() {
         let tools = tool_list();
@@ -309,7 +310,12 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(names, TOOLS);
+        // Pinned to literals, independent of `TOOLS`, so widening the root
+        // surface (any new tool, in the list or the accepted set) fails here.
+        let pinned = ["bridge_me", "bridge_send", "bridge_status"];
+        assert_eq!(names, pinned);
+        assert_eq!(names.len(), 3);
+        assert_eq!(TOOLS.as_slice(), pinned.as_slice());
         for tool in tools.as_array().unwrap() {
             assert_eq!(tool["inputSchema"]["additionalProperties"], false);
         }
@@ -350,6 +356,9 @@ mod tests {
             "bridge_retry",
             "bridge_list",
             "bridge_admin",
+            "bridge_counts",
+            "bridge_transfer_lineage",
+            "bridge_incidents",
         ] {
             let unknown_tool = run(
                 &json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
@@ -361,7 +370,9 @@ mod tests {
             assert_eq!(unknown_tool["error"]["code"], -32602, "{tool}");
         }
         let listed = tool_list().to_string();
-        assert!(!listed.contains("ack") && !listed.contains("receipt"));
+        for operator_only in ["ack", "receipt", "count", "lineage", "incident"] {
+            assert!(!listed.contains(operator_only), "{operator_only}");
+        }
         let extra = run(
             r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"bridge_me","caller":"x"}}"#,
             &unreachable_sealer,

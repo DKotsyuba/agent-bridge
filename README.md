@@ -80,10 +80,11 @@ automatically repeated after a possible handoff.
   trust model, configuration and unqualified native gaps.
 - `crates/bridge-interfaces` — the restricted root MCP (`bridge-root-mcp`
   frontend + `bridge-root-relay`: attested `bridge_me` / `bridge_send` /
-  `bridge_status` only), the operator CLI over core incidents and audited
-  same-event recovery, outbound-only owner notification (Telegram) with a
-  durable send ledger, and packaging, install, rollback, process lifecycle
-  and doctor (`bridge`). See `crates/bridge-interfaces/README.md` for the
+  `bridge_status` only), the operator CLI over core counts, incidents,
+  audited same-event recovery and audited stream-lineage transfer,
+  outbound-only owner notification (Telegram) with a durable send ledger,
+  and packaging, install, rollback, process lifecycle and doctor
+  (`bridge`). See `crates/bridge-interfaces/README.md` for the
   operator, Telegram and install guides and its evidence levels.
 - `xtask` — `cargo xtask package` (release bundle) and `cargo xtask
   qualify --prefix ABS` (isolated install/lifecycle qualification);

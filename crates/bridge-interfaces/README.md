@@ -66,10 +66,12 @@ without `[root].channel`), `caller_missing`, `caller_duplicate`,
   automatic resend). Tier details are withheld.
 
 There is no enumeration, retry, reset, drain, admin, raw passthrough or
-acknowledgement tool. **`bridge.ack` is not implemented**: core records
-`receipt_token_possession` only as an annotation, issues no recipient
-receipt token and has no predeclared release/GC tier, and no producer has
-declared one (peer gap for the core module).
+acknowledgement tool, and no counts, incident or lineage tool (those are
+operator-only CLI commands). **`bridge.ack` is conditional and inactive**:
+core records `receipt_token_possession` only as an operator annotation that
+never settles, releases, renders or retries anything, and no producer in
+this delivery declares that evidence tier. The guard that refuses it is a
+required passing check, not a waived one.
 
 ### Host installation of the frontend
 
@@ -101,21 +103,61 @@ server of the harness. The relay socket's directory must be `0700`.
 ## Operator recovery guide
 
 ```sh
+bridge operator interfaces.toml counts
 bridge operator interfaces.toml incidents [--all] [--limit N]
-bridge operator interfaces.toml holds
+bridge operator interfaces.toml holds [--limit N]
 bridge operator interfaces.toml evidence PUBLISHER EVENT ATTEMPT TIER --detail TEXT
 bridge operator interfaces.toml dispose  PUBLISHER EVENT --note TEXT
 bridge operator interfaces.toml waive    PUBLISHER EVENT --note TEXT
 bridge operator interfaces.toml retry    PUBLISHER EVENT --note TEXT --accept-duplicate-risk
 bridge operator interfaces.toml pause RECIPIENT --reason TEXT | resume RECIPIENT | shutdown
+bridge operator interfaces.toml transfer-lineage --recipient ADDR --kind KIND --mode MODE \
+  --project PROJECT --task TASK --stream STREAM --new-publisher ID --note TEXT
 ```
+
+All operator commands need the core *operator* grant; a publisher or root
+credential is refused by the core (`forbidden`) and the refusal is printed
+unchanged. Before the connection is opened the CLI refuses blank notes
+and reasons, a retry without `--accept-duplicate-risk`, and a lineage
+scope or new producer that fails the core's public validators (address,
+kind, mode, stream, publisher id, project/task metadata) — such a decision
+never contacts the core. The core itself validates the final operator
+text (for example its length and control characters) before any
+mutation and its refusal is printed unchanged. Each decision is sent once;
+a lost answer prints `outcome unknown … it was not resent`: re-read
+`counts` and `incidents` before deciding again. A failed read-only query
+(`counts`, `incidents`, `holds`) prints `read failed: the current data is
+unknown`; it changed nothing.
+
+- `counts` prints the core's ten complete totals at one instant
+  (`unhanded`, `reserved`, `invoking`, `held` — including written without
+  receipt — `review`, `accepted`, `hook_submitted`, `refused`, `disposed`,
+  `open_incidents`). They are totals, not a sample.
+- `incidents` and `holds` are listings bounded by `--limit` (default 100,
+  at most 200); use `counts` for totals.
+- `transfer-lineage` hands a `latest` stream lineage to another producer.
+  The scope is the full coalescing scope without the publisher: canonical
+  recipient, kind, mode, declared project and task (pass `""` when
+  undeclared) and stream. The core decides everything: it refuses while
+  another producer's event in the lineage has a possible or unknown native
+  effect (resolve it first), holds the previous producer's still pending
+  snapshots with a `lineage_authority_lost` incident and declines its
+  further `latest` publications. Event ids, watermarks, attempts and
+  evidence are never rewritten. The handover is audited with the note.
 
 Each incident shows the core's reason, age, deadlines, responsible source,
 blocked dependents and resolution, plus a `category` and `next_action`:
 `unknown` (possible hand-off, outcome unknown), `overdue` (native hold or
 written-without-receipt past its deadline), `held` (recipient
-unknown/disconnected/paused), `refused`, `integrity`. Routine
-written-without-receipt hand-offs within their deadline are not incidents.
+unknown/disconnected/paused), `refused`, `integrity`, `lineage` (the
+producer lost authority by an audited transfer: its held event is not
+dispatched while another producer owns the lineage and is never replayed
+automatically; confirm the current owner and usually `dispose` it. Only if
+the original producer must be authoritative again, transfer the lineage
+back explicitly and then decide an audited `retry` with its recorded
+duplicate risk). Routine
+written-without-receipt hand-offs within their deadline are not incidents;
+they are counted in `held`.
 
 Procedure for an `unknown` incident:
 
@@ -225,10 +267,26 @@ bridge service stop relay|core --home H --state S
 - Rollback switches program code only. The custody database, incidents,
   audit and configuration stay; a release with an older core schema than
   one already activated is refused (no live-schema downgrade, no snapshot
-  restore).
+  restore). This composition's core writes storage schema 5 (stream
+  lineage authority); once a schema-5 release has been activated, the
+  floor is 5 and any schema-4 release is refused for install and rollback.
 - `doctor` exit codes: 0 no failed check, 2 a check failed, 3 invalid
   invocation. Declared adapter capabilities and Telegram are always
   `not_verified`; the overall qualification is `not_verified`.
+- `doctor` `recovery.pending` reads the core's complete `counts` and then,
+  separately, a bounded sample of at most 200 open incidents; the two
+  reads are not one snapshot. `ok`/`empty` only when the counts show
+  nothing waiting, nothing in review and no open incident *and* the
+  sample is empty; `warn`/`routine_waiting` when events wait (for example
+  a paused recipient) with no incident or review in either read;
+  otherwise `warn`/`attention` (open incidents, hand-offs in review, or a
+  sample that disagrees with the counts). Totals come from `counts`; the
+  category breakdown covers only the sample. `observations_consistent`
+  is false when the sample holds more incidents than the counted total,
+  and `sample_complete` is true only for a consistent sample of exactly
+  the counted number. A refused counts call, authentication error or unreadable
+  token is `fail` with `state: unknown`, never zero. No native delivery
+  is asserted.
 
 ## Evidence levels
 
@@ -240,6 +298,14 @@ bridge service stop relay|core --home H --state S
   executables with kernel peer identities. The harness is a labeled
   stand-in (the test executable qualified in an owned profile); it is **not**
   native Claude or Codex evidence.
+- `tests/operator_counts.rs`: real schema-5 core service and the real
+  `bridge` CLI: complete counts, CLI lineage transfer with the incident it
+  creates, more than 200 open incidents against the bounded doctor sample,
+  publisher-credential refusal, pre-request validation and a silent core
+  that receives each decision exactly once (outcome unknown, not resent).
+- The conditional `bridge.ack` guard is a required passing check: the
+  root tool list and calls refuse acknowledgement, counts, lineage and
+  incident tools (`mcp` unit tests).
 - `cargo xtask qualify --prefix ABS`: the packaged release in one isolated
   prefix (tamper refusal, install, version/hash, start, doctor, upgrade,
   rollback, restart, stop).

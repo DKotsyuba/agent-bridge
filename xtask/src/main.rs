@@ -401,10 +401,14 @@ fn qualify(prefix: &Path) -> Result<(), String> {
     let (label_a, label_b) = (format!("{base}.qa"), format!("{base}.qb"));
     let bundle_a = prefix.join("dist").join("a");
     let bundle_b = prefix.join("dist").join("b");
-    let sums_a = package(&label_a, &bundle_a)?["sums_sha256"]
+    let packaged_a = package(&label_a, &bundle_a)?;
+    let sums_a = packaged_a["sums_sha256"]
         .as_str()
         .unwrap_or_default()
         .to_string();
+    // The storage schema the packaged binaries were built with (no fixed
+    // number here: the bundle manifest is the authority).
+    let packaged_schema = packaged_a["manifest"]["core_schema"].clone();
     let sums_b = package(&label_b, &bundle_b)?["sums_sha256"]
         .as_str()
         .unwrap_or_default()
@@ -453,7 +457,9 @@ fn qualify(prefix: &Path) -> Result<(), String> {
     let (_, version) = product(Command::new(bin.join("bridge")).arg("version"))?;
     recorder.check(
         "installed_version_is_a",
-        version["build_label"] == label_a.as_str(),
+        version["build_label"] == label_a.as_str()
+            && packaged_schema.is_u64()
+            && version["core_schema"] == packaged_schema,
         version,
     );
 
@@ -571,6 +577,15 @@ kinds = ["root.note"]
 
     start_all(&mut recorder, &daemon, "a")?;
     let (code, report) = doctor(&daemon)?;
+    let recovery_a = report["checks"]
+        .as_array()
+        .and_then(|checks| {
+            checks
+                .iter()
+                .find(|check| check["name"] == "recovery.pending")
+        })
+        .cloned()
+        .unwrap_or(Value::Null);
     recorder.check("doctor_a_running", code == 0 && healthy(&report), report);
     let (code, incidents) = product(
         Command::new(bin.join("bridge"))
@@ -582,6 +597,32 @@ kinds = ["root.note"]
         "operator_reads_installed_core",
         code == 0 && incidents["incidents"].as_array().is_some_and(Vec::is_empty),
         incidents,
+    );
+    let (code, counts) = product(
+        Command::new(bin.join("bridge"))
+            .args(["operator"])
+            .arg(&interfaces)
+            .arg("counts"),
+    )?;
+    recorder.check(
+        "operator_counts_complete_and_empty",
+        code == 0
+            && counts["counts"]
+                .as_object()
+                .is_some_and(|fields| fields.len() == 10 && fields.values().all(|v| v == 0)),
+        counts,
+    );
+    recorder.check(
+        "doctor_recovery_empty_from_counts",
+        recovery_a["status"] == "ok"
+            && recovery_a["detail"]["state"] == "empty"
+            && recovery_a["detail"]["waiting_events"] == 0
+            && recovery_a["detail"]["incident_sample"]["sampled"] == 0
+            && recovery_a["detail"]["incident_sample"]["sample_complete"] == true
+            && recovery_a["detail"]["counts"]
+                .as_object()
+                .is_some_and(|fields| fields.len() == 10 && fields.values().all(|v| v == 0)),
+        recovery_a,
     );
 
     // Upgrade to B: activation does not restart; the relay binding and

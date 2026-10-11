@@ -17,16 +17,30 @@
 //! - `held`: the recipient itself is held (unknown/disconnected/paused);
 //! - `refused`: known non-acceptance (`permanent_refusal`,
 //!   `retries_exhausted`);
-//! - `integrity`: storage integrity.
+//! - `integrity`: storage integrity;
+//! - `lineage`: a producer lost authority over a `latest` stream lineage
+//!   by an audited transfer (`lineage_authority_lost`); its held event is
+//!   not dispatched while another producer owns the lineage and is never
+//!   replayed automatically. It is usually closed by an audited
+//!   disposition; an explicit transfer back followed by an audited retry
+//!   (with its recorded duplicate risk) is the other deliberate path.
 //!
 //! Recovery decisions are sent to the core, which applies and audits them
 //! under the operator grant identity. A manual retry repeats the *same*
 //! event and the core records the duplicate risk forever; this module
 //! refuses to send one unless the operator explicitly accepted that risk.
 //! Lost answers to decisions are never resent (the client reports
-//! `transport`; re-read the incidents to see the outcome).
+//! `transport`; re-read the incidents or counts to see the outcome).
+//! Before any request, [`check`] refuses blank notes and reasons and a
+//! lineage scope or new producer that fails the core's public validators;
+//! the core still validates the final operator text (length, controls)
+//! itself, alone decides ownership and refuses a handover over a possible
+//! native effect.
 
-use bridge_client::{BridgeClient, EvidenceTier, IncidentView, NativeAddress, ProtocolError};
+use bridge_client::{
+    BridgeClient, EvidenceTier, IncidentView, Kind, LineageScope, Metadata, Mode, NativeAddress,
+    ProtocolError, PublisherId, StreamId,
+};
 use serde::Serialize;
 
 /// One incident with its operator annotations.
@@ -35,7 +49,8 @@ pub struct IncidentReport {
     /// The core's incident, unchanged.
     #[serde(flatten)]
     pub incident: IncidentView,
-    /// `unknown`, `overdue`, `held`, `refused`, `integrity` or `other`.
+    /// `unknown`, `overdue`, `held`, `refused`, `integrity`, `lineage` or
+    /// `other`.
     pub category: &'static str,
     /// The next human action for this kind.
     pub next_action: &'static str,
@@ -67,6 +82,10 @@ pub fn classify(kind: &str) -> (&'static str, &'static str) {
         "storage_integrity" => (
             "integrity",
             "storage integrity problem: stop the service and inspect the database; do not retry.",
+        ),
+        "lineage_authority_lost" => (
+            "lineage",
+            "this producer lost authority over the stream lineage by an audited transfer; its event is held, is not dispatched while another producer owns the lineage and is never replayed automatically. Confirm the current owner with the producers. Usually dispose this event with an audited note and let the current owner publish fresh snapshots; only if the original producer must be authoritative again, transfer the lineage back explicitly and then decide an audited retry with its recorded duplicate risk. A producer without current authority is not treated as current.",
         ),
         _ => ("other", "inspect the event and decide explicitly."),
     }
@@ -147,39 +166,70 @@ pub enum Decision {
     },
     /// Drained service stop.
     Shutdown,
+    /// Audited handover of a stream lineage to `new_publisher`.
+    TransferLineage {
+        /// The full lineage scope (canonical recipient, kind, mode,
+        /// project, task, stream; project and task empty when undeclared).
+        scope: LineageScope,
+        /// The producer that becomes authoritative.
+        new_publisher: String,
+        /// Audit note.
+        note: String,
+    },
 }
 
-/// Applies one decision through the operator grant.
+/// Checks a decision's local rules, before any connection or request.
 ///
-/// Refuses locally (class `invalid`) an empty note or reason, and a retry
-/// without explicit duplicate-risk acceptance; otherwise the core's answer
-/// is returned unchanged.
-pub fn apply(
-    client: &mut BridgeClient,
-    token: &str,
-    decision: &Decision,
-) -> Result<(), ProtocolError> {
-    let refuse = |detail: &str| ProtocolError {
-        class: "invalid".into(),
-        detail: detail.into(),
+/// Refuses (class `invalid`) an empty note or reason, a retry without
+/// explicit duplicate-risk acceptance and a lineage transfer whose scope
+/// or new producer fails [`check_scope`].
+pub fn check(decision: &Decision) -> Result<(), ProtocolError> {
+    let refuse = |detail: String| {
+        Err(ProtocolError {
+            class: "invalid".into(),
+            detail,
+        })
     };
     match decision {
         Decision::Retry {
             accept_duplicate_risk: false,
             ..
-        } => Err(refuse(
-            "a manual retry repeats the same event and may duplicate it; pass --accept-duplicate-risk",
-        )),
+        } => refuse(
+            "a manual retry repeats the same event and may duplicate it; pass --accept-duplicate-risk"
+                .into(),
+        ),
         Decision::Retry { note, .. }
         | Decision::Dispose { note, .. }
         | Decision::Waive { note, .. }
+        | Decision::TransferLineage { note, .. }
             if note.trim().is_empty() =>
         {
-            Err(refuse("an audit note is required"))
+            refuse("an audit note is required".into())
         }
         Decision::Pause { reason, .. } if reason.trim().is_empty() => {
-            Err(refuse("a pause reason is required"))
+            refuse("a pause reason is required".into())
         }
+        Decision::TransferLineage {
+            scope,
+            new_publisher,
+            ..
+        } => check_scope(scope, new_publisher).or_else(refuse),
+        _ => Ok(()),
+    }
+}
+
+/// Applies one decision through the operator grant.
+///
+/// Runs [`check`] first (nothing is sent on a local refusal); otherwise the
+/// core's answer is returned unchanged. Each decision is sent at most once
+/// (a lost answer is a `transport` error, see [`failure_text`]).
+pub fn apply(
+    client: &mut BridgeClient,
+    token: &str,
+    decision: &Decision,
+) -> Result<(), ProtocolError> {
+    check(decision)?;
+    match decision {
         Decision::Retry {
             publisher,
             event_id,
@@ -206,6 +256,62 @@ pub fn apply(
         Decision::Pause { recipient, reason } => client.pause(token, recipient, reason),
         Decision::Resume { recipient } => client.resume(token, recipient),
         Decision::Shutdown => client.shutdown(token),
+        Decision::TransferLineage {
+            scope,
+            new_publisher,
+            note,
+        } => client.transfer_lineage(token, scope, new_publisher, note),
+    }
+}
+
+/// Checks a lineage scope and the new producer with the core's public
+/// validators before any request: canonical-parseable recipient, kind, mode,
+/// stream and publisher id, and project/task as metadata values (each may
+/// be empty when undeclared). Returns the first violation.
+pub fn check_scope(scope: &LineageScope, new_publisher: &str) -> Result<(), String> {
+    NativeAddress::parse(&scope.recipient).map_err(|error| format!("recipient: {error}"))?;
+    Kind::new(scope.kind.clone()).map_err(|error| format!("kind: {error}"))?;
+    Mode::parse(&scope.mode).map_err(|error| format!("mode: {error}"))?;
+    StreamId::new(scope.stream.clone()).map_err(|error| format!("stream: {error}"))?;
+    PublisherId::new(new_publisher.to_string())
+        .map_err(|error| format!("new publisher: {error}"))?;
+    let mut declared = Metadata::new();
+    for (key, value) in [("project", &scope.project), ("task", &scope.task)] {
+        if !value.is_empty() {
+            declared.insert(key.to_string(), value.clone());
+        }
+    }
+    bridge_core::validate_metadata(&declared).map_err(|error| format!("scope: {error}"))
+}
+
+/// Operator-facing text for a refused or failed *mutating* decision. A
+/// `transport` failure means the request may already have been applied:
+/// the text says so and that nothing is resent; every other class is the
+/// core's (or the local validation's) refusal unchanged. Read-only
+/// queries use [`read_failure_text`] instead.
+pub fn failure_text(error: &ProtocolError) -> String {
+    if error.class == "transport" {
+        format!(
+            "outcome unknown: the request may have been applied ({}); it was not resent. Re-read incidents and counts before deciding again.",
+            error.detail
+        )
+    } else {
+        error.to_string()
+    }
+}
+
+/// Operator-facing text for a failed read-only query (counts, incidents,
+/// holds). A `transport` failure leaves the current data unknown — nothing
+/// was changed by the query (the client may have repeated a repeatable
+/// read once); every other class is the core's refusal unchanged.
+pub fn read_failure_text(error: &ProtocolError) -> String {
+    if error.class == "transport" {
+        format!(
+            "read failed: the current data is unknown ({}); nothing was changed by this query",
+            error.detail
+        )
+    } else {
+        error.to_string()
     }
 }
 
@@ -241,6 +347,69 @@ mod tests {
         assert_eq!(classify("recipient_held").0, "held");
         assert_eq!(classify("retries_exhausted").0, "refused");
         assert!(classify("unknown_handoff").1.contains("Never resent"));
+    }
+
+    #[test]
+    fn lineage_loss_is_its_own_class_without_replay() {
+        let (category, next) = classify("lineage_authority_lost");
+        assert_eq!(category, "lineage");
+        assert!(next.contains("not dispatched while another producer owns the lineage"));
+        assert!(next.contains("never replayed automatically"));
+        // The deliberate alternative is conditional and audited, never a
+        // plain replay.
+        assert!(next.contains("transfer the lineage back explicitly"));
+        assert!(next.contains("audited retry with its recorded duplicate risk"));
+        assert!(!next.contains("never dispatched"));
+    }
+
+    #[test]
+    fn transfers_are_checked_before_any_request() {
+        let scope = LineageScope {
+            recipient: "lab/claude-code/store/session".into(),
+            kind: "view.snapshot".into(),
+            mode: "inject".into(),
+            project: String::new(),
+            task: String::new(),
+            stream: "s1".into(),
+        };
+        let transfer = |scope: LineageScope, publisher: &str, note: &str| {
+            check(&Decision::TransferLineage {
+                scope,
+                new_publisher: publisher.into(),
+                note: note.into(),
+            })
+        };
+        assert!(transfer(scope.clone(), "producer-b", "handover").is_ok());
+        assert!(transfer(scope.clone(), "producer-b", " \n").is_err());
+        assert!(transfer(scope.clone(), "", "handover").is_err());
+        for broken in [
+            LineageScope {
+                recipient: "not-an-address".into(),
+                ..scope.clone()
+            },
+            LineageScope {
+                mode: "teleport".into(),
+                ..scope.clone()
+            },
+            LineageScope {
+                stream: String::new(),
+                ..scope.clone()
+            },
+            LineageScope {
+                task: "a\u{1}b".into(),
+                ..scope.clone()
+            },
+        ] {
+            let refused = transfer(broken, "producer-b", "handover").unwrap_err();
+            assert_eq!(refused.class, "invalid");
+        }
+        let lost = ProtocolError {
+            class: "transport".into(),
+            detail: "closed".into(),
+        };
+        assert!(failure_text(&lost).contains("outcome unknown"));
+        let read = read_failure_text(&lost);
+        assert!(read.contains("read failed") && !read.contains("may have been applied"));
     }
 
     #[test]
