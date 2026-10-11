@@ -1,48 +1,71 @@
-//! Authenticated typed local publisher service.
+//! Authenticated typed local service: publisher and operator surfaces.
 //!
-//! The Bridge publisher surface: a local Unix-stream socket speaking one
-//! JSON object per line (ndjson). Every ingress is authenticated by an
-//! integration-grant token before anything else happens, authorized against
-//! the grant's bound publisher identity, recipient/kind/mode/policy
-//! allowlists, and only then validated and admitted through durable custody.
-//! There is deliberately no generic RPC surface: `publish` and `status` are
-//! the whole protocol, plus an administrative `shutdown` for bounded daemon
-//! control. Bridge stamps the publisher identity from the authenticated
-//! grant — a request never asserts its own publisher.
+//! A local Unix-stream socket speaking one JSON object per line (ndjson).
+//! Every ingress is authenticated by a grant token before anything else
+//! happens. Two disjoint credential realms exist:
 //!
+//! - **publisher grants** bind one publisher identity and the recipients,
+//!   kinds, modes and policies it may use; they can only `publish` and read
+//!   the `status` of their own events. The restricted root orchestrator
+//!   surface consumes this same protocol through its own backend grant whose
+//!   allowlist forces `keep_all` and its exact authorized recipients;
+//!   external root credentials are never core credentials.
+//! - **operator grants** (`admin = true`) carry empty allowlists, can never
+//!   publish or read publisher status, and alone can list incidents, record
+//!   audited recovery decisions, pause recipients and stop the daemon.
+//!
+//! There is deliberately no generic RPC surface. Bridge stamps the publisher
+//! identity from the authenticated grant — a request never asserts its own
+//! publisher or operator identity.
+//!
+//! Lifecycle: bounded connection admission and per-connection timeouts, a
+//! maintenance thread that reconciles leases and rechecks and drives
+//! registered carriers, and a stop that fences new work under the storage
+//! lock, drains in-flight requests and removes only this instance's socket.
 //! Structured logging is JSON lines on stderr; token values are never
 //! logged.
 
-use std::io::{BufRead, BufReader, Write};
+use std::collections::HashMap;
+use std::io::{BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::storage::{CustodyReceipt, Storage};
+use crate::dispatch::{
+    DispatchCarrier, DispatchReport, DispatchTiming, dispatch_message, lock_storage,
+};
+use crate::recovery::{EvidenceTier, HoldView, IncidentView};
+use crate::storage::{CustodyReceipt, Limits, Storage};
 use crate::types::{
     CoreError, Envelope, EventId, ExpiresAt, Kind, Metadata, Mode, NativeAddress, Payload, Policy,
     PublisherId,
 };
+use crate::wire::{MAX_REQUEST_BYTES, read_bounded_line, write_line};
 
-/// Maximum accepted request line length in bytes.
-///
-/// Larger lines are refused before parsing; requests carry bounded
-/// envelopes by contract, so this is a backstop, not a working limit. The
-/// reader enforces this bound incrementally, so an unterminated
-/// attacker-controlled line never allocates unbounded memory.
-const MAX_REQUEST_BYTES: usize = 512 * 1024;
+pub use crate::recovery::DeliveryEvidence;
 
-/// Maximum concurrently served connections.
-///
-/// Beyond this admission bound the listener drops new connections
-/// immediately (with a log line) instead of spawning without limit; this
-/// keeps memory and scheduler pressure bounded under connection floods.
-const MAX_CONNECTIONS: usize = 64;
+/// How long a stop waits for in-flight connections before giving up.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Interval between reconciliation and dispatch passes.
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Shortest accepted grant token, in bytes (tokens must be unguessable).
+const MIN_TOKEN_BYTES: usize = 16;
+
+/// Largest listing an operator request may ask for.
+const MAX_LISTING: usize = 200;
+
+/// Recipients dispatched per maintenance pass.
+const RECIPIENTS_PER_PASS: usize = 16;
+
+/// Attempts driven per recipient per maintenance pass.
+const ATTEMPTS_PER_RECIPIENT: usize = 4;
 
 /// Daemon and service configuration, usually loaded from a TOML file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,27 +77,23 @@ pub struct Config {
     /// Admission limits handed to storage.
     pub limits: crate::storage::Limits,
     /// Integration grants; at least one is required to serve anything.
-    #[serde(default)]
+    #[serde(default, alias = "grant")]
     pub grants: Vec<GrantConfig>,
 }
 
-/// One authenticated integration grant.
+/// One authenticated grant.
 ///
-/// A grant binds a secret token to exactly one publisher identity and to
-/// the recipients, kinds, modes and policies that publisher may use. The
-/// token is supplied out-of-band to the producer; possession of the token
-/// plus socket access is the caller's authentication.
-///
-/// The restricted root orchestrator surface (M-006) consumes this same
-/// `publish`/`status` protocol through its own dedicated backend grant
-/// whose allowlist forces `keep_all` and its exact authorized recipients;
-/// external root credentials are never core credentials, and an
-/// operator/admin grant is a separate token from every integration grant.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A publisher grant binds a secret token to exactly one publisher identity
+/// and to the recipients, kinds, modes and policies that publisher may use;
+/// its `publisher` identity is also the source tag Bridge renders around its
+/// events. An operator grant (`admin = true`) must carry empty allowlists.
+/// The token is supplied out-of-band; possession of the token plus socket
+/// access is the caller's authentication.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct GrantConfig {
-    /// Secret bearer token (unguessable, generated by the operator).
+    /// Secret bearer token (unguessable, at least 16 bytes, unique).
     pub token: String,
-    /// The single publisher identity this grant authenticates.
+    /// The single publisher (or operator) identity this grant authenticates.
     pub publisher: String,
     /// Exact canonical recipient addresses this grant may publish to.
     pub recipients: Vec<String>,
@@ -84,20 +103,58 @@ pub struct GrantConfig {
     pub modes: Vec<String>,
     /// Coalescing policy names this grant may use.
     pub policies: Vec<String>,
-    /// Whether this grant may request daemon shutdown (operator only).
+    /// Whether this is an operator grant: recovery, pause and shutdown
+    /// operations, never publishing.
     #[serde(default)]
     pub admin: bool,
+}
+
+impl std::fmt::Debug for GrantConfig {
+    /// Prints the identity and allowlist sizes, never the token.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GrantConfig")
+            .field("token", &"<redacted>")
+            .field("publisher", &self.publisher)
+            .field("recipients", &self.recipients.len())
+            .field("kinds", &self.kinds)
+            .field("modes", &self.modes)
+            .field("policies", &self.policies)
+            .field("admin", &self.admin)
+            .finish()
+    }
 }
 
 impl GrantConfig {
     /// Parses and validates everything the runtime will check against.
     ///
-    /// Publisher, recipient addresses, kinds and modes must be well-formed
-    /// at load time so authorization decisions never run on malformed
-    /// allowlist entries. Returns [`CoreError::InvalidEnvelope`]-class
-    /// errors naming the first problem.
+    /// Publisher identity, recipient addresses, kinds, modes and policies
+    /// must be well-formed at load time so authorization decisions never
+    /// run on malformed allowlist entries; a publisher identity must also be
+    /// usable as a source tag; the token must be at least 16 bytes; an
+    /// operator grant must have empty allowlists. Returns the first
+    /// problem as [`CoreError::InvalidEnvelope`].
     pub fn validate(&self) -> Result<(), CoreError> {
         PublisherId::new(self.publisher.clone())?;
+        if self.token.len() < MIN_TOKEN_BYTES {
+            return Err(CoreError::InvalidEnvelope(format!(
+                "grant token for {} is shorter than {MIN_TOKEN_BYTES} bytes",
+                self.publisher
+            )));
+        }
+        if self.admin {
+            if !(self.recipients.is_empty()
+                && self.kinds.is_empty()
+                && self.modes.is_empty()
+                && self.policies.is_empty())
+            {
+                return Err(CoreError::InvalidEnvelope(format!(
+                    "operator grant {} must not carry publisher allowlists",
+                    self.publisher
+                )));
+            }
+        } else {
+            crate::framing::validate_tag(&self.publisher)?;
+        }
         for recipient in &self.recipients {
             NativeAddress::parse(recipient)?;
         }
@@ -120,15 +177,6 @@ impl GrantConfig {
         Ok(())
     }
 }
-
-/// One root orchestrator grant is a [`GrantConfig`] with
-/// `role = "root"`: root grants form a separate authorization universe
-/// from publisher and admin grants — a root token can never publish with
-/// producer policies, and a producer or admin token can never use the
-/// root surface. A root send is always `keep_all`, always to exact
-/// pre-authorized recipients, and carries no retry/reset/permission
-/// capability. Root grants are validated by the same
-/// [`GrantConfig::validate`] load-time checks.
 
 /// A publish request body: everything an envelope carries except the
 /// publisher identity and schema version, which Bridge stamps.
@@ -153,29 +201,143 @@ pub struct PublishBody {
     pub expires_at: Option<ExpiresAt>,
 }
 
+/// A bearer token that never appears in `Debug` output.
+///
+/// On the wire it is a plain JSON string (the early wire format is
+/// unchanged); in memory it dereferences to `&str` for comparison. Request
+/// and grant types hold it, so logging or panicking with one of them cannot
+/// disclose a credential.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Token(String);
+
+impl Token {
+    /// Wraps a bearer token string.
+    pub fn new(value: impl Into<String>) -> Self {
+        Token(value.into())
+    }
+}
+
+impl std::ops::Deref for Token {
+    type Target = str;
+
+    /// The token text, for comparison only; never log it.
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Token {
+    /// Prints a fixed placeholder instead of the credential.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Token(<redacted>)")
+    }
+}
+
 /// One request line as it arrives on the socket.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum Request {
     /// Publish (or idempotently replay) one event under custody.
     Publish {
-        /// Integration-grant bearer token.
-        token: String,
+        /// Publisher-grant bearer token.
+        token: Token,
         /// The event body; publisher is stamped from the grant.
-        event: PublishBody,
+        event: Box<PublishBody>,
     },
     /// Look up the caller's own publication status.
     Status {
-        /// Integration-grant bearer token.
-        token: String,
+        /// Publisher-grant bearer token.
+        token: Token,
         /// The caller's event id.
         event_id: String,
     },
     /// Stop the daemon: refuse new work, drain, exit.
     Shutdown {
-        /// Integration-grant bearer token (admin grants only).
-        token: String,
+        /// Operator-grant bearer token.
+        token: Token,
+    },
+    /// List retained incidents with age, deadlines and blocked dependents.
+    Incidents {
+        /// Operator-grant bearer token.
+        token: Token,
+        /// Include settled incidents too.
+        #[serde(default)]
+        include_closed: bool,
+        /// Maximum rows (default 100, at most 200).
+        limit: Option<usize>,
+    },
+    /// List visible recipient holds.
+    Holds {
+        /// Operator-grant bearer token.
+        token: Token,
+        /// Maximum rows (default 100, at most 200).
+        limit: Option<usize>,
+    },
+    /// Authorize one more attempt of the same event after an unresolved
+    /// possible hand-off; the duplicate risk is recorded permanently.
+    AuthorizeRetry {
+        /// Operator-grant bearer token.
+        token: Token,
+        /// Publisher of the event.
+        publisher: String,
+        /// The event to retry.
+        event_id: String,
+        /// Audit note (why the retry is acceptable).
+        note: String,
+    },
+    /// Close an event with an audited disposition (never claims delivery).
+    Dispose {
+        /// Operator-grant bearer token.
+        token: Token,
+        /// Publisher of the event.
+        publisher: String,
+        /// The event to dispose.
+        event_id: String,
+        /// Audit note.
+        note: String,
+    },
+    /// Waive a missing or expired predecessor of a dependent event.
+    WaivePredecessor {
+        /// Operator-grant bearer token.
+        token: Token,
+        /// Publisher of the dependent event.
+        publisher: String,
+        /// The dependent event.
+        event_id: String,
+        /// Audit note.
+        note: String,
+    },
+    /// Record positive late evidence that settles an uncertain attempt.
+    Evidence {
+        /// Operator-grant bearer token.
+        token: Token,
+        /// Publisher of the event.
+        publisher: String,
+        /// The event the evidence concerns.
+        event_id: String,
+        /// The attempt the evidence concerns.
+        attempt_seq: u64,
+        /// The evidence tier.
+        tier: EvidenceTier,
+        /// The observed fact.
+        detail: String,
+    },
+    /// Set the durable no-wake policy for a recipient.
+    Pause {
+        /// Operator-grant bearer token.
+        token: Token,
+        /// The recipient to pause.
+        recipient: NativeAddress,
+        /// Why it is paused.
+        reason: String,
+    },
+    /// Clear the durable no-wake policy for a recipient.
+    Resume {
+        /// Operator-grant bearer token.
+        token: Token,
+        /// The recipient to resume.
+        recipient: NativeAddress,
     },
 }
 
@@ -191,90 +353,227 @@ pub enum Response {
     Status {
         /// The custody receipt, or `None` when never accepted.
         receipt: Option<CustodyReceipt>,
-        /// Delivery evidence tiers from the newest attempt, distinct from
-        /// custody: acceptance, hold, hook submission, known-unsent,
-        /// unknown or refusal, with the effective mode. `None` until a
-        /// dispatch attempt exists; callers must treat absent tiers as
-        /// not_available rather than delivered.
-        delivery: Option<DeliveryEvidence>,
+        /// Delivery evidence tiers, distinct from custody; `None` when the
+        /// event was never accepted. Callers must treat absent tiers as
+        /// not_available, never as delivered.
+        delivery: Option<Box<DeliveryEvidence>>,
     },
+    /// Retained incidents.
+    Incidents {
+        /// The incidents, bounded by the request limit.
+        incidents: Vec<IncidentView>,
+    },
+    /// Visible recipient holds.
+    Holds {
+        /// The holds, bounded by the request limit.
+        holds: Vec<HoldView>,
+    },
+    /// An operator action was applied (and audited).
+    Done,
     /// Shutdown acknowledged; the daemon exits after draining.
     ShuttingDown,
     /// Structured refusal; nothing was accepted or disclosed.
     Error {
         /// Machine-readable class: auth, forbidden, unsupported, invalid,
-        /// conflict, capacity, held, fence or internal.
+        /// conflict, capacity, held, fence, busy or internal.
         class: String,
         /// Human-readable detail without secrets.
         detail: String,
     },
 }
 
-/// A running publisher service bound to its socket.
+impl Response {
+    /// Revalidates the parts of a decoded response that are not validated
+    /// by their own types: operator listings (identifiers, ranges, bounds).
+    ///
+    /// Receipts, hashes, addresses and delivery evidence already revalidate
+    /// during deserialization. Clients call this on every decoded response
+    /// so a damaged or hostile line is never trusted for its numbers.
+    pub fn validate(&self) -> Result<(), CoreError> {
+        match self {
+            Response::Incidents { incidents } => {
+                incidents.iter().try_for_each(IncidentView::validate)
+            }
+            Response::Holds { holds } => holds.iter().try_for_each(HoldView::validate),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// A structured refusal; small enough to travel in `Result` errors.
+struct Refusal {
+    /// Machine-readable class (see [`Response::Error`]).
+    class: &'static str,
+    /// Human-readable detail without secrets.
+    detail: String,
+}
+
+impl Refusal {
+    /// Builds a refusal.
+    fn new(class: &'static str, detail: impl Into<String>) -> Self {
+        Refusal {
+            class,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl From<Refusal> for Response {
+    /// Converts the refusal to its wire form.
+    fn from(refusal: Refusal) -> Self {
+        Response::Error {
+            class: refusal.class.to_string(),
+            detail: refusal.detail,
+        }
+    }
+}
+
+impl From<CoreError> for Refusal {
+    /// Maps a [`CoreError`] to its wire refusal class.
+    fn from(error: CoreError) -> Self {
+        let class = match &error {
+            CoreError::InvalidEnvelope(_) => "invalid",
+            CoreError::Conflict { .. } => "conflict",
+            CoreError::Capacity { .. } => "capacity",
+            CoreError::PolicyHold { .. } => "held",
+            CoreError::Fence(_) => "fence",
+            CoreError::Busy(_) => "busy",
+            CoreError::Unsupported(_) => "unsupported",
+            CoreError::Storage(_) | CoreError::Integrity(_) => "internal",
+        };
+        Refusal::new(class, error.to_string())
+    }
+}
+
+/// A running service bound to its socket.
 ///
 /// Dropping the handle does not stop the service; call [`Running::shutdown`]
 /// and [`Running::join`] for a bounded, drained stop.
 pub struct Running {
+    /// The bound socket path.
     socket_path: PathBuf,
+    /// State shared with the worker threads.
     state: Arc<ServiceState>,
+    /// The accept loop.
     accept_thread: JoinHandle<()>,
+    /// The reconciliation and dispatch loop.
+    maintenance_thread: JoinHandle<()>,
 }
 
-/// Shared server state behind the accept loop.
+/// A carrier owned by the dispatch loop.
+type BoxedCarrier = Box<dyn DispatchCarrier + Send>;
+
+/// Shared server state behind the worker threads.
 struct ServiceState {
+    /// The custody store; its lock also fences shutdown against publishes.
     storage: Mutex<Storage>,
+    /// Validated grants.
     grants: Vec<GrantConfig>,
+    /// Connection and timeout bounds (see [`Limits`]).
+    limits: Limits,
+    /// `false` once a stop was requested; new work is refused under the
+    /// storage lock after that.
     running: AtomicBool,
+    /// The configured socket path.
     socket_path: PathBuf,
     /// Identity (device, inode) of the socket file this instance bound, so
     /// shutdown only ever unlinks its own endpoint.
-    socket_identity: Mutex<Option<(u64, u64)>>,
-    /// Currently served connections, bounded by [`MAX_CONNECTIONS`].
-    active_connections: std::sync::atomic::AtomicUsize,
+    socket_identity: (u64, u64),
+    /// Currently served connections, bounded by `limits.max_connections`.
+    active_connections: AtomicUsize,
+    /// Read-half handles of served connections, to wake them at a stop.
+    streams: Mutex<HashMap<u64, UnixStream>>,
+    /// Source of connection registry keys.
+    next_stream_id: AtomicU64,
+    /// Carriers driven by the maintenance loop.
+    carriers: Mutex<Vec<BoxedCarrier>>,
+    /// The advisory lock that proves exclusive ownership of the endpoint;
+    /// held until the service state is dropped, i.e. past the socket's
+    /// removal.
+    _endpoint_lock: std::fs::File,
 }
 
-/// Starts the service: opens storage, binds the socket and spawns the
-/// accept loop.
+impl ServiceState {
+    /// Requests a stop and fences new work.
+    ///
+    /// The flag is flipped while holding the storage lock, so any publish
+    /// that is already inside its critical section finishes first and every
+    /// later one observes the flag before touching custody: once this
+    /// returns, no further publish can be accepted.
+    fn stop(&self) {
+        let _fence = lock_storage(&self.storage);
+        self.running.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Starts the service without carriers: custody and operator surfaces only.
 ///
-/// A stale socket file at the configured path is removed before binding
-/// (it can only belong to a dead daemon on this local path). Fails if the
-/// database cannot be opened, the socket cannot be bound or a grant is
-/// malformed — never serves with partial authentication state.
+/// Events stay pending (visibly) until a qualified adapter drives them. See
+/// [`start_with_carriers`] for the full contract.
 pub fn start(config: Config) -> Result<Running, CoreError> {
+    start_with_carriers(config, Vec::new())
+}
+
+/// Starts the service: validates grants, opens storage, claims and binds the
+/// socket and spawns the accept and maintenance loops.
+///
+/// Fails if a grant is malformed or duplicated, the database cannot be
+/// opened, a source tag conflicts, or the socket cannot be bound — never
+/// serves with partial authentication state. A path held by a live listener
+/// is refused; a stale socket is claimed only when a connection attempt is
+/// positively refused; any other existing path is preserved untouched.
+/// `carriers` are driven by the maintenance loop for the message path.
+pub fn start_with_carriers(
+    config: Config,
+    carriers: Vec<BoxedCarrier>,
+) -> Result<Running, CoreError> {
+    let mut tokens: Vec<&str> = Vec::new();
     for grant in &config.grants {
         grant.validate()?;
+        if tokens.contains(&grant.token.as_str()) {
+            return Err(CoreError::InvalidEnvelope(
+                "two grants share one token".into(),
+            ));
+        }
+        tokens.push(&grant.token);
     }
-    let storage = Storage::open(&config.database, config.limits)?;
-    claim_socket(&config.socket)?;
+    config.limits.validate()?;
     if let Some(parent) = config.socket.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            CoreError::Storage(rusqlite::Error::InvalidParameterName(format!(
-                "cannot create socket directory: {error}"
-            )))
-        })?;
+        std::fs::create_dir_all(parent)
+            .map_err(|error| io_failure(format!("cannot create socket directory: {error}")))?;
     }
+    // Serializes every daemon that wants this endpoint, before the database
+    // is touched: a loser changes nothing.
+    let endpoint_lock = acquire_endpoint_lock(&config.socket)?;
+    let mut storage = Storage::open(&config.database, config.limits)?;
+    for grant in config.grants.iter().filter(|grant| !grant.admin) {
+        storage.register_source_tag(&grant.publisher, &grant.publisher)?;
+    }
+    claim_socket(&config.socket)?;
     let listener = UnixListener::bind(&config.socket).map_err(|error| {
-        CoreError::Storage(rusqlite::Error::InvalidParameterName(format!(
+        io_failure(format!(
             "cannot bind socket {}: {error}",
             config.socket.display()
-        )))
+        ))
     })?;
-    listener.set_nonblocking(true).map_err(|error| {
-        CoreError::Storage(rusqlite::Error::InvalidParameterName(format!(
-            "cannot set socket non-blocking: {error}"
-        )))
-    })?;
-    let identity = std::fs::symlink_metadata(&config.socket).ok().map(|meta| {
-        use std::os::unix::fs::MetadataExt;
-        (meta.dev(), meta.ino())
-    });
+    let identity = socket_identity(&config.socket)?;
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(&config.socket, std::fs::Permissions::from_mode(0o600));
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| io_failure(format!("cannot set socket non-blocking: {error}")))?;
     let state = Arc::new(ServiceState {
         storage: Mutex::new(storage),
         grants: config.grants,
+        limits: config.limits,
         running: AtomicBool::new(true),
         socket_path: config.socket.clone(),
-        socket_identity: Mutex::new(identity),
-        active_connections: std::sync::atomic::AtomicUsize::new(0),
+        socket_identity: identity,
+        active_connections: AtomicUsize::new(0),
+        streams: Mutex::new(HashMap::new()),
+        next_stream_id: AtomicU64::new(0),
+        carriers: Mutex::new(carriers),
+        _endpoint_lock: endpoint_lock,
     });
     log_event(
         "info",
@@ -288,93 +587,231 @@ pub fn start(config: Config) -> Result<Running, CoreError> {
     let accept_thread = std::thread::Builder::new()
         .name("bridge-accept".into())
         .spawn(move || accept_loop(listener, accept_state))
+        .map_err(|error| io_failure(format!("cannot spawn accept thread: {error}")))?;
+    let maintenance_state = Arc::clone(&state);
+    let maintenance_thread = std::thread::Builder::new()
+        .name("bridge-maintenance".into())
+        .spawn(move || maintenance_loop(&maintenance_state))
         .map_err(|error| {
-            CoreError::Storage(rusqlite::Error::InvalidParameterName(format!(
-                "cannot spawn accept thread: {error}"
-            )))
+            state.stop();
+            io_failure(format!("cannot spawn maintenance thread: {error}"))
         })?;
     Ok(Running {
         socket_path: config.socket,
         state,
         accept_thread,
+        maintenance_thread,
     })
+}
+
+/// Wraps an operating-system failure as a storage-class core error.
+fn io_failure(detail: String) -> CoreError {
+    CoreError::Storage(rusqlite::Error::InvalidParameterName(detail))
 }
 
 impl Running {
     /// The bound socket path for clients.
-    pub fn socket_path(&self) -> &std::path::Path {
+    pub fn socket_path(&self) -> &Path {
         &self.socket_path
     }
 
-    /// Requests a drained stop (idempotent).
-    pub fn shutdown(&self) {
-        self.state.running.store(false, Ordering::SeqCst);
+    /// Whether the service still accepts work (no stop was requested by
+    /// [`Running::shutdown`] or an operator over the socket).
+    pub fn is_running(&self) -> bool {
+        self.state.running.load(Ordering::SeqCst)
     }
 
-    /// Waits for the accept loop to finish; bounded by the caller.
+    /// Requests a drained stop (idempotent).
+    ///
+    /// Fences new work under the storage lock: when this returns, no
+    /// further publish or operator mutation can be accepted.
+    pub fn shutdown(&self) {
+        self.state.stop();
+    }
+
+    /// Waits for the loops to finish and in-flight connections to drain,
+    /// each bounded by a drain timeout; the caller requests the stop first.
+    ///
+    /// A carrier that hangs inside a hand-off cannot make the stop
+    /// unbounded: the maintenance thread is then left to finish on its own
+    /// (its attempt stays `invoking` and becomes a retained unknown outcome
+    /// at its deadline, never a replay), and the timeout is logged.
     pub fn join(self) {
-        let _ = self.accept_thread.join();
+        let deadline = Instant::now() + DRAIN_TIMEOUT;
+        for (name, handle) in [
+            ("accept", self.accept_thread),
+            ("maintenance", self.maintenance_thread),
+        ] {
+            while !handle.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                log_event("warn", "drain_timeout", &[("thread", name)]);
+            }
+        }
+        while self.state.active_connections.load(Ordering::SeqCst) > 0 {
+            if Instant::now() >= deadline {
+                log_event(
+                    "warn",
+                    "drain_timeout",
+                    &[(
+                        "active",
+                        &self
+                            .state
+                            .active_connections
+                            .load(Ordering::SeqCst)
+                            .to_string(),
+                    )],
+                );
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Runs `action` with exclusive access to the custody store.
+    ///
+    /// For in-process adapters (a qualified hook calling
+    /// [`Storage::drain_inject`], evidence reporting) that must act on the
+    /// same store the service uses. The lock is the same one that fences
+    /// shutdown, so do not hold it across slow work.
+    pub fn with_storage<T>(&self, action: impl FnOnce(&mut Storage) -> T) -> T {
+        action(&mut lock_storage(&self.state.storage))
     }
 }
 
-/// Claims the socket path for binding, proving staleness first.
+/// Takes the exclusive advisory lock that serializes daemons contending for
+/// one socket path.
+///
+/// The lock file is `<socket>.lock`; it is created if absent and left in
+/// place afterwards (removing it would reopen the race it closes). A
+/// non-regular file at that path is foreign and refused. A holder that is
+/// still running refuses every later start before it can inspect, remove or
+/// bind anything, so two daemons can never both decide that the same stale
+/// socket is theirs.
+fn acquire_endpoint_lock(socket: &Path) -> Result<std::fs::File, CoreError> {
+    let mut name = socket.as_os_str().to_owned();
+    name.push(".lock");
+    let path = PathBuf::from(name);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(io_failure(format!(
+                "refusing endpoint lock path {}: not a regular file",
+                path.display()
+            )));
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(io_failure(format!(
+                "cannot inspect endpoint lock path {}: {error}",
+                path.display()
+            )));
+        }
+        _ => {}
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|error| {
+            io_failure(format!(
+                "cannot open endpoint lock {}: {error}",
+                path.display()
+            ))
+        })?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(io_failure(format!(
+            "another daemon owns the endpoint {}; refusing to start",
+            socket.display()
+        ))),
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(io_failure(format!("cannot lock the endpoint: {error}")))
+        }
+    }
+}
+
+/// Reads the (device, inode) identity of the socket file at `path`.
+fn socket_identity(path: &Path) -> Result<(u64, u64), CoreError> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| io_failure(format!("cannot inspect bound socket: {error}")))?;
+    if !metadata.file_type().is_socket() {
+        return Err(io_failure(format!(
+            "bound path {} is not a socket",
+            path.display()
+        )));
+    }
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+/// Claims the socket path for binding, proving staleness positively.
 ///
 /// Ownership rules: a path with a live listener is refused (a second
 /// instance must never replace a working endpoint or get unlinked by the
-/// first instance's shutdown); a stale socket (connect refused) is removed
-/// and rebound; any other existing path (regular file, directory, symlink)
-/// is preserved untouched and startup refuses rather than deleting
+/// first instance's shutdown); a socket is removed only when a connection
+/// attempt is *refused* (nothing is listening) and the file is still the
+/// very inode that was inspected; any other connect error is not positive
+/// proof and refuses; any other existing path (regular file, directory,
+/// symlink) is preserved untouched and startup refuses rather than deleting
 /// foreign data.
-fn claim_socket(path: &std::path::Path) -> Result<(), CoreError> {
-    match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(CoreError::Storage(rusqlite::Error::InvalidParameterName(
-            format!("cannot inspect socket path {}: {error}", path.display()),
+fn claim_socket(path: &Path) -> Result<(), CoreError> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let metadata = match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(io_failure(format!(
+                "cannot inspect socket path {}: {error}",
+                path.display()
+            )));
+        }
+        Ok(metadata) => metadata,
+    };
+    if !metadata.file_type().is_socket() {
+        return Err(io_failure(format!(
+            "refusing to remove non-socket path {}",
+            path.display()
+        )));
+    }
+    match UnixStream::connect(path) {
+        Ok(_) => Err(io_failure(format!(
+            "a live daemon already owns socket {}; refusing to replace it",
+            path.display()
         ))),
-        Ok(metadata) => {
-            use std::os::unix::fs::FileTypeExt;
-            if !metadata.file_type().is_socket() {
-                return Err(CoreError::Storage(rusqlite::Error::InvalidParameterName(
-                    format!("refusing to remove non-socket path {}", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+            let again = std::fs::symlink_metadata(path)
+                .map_err(|error| io_failure(format!("socket path changed: {error}")))?;
+            if again.dev() != metadata.dev() || again.ino() != metadata.ino() {
+                return Err(io_failure(format!(
+                    "socket {} was replaced while it was inspected; refusing",
+                    path.display()
                 )));
             }
-            match UnixStream::connect(path) {
-                Ok(_) => Err(CoreError::Storage(rusqlite::Error::InvalidParameterName(
-                    format!(
-                        "a live daemon already owns socket {}; refusing to replace it",
-                        path.display()
-                    ),
-                ))),
-                Err(_) => {
-                    // Nothing is listening: stale socket from a dead
-                    // daemon, safe to claim.
-                    std::fs::remove_file(path).map_err(|error| {
-                        CoreError::Storage(rusqlite::Error::InvalidParameterName(format!(
-                            "cannot remove stale socket {}: {error}",
-                            path.display()
-                        )))
-                    })
-                }
-            }
+            std::fs::remove_file(path).map_err(|error| {
+                io_failure(format!(
+                    "cannot remove stale socket {}: {error}",
+                    path.display()
+                ))
+            })
         }
+        Err(error) => Err(io_failure(format!(
+            "cannot prove socket {} is stale ({error}); refusing to remove it",
+            path.display()
+        ))),
     }
 }
 
 /// Removes the socket file only if this instance still owns it.
 ///
 /// Compares the file's (device, inode) identity with the one recorded at
-/// bind time; a replacement endpoint bound by another daemon after this
-/// one stopped is never unlinked.
+/// bind time; a replacement endpoint bound by another daemon after this one
+/// stopped is never unlinked.
 fn release_socket(state: &ServiceState) {
-    let owned = *state
-        .socket_identity
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    if let Some((dev, ino)) = owned
-        && let Ok(metadata) = std::fs::symlink_metadata(&state.socket_path)
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.dev() == dev && metadata.ino() == ino {
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(metadata) = std::fs::symlink_metadata(&state.socket_path) {
+        if (metadata.dev(), metadata.ino()) == state.socket_identity {
             let _ = std::fs::remove_file(&state.socket_path);
         } else {
             log_event("warn", "socket_replaced_before_stop", &[]);
@@ -383,226 +820,394 @@ fn release_socket(state: &ServiceState) {
 }
 
 /// Accept loop: non-blocking accept polled while running; each admitted
-/// connection runs on its own thread up to [`MAX_CONNECTIONS`].
+/// connection runs on its own thread up to `limits.max_connections`.
 ///
-/// A drained stop closes the accept loop within one poll interval and
-/// removes only this instance's socket. Connection threads are admitted
-/// under the connection cap and fence every request against the stop flag
-/// (a publish that arrives after shutdown is refused without custody);
-/// they are not joined, because a producer may legitimately keep an idle
-/// connection open forever, and bounded shutdown must not depend on it.
+/// A stop ends the loop within one poll interval, wakes every served
+/// connection (their read halves are shut down, so idle ones end at once
+/// while a request in flight still finishes and answers) and removes only
+/// this instance's socket. Spawn failure releases the admission slot.
 fn accept_loop(listener: UnixListener, state: Arc<ServiceState>) {
     while state.running.load(Ordering::SeqCst) {
         match listener.accept() {
-            Ok((stream, _)) => {
-                let active = state.active_connections.fetch_add(1, Ordering::SeqCst) + 1;
-                if active > MAX_CONNECTIONS {
-                    state.active_connections.fetch_sub(1, Ordering::SeqCst);
-                    log_event(
-                        "warn",
-                        "connection_refused_admission",
-                        &[("active", &active.to_string())],
-                    );
-                    drop(stream);
-                    continue;
-                }
-                let connection_state = Arc::clone(&state);
-                let guard_state = Arc::clone(&state);
-                let _ = std::thread::Builder::new()
-                    .name("bridge-connection".into())
-                    .spawn(move || {
-                        let _guard = ConnectionGuard(guard_state.as_ref());
-                        handle_connection(stream, connection_state);
-                    });
-            }
+            Ok((stream, _)) => admit(&state, stream),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(20));
             }
             Err(error) => {
                 log_event("error", "accept_failed", &[("error", &error.to_string())]);
+                std::thread::sleep(Duration::from_millis(50));
             }
         }
+    }
+    for stream in state
+        .streams
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .values()
+    {
+        let _ = stream.shutdown(std::net::Shutdown::Read);
     }
     release_socket(&state);
     log_event("info", "service_stopped", &[]);
 }
 
-/// Decrements the admission counter when a connection thread ends.
-struct ConnectionGuard<'a>(&'a ServiceState);
-
-impl Drop for ConnectionGuard<'_> {
-    /// Releases the admission slot; never panics.
-    fn drop(&mut self) {
-        self.0.active_connections.fetch_sub(1, Ordering::SeqCst);
+/// Admits one accepted connection under the connection cap.
+fn admit(state: &Arc<ServiceState>, stream: UnixStream) {
+    let active = state.active_connections.fetch_add(1, Ordering::SeqCst) + 1;
+    if active > state.limits.max_connections {
+        state.active_connections.fetch_sub(1, Ordering::SeqCst);
+        log_event(
+            "warn",
+            "connection_refused_admission",
+            &[("active", &active.to_string())],
+        );
+        return;
+    }
+    let id = state.next_stream_id.fetch_add(1, Ordering::SeqCst);
+    if let Ok(clone) = stream.try_clone() {
+        state
+            .streams
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(id, clone);
+    }
+    let connection_state = Arc::clone(state);
+    let spawned = std::thread::Builder::new()
+        .name("bridge-connection".into())
+        .spawn(move || {
+            let _guard = ConnectionGuard {
+                state: Arc::clone(&connection_state),
+                id,
+            };
+            handle_connection(stream, &connection_state);
+        });
+    if let Err(error) = spawned {
+        log_event(
+            "error",
+            "connection_spawn_failed",
+            &[("error", &error.to_string())],
+        );
+        state
+            .streams
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&id);
+        state.active_connections.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
-/// Serves one connection with bounded framing and a shutdown fence.
+/// Releases a connection's admission slot and registry entry on exit, also
+/// when the handler panics.
+struct ConnectionGuard {
+    /// Shared state owning the counters.
+    state: Arc<ServiceState>,
+    /// Registry key of this connection.
+    id: u64,
+}
+
+impl Drop for ConnectionGuard {
+    /// Releases the admission slot and the registry entry; never panics.
+    fn drop(&mut self) {
+        self.state
+            .streams
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&self.id);
+        self.state.active_connections.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Serves one connection with bounded framing, timeouts and a shutdown
+/// fence.
 ///
-/// Reads at most one newline-terminated request at a time, never
-/// allocating more than [`MAX_REQUEST_BYTES`] for a line: an oversized or
-/// unterminated line is refused and the connection closed (an
-/// attacker-controlled stream cannot hold memory or the connection
-/// forever). Every parsed request is fenced against the stop flag before
-/// it is served: a publish arriving after shutdown is refused without
-/// custody. The connection ends at EOF, refusal or shutdown.
-fn handle_connection(stream: UnixStream, state: Arc<ServiceState>) {
+/// Reads at most one newline-terminated request at a time without ever
+/// allocating more than the request cap for a line; a silent connection is
+/// closed after the idle timeout, a stalled partial line after the request
+/// timeout, and a peer that stops reading after the write timeout. Every
+/// parsed request is fenced against the stop flag (and mutations re-check it
+/// under the storage lock). The connection ends at EOF, refusal, timeout or
+/// shutdown.
+fn handle_connection(stream: UnixStream, state: &Arc<ServiceState>) {
     let _ = stream.set_nonblocking(false);
-    let cloned = match stream.try_clone() {
-        Ok(cloned) => cloned,
-        Err(error) => {
-            log_event(
-                "error",
-                "connection_clone_failed",
-                &[("error", &error.to_string())],
-            );
-            return;
-        }
+    let Ok(reader_stream) = stream.try_clone() else {
+        log_event("error", "connection_clone_failed", &[]);
+        return;
     };
-    let mut reader = BufReader::new(cloned);
+    let mut reader = BufReader::new(reader_stream);
     let mut writer = stream;
     loop {
-        let line = match read_limited_line(&mut reader, MAX_REQUEST_BYTES) {
+        let line = match read_bounded_line(
+            &mut reader,
+            MAX_REQUEST_BYTES,
+            Duration::from_millis(state.limits.idle_timeout_ms),
+            Duration::from_millis(state.limits.request_timeout_ms),
+        ) {
             Ok(Some(line)) => line,
-            Ok(None) => break, // clean EOF
+            Ok(None) => break,
             Err(error) => {
-                let _ = write_response(
-                    &mut writer,
-                    &Response::Error {
-                        class: "invalid".into(),
-                        detail: error.to_string(),
-                    },
-                );
-                break; // close: framing cannot be trusted past the limit
+                // An idle connection or a peer that vanished mid-line is
+                // closed silently: an unsolicited line would be mistaken
+                // for the answer to the peer's next request.
+                if !matches!(
+                    error.kind(),
+                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::WouldBlock
+                ) {
+                    let _ = respond(
+                        state,
+                        &mut writer,
+                        &Refusal::new("invalid", error.to_string()).into(),
+                    );
+                }
+                break; // framing cannot be trusted past a violation
             }
         };
         if !state.running.load(Ordering::SeqCst) {
-            let _ = write_response(
-                &mut writer,
-                &Response::Error {
-                    class: "held".into(),
-                    detail: "service is shutting down; no new work is accepted".into(),
-                },
-            );
+            let _ = respond(state, &mut writer, &stopping().into());
             break;
         }
-        let request: Request = match serde_json::from_str(&line) {
-            Ok(request) => request,
+        let response = match serde_json::from_str::<Request>(&line) {
+            Ok(request) => serve(state, request).unwrap_or_else(Response::from),
             Err(error) => {
-                let _ = write_response(
-                    &mut writer,
-                    &Response::Error {
-                        class: "unsupported".into(),
-                        detail: format!("unparseable request: {error}"),
-                    },
-                );
-                continue;
+                // The request text is never echoed: it may carry a token.
+                Refusal::new(
+                    "unsupported",
+                    format!(
+                        "unparseable request ({:?} error at column {})",
+                        error.classify(),
+                        error.column()
+                    ),
+                )
+                .into()
             }
         };
-        match serve(&state, request) {
-            Ok(response) => {
-                let stopping = matches!(response, Response::ShuttingDown);
-                if write_response(&mut writer, &response).is_err() {
-                    break;
-                }
-                if stopping {
-                    return;
-                }
-            }
-            Err(response) => {
-                if write_response(&mut writer, &response).is_err() {
-                    break;
-                }
-            }
+        let stopping_now = matches!(response, Response::ShuttingDown);
+        if respond(state, &mut writer, &response).is_err() || stopping_now {
+            break;
         }
     }
 }
 
-/// Reads one newline-terminated line with a hard incremental byte cap.
-///
-/// Returns `Ok(None)` at clean EOF before any bytes, one line (without the
-/// terminator) when it terminates within `max` bytes, and an error when
-/// the line exceeds `max` before terminating or is not valid UTF-8.
-/// Memory use is bounded by `max` plus one buffer chunk regardless of how
-/// much the peer sends.
-fn read_limited_line(
-    reader: &mut BufReader<UnixStream>,
-    max: usize,
-) -> std::io::Result<Option<String>> {
-    let mut line: Vec<u8> = Vec::with_capacity(256);
-    loop {
-        let available = reader.fill_buf()?;
-        if available.is_empty() {
-            return if line.is_empty() {
-                Ok(None)
-            } else {
-                Err(std::io::Error::other(format!(
-                    "connection closed mid-request after {} bytes",
-                    line.len()
-                )))
-            };
-        }
-        if let Some(terminator) = available.iter().position(|&byte| byte == b'\n') {
-            if line.len() + terminator > max {
-                return Err(std::io::Error::other(format!(
-                    "request exceeds {max} bytes before terminating"
-                )));
-            }
-            line.extend_from_slice(&available[..terminator]);
-            reader.consume(terminator + 1);
-            return String::from_utf8(line)
-                .map(Some)
-                .map_err(|_| std::io::Error::other("request is not valid UTF-8"));
-        }
-        if line.len() + available.len() > max {
-            return Err(std::io::Error::other(format!(
-                "request exceeds {max} bytes before terminating"
-            )));
-        }
-        let chunk = available.len();
-        line.extend_from_slice(available);
-        reader.consume(chunk);
-    }
+/// The refusal returned for work that arrives after a stop.
+fn stopping() -> Refusal {
+    Refusal::new("held", "service is shutting down; no new work is accepted")
 }
 
-/// Authenticates and serves one parsed request; refusals come back as the
-/// `Err` response variant.
-fn serve(state: &ServiceState, request: Request) -> Result<Response, Response> {
+/// Writes one response line with the write timeout.
+fn respond(
+    state: &ServiceState,
+    stream: &mut UnixStream,
+    response: &Response,
+) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(response).map_err(std::io::Error::other)?;
+    write_line(
+        stream,
+        &bytes,
+        Duration::from_millis(state.limits.write_timeout_ms),
+    )
+}
+
+/// Authenticates and serves one parsed request.
+fn serve(state: &ServiceState, request: Request) -> Result<Response, Refusal> {
     match request {
         Request::Publish { token, event } => serve_publish(state, &token, &event),
         Request::Status { token, event_id } => serve_status(state, &token, &event_id),
         Request::Shutdown { token } => {
-            let grant = authenticate(state, &token)?;
-            if !grant.admin {
-                return Err(Response::Error {
-                    class: "forbidden".into(),
-                    detail: "shutdown requires an admin grant".into(),
-                });
-            }
-            state.running.store(false, Ordering::SeqCst);
+            let grant = operator(state, &token)?;
+            state.stop();
             log_event(
                 "info",
                 "shutdown_requested",
-                &[("publisher", &grant.publisher)],
+                &[("operator", &grant.publisher)],
             );
             Ok(Response::ShuttingDown)
+        }
+        Request::Incidents {
+            token,
+            include_closed,
+            limit,
+        } => {
+            operator(state, &token)?;
+            let storage = lock_storage(&state.storage);
+            Ok(Response::Incidents {
+                incidents: storage.incidents(
+                    include_closed,
+                    current_unix_millis(),
+                    listing(limit),
+                )?,
+            })
+        }
+        Request::Holds { token, limit } => {
+            operator(state, &token)?;
+            let storage = lock_storage(&state.storage);
+            Ok(Response::Holds {
+                holds: storage.holds(listing(limit))?,
+            })
+        }
+        Request::AuthorizeRetry {
+            token,
+            publisher,
+            event_id,
+            note,
+        } => {
+            let grant = operator(state, &token)?;
+            mutate(state, |storage| {
+                storage.authorize_manual_retry(
+                    &publisher,
+                    &event_id,
+                    &grant.publisher,
+                    &note,
+                    current_unix_millis(),
+                )
+            })
+        }
+        Request::Dispose {
+            token,
+            publisher,
+            event_id,
+            note,
+        } => {
+            let grant = operator(state, &token)?;
+            mutate(state, |storage| {
+                storage.dispose_event(
+                    &publisher,
+                    &event_id,
+                    &grant.publisher,
+                    &note,
+                    current_unix_millis(),
+                )
+            })
+        }
+        Request::WaivePredecessor {
+            token,
+            publisher,
+            event_id,
+            note,
+        } => {
+            let grant = operator(state, &token)?;
+            mutate(state, |storage| {
+                storage.waive_predecessor(
+                    &publisher,
+                    &event_id,
+                    &grant.publisher,
+                    &note,
+                    current_unix_millis(),
+                )
+            })
+        }
+        Request::Evidence {
+            token,
+            publisher,
+            event_id,
+            attempt_seq,
+            tier,
+            detail,
+        } => {
+            operator(state, &token)?;
+            mutate(state, |storage| {
+                storage
+                    .record_evidence(
+                        &publisher,
+                        &event_id,
+                        attempt_seq,
+                        tier,
+                        &detail,
+                        current_unix_millis(),
+                    )
+                    .map(|_| ())
+            })
+        }
+        Request::Pause {
+            token,
+            recipient,
+            reason,
+        } => {
+            let grant = operator(state, &token)?;
+            mutate(state, |storage| {
+                storage.set_no_wake(
+                    &recipient.to_canonical_string(),
+                    true,
+                    Some(&reason),
+                    &grant.publisher,
+                    current_unix_millis(),
+                )
+            })
+        }
+        Request::Resume { token, recipient } => {
+            let grant = operator(state, &token)?;
+            mutate(state, |storage| {
+                storage.set_no_wake(
+                    &recipient.to_canonical_string(),
+                    false,
+                    None,
+                    &grant.publisher,
+                    current_unix_millis(),
+                )
+            })
         }
     }
 }
 
+/// Bounds a requested listing size.
+fn listing(limit: Option<usize>) -> usize {
+    limit.unwrap_or(100).clamp(1, MAX_LISTING)
+}
+
+/// Runs a storage mutation under the lock after re-checking the stop flag.
+fn mutate(
+    state: &ServiceState,
+    action: impl FnOnce(&mut Storage) -> Result<(), CoreError>,
+) -> Result<Response, Refusal> {
+    let mut storage = lock_storage(&state.storage);
+    if !state.running.load(Ordering::SeqCst) {
+        return Err(stopping());
+    }
+    action(&mut storage)?;
+    Ok(Response::Done)
+}
+
 /// Authenticates a token to its grant; the single entry gate for every
 /// operation, before validation, dedup or any status disclosure.
-fn authenticate<'a>(state: &'a ServiceState, token: &str) -> Result<&'a GrantConfig, Response> {
+///
+/// Every grant is compared in constant time (no early exit on the first
+/// match), so timing reveals neither which grant matched nor how much of a
+/// token was right.
+fn authenticate<'a>(state: &'a ServiceState, token: &str) -> Result<&'a GrantConfig, Refusal> {
+    let mut matched: Option<&GrantConfig> = None;
     for grant in &state.grants {
         if constant_time_eq(token.as_bytes(), grant.token.as_bytes()) {
-            return Ok(grant);
+            matched = Some(grant);
         }
     }
-    log_event("warn", "auth_failed", &[]);
-    Err(Response::Error {
-        class: "auth".into(),
-        detail: "unknown or invalid grant token".into(),
+    matched.ok_or_else(|| {
+        log_event("warn", "auth_failed", &[]);
+        Refusal::new("auth", "unknown or invalid grant token")
     })
+}
+
+/// Authenticates a token and requires an operator grant.
+fn operator<'a>(state: &'a ServiceState, token: &str) -> Result<&'a GrantConfig, Refusal> {
+    let grant = authenticate(state, token)?;
+    if grant.admin {
+        Ok(grant)
+    } else {
+        Err(Refusal::new(
+            "forbidden",
+            "this operation requires an operator grant",
+        ))
+    }
+}
+
+/// Authenticates a token and requires a publisher grant.
+fn publisher<'a>(state: &'a ServiceState, token: &str) -> Result<&'a GrantConfig, Refusal> {
+    let grant = authenticate(state, token)?;
+    if grant.admin {
+        Err(Refusal::new(
+            "forbidden",
+            "operator grants cannot publish or read publisher status",
+        ))
+    } else {
+        Ok(grant)
+    }
 }
 
 /// Publish flow: authenticate, authorize, stamp, validate, admit.
@@ -610,18 +1215,18 @@ fn serve_publish(
     state: &ServiceState,
     token: &str,
     body: &PublishBody,
-) -> Result<Response, Response> {
-    let grant = authenticate(state, token)?;
+) -> Result<Response, Refusal> {
+    let grant = publisher(state, token)?;
 
     let recipient_text = body.recipient.to_canonical_string();
-    let authorize = |allowed: bool, what: &str| -> Result<(), Response> {
+    let authorize = |allowed: bool, what: &str| -> Result<(), Refusal> {
         if allowed {
             Ok(())
         } else {
-            Err(Response::Error {
-                class: "forbidden".into(),
-                detail: format!("grant does not allow {what}"),
-            })
+            Err(Refusal::new(
+                "forbidden",
+                format!("grant does not allow {what}"),
+            ))
         }
     };
     authorize(grant.recipients.contains(&recipient_text), "this recipient")?;
@@ -645,132 +1250,174 @@ fn serve_publish(
     )?;
 
     // Bridge stamps the authenticated publisher; the body never carries one.
-    let publisher = PublisherId::new(grant.publisher.clone()).map_err(invalid)?;
     let envelope = Envelope::new(
-        publisher,
-        EventId::new(body.event_id.clone()).map_err(invalid)?,
+        PublisherId::new(grant.publisher.clone())?,
+        EventId::new(body.event_id.clone())?,
         body.recipient.clone(),
-        Kind::new(body.kind.clone()).map_err(invalid)?,
+        Kind::new(body.kind.clone())?,
         body.mode,
         body.policy.clone(),
-        Payload::new(body.payload.clone()).map_err(invalid)?,
+        Payload::new(body.payload.clone())?,
         body.metadata.clone(),
         body.expires_at,
-    )
-    .map_err(invalid)?;
+    )?;
 
-    let now_ms = current_unix_millis();
-    let mut storage = state
-        .storage
-        .lock()
-        .map_err(|_| internal("storage mutex poisoned"))?;
-    match storage.publish(&envelope, now_ms) {
-        Ok(outcome) => {
-            log_event(
-                "info",
-                "publish",
-                &[
-                    ("publisher", grant.publisher.as_str()),
-                    ("event_id", envelope.event_id.as_str()),
-                    (
-                        "replayed",
-                        if outcome.receipt.replayed {
-                            "true"
-                        } else {
-                            "false"
-                        },
-                    ),
-                ],
-            );
-            Ok(Response::Published {
-                receipt: outcome.receipt,
-            })
-        }
-        Err(error) => Err(error_response(error)),
+    let mut storage = lock_storage(&state.storage);
+    // The stop flag is read under the storage lock: `stop` flips it under
+    // the same lock, so nothing is accepted after a stop has returned.
+    if !state.running.load(Ordering::SeqCst) {
+        return Err(stopping());
     }
+    let outcome = storage.publish(&envelope, current_unix_millis())?;
+    log_event(
+        "info",
+        "publish",
+        &[
+            ("publisher", grant.publisher.as_str()),
+            ("event_id", envelope.event_id.as_str()),
+            (
+                "replayed",
+                if outcome.receipt.replayed {
+                    "true"
+                } else {
+                    "false"
+                },
+            ),
+        ],
+    );
+    Ok(Response::Published {
+        receipt: outcome.receipt,
+    })
 }
 
 /// Status flow: authenticate, then disclose only the caller's own event.
-fn serve_status(state: &ServiceState, token: &str, event_id: &str) -> Result<Response, Response> {
-    let grant = authenticate(state, token)?;
-    let publisher = PublisherId::new(grant.publisher.clone()).map_err(invalid)?;
-    let event = EventId::new(event_id.to_string()).map_err(invalid)?;
-    let storage = state
-        .storage
-        .lock()
-        .map_err(|_| internal("storage mutex poisoned"))?;
-    match storage.lookup(&publisher, &event) {
-        Ok(receipt) => {
-            let delivery = storage
-                .latest_attempt(publisher.as_str(), event.as_str())
-                .map_err(error_response)?
-                .map(|attempt| DeliveryEvidence {
-                    attempt_state: attempt.state.as_str().to_string(),
-                    effective_mode: attempt.effective_mode.as_str().to_string(),
-                    note: attempt.note,
-                });
-            Ok(Response::Status { receipt, delivery })
-        }
-        Err(error) => Err(error_response(error)),
-    }
+fn serve_status(state: &ServiceState, token: &str, event_id: &str) -> Result<Response, Refusal> {
+    let grant = publisher(state, token)?;
+    let publisher_id = PublisherId::new(grant.publisher.clone())?;
+    let event = EventId::new(event_id.to_string())?;
+    let storage = lock_storage(&state.storage);
+    let receipt = storage.lookup(&publisher_id, &event)?;
+    let delivery = storage.delivery_evidence(publisher_id.as_str(), event.as_str())?;
+    Ok(Response::Status {
+        receipt,
+        delivery: delivery.map(Box::new),
+    })
 }
 
-/// Delivery evidence from the newest dispatch attempt, as exposed on the
-/// status surface.
+/// The reconciliation and dispatch loop.
 ///
-/// Tiers are distinct from custody: `native_accepted`, `native_held`,
-/// `hook_submitted`, `known_unsent`, `outcome_unknown`,
-/// `permanent_refusal`, or the pre-handoff `reserved`/`invoking`. Absent
-/// evidence (`None`) means no attempt exists yet — callers must report
-/// not_available, never delivered.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeliveryEvidence {
-    /// Newest attempt's durable state name.
-    pub attempt_state: String,
-    /// Effective mode recorded on that attempt.
-    pub effective_mode: String,
-    /// Evidence/audit note, when one was recorded.
-    pub note: Option<String>,
+/// Once per interval (checked at a fine grain so a stop is prompt): one
+/// bounded maintenance pass, then — when carriers are registered — a
+/// bounded dispatch pass over the recipients with eligible work, oldest
+/// first. Failures are logged and retried next pass; nothing here replays
+/// an uncertain hand-off.
+fn maintenance_loop(state: &ServiceState) {
+    let mut next_pass = Instant::now();
+    while state.running.load(Ordering::SeqCst) {
+        if Instant::now() < next_pass {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        next_pass = Instant::now() + MAINTENANCE_INTERVAL;
+        // A panic in maintenance or in a carrier must not end the recovery
+        // loop: it is logged and the next pass retries.
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| maintenance_pass(state)))
+            .is_err()
+        {
+            log_event("error", "maintenance_panicked", &[]);
+        }
+    }
 }
 
-/// Maps a [`CoreError`] to its wire refusal class.
-fn error_response(error: CoreError) -> Response {
-    let class = match &error {
-        CoreError::InvalidEnvelope(_) => "invalid",
-        CoreError::Conflict { .. } => "conflict",
-        CoreError::Capacity { .. } => "capacity",
-        CoreError::PolicyHold { .. } => "held",
-        CoreError::Fence(_) => "fence",
-        CoreError::Storage(_) => "internal",
+/// One reconciliation pass followed by one dispatch pass.
+fn maintenance_pass(state: &ServiceState) {
+    let report = lock_storage(&state.storage).run_maintenance(current_unix_millis());
+    match report {
+        Ok(report) => {
+            if report.unknown_handoffs + report.overdue_rechecks + report.escalated_holds > 0 {
+                log_event(
+                    "warn",
+                    "maintenance_incidents",
+                    &[
+                        ("unknown_handoffs", &report.unknown_handoffs.to_string()),
+                        ("overdue_rechecks", &report.overdue_rechecks.to_string()),
+                        ("escalated_holds", &report.escalated_holds.to_string()),
+                    ],
+                );
+            }
+        }
+        Err(error) => log_event(
+            "error",
+            "maintenance_failed",
+            &[("error", &error.to_string())],
+        ),
+    }
+    dispatch_pass(state);
+}
+
+/// Drives the registered carriers over recipients with eligible work.
+fn dispatch_pass(state: &ServiceState) {
+    let mut carriers = state
+        .carriers
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if carriers.is_empty() {
+        return;
+    }
+    let recipients = match lock_storage(&state.storage)
+        .recipients_with_work(current_unix_millis(), RECIPIENTS_PER_PASS)
+    {
+        Ok(recipients) => recipients,
+        Err(error) => {
+            log_event(
+                "error",
+                "dispatch_listing_failed",
+                &[("error", &error.to_string())],
+            );
+            return;
+        }
     };
-    Response::Error {
-        class: class.to_string(),
-        detail: error.to_string(),
+    let timing = DispatchTiming::default();
+    for recipient in recipients {
+        if !state.running.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut last_reason = String::from("no carrier is registered for this recipient");
+        let serving = carriers
+            .iter_mut()
+            .find_map(|carrier| match carrier.attest(&recipient) {
+                Ok(_) => Some(carrier),
+                Err(reason) => {
+                    last_reason = reason;
+                    None
+                }
+            });
+        let Some(carrier) = serving else {
+            let reason = format!("no carrier attests this endpoint: {last_reason}");
+            if let Err(error) =
+                lock_storage(&state.storage).record_hold(&recipient, &reason, current_unix_millis())
+            {
+                log_event("error", "hold_failed", &[("error", &error.to_string())]);
+            }
+            continue;
+        };
+        for _ in 0..ATTEMPTS_PER_RECIPIENT {
+            match dispatch_message(
+                &state.storage,
+                carrier.as_mut(),
+                &recipient,
+                &current_unix_millis,
+                &timing,
+            ) {
+                Ok(DispatchReport::Sent { .. }) => {}
+                Ok(DispatchReport::Idle | DispatchReport::Held(_)) => break,
+                Err(error) => {
+                    log_event("error", "dispatch_failed", &[("error", &error.to_string())]);
+                    break;
+                }
+            }
+        }
     }
-}
-
-/// Wraps an invalid-envelope error as a wire response.
-fn invalid(error: CoreError) -> Response {
-    Response::Error {
-        class: "invalid".into(),
-        detail: error.to_string(),
-    }
-}
-
-/// Wraps an internal failure as a wire response.
-fn internal(detail: &str) -> Response {
-    Response::Error {
-        class: "internal".into(),
-        detail: detail.to_string(),
-    }
-}
-
-/// Writes one ndjson response line.
-fn write_response(stream: &mut UnixStream, response: &Response) -> std::io::Result<()> {
-    let mut line = serde_json::to_vec(response).map_err(std::io::Error::other)?;
-    line.push(b'\n');
-    stream.write_all(&line)?;
-    stream.flush()
 }
 
 /// Constant-time byte-slice equality for token comparison.
@@ -791,11 +1438,11 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 /// Current wall clock in Unix epoch milliseconds.
 ///
 /// Single clock source for the service edge; falls back to 0 only before
-/// the Unix epoch, which cannot occur on supported hosts.
-fn current_unix_millis() -> u64 {
+/// the Unix epoch and saturates instead of wrapping far in the future.
+pub fn current_unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|since| since.as_millis() as u64)
+        .map(|since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
 }
 
@@ -814,7 +1461,7 @@ pub fn log_event(level: &str, event: &str, fields: &[(&str, &str)]) {
         object.insert((*key).into(), serde_json::json!(value));
     }
     let mut line = serde_json::to_vec(&serde_json::Value::Object(object))
-        .unwrap_or_else(|_| b"{}\"level\":\"error\",\"event\":\"log_serialize_failed\"}".to_vec());
+        .unwrap_or_else(|_| b"{\"level\":\"error\",\"event\":\"log_serialize_failed\"}".to_vec());
     line.push(b'\n');
     let _ = std::io::stderr().write_all(&line);
 }

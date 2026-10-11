@@ -10,23 +10,33 @@
 //! Module layout:
 //! - [`types`]: canonical address, envelope, policy and expiry types with
 //!   validation and canonical hashing.
-//! - [`storage`]: transactional custody storage with idempotent publication,
-//!   conflict detection, stream watermarks and admission caps.
+//! - [`storage`] and [`schema`]: transactional custody storage with
+//!   idempotent publication, conflict detection, stream watermarks,
+//!   admission caps and forward-only schema migration.
+//! - [`framing`]: source-wrapped, escaped, bounded manifests.
+//! - [`dispatch`]: fenced attempts over a frozen manifest and the carrier
+//!   contract.
+//! - [`recovery`]: evidence tiers, retained incidents, audited operator
+//!   recovery and reconciliation.
+//! - [`service`]: the authenticated local socket service and its lifecycle.
 //!
-//! Boundary note: authentication and authorization of publishers, the IPC
-//! protocol and dispatch state machinery live in later tasks of this Module
-//! and are intentionally absent here. Storage callers pass an
-//! already-authenticated publisher identity.
+//! Boundary note: storage callers pass an already-authenticated publisher
+//! identity; the service authenticates every ingress. Native adapters are
+//! consumers of the [`dispatch`] contract and are not part of this crate.
 
 pub mod dispatch;
 pub mod framing;
+pub mod recovery;
+pub mod schema;
 pub mod service;
 pub mod storage;
 pub mod types;
+pub mod wire;
 
+pub use recovery::DeliveryEvidence;
 pub use service::{
-    Config, DeliveryEvidence, GrantConfig, PublishBody, Request, Response, Running,
-    start as start_service,
+    Config, GrantConfig, PublishBody, Request, Response, Running, start as start_service,
+    start_with_carriers,
 };
 pub use storage::{CustodyReceipt, EventState, Limits, PublishOutcome, Storage};
 pub use types::{
