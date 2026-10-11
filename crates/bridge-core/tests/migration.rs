@@ -11,7 +11,10 @@ mod common;
 
 use bridge_core::dispatch::{DispatchTiming, EffectiveMode, Lifecycle, Selection};
 use bridge_core::recovery::DeliveryState;
-use bridge_core::{CoreError, Envelope, EventState, Limits, Mode, Storage};
+use bridge_core::types::{
+    EventId, Harness, Kind, Metadata, NativeAddress, Payload, PublisherId, StreamId,
+};
+use bridge_core::{CoreError, Envelope, EventState, Limits, Mode, Policy, Storage};
 use common::{TempDir, attest, codex, keep_all, latest, register_tags};
 use rusqlite::{Connection, params};
 
@@ -155,7 +158,7 @@ fn version_two_databases_migrate_without_touching_accepted_bytes_or_identity() {
         .collect();
 
     let mut storage = Storage::open(&path, Limits::new(100)).unwrap();
-    assert_eq!(version(&path), "4");
+    assert_eq!(version(&path), "5");
     let after: Vec<(String, Vec<u8>, String)> = Connection::open(&path)
         .unwrap()
         .prepare("SELECT event_id, envelope_json, envelope_hash FROM events ORDER BY event_id")
@@ -304,7 +307,7 @@ fn version_three_attempts_that_may_have_reached_a_carrier_are_never_redispatched
 #[test]
 fn unknown_versions_and_foreign_files_are_refused_untouched() {
     let dir = TempDir::new("migrate-refuse");
-    for stored in ["1", "5", "garbage"] {
+    for stored in ["1", "6", "garbage"] {
         let path = dir.path(&format!("v{stored}.db"));
         {
             let connection = Connection::open(&path).unwrap();
@@ -444,4 +447,287 @@ fn retained_history_hard_cap_refuses_admission_without_evicting_dedup() {
             .receipt
             .replayed
     );
+}
+
+/// A version 4 database gains the events.lineage_key column and the stream_lineages table:
+/// no stored row changes and lineage fencing works immediately.
+#[test]
+fn version_four_databases_gain_lineages_additively() {
+    let dir = TempDir::new("migrate-v4");
+    let path = dir.path("v4.db");
+    {
+        let storage = Storage::open(&path, Limits::new(10)).unwrap();
+        let connection = &rusqlite::Connection::open(&path).unwrap();
+        drop(storage);
+        connection
+            .execute_batch(
+                "DROP INDEX events_by_lineage;
+                 DROP TABLE stream_lineages;
+                 ALTER TABLE events DROP COLUMN lineage_key;
+                 UPDATE schema_meta SET value = '4' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+    }
+    let mut storage = Storage::open(&path, Limits::new(10)).unwrap();
+    assert_eq!(version(&path), "5");
+    // Lineage fencing is live on the migrated database.
+    let event = Envelope::new(
+        PublisherId::new("agent-run").unwrap(),
+        EventId::new("lin-1").unwrap(),
+        NativeAddress::new("host-1", Harness::Codex, "default", "thread-1").unwrap(),
+        Kind::new("diagnostics.view").unwrap(),
+        Mode::Message,
+        Policy::Latest {
+            stream: StreamId::new("diag").unwrap(),
+            revision: 1,
+        },
+        Payload::new("{}").unwrap(),
+        Metadata::new(),
+        None,
+    )
+    .unwrap();
+    storage.publish(&event, 1_000).unwrap();
+    let mut other = event.clone();
+    other.publisher = PublisherId::new("agent-ide").unwrap();
+    other.event_id = EventId::new("lin-2").unwrap();
+    assert!(matches!(
+        storage.publish(&other, 2_000),
+        Err(CoreError::Fence(_))
+    ));
+}
+
+/// A v4 database with TWO historical producers on one lineage migrates to
+/// an explicit ambiguous fence: every publisher is declined until an
+/// operator resolves the authority; no owner is picked by arrival.
+#[test]
+fn ambiguous_legacy_lineages_fence_every_publisher_until_resolved() {
+    let dir = TempDir::new("migrate-ambig");
+    let path = dir.path("ambig.db");
+    {
+        let mut storage = Storage::open(&path, Limits::new(100)).unwrap();
+        let mut envelope = lineage_event("source-a", "a1", 3);
+        envelope.mode = Mode::Auto;
+        storage.publish(&envelope, 1_000).unwrap();
+        drop(storage);
+        // Emulate true legacy ambiguity: a second historical producer's
+        // watermark and event row exist from before lineage tracking.
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "DROP INDEX events_by_lineage;
+                 DROP TABLE stream_lineages;
+                 ALTER TABLE events DROP COLUMN lineage_key;
+                 UPDATE schema_meta SET value = '4' WHERE key = 'schema_version';
+                 INSERT INTO watermarks
+                     (publisher_id, recipient, kind, mode, project, task, stream_id, revision)
+                 VALUES ('source-b',
+                         'host-1/codex/default/thread-7', 'diagnostics.view', 'auto',
+                         '', '', 'diag', 7);
+                 INSERT INTO events
+                     (publisher_id, event_id, envelope_hash, envelope_json, state,
+                      acceptance_seq, accepted_at_ms, recipient, policy_class, mode,
+                      scope_key, revision)
+                 VALUES ('source-b', 'b1', 'legacy', x'7b7d', 'superseded',
+                         2, 1000, 'host-1/codex/default/thread-7', 'latest', 'auto',
+                         '', 7);",
+            )
+            .unwrap();
+    }
+
+    let mut storage = Storage::open(&path, Limits::new(100)).unwrap();
+    for publisher in ["source-a", "source-b", "source-c"] {
+        let mut envelope = lineage_event(publisher, "late", 99);
+        envelope.mode = Mode::Auto;
+        assert!(
+            matches!(
+                storage.publish(&envelope, 2_000),
+                Err(CoreError::Fence(detail)) if detail.contains("ambiguous")
+            ),
+            "{publisher} must be fenced on the ambiguous lineage"
+        );
+    }
+
+    // An operator resolves the ambiguity; the resolved owner publishes.
+    storage
+        .transfer_lineage(
+            &bridge_core::recovery::LineageScope {
+                recipient: lineage_recipient(),
+                kind: "diagnostics.view".into(),
+                mode: "auto".into(),
+                project: String::new(),
+                task: String::new(),
+                stream: "diag".into(),
+            },
+            "source-c",
+            "operator resolved the ambiguous legacy stream",
+            "bridge-ops",
+            2_500,
+        )
+        .unwrap();
+    let mut resolved = lineage_event("source-c", "resolved-1", 1);
+    resolved.mode = Mode::Auto;
+    storage.publish(&resolved, 3_000).unwrap();
+}
+
+/// A compacted (purged-payload) latest event still backfills its lineage
+/// from the retained watermark and fences a different producer.
+#[test]
+fn purged_latest_events_backfill_lineage_from_watermarks() {
+    let dir = TempDir::new("migrate-purged");
+    let path = dir.path("purged.db");
+    {
+        let mut storage = Storage::open(&path, Limits::new(100)).unwrap();
+        let mut envelope = lineage_event("source-a", "keep-new", 2);
+        envelope.mode = Mode::Auto;
+        storage.publish(&envelope, 1_000).unwrap();
+        let mut old = lineage_event("source-a", "purge-me", 1);
+        old.mode = Mode::Auto;
+        storage.publish(&old, 1_000).unwrap();
+        // Compact the superseded member so its envelope bytes are gone.
+        assert_eq!(storage.compact_payloads(0).unwrap(), 1);
+        drop(storage);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "DROP INDEX events_by_lineage;
+                 DROP TABLE stream_lineages;
+                 ALTER TABLE events DROP COLUMN lineage_key;
+                 UPDATE schema_meta SET value = '4' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+    }
+
+    let mut storage = Storage::open(&path, Limits::new(100)).unwrap();
+    let mut challenger = lineage_event("source-b", "b1", 1);
+    challenger.mode = Mode::Auto;
+    assert!(matches!(
+        storage.publish(&challenger, 2_000),
+        Err(CoreError::Fence(_))
+    ));
+    // The purged event itself keeps its dedup identity and disposition.
+    let replay = storage
+        .publish(&lineage_event("source-a", "purge-me", 1), 2_100)
+        .unwrap();
+    assert!(replay.receipt.replayed);
+}
+
+/// A version 2 database with a legacy latest producer migrates with the
+/// lineage authority backfilled: a different producer is fenced.
+#[test]
+fn version_two_databases_backfill_lineage_authority() {
+    let dir = TempDir::new("migrate-v2-lineage");
+    let path = dir.path("v2l.db");
+    {
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(V2_DDL).unwrap();
+        connection
+            .execute("INSERT INTO schema_meta VALUES ('schema_version', '2')", [])
+            .unwrap();
+        let mut envelope = lineage_event("source-a", "legacy-a", 5);
+        envelope.mode = Mode::Auto;
+        let hash = envelope.envelope_hash().as_str().to_string();
+        let bytes = envelope.canonical_bytes();
+        connection
+            .execute(
+                "INSERT INTO events (publisher_id, event_id, envelope_hash, envelope_json,
+                                     state, acceptance_seq, accepted_at_ms)
+                 VALUES ('source-a', 'legacy-a', ?1, ?2, 'pending', 1, 1000)",
+                rusqlite::params![hash, bytes],
+            )
+            .unwrap();
+    }
+
+    let mut storage = Storage::open(&path, Limits::new(100)).unwrap();
+    let mut challenger = lineage_event("source-b", "b1", 1);
+    challenger.mode = Mode::Auto;
+    assert!(
+        matches!(
+            storage.publish(&challenger, 2_000),
+            Err(CoreError::Fence(_))
+        ),
+        "a v2 legacy producer's stream must not be claimable by a different publisher"
+    );
+}
+
+/// The lineage fixtures of this file: one recipient, one stream.
+fn lineage_recipient() -> String {
+    NativeAddress::new("host-1", Harness::Codex, "default", "thread-7")
+        .unwrap()
+        .to_canonical_string()
+}
+
+/// A latest envelope on the fixture lineage.
+fn lineage_event(publisher: &str, event: &str, revision: u64) -> Envelope {
+    Envelope::new(
+        PublisherId::new(publisher).unwrap(),
+        EventId::new(event).unwrap(),
+        NativeAddress::new("host-1", Harness::Codex, "default", "thread-7").unwrap(),
+        Kind::new("diagnostics.view").unwrap(),
+        Mode::Auto,
+        Policy::Latest {
+            stream: StreamId::new("diag").unwrap(),
+            revision,
+        },
+        Payload::new("{\"view\":\"ok\"}").unwrap(),
+        Metadata::new(),
+        None,
+    )
+    .unwrap()
+}
+
+/// Pending work of an ambiguous migrated lineage is never selected: the
+/// head is held with a retained incident instead of being dispatched, and
+/// its bytes stay untouched.
+#[test]
+fn ambiguous_migrated_pending_work_is_held_not_dispatched() {
+    let dir = TempDir::new("migrate-ambig-pending");
+    let path = dir.path("pending.db");
+    let mut pending = lineage_event("source-a", "a-pending", 3);
+    pending.mode = Mode::Message;
+    {
+        let mut storage = Storage::open(&path, Limits::new(100)).unwrap();
+        storage.publish(&pending, 1_000).unwrap();
+        drop(storage);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "DROP INDEX events_by_lineage;
+                 DROP TABLE stream_lineages;
+                 ALTER TABLE events DROP COLUMN lineage_key;
+                 UPDATE schema_meta SET value = '4' WHERE key = 'schema_version';
+                 INSERT INTO watermarks
+                     (publisher_id, recipient, kind, mode, project, task, stream_id, revision)
+                 VALUES ('source-b',
+                         'host-1/codex/default/thread-7', 'diagnostics.view', 'message',
+                         '', '', 'diag', 7);",
+            )
+            .unwrap();
+    }
+
+    let mut storage = Storage::open(&path, Limits::new(100)).unwrap();
+    storage.register_source_tag("source-a", "source-a").unwrap();
+    let address = NativeAddress::new("host-1", Harness::Codex, "default", "thread-7").unwrap();
+    let attestation = attest(&address, Lifecycle::Inactive, 1);
+    let selection = storage
+        .reserve_next(
+            &attestation,
+            EffectiveMode::Message,
+            2_000,
+            &DispatchTiming::default(),
+        )
+        .unwrap();
+    assert!(matches!(selection, Selection::Idle), "{selection:?}");
+    assert!(
+        storage
+            .open_incidents(2_000, 10)
+            .unwrap()
+            .iter()
+            .any(|incident| incident.event_id == "a-pending"
+                && incident.kind == "lineage_authority_lost")
+    );
+    let row = storage
+        .lookup(&pending.publisher, &pending.event_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.envelope_hash, pending.envelope_hash());
 }

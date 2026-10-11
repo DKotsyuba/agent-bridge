@@ -559,6 +559,7 @@ impl Storage {
             )));
         }
         check_supported(&tx, envelope)?;
+        let lineage_key = lineage_gate(&tx, envelope, now_ms)?;
 
         let state = snapshot_state(&tx, envelope, &hash)?;
         if count(
@@ -582,8 +583,8 @@ impl Storage {
             "INSERT INTO events
                  (publisher_id, event_id, envelope_hash, envelope_json, state,
                   acceptance_seq, accepted_at_ms, expires_at_ms, recipient, policy_class,
-                  mode, scope_key, revision, predecessor)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                  mode, scope_key, revision, predecessor, lineage_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 envelope.publisher.as_str(),
                 envelope.event_id.as_str(),
@@ -599,6 +600,7 @@ impl Storage {
                 scope,
                 revision,
                 predecessor,
+                lineage_key,
             ],
         )?;
 
@@ -878,6 +880,166 @@ fn snapshot_state(
         Some(stored) if stored > revision => Ok(EventState::Superseded),
         _ => Ok(EventState::Pending),
     }
+}
+
+/// Enforces the one-authority producer-lineage rule for `latest` streams.
+///
+/// The lineage key is the coalescing scope *without* the publisher: exact
+/// recipient, kind, requested mode, declared project/task and stream. The
+/// first authenticated publisher to publish into that lineage claims it
+/// durably; every other publisher's `latest` publication is declined
+/// before acceptance with [`CoreError::Fence`] naming the current owner —
+/// there is no implicit multisource interleave and no implicit handover.
+/// Authority passes only through an audited operator transition
+/// ([`Storage::transfer_lineage`]), which never rewrites event ids,
+/// watermarks, attempts or evidence: the old producer's watermark stays,
+/// so its late stale revisions can never revive, and its already-accepted
+/// or uncertain events keep their content and delivery state untouched.
+///
+/// `keep_all` and `batch` events never claim or check lineage; publisher
+/// identity itself is always the Bridge-stamped grant identity, never
+/// caller metadata.
+fn lineage_gate(tx: &Connection, envelope: &Envelope, now_ms: u64) -> Result<String, CoreError> {
+    let Policy::Latest { stream, .. } = &envelope.policy else {
+        return Ok(String::new());
+    };
+    let lineage_key = lineage_key(
+        &envelope.recipient.to_canonical_string(),
+        envelope.kind.as_str(),
+        envelope.mode.as_str(),
+        envelope.metadata.get("project").map_or("", String::as_str),
+        envelope.metadata.get("task").map_or("", String::as_str),
+        stream.as_str(),
+    );
+    let owner: Option<String> = tx
+        .query_row(
+            "SELECT owner FROM stream_lineages WHERE lineage_key = ?1",
+            params![lineage_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match owner {
+        None => {
+            tx.execute(
+                "INSERT INTO stream_lineages (lineage_key, owner, set_ms, note)
+                 VALUES (?1, ?2, ?3, 'claimed by first authenticated publication')",
+                params![lineage_key, envelope.publisher.as_str(), to_sql(now_ms)?],
+            )?;
+            Ok(lineage_key)
+        }
+        Some(owner) if owner == envelope.publisher.as_str() => Ok(lineage_key),
+        Some(owner) if owner.is_empty() => Err(CoreError::Fence(format!(
+            "stream lineage {} has ambiguous historical producers; an operator must \
+             resolve the authority before anyone publishes this stream",
+            redact_lineage(&lineage_key)
+        ))),
+        Some(owner) => Err(CoreError::Fence(format!(
+            "stream lineage {} is owned by {owner}; an audited operator transition is \
+             required before another producer publishes this stream",
+            redact_lineage(&lineage_key)
+        ))),
+    }
+}
+
+/// Builds the lineage key: the coalescing group without the publisher.
+///
+/// Unit-separator joined like [`scope_key`]; injective for the same
+/// reason.
+pub(crate) fn lineage_key(
+    recipient: &str,
+    kind: &str,
+    mode: &str,
+    project: &str,
+    task: &str,
+    stream: &str,
+) -> String {
+    [recipient, kind, mode, project, task, stream].join("\u{1f}")
+}
+
+/// Renders a lineage key for an error without dumping every component.
+fn redact_lineage(key: &str) -> String {
+    key.split('\u{1f}')
+        .next_back()
+        .unwrap_or("stream")
+        .to_string()
+}
+
+/// Reports why an event's dispatch is blocked by current lineage
+/// ownership, if it is.
+///
+/// `None` for events outside lineage tracking (`lineage_key` empty) or
+/// whose publisher still owns its lineage. A `Some(reason)` means the
+/// event must not be selected or invoked now: the publisher lost
+/// authority (audited transfer) or the lineage is an ambiguous migration
+/// record. Already-invoking or delivered attempts are never touched by
+/// this check — possible effects are not recalled.
+pub(crate) fn lineage_block(
+    tx: &Connection,
+    publisher: &str,
+    lineage_key: &str,
+) -> Result<Option<String>, CoreError> {
+    if lineage_key.is_empty() {
+        return Ok(None);
+    }
+    let owner: Option<String> = tx
+        .query_row(
+            "SELECT owner FROM stream_lineages WHERE lineage_key = ?1",
+            params![lineage_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(match owner.as_deref() {
+        None => None,
+        Some(owner) if owner == publisher => None,
+        Some("") => Some(format!(
+            "lineage {} has ambiguous historical producers; an operator must resolve \
+             authority before this event can be dispatched",
+            redact_lineage(lineage_key)
+        )),
+        Some(owner) => Some(format!(
+            "lineage {} is now owned by {owner}; the producer lost authority over this \
+             stream (audited operator resolution required)",
+            redact_lineage(lineage_key)
+        )),
+    })
+}
+
+/// Holds one unhanded latest event whose producer lost lineage authority,
+/// visibly and durably, with a retained incident.
+///
+/// The event's bytes, id, hash and any attempt evidence stay untouched;
+/// only its delivery moves to `held`, so it cannot be silently dropped or
+/// silently dispatched. An operator resolves it with the existing audited
+/// disposition path. Idempotent per event while an open incident exists.
+pub(crate) fn hold_for_lineage(
+    tx: &Connection,
+    publisher: &str,
+    event_id: &str,
+    reason: &str,
+    now_ms: u64,
+) -> Result<(), CoreError> {
+    tx.execute(
+        "UPDATE events SET delivery = 'held'
+         WHERE publisher_id = ?1 AND event_id = ?2
+           AND state = 'pending' AND delivery IN ('unhanded', 'reserved')",
+        params![publisher, event_id],
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO incidents
+             (incident_seq, publisher_id, event_id, kind, reason, state,
+              created_ms, updated_ms, next_check_ms, review_deadline_ms,
+              responsible, resolution)
+         VALUES (
+           (SELECT value FROM counters WHERE name = 'incident_seq') + 1,
+           ?1, ?2, 'lineage_authority_lost', ?3, 'open', ?4, ?4, ?4, ?4 + 3600000,
+           'operator', NULL)",
+        params![publisher, event_id, reason, to_sql(now_ms)?],
+    )?;
+    tx.execute(
+        "UPDATE counters SET value = value + 1 WHERE name = 'incident_seq'",
+        [],
+    )?;
+    Ok(())
 }
 
 /// The coalescing scope key of an envelope, or empty when it never

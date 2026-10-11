@@ -21,7 +21,88 @@ use crate::types::{CoreError, Envelope};
 /// per attempt, adds the per-event delivery state, coalescing scope,
 /// predecessor ordering, evidence, bindings, holds, source tags and the
 /// operator audit log.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
+
+/// Backfills each migrated `latest` event's lineage key.
+///
+/// Intact envelopes are authoritative (their metadata and stream define
+/// the lineage). Compacted events — which by construction are terminal
+/// superseded/expired rows, never dispatchable — fall back to a watermark
+/// join only where exactly one watermark row matches the event's
+/// publisher/recipient/kind/mode tuple; an unmatchable row keeps an empty
+/// key, meaning "lineage unknown": it stays retained and auditable but is
+/// never dispatchable (compacted rows are terminal and never eligible), so an
+/// unknown lineage cannot silently re-enter delivery after a migration.
+fn backfill_event_lineage_keys(tx: &Transaction<'_>) -> Result<(), CoreError> {
+    // The events table stores recipient and mode as columns but not kind;
+    // intact envelopes supply kind, project, task and stream, while
+    // compacted rows fall back to a watermark join on the stored columns
+    // (publisher, recipient, mode) that accepts exactly one matching
+    // watermark row.
+    tx.execute_batch(
+        "UPDATE events SET lineage_key =
+             recipient || char(31)
+             || COALESCE(json_extract(envelope_json, '$.kind'), '')
+             || char(31) || mode || char(31)
+             || COALESCE(json_extract(envelope_json, '$.metadata.project'), '')
+             || char(31) || COALESCE(json_extract(envelope_json, '$.metadata.task'), '')
+             || char(31) || json_extract(envelope_json, '$.policy.Latest.stream')
+         WHERE policy_class = 'latest' AND lineage_key = ''
+           AND CASE WHEN json_valid(envelope_json)
+                    THEN json_extract(envelope_json, '$.policy.Latest.stream') END IS NOT NULL;
+         UPDATE events SET lineage_key = COALESCE((
+             SELECT events.recipient || char(31) || w.kind || char(31) || events.mode
+                    || char(31) || w.project || char(31) || w.task || char(31) || w.stream_id
+             FROM watermarks w
+             WHERE w.publisher_id = events.publisher_id AND w.recipient = events.recipient
+               AND w.mode = events.mode
+               AND (SELECT COUNT(*) FROM watermarks x
+                    WHERE x.publisher_id = events.publisher_id
+                      AND x.recipient = events.recipient AND x.mode = events.mode) = 1
+         ), '')
+         WHERE policy_class = 'latest' AND lineage_key = ''
+           AND CASE WHEN json_valid(envelope_json)
+                    THEN json_extract(envelope_json, '$.policy.Latest.stream') END IS NULL;",
+    )?;
+    Ok(())
+}
+
+/// Backfills stream-lineage authority from durable historical evidence.
+///
+/// Called when a database predates lineage tracking (migrations from
+/// versions 2, 3 and 4). The evidence is the union of the per-event
+/// lineage keys (see [`backfill_event_lineage_keys`]) and the watermark
+/// table, which every `latest` publication wrote and which retention never
+/// evicts: per lineage (the coalescing scope without the publisher)
+/// exactly one distinct historical producer across *both* sources backs
+/// the owner; two or more distinct producers are an ambiguous legacy
+/// stream and are recorded with an empty owner, which fences every new
+/// admission and every pending dispatch until an operator resolves the
+/// authority — an owner is never chosen by arrival time or revision.
+/// Accepted bytes, ids, dedup entries, watermarks, attempts and evidence
+/// are untouched.
+fn backfill_lineages(tx: &Transaction<'_>) -> Result<(), CoreError> {
+    tx.execute_batch(
+        "WITH evidence (lineage_key, publisher_id) AS (
+             SELECT lineage_key, publisher_id FROM events
+             WHERE policy_class = 'latest' AND lineage_key != ''
+             UNION
+             SELECT recipient || char(31) || kind || char(31) || mode || char(31)
+                    || project || char(31) || task || char(31) || stream_id,
+                    publisher_id
+             FROM watermarks
+         )
+         INSERT OR IGNORE INTO stream_lineages (lineage_key, owner, set_ms, note)
+         SELECT lineage_key,
+                CASE WHEN COUNT(*) = 1 THEN MIN(publisher_id) ELSE '' END,
+                0,
+                CASE WHEN COUNT(*) = 1
+                     THEN 'owner backfilled from durable history (unambiguous single producer)'
+                     ELSE 'ambiguous legacy producers; operator resolution required' END
+         FROM evidence GROUP BY lineage_key;",
+    )?;
+    Ok(())
+}
 
 /// Idempotent DDL of the current schema (tables whose shape did not change
 /// between versions use `IF NOT EXISTS`; changed tables are created fresh or
@@ -59,6 +140,7 @@ CREATE TABLE IF NOT EXISTS events (
     attempts_made INTEGER NOT NULL DEFAULT 0,
     not_before_ms INTEGER NOT NULL DEFAULT 0,
     duplicate_risk INTEGER NOT NULL DEFAULT 0,
+    lineage_key TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (publisher_id, event_id)
 );
 CREATE TABLE IF NOT EXISTS watermarks (
@@ -159,6 +241,14 @@ CREATE TABLE IF NOT EXISTS audit (
     event_id TEXT NOT NULL,
     detail TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS stream_lineages (
+    lineage_key TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    set_ms INTEGER NOT NULL,
+    note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS events_by_lineage
+    ON events (lineage_key, policy_class, delivery) WHERE lineage_key != '';
 CREATE INDEX IF NOT EXISTS events_dispatch
     ON events (state, delivery, recipient, policy_class, acceptance_seq);
 CREATE INDEX IF NOT EXISTS events_scope
@@ -220,6 +310,31 @@ pub fn ensure(tx: &Transaction<'_>) -> Result<(), CoreError> {
             tx.execute_batch(CURRENT_DDL)?;
             Ok(())
         }
+        // Version 4 databases lack the additive `events.lineage_key` column
+        // and the stream_lineages table. The column is added before the
+        // idempotent DDL (whose index references it); no stored row is
+        // rewritten except the new key column, which is backfilled from
+        // retained evidence.
+        Some(Ok(4)) => {
+            let has_key: bool = tx.query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('events') WHERE name = 'lineage_key'",
+                [],
+                |row| row.get(0),
+            )?;
+            if !has_key {
+                tx.execute_batch(
+                    "ALTER TABLE events ADD COLUMN lineage_key TEXT NOT NULL DEFAULT '';",
+                )?;
+            }
+            tx.execute_batch(CURRENT_DDL)?;
+            backfill_event_lineage_keys(tx)?;
+            backfill_lineages(tx)?;
+            tx.execute(
+                "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
+                params![SCHEMA_VERSION.to_string()],
+            )?;
+            Ok(())
+        }
         Some(Ok(version @ (2 | 3))) => migrate(tx, version),
         other => Err(corrupt(format!(
             "refusing database with schema version {other:?}; no migration path"
@@ -266,6 +381,7 @@ fn migrate(tx: &Transaction<'_>, from: u32) -> Result<(), CoreError> {
         ("attempts_made", "INTEGER NOT NULL DEFAULT 0"),
         ("not_before_ms", "INTEGER NOT NULL DEFAULT 0"),
         ("duplicate_risk", "INTEGER NOT NULL DEFAULT 0"),
+        ("lineage_key", "TEXT NOT NULL DEFAULT ''"),
     ] {
         tx.execute_batch(&format!(
             "ALTER TABLE events ADD COLUMN {column} {definition};"
@@ -274,6 +390,8 @@ fn migrate(tx: &Transaction<'_>, from: u32) -> Result<(), CoreError> {
     tx.execute_batch("DROP INDEX IF EXISTS events_dispatch;")?;
     tx.execute_batch(CURRENT_DDL)?;
     backfill_events(tx)?;
+    backfill_event_lineage_keys(tx)?;
+    backfill_lineages(tx)?;
     if from == 3 {
         migrate_v3_attempts(tx)?;
     }

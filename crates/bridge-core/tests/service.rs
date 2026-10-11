@@ -435,13 +435,20 @@ fn expiry_flows_through_the_service() {
 
     let mut client = bridge_client::BridgeClient::connect(&socket).unwrap();
     let mut expiring = body("evt-exp");
-    expiring.expires_at = Some(ExpiresAt::from_unix_millis(1_000).unwrap());
+    // Keep the event unexpired while the real service runs; advance the
+    // explicit test clock only after it stops, avoiding maintenance races.
+    let expires_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 60_000;
+    expiring.expires_at = Some(ExpiresAt::from_unix_millis(expires_ms).unwrap());
     client.publish(GRANT_TOKEN, &expiring).unwrap();
     running.shutdown();
     running.join();
 
     let storage = Storage::open(dir.path("bridge.db"), Limits::new(100)).unwrap();
-    assert_eq!(storage.expire_due(2_000).unwrap(), 1);
+    assert_eq!(storage.expire_due(expires_ms + 1).unwrap(), 1);
     let row = storage
         .lookup(
             &PublisherId::new("agent-run").unwrap(),

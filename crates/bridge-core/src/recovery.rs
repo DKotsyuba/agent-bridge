@@ -17,7 +17,9 @@ use crate::dispatch::{
     AttemptState, EffectiveMode, Outcome, apply_outcome, load_attempt, release_reservation,
 };
 use crate::storage::{Storage, bump_counter, corrupt, count, delivery, from_sql, to_sql};
-use crate::types::{CoreError, Mode, NativeAddress};
+use crate::types::{
+    CoreError, Kind, Metadata, Mode, NativeAddress, PublisherId, StreamId, validate_metadata,
+};
 
 /// How long a new incident waits for review before it is overdue.
 const REVIEW_WINDOW_MS: u64 = 3_600_000;
@@ -583,6 +585,45 @@ pub(crate) fn record_evidence_row(
         ],
     )?;
     Ok(inserted == 1)
+}
+
+/// Identifies one stream lineage: the coalescing scope without the
+/// publisher.
+///
+/// `recipient` is the canonical address text; `project` and `task` are
+/// the declared scope values, empty when none. Two publishers publishing
+/// `latest` snapshots into the same [`LineageScope`] are in one lineage:
+/// the first authenticated producer owns it and any other is declined
+/// until an audited [`Storage::transfer_lineage`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineageScope {
+    /// Canonical recipient address text.
+    pub recipient: String,
+    /// Event kind.
+    pub kind: String,
+    /// Requested delivery mode name.
+    pub mode: String,
+    /// Declared project scope, empty when none.
+    pub project: String,
+    /// Declared task scope, empty when none.
+    pub task: String,
+    /// The authoritative stream id.
+    pub stream: String,
+}
+
+/// One operator audit row, newest first, for verification surfaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditEntry {
+    /// Who performed the action (operator publisher id).
+    pub actor: String,
+    /// What was done (pause, resume, transfer_lineage, ...).
+    pub action: String,
+    /// Publisher the action concerns, when applicable.
+    pub publisher_id: String,
+    /// Event the action concerns, when applicable.
+    pub event_id: String,
+    /// The audited detail; never a credential.
+    pub detail: String,
 }
 
 /// Appends an operator audit row.
@@ -1234,6 +1275,181 @@ impl Storage {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Reads the most recent audit rows, newest first.
+    ///
+    /// Bounded by `limit`; intended for operator/test verification of
+    /// audited transitions. Details never contain credentials.
+    pub fn audit_entries(&self, limit: usize) -> Result<Vec<AuditEntry>, CoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT actor, action, publisher_id, event_id, detail FROM audit
+             ORDER BY audit_seq DESC LIMIT ?1",
+        )?;
+        let rows = statement
+            .query_map(params![to_sql(limit as u64)?], |row| {
+                Ok(AuditEntry {
+                    actor: row.get(0)?,
+                    action: row.get(1)?,
+                    publisher_id: row.get(2)?,
+                    event_id: row.get(3)?,
+                    detail: row.get(4)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Transfers a stream lineage's authoritative producer, audited.
+    ///
+    /// The lineage is [`LineageScope`] — the coalescing scope without the
+    /// publisher. Every scope field is validated with the same domain rules
+    /// publication uses ([`NativeAddress::parse`], [`Kind::new`],
+    /// [`Mode::parse`], [`StreamId::new`] and the project/task metadata
+    /// rules), and the lineage key is built from the *canonical* forms, so
+    /// a differently spelled but equivalent recipient addresses the same
+    /// lineage and no separator or control byte can alias another one.
+    ///
+    /// The transfer records the new owner with the operator's note and
+    /// nothing else: event ids, both producers' watermarks, attempts and
+    /// evidence stay exactly as they are. Other producers' still unhanded
+    /// or reserved `latest` events in the lineage are held visibly (with a
+    /// retained `lineage_authority_lost` incident) so they are never
+    /// selected or invoked afterwards, and their further `latest`
+    /// publications are declined. The new owner starts its own monotonic
+    /// revisions without inheriting or resetting anyone's watermark. A
+    /// lineage no producer claimed yet may be pre-declared the same way,
+    /// and an ambiguous migrated lineage (empty owner) is resolved by it.
+    ///
+    /// A possible or unknown native effect cannot be recalled. The
+    /// handover is therefore refused with [`CoreError::Fence`], changing
+    /// nothing, while any other producer's event in the lineage is
+    /// `invoking`, in `review`, or held by the native side. Closed historical
+    /// lineage incidents do not exempt a new native hold from this fence.
+    /// The operator first resolves each one with the audited disposition
+    /// (`dispose_event`) or retry authorization, then repeats the transfer.
+    ///
+    /// Returns the previous owner (empty for an ambiguous legacy lineage),
+    /// or `None` when the lineage had none.
+    pub fn transfer_lineage(
+        &mut self,
+        scope: &LineageScope,
+        new_owner: &str,
+        note: &str,
+        operator: &str,
+        now_ms: u64,
+    ) -> Result<Option<String>, CoreError> {
+        let recipient = NativeAddress::parse(&scope.recipient)?.to_canonical_string();
+        PublisherId::new(new_owner.to_string())?;
+        let kind = Kind::new(scope.kind.to_string())?;
+        let mode = Mode::parse(&scope.mode)?;
+        let stream = StreamId::new(scope.stream.to_string())?;
+        // Project and task follow exactly the publication metadata rules,
+        // so a scope cannot smuggle separator or control bytes into a
+        // lineage key or target a different lineage through a collision.
+        let mut scope_metadata = Metadata::new();
+        if !scope.project.is_empty() {
+            scope_metadata.insert("project".to_string(), scope.project.clone());
+        }
+        if !scope.task.is_empty() {
+            scope_metadata.insert("task".to_string(), scope.task.clone());
+        }
+        validate_metadata(&scope_metadata)?;
+        operator_text("operator", operator)?;
+        operator_text("note", note)?;
+        let lineage_key = crate::storage::lineage_key(
+            &recipient,
+            kind.as_str(),
+            mode.as_str(),
+            &scope.project,
+            &scope.task,
+            stream.as_str(),
+        );
+        let tx = self.begin()?;
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT owner FROM stream_lineages WHERE lineage_key = ?1",
+                params![lineage_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let handover = previous.as_deref() != Some(new_owner);
+        if handover {
+            let unresolved: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT e.publisher_id, e.event_id FROM events e
+                     WHERE e.lineage_key = ?1 AND e.policy_class = 'latest'
+                       AND e.publisher_id != ?2
+                       AND (e.delivery IN ('invoking', 'review')
+                            OR (e.delivery = 'held' AND NOT EXISTS (
+                                SELECT 1 FROM incidents i
+                                WHERE i.publisher_id = e.publisher_id
+                                  AND i.event_id = e.event_id
+                                  AND i.kind = 'lineage_authority_lost'
+                                  AND i.state = 'open')))
+                     ORDER BY e.acceptance_seq LIMIT 1",
+                    params![lineage_key, new_owner],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((publisher, event_id)) = unresolved {
+                return Err(CoreError::Fence(format!(
+                    "event {publisher}/{event_id} in this lineage has a possible or unknown \
+                     native effect that cannot be recalled; dispose or resolve it with an \
+                     audited operator decision before handing the stream to {new_owner}"
+                )));
+            }
+        }
+        tx.execute(
+            "INSERT INTO stream_lineages (lineage_key, owner, set_ms, note)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (lineage_key) DO UPDATE
+               SET owner = excluded.owner, set_ms = excluded.set_ms, note = excluded.note",
+            params![lineage_key, new_owner, to_sql(now_ms)?, note],
+        )?;
+        // Other producers' still-unhanded `latest` work in this lineage is
+        // held visibly: bytes and any attempt evidence stay, but stale
+        // snapshots of a transferred stream are never selected or invoked
+        // afterwards. The unsafe states were refused above, so nothing
+        // already handed off is touched.
+        if handover {
+            let mut statement = tx.prepare(
+                "SELECT publisher_id, event_id FROM events
+                 WHERE lineage_key = ?1 AND policy_class = 'latest'
+                   AND publisher_id != ?2
+                   AND state = 'pending' AND delivery IN ('unhanded', 'reserved')",
+            )?;
+            let stale: Vec<(String, String)> = statement
+                .query_map(params![lineage_key, new_owner], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?
+                .collect::<Result<_, _>>()?;
+            drop(statement);
+            for (publisher, event_id) in stale {
+                crate::storage::hold_for_lineage(
+                    &tx,
+                    &publisher,
+                    &event_id,
+                    &format!("lineage authority transferred to {new_owner}: {note}"),
+                    now_ms,
+                )?;
+            }
+        }
+        audit(
+            &tx,
+            now_ms,
+            operator,
+            "transfer_lineage",
+            new_owner,
+            "",
+            &format!(
+                "lineage {} -> {new_owner} (previously {}): {note}",
+                stream.as_str(),
+                previous.as_deref().unwrap_or("none")
+            ),
+        )?;
+        tx.commit()?;
+        Ok(previous)
     }
 
     /// Sets or clears the durable no-wake policy for one recipient.

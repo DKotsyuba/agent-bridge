@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use crate::dispatch::{
     DispatchCarrier, DispatchReport, DispatchTiming, dispatch_message, lock_storage,
 };
-use crate::recovery::{DeliveryState, EvidenceTier, HoldView, IncidentView};
+use crate::recovery::{DeliveryState, EvidenceTier, HoldView, IncidentView, LineageScope};
 use crate::storage::{CustodyReceipt, Limits, Storage};
 use crate::types::{
     CoreError, Envelope, EventId, ExpiresAt, Kind, Metadata, Mode, NativeAddress, Payload, Policy,
@@ -359,6 +359,36 @@ pub enum Request {
         tier: EvidenceTier,
         /// The observed fact.
         detail: String,
+    },
+    /// Transfer a stream lineage's authoritative producer (audited).
+    ///
+    /// Operator grants only. The lineage is the coalescing scope without
+    /// the publisher (exact recipient, kind, mode, declared project/task,
+    /// stream); the previous owner is fenced from further `latest`
+    /// publications into it, and neither producer's watermarks, event ids,
+    /// attempts nor evidence are rewritten. Refused while another
+    /// producer's event in the lineage has a possible or unknown native
+    /// effect (invoking, review or natively held): resolve it first.
+    TransferLineage {
+        /// Operator-grant bearer token.
+        token: Token,
+        /// Exact recipient address of the lineage.
+        recipient: NativeAddress,
+        /// Event kind of the lineage.
+        kind: String,
+        /// Requested delivery mode of the lineage.
+        mode: String,
+        /// Declared project scope (empty string when none).
+        project: String,
+        /// Declared task scope (empty string when none).
+        task: String,
+        /// The authoritative stream.
+        stream: String,
+        /// The publisher taking authority (validated, Bridge-stamped
+        /// thereafter; never taken from event metadata).
+        new_publisher: String,
+        /// Audit note: why the handover is acceptable.
+        note: String,
     },
     /// Set the durable no-wake policy for a recipient.
     Pause {
@@ -1175,6 +1205,36 @@ fn serve(state: &ServiceState, request: Request) -> Result<Response, Refusal> {
                         current_unix_millis(),
                     )
                     .map(|_| ())
+            })
+        }
+        Request::TransferLineage {
+            token,
+            recipient,
+            kind,
+            mode,
+            project,
+            task,
+            stream,
+            new_publisher,
+            note,
+        } => {
+            let grant = operator(state, &token)?;
+            mutate(state, |storage| {
+                storage.transfer_lineage(
+                    &LineageScope {
+                        recipient: recipient.to_canonical_string(),
+                        kind,
+                        mode,
+                        project,
+                        task,
+                        stream,
+                    },
+                    &new_publisher,
+                    &note,
+                    &grant.publisher,
+                    current_unix_millis(),
+                )?;
+                Ok(())
             })
         }
         Request::Pause {
