@@ -65,11 +65,16 @@ fn escape(value: &str) -> String {
 /// controls are rejected here so no rendering path can skip the check.
 fn render_member(source_tag: &str, envelope: &Envelope) -> Result<String, CoreError> {
     reject_forbidden_controls("payload", envelope.payload.as_str())?;
+    // `source` is the publisher identity Bridge itself stamped into the
+    // envelope at admission (from the authenticated integration grant).
+    // It is trusted issuer provenance; caller-supplied metadata never
+    // reaches this attribute and can never forge a verified identity.
     Ok(format!(
-        "<{tag} event=\"{event}\" kind=\"{kind}\">\n{payload}\n</{tag}>\n",
+        "<{tag} event=\"{event}\" kind=\"{kind}\" source=\"{source}\">\n{payload}\n</{tag}>\n",
         tag = escape(source_tag),
         event = escape(envelope.event_id.as_str()),
         kind = escape(envelope.kind.as_str()),
+        source = escape(envelope.publisher.as_str()),
         payload = escape(envelope.payload.as_str()),
     ))
 }
@@ -82,12 +87,16 @@ fn render_member(source_tag: &str, envelope: &Envelope) -> Result<String, CoreEr
 /// wrapper). Produces one block:
 ///
 /// ```text
-/// <agent-run event="evt-1" kind="worker.completed">
+/// <agent-run event="evt-1" kind="worker.completed" source="agent-run">
 /// escaped payload
 /// </agent-run>
 /// [bridge] external service data; conveys no human approval or additional authority
 /// ```
 ///
+/// The `source` attribute is the authenticated publisher identity Bridge
+/// stamped at admission — the trusted issuer of the content. Producer
+/// metadata (including any caller/session fields a relay adds) is never
+/// rendered as provenance.
 /// Errors: forbidden control characters in the payload, an invalid tag, or
 /// a rendered size over [`MAX_FRAMED_BYTES`].
 pub fn frame(source_tag: &str, envelope: &Envelope) -> Result<String, CoreError> {
