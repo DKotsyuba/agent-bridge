@@ -15,9 +15,13 @@
 //! about the recipient's activity, so it is never used as lifecycle.
 //!
 //! Outcome classification is conservative: a failure before the
-//! `thread/queue/add` line was written is known-unsent; a native error
-//! response refuses positively; silence, EOF or a timeout after the write
-//! is an unknown outcome that is retained and never resent.
+//! `thread/queue/add` line was written is known-unsent. After the write,
+//! only a schema-valid success naming the same `clientUserMessageId` in its
+//! `queuedSubmission` is native acceptance. Every native error response is
+//! an unknown outcome: no error code or message of the loaded build is
+//! qualified as proof that nothing was queued (a generic internal error can
+//! follow a queue effect). Silence, EOF, a timeout or a malformed success
+//! are unknown too. Unknown outcomes are retained and never resent.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -30,7 +34,7 @@ use bridge_core::dispatch::{AttemptRecord, Attestation, DispatchCarrier, Outcome
 use bridge_core::{Harness, NativeAddress};
 use serde_json::{Value, json};
 
-use crate::registry::{RecipientBinding, Registry};
+use crate::registry::{RecipientBinding, Registry, prefix_within};
 use crate::server::lock_registry;
 
 /// macOS Seatbelt policy of the helper: everything the stock App Server
@@ -109,7 +113,7 @@ impl DispatchCarrier for CodexQueueCarrier {
         let client_id = format!(
             "agent-bridge-{}-{}",
             attempt.fence.attempt_seq,
-            &attempt.fence.manifest_hash[..16.min(attempt.fence.manifest_hash.len())]
+            prefix_within(&attempt.fence.manifest_hash, 16)
         );
         let helper = Helper {
             sandbox: &self.sandbox,
@@ -118,6 +122,55 @@ impl DispatchCarrier for CodexQueueCarrier {
             timeout: self.timeout,
         };
         helper.queue_add(&address.native_session_id, &client_id, &attempt.manifest)
+    }
+}
+
+/// Classifies the native answer to a written `thread/queue/add`.
+///
+/// Only a success whose `queuedSubmission.clientUserMessageId` is
+/// `client_id` is [`Outcome::NativeAccepted`] (with the native submission
+/// id as evidence). A native error, a malformed success or no answer is
+/// [`Outcome::OutcomeUnknown`]: the write happened, and no error of the
+/// loaded build is qualified as proof of no queue effect.
+pub fn classify_add(response: Option<&Value>, client_id: &str) -> Outcome {
+    let bounded = |value: &Value| -> String {
+        let text: String = value
+            .to_string()
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect();
+        prefix_within(&text, 300).to_string()
+    };
+    let Some(response) = response else {
+        return Outcome::OutcomeUnknown {
+            reason: "thread/queue/add written without a native response".into(),
+        };
+    };
+    if let Some(error) = response.get("error") {
+        return Outcome::OutcomeUnknown {
+            reason: format!(
+                "native thread/queue/add error after the write, not qualified as no-acceptance: {}",
+                bounded(error)
+            ),
+        };
+    }
+    let submission = &response["result"]["queuedSubmission"];
+    match (
+        submission["clientUserMessageId"].as_str(),
+        submission["id"].as_str(),
+    ) {
+        (Some(echoed), Some(id)) if echoed == client_id => Outcome::NativeAccepted {
+            evidence: format!(
+                "native thread/queue/add accepted clientUserMessageId {client_id} as queued submission {} (queue storage, not delivery)",
+                bounded(&Value::String(id.to_string()))
+            ),
+        },
+        _ => Outcome::OutcomeUnknown {
+            reason: format!(
+                "thread/queue/add success without a matching queuedSubmission: {}",
+                bounded(&response["result"])
+            ),
+        },
     }
 }
 
@@ -334,27 +387,72 @@ impl Helper<'_> {
         };
         let response = running.response(id, deadline);
         drop(running);
-        match response {
-            Some(value) if value.get("result").is_some() => Outcome::NativeAccepted {
-                evidence: format!(
-                    "native thread/queue/add accepted clientUserMessageId {client_id} (queue storage, not delivery)"
+        classify_add(response.as_ref(), client_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Classification of native `thread/queue/add` answers.
+
+    use super::*;
+
+    /// Only a correlated `queuedSubmission` is acceptance; every native
+    /// error (validation-like or internal) and a malformed success stay
+    /// unknown, never known-unsent.
+    #[test]
+    fn only_correlated_success_is_acceptance() {
+        let ok = json!({"id": 3, "result": {"queuedSubmission": {"id": "q-1", "clientUserMessageId": "c-1", "input": []}}});
+        assert!(matches!(
+            classify_add(Some(&ok), "c-1"),
+            Outcome::NativeAccepted { .. }
+        ));
+        assert!(matches!(
+            classify_add(Some(&ok), "c-2"),
+            Outcome::OutcomeUnknown { .. }
+        ));
+        for answer in [
+            json!({"id": 3, "error": {"code": -32603, "message": "failed to read thread: invalid thread-store request: no rollout found"}}),
+            json!({"id": 3, "error": {"code": -32600, "message": "thread archived"}}),
+            json!({"id": 3, "result": {}}),
+        ] {
+            assert!(
+                matches!(
+                    classify_add(Some(&answer), "c-1"),
+                    Outcome::OutcomeUnknown { .. }
                 ),
-            },
-            Some(value) => {
-                let error = value
-                    .get("error")
-                    .cloned()
-                    .unwrap_or(Value::Null)
-                    .to_string();
-                let mut error: String = error.chars().filter(|c| !c.is_control()).collect();
-                error.truncate(300);
-                Outcome::KnownUnsent {
-                    evidence: format!("native thread/queue/add refused: {error}"),
+                "{answer}"
+            );
+        }
+        assert!(matches!(
+            classify_add(None, "c-1"),
+            Outcome::OutcomeUnknown { .. }
+        ));
+    }
+
+    /// Native text with multi-byte characters across the 300-byte bound
+    /// (an error message, a malformed success) is cut on a character
+    /// boundary, never panics, and stays unknown.
+    #[test]
+    fn unicode_native_text_is_bounded_without_panic() {
+        // Each "é" is two bytes and each emoji four, so byte 300 falls inside
+        // a character for some prefix length below.
+        for pad in 0..4 {
+            let message = format!("{}{}", "a".repeat(pad), "é🙂".repeat(120));
+            let error = json!({"id": 3, "error": {"code": -32603, "message": message}});
+            let malformed = json!({"id": 3, "result": {"note": message}});
+            for answer in [error, malformed] {
+                match classify_add(Some(&answer), "c-1") {
+                    Outcome::OutcomeUnknown { reason } => assert!(reason.len() < 300 + 120),
+                    other => panic!("{other:?}"),
                 }
             }
-            None => Outcome::OutcomeUnknown {
-                reason: "thread/queue/add written without a native response".into(),
-            },
         }
+        let submission = format!("q-{}", "🙂".repeat(100));
+        let ok = json!({"id": 3, "result": {"queuedSubmission": {"id": submission, "clientUserMessageId": "c-1", "input": []}}});
+        assert!(matches!(
+            classify_add(Some(&ok), "c-1"),
+            Outcome::NativeAccepted { .. }
+        ));
     }
 }

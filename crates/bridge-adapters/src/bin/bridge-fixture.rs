@@ -32,18 +32,25 @@
 //!   the result. The harness `mcp` command takes `"seal": true`.
 //! - `bridge-fixture relay <socket>` with a sealed proof on stdin: redeems
 //!   it as a relay and prints the result.
-//! - `bridge-fixture publish <core> <token> <recipient> <mode> <event>
-//!   <payload>` and `bridge-fixture status <core> <token> <event>`: one
-//!   publisher request to the core socket (synthetic probe grant), printing
-//!   the response. `bridge-fixture pause <core> <admin-token> <recipient>
-//!   on|off` sets or clears the no-wake policy (synthetic operator grant).
-//! - `bridge-fixture mcp-server <channel> <core> <token> <evidence>`: a
+//! - `bridge-fixture publish <core> <token-file> <recipient> <mode> <event>
+//!   <payload>` and `bridge-fixture status <core> <token-file> <event>`:
+//!   one publisher request to the core socket (synthetic probe grant),
+//!   printing the response. `bridge-fixture pause <core> <admin-token-file>
+//!   <recipient> on|off` sets or clears the no-wake policy (synthetic
+//!   operator grant). Every `*-token-file` is an owned 0600 file; tokens
+//!   never appear in argv.
+//! - `bridge-fixture queue-add <sandbox> <codex> <store> <thread>
+//!   <client-id> <text-file>`: one product `Helper::queue_add`, printing
+//!   its classified outcome (root-run Codex queue qualification).
+//! - `bridge-fixture mcp-server <channel> <core> <token-file> <evidence>`: a
 //!   minimal MCP stdio server with one `bridge_probe` tool for root-run
 //!   native probes (see `qualification/`).
 //! - `bridge-fixture app-server ...`: a fake Codex App Server speaking the
 //!   queue-only subset; records `thread/queue/add` params to
 //!   `$CODEX_HOME/queue.jsonl`. `$CODEX_HOME/behavior` = `refuse` answers
-//!   an error, `silent` never answers the add, `flood` also streams
+//!   an error, `internal` records the item then answers an internal error,
+//!   `malformed` answers a success without `queuedSubmission`, `silent` never
+//!   answers the add, `flood` also streams
 //!   notifications forever after `initialize`, and `stall` stops reading
 //!   stdin after `initialize`. On `initialize` it probes
 //!   its own confinement (TCP connect to the port in
@@ -410,8 +417,29 @@ fn app_server() {
                             json!({"id": id, "error": {"code": -32600, "message": "thread archived"}})
                         );
                     }
-                    _ => {
+                    // The item is already recorded: an internal error after a
+                    // queue effect.
+                    "internal" => {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            json!({"id": id, "error": {"code": -32603, "message": "internal error"}})
+                        );
+                    }
+                    "malformed" => {
                         let _ = writeln!(stdout, "{}", json!({"id": id, "result": {}}));
+                    }
+                    _ => {
+                        let submission = json!({
+                            "id": format!("q-{id}"),
+                            "clientUserMessageId": message["params"]["clientUserMessageId"],
+                            "input": message["params"]["input"],
+                        });
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            json!({"id": id, "result": {"queuedSubmission": submission}})
+                        );
                     }
                 }
             }
@@ -625,6 +653,67 @@ fn mcp_server(channel: &str, core: &str, token: &str, evidence: &str) {
     }
 }
 
+/// Reads a synthetic grant token from an owned credential file.
+///
+/// The file must be a regular file (not a symlink) owned by this user with
+/// no group or other permission bits, at most 4 KiB; its trimmed content is
+/// the token. Anything else exits with status 5 and a message that never
+/// contains file content. Tokens are never taken from argv.
+fn credential(path: &str) -> String {
+    use std::os::unix::fs::MetadataExt;
+    let own = bridge_adapters::os::process_facts(std::process::id()).and_then(|facts| facts.uid);
+    let usable = std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.is_file()
+            && Some(metadata.uid()) == own
+            && metadata.mode() & 0o077 == 0
+            && metadata.len() <= 4096
+    });
+    let token = usable
+        .then(|| std::fs::read_to_string(path).ok())
+        .flatten()
+        .map(|text| text.trim().to_string())
+        .filter(|token| !token.is_empty());
+    match token {
+        Some(token) => token,
+        None => {
+            eprintln!("credential file refused: must be an owned 0600 regular file");
+            std::process::exit(5);
+        }
+    }
+}
+
+/// Runs the product's confined Codex helper once and prints its outcome.
+fn queue_add(
+    sandbox: &str,
+    codex: &str,
+    store: &str,
+    thread: &str,
+    client_id: &str,
+    text_file: &str,
+) {
+    let text = std::fs::read_to_string(text_file).unwrap_or_default();
+    let helper = bridge_adapters::codex::Helper {
+        sandbox: Path::new(sandbox),
+        executable: Path::new(codex),
+        store: Path::new(store),
+        timeout: Duration::from_secs(30),
+    };
+    let outcome = helper.queue_add(thread, client_id, &text);
+    let (kind, detail) = match &outcome {
+        bridge_core::dispatch::Outcome::NativeAccepted { evidence } => {
+            ("native_accepted", evidence.clone())
+        }
+        bridge_core::dispatch::Outcome::KnownUnsent { evidence } => {
+            ("known_unsent", evidence.clone())
+        }
+        bridge_core::dispatch::Outcome::OutcomeUnknown { reason } => {
+            ("outcome_unknown", reason.clone())
+        }
+        other => ("other", format!("{other:?}")),
+    };
+    println!("{}", json!({"outcome": kind, "detail": detail}));
+}
+
 /// Mode dispatch.
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -637,17 +726,34 @@ fn main() {
         Some("publish") if args.len() == 8 => {
             println!(
                 "{}",
-                publish(&args[2], &args[3], &args[4], &args[5], &args[6], &args[7])
+                publish(
+                    &args[2],
+                    &credential(&args[3]),
+                    &args[4],
+                    &args[5],
+                    &args[6],
+                    &args[7]
+                )
             );
         }
-        Some("status") if args.len() == 5 => println!("{}", status(&args[2], &args[3], &args[4])),
-        Some("pause") if args.len() == 6 => {
-            println!("{}", pause(&args[2], &args[3], &args[4], args[5] == "on"));
+        Some("status") if args.len() == 5 => {
+            println!("{}", status(&args[2], &credential(&args[3]), &args[4]));
         }
-        Some("mcp-server") if args.len() == 6 => mcp_server(&args[2], &args[3], &args[4], &args[5]),
+        Some("pause") if args.len() == 6 => {
+            println!(
+                "{}",
+                pause(&args[2], &credential(&args[3]), &args[4], args[5] == "on")
+            );
+        }
+        Some("mcp-server") if args.len() == 6 => {
+            mcp_server(&args[2], &args[3], &credential(&args[4]), &args[5]);
+        }
+        Some("queue-add") if args.len() == 8 => {
+            queue_add(&args[2], &args[3], &args[4], &args[5], &args[6], &args[7]);
+        }
         _ => {
             eprintln!(
-                "usage: bridge-fixture harness | mcp <socket> | relay <socket> | app-server | publish <core> <token> <recipient> <mode> <event> <payload> | status <core> <token> <event> | pause <core> <admin-token> <recipient> on|off | mcp-server <channel> <core> <token> <evidence>"
+                "usage: bridge-fixture harness | mcp <socket> | relay <socket> | app-server | publish <core> <token-file> <recipient> <mode> <event> <payload> | status <core> <token-file> <event> | pause <core> <admin-token-file> <recipient> on|off | mcp-server <channel> <core> <token-file> <evidence> | queue-add <sandbox> <codex> <store> <thread> <client-id> <text-file>"
             );
             std::process::exit(2);
         }

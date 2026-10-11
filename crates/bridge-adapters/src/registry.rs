@@ -770,11 +770,27 @@ fn checked_id(value: &str, field: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
-/// Bounded single-line proof reference text.
+/// The longest prefix of `text` that is at most `max_bytes` bytes long and
+/// ends on a UTF-8 character boundary.
+///
+/// Never splits a multi-byte character and never panics, whatever the
+/// input (configured labels, native error text, stored hashes); a shorter
+/// text is returned whole.
+pub(crate) fn prefix_within(text: &str, max_bytes: usize) -> &str {
+    let mut end = text.len().min(max_bytes);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Bounded single-line proof reference text: control characters removed,
+/// then at most 256 bytes cut on a character boundary (the input includes
+/// the operator-configured version label, which may be any UTF-8), so the
+/// result always satisfies core's proof reference bound and never panics.
 fn proof(text: String) -> String {
-    let mut text: String = text.chars().filter(|c| !c.is_control()).collect();
-    text.truncate(256);
-    text
+    let text: String = text.chars().filter(|c| !c.is_control()).collect();
+    prefix_within(&text, 256).to_string()
 }
 
 impl Registry {

@@ -15,10 +15,14 @@
 //! killed and reaped on every path (including panics), and each session
 //! has one total time budget that notifications cannot extend.
 //!
-//! What a pass shows: the loaded build accepts a queue-only
-//! `thread/queue/add` for an unloaded thread of the attested store (native
-//! queue storage, `NativeAccepted`). It does not show model delivery,
-//! context, GUI consumption, lifecycle or caller identity.
+//! What a pass shows: against the loaded build, the product helper never
+//! classifies a native error after its write as known-unsent (unpersisted
+//! owned thread, missing thread), and any acceptance is backed by a native
+//! queue readback. Positive queue acceptance needs a thread with a
+//! persisted rollout, which a model-less owner cannot create on
+//! 0.162.0-alpha.17.2; that case runs inside the bounded Codex model probe
+//! (`qualification/codex-native-probe.cjs`, phase 3). Nothing here shows
+//! model delivery, context, GUI consumption, lifecycle or caller identity.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -136,8 +140,8 @@ fn session(exe: &Path, home: &Path, requests: &[(&str, Value)]) -> Vec<Value> {
     responses
 }
 
-/// Real Codex: the confined helper queues to an unloaded owned thread and a
-/// missing thread refuses.
+/// Real Codex: native errors after the helper's write are never
+/// known-unsent, and any acceptance is backed by a native readback.
 #[test]
 #[ignore = "needs a provisioned real Codex build (BRIDGE_QUALIFY_CODEX_EXE)"]
 fn real_codex_queue_only_helper_adds_to_an_unloaded_owned_thread() {
@@ -166,37 +170,43 @@ fn real_codex_queue_only_helper_adds_to_an_unloaded_owned_thread() {
         store: &home.0,
         timeout: Duration::from_secs(20),
     };
-    let outcome = helper.queue_add(&thread, "agent-bridge-qual-1", "AGENT_BRIDGE_QUAL_MARKER");
-    println!("qualify: queue_add outcome {outcome:?}");
+    // A model-less owned thread has no persisted rollout on this build
+    // (root run on 0210a732: native -32603 "no rollout found"). Whatever the
+    // native answer, it must never be classified as known-unsent: an error
+    // after the write is unknown.
+    let unpersisted = helper.queue_add(&thread, "agent-bridge-qual-1", "AGENT_BRIDGE_QUAL_MARKER");
+    println!("qualify: unpersisted-thread outcome {unpersisted:?}");
     assert!(
-        matches!(outcome, Outcome::NativeAccepted { .. }),
-        "{outcome:?}"
+        !matches!(unpersisted, Outcome::KnownUnsent { .. }),
+        "{unpersisted:?}"
     );
+    if matches!(unpersisted, Outcome::NativeAccepted { .. }) {
+        // Acceptance must be backed by a native readback of the same item.
+        let reader = session(
+            &exe,
+            &home.0,
+            &[
+                ("initialize", init.clone()),
+                ("thread/queue/list", json!({"threadId": thread})),
+            ],
+        );
+        let items = reader[1]["result"]["data"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        println!("qualify: queue/list items {}", items.len());
+        assert!(
+            items
+                .iter()
+                .any(|item| item["clientUserMessageId"] == "agent-bridge-qual-1"
+                    && item.to_string().contains("AGENT_BRIDGE_QUAL_MARKER")),
+            "{}",
+            reader[1]
+        );
+    }
 
-    // Reader: the queue holds exactly the helper's item with its text.
-    let reader = session(
-        &exe,
-        &home.0,
-        &[
-            ("initialize", init.clone()),
-            ("thread/queue/list", json!({"threadId": thread})),
-        ],
-    );
-    let items = reader[1]["result"]["data"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    println!("qualify: queue/list items {}", items.len());
-    assert!(
-        items
-            .iter()
-            .any(|item| item["clientUserMessageId"] == "agent-bridge-qual-1"
-                && item.to_string().contains("AGENT_BRIDGE_QUAL_MARKER")),
-        "{}",
-        reader[1]
-    );
-
-    // A thread that does not exist in the store is refused natively.
+    // A thread that does not exist in the store: an error answer is never
+    // known-unsent or accepted.
     let missing = helper.queue_add(
         "00000000-0000-7000-8000-000000000000",
         "agent-bridge-qual-2",
@@ -204,7 +214,7 @@ fn real_codex_queue_only_helper_adds_to_an_unloaded_owned_thread() {
     );
     println!("qualify: missing-thread outcome {missing:?}");
     assert!(
-        matches!(missing, Outcome::KnownUnsent { .. }),
+        matches!(missing, Outcome::OutcomeUnknown { .. }),
         "{missing:?}"
     );
 }

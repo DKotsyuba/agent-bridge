@@ -73,8 +73,12 @@ Codex / Claude qualification is **not** established (see the end).
   budget bounds the exchange: a watchdog kills the helper at the deadline
   (unblocking a stalled write), notifications never extend it, and the helper
   is always killed and reaped. Failure
-  before the add is written is known-unsent; a native error is a positive
-  refusal; silence after the write is unknown. Queue acceptance is storage,
+  before the add is written is known-unsent. After the write, only a success
+  whose `queuedSubmission` echoes the same `clientUserMessageId` is
+  acceptance; every native error (including validation-like and generic
+  internal errors, which can follow a queue effect), a malformed success and
+  silence are unknown. No error of the loaded build is qualified as proof of
+  no queue effect. Queue acceptance is storage,
   not delivery; `clientUserMessageId` never deduplicates. Without the launcher
   the Codex message capability is never granted (publication refuses before
   acceptance).
@@ -148,15 +152,47 @@ Build first: `cargo +1.98.1 build --offline -p bridge-adapters --bins`.
 
 | Probe | Model | Command | Passing evidence |
 |---|---|---|---|
-| Codex queue helper | no | `BRIDGE_QUALIFY_CODEX_EXE=<codex> cargo +1.98.1 test --offline -p bridge-adapters --test qualify_codex -- --ignored --nocapture` | `NativeAccepted` for an unloaded owned thread, queue/list shows the item and text, missing thread `KnownUnsent` |
-| Claude hooks, caller, inject, `later`, pause | yes (haiku, 0.5 USD cap) | `node qualification/claude-native-probe.cjs` | `checks.json`: root/child attested from real `toolUseId`, the hook-injected marker quoted by the model, a message marker answered in a distinct unprompted turn, no turn while paused and one after resume; `daemon_events` shows whether real receipts were verifiable |
-| Codex hooks, caller (callId = tool_use_id), inject, child thread | yes | `node qualification/codex-native-probe.cjs` | `checks.json`: root join succeeded (proves the callId/tool_use_id equality for that build), marker in the reply, child attested on its own thread address |
+| Q1 Codex helper classification | no | `BRIDGE_QUALIFY_CODEX_EXE=<codex> cargo +1.98.1 test --offline -p bridge-adapters --test qualify_codex -- --ignored --nocapture` | conservative classification only: native errors after the write (model-less unpersisted thread, missing thread) are never known-unsent; any acceptance has a native readback. Not positive queue qualification |
+| Q2 Claude hooks, caller, inject, `later`, pause | haiku, low, 0.5 USD cap | `node qualification/claude-native-probe.cjs` | `checks.json` with no failures: root/child attested from the real `toolUseId`, the hook-injected marker quoted while the planted project-memory canary is absent, a message answered in a distinct unprompted turn, pause applied with the paused event held (no attempt, no-wake hold reason) and no turn while the receiver was alive with budget, then a distinct turn after resume; `daemon_events` shows whether real receipts were verifiable |
+| Q3 Codex gate only | no | `CODEX_PROBE_GATE_ONLY=1 node qualification/codex-native-probe.cjs` | `hooks_isolated: true` (ends with `gate_only_run` by design) |
+| Q3 Codex hooks, caller, inject, child, queue | gpt-6-luna, low | `node qualification/codex-native-probe.cjs` | `checks.json` with no failures: model in the build catalog, hooks isolated, root join succeeded (shows callId = tool_use_id for that build), marker in the reply, child attested on its own thread, the helper's correlated `native_accepted` with native readback on the persisted thread, and the probe's own queue item removed and verified gone |
 
-All probes use fresh owned Bridge state, a new session/thread, a daemon grant
-naming only it, the probe MCP server (`bridge-fixture mcp-server`, which
-attests from `_meta` only and never returns the marker in the tool result),
-and terminate their children. They show what the named build did once; they
-are not release qualification.
+Shared lifecycle (`qualification/probe-lib.cjs`): one absolute total budget
+(a local command is refused once it is spent); a lifecycle fence refuses any
+new process once cleanup starts, except a registered cleanup action's own
+marked process; every child in its own process
+group, its stderr descriptor closed in the parent; cleanup runs registered
+cleanup actions (own fixed allowance), then SIGTERM, bounded grace, SIGKILL,
+and waits for each child to exit *and* its stdout to end before ending its
+log (`unreaped:` / `unclosed:` failures otherwise); an orphan sweep by
+private-directory/session markers; synthetic grant tokens only in 0600 files
+(never argv), redacted from any evidence file and from the written result,
+which records `secret_in_*` failures. A required check that is missing or
+not exactly `true` is a failure. `node qualification/probe-lib.cjs
+--self-test` exercises all of this without any model and passes only on its
+exact expected failure set.
+
+Isolation: Q2 uses `--setting-sources ''`, `--restricted`, `--no-chrome`,
+`--permission-prompts none`, `--strict-mcp-config`, its own settings/agent,
+and the installed build's memory switches (`CLAUDE_CODE_DISABLE_CLAUDE_MDS`,
+`CLAUDE_CODE_DISABLE_AUTO_MEMORY`, `CLAUDE_CODE_DISABLE_ORG_MEMORY`), checked
+by the canary; `--bare` is not used because it disables OAuth. Q3 runs its
+isolation gate before the first model call: a confined App Server lists the
+hooks Codex would load, every foreign enabled hook is disabled and the
+probe's own hooks are trusted by their listed hash, all in one per-launch
+whole-map override `-c hooks.state={"<key>"={...},...}` (hook keys contain
+dots, so per-leaf dotted `-c` paths are split and ignored by 0.162.0-alpha.17.2,
+as the root's gate run on the previous candidate showed). A second listing
+must confirm it and the build must report no ignored setting; otherwise the
+probe stops with `isolation_unavailable`. No trust bypass, no coexistence
+override, nothing persisted. Gate-only runs on this candidate (no model,
+no network, no child processes) showed all 7 user hooks disabled and the 5
+probe hooks enabled and trusted, with `~/.codex` files unmodified; the
+model phases themselves have not run. All probes use fresh owned Bridge state, a new
+session/thread, a daemon grant naming only it, and the probe MCP server
+(`bridge-fixture mcp-server`, which attests from `_meta` only and never
+returns the marker in the tool result). The probes show what the named build
+did once; they are not release qualification.
 
 ## Not yet established
 
@@ -173,6 +209,10 @@ are not release qualification.
   design and those hand-offs rely on transcript closure or the overdue
   incident; that would make held-release unsupported, never silently
   accepted.
-- The Codex helper has not been run against the real App Server here (see
-  the gated test); Linux has no confinement launcher, so Codex message is
-  unsupported there.
+- Codex queue acceptance on a real build is not established. The root's Q1
+  run on Codex 0.162.0-alpha.17.2 (source 0210a732) got native -32603 "no
+  rollout found" for a model-less owned thread: a thread needs a persisted
+  rollout, so positive acceptance is checked in Q3 phase 3. That error is
+  a plausible pre-effect failure but is not qualified as no-acceptance, so
+  it is classified unknown. Linux has no confinement launcher, so Codex
+  message is unsupported there.

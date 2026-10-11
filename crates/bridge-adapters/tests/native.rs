@@ -666,19 +666,28 @@ fn codex_queue_helper_is_confined_and_classifies_outcomes() {
         json!({"network_connected": true, "child_spawned": true})
     );
 
-    codex_setup(&lab, "refuse", port);
-    lab.publish("evt-q2", &address, Mode::Message, "refused payload");
-    let report = dispatch_message(&lab.storage, &mut carrier, &address, &now, &timing).unwrap();
-    assert!(
-        matches!(
-            report,
-            DispatchReport::Sent {
-                state: AttemptState::KnownUnsent,
-                ..
-            }
-        ),
-        "{report:?}"
-    );
+    // Native errors after the write (validation-like or internal after a
+    // queue effect) and a success without a correlated submission are all
+    // unknown: retained, never known-unsent, never retried.
+    for (event, behavior) in [
+        ("evt-q2", "refuse"),
+        ("evt-q2i", "internal"),
+        ("evt-q2m", "malformed"),
+    ] {
+        codex_setup(&lab, behavior, port);
+        lab.publish(event, &address, Mode::Message, "refused payload");
+        let report = dispatch_message(&lab.storage, &mut carrier, &address, &now, &timing).unwrap();
+        assert!(
+            matches!(
+                report,
+                DispatchReport::Sent {
+                    state: AttemptState::OutcomeUnknown,
+                    ..
+                }
+            ),
+            "{behavior}: {report:?}"
+        );
+    }
 
     codex_setup(&lab, "silent", port);
     let mut slow = CodexQueueCarrier::new(
@@ -687,7 +696,6 @@ fn codex_queue_helper_is_confined_and_classifies_outcomes() {
         Duration::from_secs(2),
     );
     lab.publish("evt-q3", &address, Mode::Message, "silent payload");
-    // evt-q2 waits for its retry delay; evt-q3 is the next attempt.
     let report = dispatch_message(&lab.storage, &mut slow, &address, &now, &timing).unwrap();
     assert!(
         matches!(
@@ -981,6 +989,13 @@ fn daemon_composition_hands_probe_context_to_the_root_hook() {
     let core = dir.0.join("core.sock");
     let evidence = dir.0.join("probe.jsonl");
     let token = "probe-token-0123456789abcdef";
+    let token_file = dir.0.join("publisher.token");
+    std::fs::write(&token_file, token).unwrap();
+    std::fs::set_permissions(
+        &token_file,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
     let address =
         bridge_core::NativeAddress::new(HOST, Harness::ClaudeCode, "claude-lab", "sess-d").unwrap();
     let sha = bridge_adapters::registry::file_sha256(&fixture_exe()).unwrap();
@@ -1044,7 +1059,7 @@ message = true
     );
     let reply = harness.cmd(json!({
         "cmd": "mcp_server",
-        "args": [channel, core, token, evidence],
+        "args": [channel, core, token_file, evidence],
         "requests": [
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
             {"jsonrpc": "2.0", "method": "notifications/initialized"},
@@ -1082,15 +1097,128 @@ message = true
     assert!(post["stdout"].as_str().unwrap().contains(&marker), "{post}");
     let event = record["event_id"].as_str().unwrap();
     let status = std::process::Command::new(fixture_exe())
-        .args(["status", core.to_str().unwrap(), token, event])
+        .args([
+            "status",
+            core.to_str().unwrap(),
+            token_file.to_str().unwrap(),
+            event,
+        ])
         .output()
         .unwrap();
     let status = String::from_utf8_lossy(&status.stdout).to_string();
     assert!(status.contains("Status"), "{status}");
+    // A token file readable by group or others is refused before any request.
+    std::fs::set_permissions(
+        &token_file,
+        std::os::unix::fs::PermissionsExt::from_mode(0o644),
+    )
+    .unwrap();
+    let refused = std::process::Command::new(fixture_exe())
+        .args([
+            "status",
+            core.to_str().unwrap(),
+            token_file.to_str().unwrap(),
+            event,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(5));
+    assert!(refused.stdout.is_empty());
     harness.stop();
     std::process::Command::new("kill")
         .args(["-TERM", &daemon.id().to_string()])
         .status()
         .unwrap();
     assert!(daemon.wait().unwrap().success());
+}
+
+/// Runs one root drain under a profile whose version label is `label` and
+/// returns the drained attempt's frozen proof reference. Panics (fails the
+/// test) if the registry panics: the hook then gets no answer.
+fn drain_proof_with_label(label: &str) -> String {
+    let dir = TempDir::new("vl");
+    let store = dir.0.join("s");
+    std::fs::create_dir(&store).unwrap();
+    let channel_dir = dir.0.join("ch");
+    let owner = bridge_adapters::server::private_directory(&channel_dir).unwrap();
+    let socket = channel_dir.join("c.sock");
+    let sha = bridge_adapters::registry::file_sha256(&fixture_exe()).unwrap();
+    let mut profile = profile("claude-lab", Harness::ClaudeCode, &store, &sha);
+    profile.executables[0].version = label.to_string();
+    let config = bridge_adapters::registry::RegistryConfig {
+        host_id: HOST.into(),
+        profiles: vec![profile],
+        intermediates: ["/bin/sh", "/bin/bash", "/bin/zsh", "/bin/dash"]
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect(),
+        max_call_age_ms: 600_000,
+        relays: Vec::new(),
+    };
+    let registry = Arc::new(std::sync::Mutex::new(
+        bridge_adapters::Registry::new(config, owner).unwrap(),
+    ));
+    let limits = serde_json::from_value(json!({"max_admitted_events": 10})).unwrap();
+    let mut storage = bridge_core::Storage::open_in_memory(limits).unwrap();
+    storage.register_source_tag(PUBLISHER, PUBLISHER).unwrap();
+    let storage = Arc::new(std::sync::Mutex::new(storage));
+    let _channel = bridge_adapters::ChannelServer::start(
+        &socket,
+        Arc::clone(&registry),
+        Arc::clone(&storage) as Arc<dyn Custody>,
+        DispatchTiming::default(),
+    )
+    .unwrap();
+    let mut harness = Harnessed::start(Harness::ClaudeCode, &store);
+    let start = harness.hook(&socket, Harness::ClaudeCode, hook("SessionStart", "sess-v"));
+    assert_eq!(start["stderr"], "", "{start}");
+    let address =
+        bridge_core::NativeAddress::new(HOST, Harness::ClaudeCode, "claude-lab", "sess-v").unwrap();
+    let envelope = bridge_core::Envelope::new(
+        bridge_core::PublisherId::new(PUBLISHER).unwrap(),
+        bridge_core::EventId::new("evt-label").unwrap(),
+        address,
+        bridge_core::Kind::new("worker.completed").unwrap(),
+        Mode::Inject,
+        bridge_core::Policy::KeepAll,
+        bridge_core::Payload::new("label payload").unwrap(),
+        bridge_core::Metadata::new(),
+        None,
+    )
+    .unwrap();
+    storage.lock().unwrap().publish(&envelope, now()).unwrap();
+    let post = harness.hook(
+        &socket,
+        Harness::ClaudeCode,
+        tool_hook("PostToolUse", "sess-v", "tu-v", None),
+    );
+    harness.stop();
+    assert!(
+        post["stdout"].as_str().unwrap().contains("label payload"),
+        "{post}"
+    );
+    storage
+        .lock()
+        .unwrap()
+        .latest_attempt(PUBLISHER, "evt-label")
+        .unwrap()
+        .unwrap()
+        .proof_ref
+}
+
+/// A configured version label of any UTF-8 never panics the registry: an
+/// emoji-only label longer than the 256-byte proof bound, at four
+/// paddings, puts byte 256 inside a 4-byte character for at least one of
+/// them whatever the PID/start-time digits; every hook is admitted, the
+/// root drain hands the manifest, and the frozen proof reference stays
+/// within core's bound, cut on a character boundary.
+#[test]
+fn multibyte_version_label_is_bounded_in_proof_references() {
+    for pad in 0..4 {
+        let label = format!("{}{}", "x".repeat(pad), "🙂".repeat(80));
+        assert!(label.len() > 256);
+        let proof = drain_proof_with_label(&label);
+        assert!(proof.len() <= 256, "{}", proof.len());
+        assert!(proof.contains("🙂"), "{proof}");
+    }
 }
