@@ -591,6 +591,9 @@ fn class(result: &Value) -> String {
     }
 }
 
+/// The root tools over a real core and adapter carry the attested caller, refuse
+/// replayed, missing, mixed and subagent calls, and keep `bridge_send` bounded,
+/// allowlisted, idempotent and custody-only until the recipient hook drains it.
 #[test]
 fn root_tools_compose_with_core_and_adapter_attestation() {
     let lab = lab("c");
@@ -811,6 +814,8 @@ fn root_tools_compose_with_core_and_adapter_attestation() {
     drop(harness);
 }
 
+/// A hook reply that never arrives leaves the native tier unknown and a manual
+/// incident, and the payload is never resent.
 #[test]
 fn lost_hook_reply_stays_a_manual_incident_without_resend() {
     let lab = lab("u");
@@ -941,6 +946,8 @@ fn lost_hook_reply_stays_a_manual_incident_without_resend() {
     drop(harness);
 }
 
+/// Equal session ids in different native stores are distinct callers: neither
+/// replays nor sees the other's events.
 #[test]
 fn equal_session_ids_in_two_stores_never_share_events() {
     let lab = lab("n");
@@ -1018,6 +1025,8 @@ fn equal_session_ids_in_two_stores_never_share_events() {
     drop((first, second));
 }
 
+/// A relay whose attestor yields no evidence answers `caller_unattested` and
+/// forwards nothing.
 #[test]
 fn relay_without_a_provider_fails_closed() {
     let dir = scratch("n");

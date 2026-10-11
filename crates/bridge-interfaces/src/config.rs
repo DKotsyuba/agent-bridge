@@ -481,6 +481,8 @@ kinds = ["root.note"]
         )
     }
 
+    /// The schema is closed (unknown keys fail), and a plain-http or
+    /// relative-path setting fails validation.
     #[test]
     fn closed_schema_and_rules() {
         let config: InterfacesConfig = toml::from_str(&sample("")).unwrap();
@@ -506,6 +508,8 @@ kinds = ["root.note"]
         }
     }
 
+    /// Only the exact official Telegram origin, a bounded timeout, a numeric or
+    /// `@name` chat id and bounded notify attempts validate.
     #[test]
     fn only_the_official_origin_and_bounded_deadlines_are_accepted() {
         telegram().check().unwrap();
@@ -556,6 +560,8 @@ kinds = ["root.note"]
         }
     }
 
+    /// Parse failures name a line but never echo configuration values, so a
+    /// misplaced secret is not leaked.
     #[test]
     fn parser_errors_never_quote_values() {
         let scratch = crate::testdir::TestDir::new("cfgerr");
@@ -572,6 +578,8 @@ kinds = ["root.note"]
         }
     }
 
+    /// A caller policy matches only its own host, harness, store namespace and
+    /// session.
     #[test]
     fn caller_scope_matches_exactly() {
         let config: InterfacesConfig = toml::from_str(&sample("")).unwrap();
@@ -584,6 +592,8 @@ kinds = ["root.note"]
         assert!(!policy.matches(&other_harness));
     }
 
+    /// A secret file must be a private regular file (no group/other bits, no
+    /// symlink), is trimmed, and its content is never echoed in errors.
     #[test]
     fn secrets_must_be_private_regular_files() {
         let scratch = crate::testdir::TestDir::new("secret");

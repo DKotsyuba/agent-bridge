@@ -507,6 +507,8 @@ mod tests {
         (outcome, handle.join().unwrap())
     }
 
+    /// A successful provider answer is reported only as acceptance, with the
+    /// message id, over the fixed request shape.
     #[test]
     fn provider_acceptance_is_only_acceptance() {
         let (outcome, request) = exchange(Stub::Answer(
@@ -525,6 +527,8 @@ mod tests {
         assert_eq!(body, json!({"chat_id": "4242", "text": "incident #1"}));
     }
 
+    /// Client errors are known refusals (with the rate-limit delay), while server
+    /// errors and `ok:false` on success are possible sends.
     #[test]
     fn refusals_rate_limits_and_server_errors_are_classified() {
         let (refused, _) = exchange(Stub::Answer(
@@ -555,6 +559,8 @@ mod tests {
         assert!(matches!(odd, SendOutcome::PossibleSend { .. }));
     }
 
+    /// Provider text echoing the token in any form is redacted from the outcome
+    /// detail.
     #[test]
     fn provider_echo_of_the_token_never_reaches_the_outcome() {
         let secret = TOKEN.split_once(':').unwrap().1;
@@ -602,6 +608,7 @@ mod tests {
         }
     }
 
+    /// Transport diagnostics never expose the token.
     #[test]
     fn transport_diagnostics_are_redacted() {
         let dir = TestDir::new("tgecho");
@@ -612,6 +619,7 @@ mod tests {
         }
     }
 
+    /// A closed connection or no answer after the request is a possible send.
     #[test]
     fn lost_and_silent_answers_are_possible_sends() {
         let (lost, _) = exchange(Stub::Close);
@@ -623,6 +631,8 @@ mod tests {
         );
     }
 
+    /// If the request configuration is only partly delivered to curl, the request
+    /// may still go out, so the outcome is a possible send.
     #[test]
     fn partial_config_delivery_is_a_possible_send() {
         let dir = TestDir::new("tgpart");
@@ -643,6 +653,8 @@ mod tests {
         );
     }
 
+    /// A refused connection is known-unsent, and invalid configuration never
+    /// reaches the transport.
     #[test]
     fn refused_connection_and_invalid_config_are_known_unsent_before_effect() {
         let dir = TestDir::new("tgunsent");
@@ -698,6 +710,8 @@ mod tests {
         assert_eq!(never.0.get(), 0, "no request for invalid configuration");
     }
 
+    /// The curl arguments carry neither the token nor the bot path, and pin the
+    /// https-only protocol with default config disabled.
     #[test]
     fn the_token_never_reaches_argv() {
         let args = CurlTransport::default().args(Duration::from_secs(5));

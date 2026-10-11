@@ -321,6 +321,8 @@ mod tests {
         }
     }
 
+    /// A tool call without host call metadata is refused as `caller_not_evidence`
+    /// before any sealing.
     #[test]
     fn missing_meta_refuses_without_sealing() {
         let answer = run(
@@ -334,6 +336,8 @@ mod tests {
         );
     }
 
+    /// A sealer refusal is returned as a tool error carrying its class
+    /// (`caller_duplicate`).
     #[test]
     fn attestation_refusal_is_reported_with_its_class() {
         let answer = run(
@@ -346,6 +350,9 @@ mod tests {
         );
     }
 
+    /// Tools outside the fixed list (acknowledge, retry, admin, counts, transfer,
+    /// incident listing), unknown parameters and unknown methods are refused
+    /// before attestation.
     #[test]
     fn unknown_tools_params_and_methods_are_refused() {
         // No acknowledgement, retry, reset, enumeration or admin tool
@@ -393,6 +400,8 @@ mod tests {
         );
     }
 
+    /// An over-long input line is refused and skipped, and the next request is
+    /// still served.
     #[test]
     fn oversize_lines_are_refused_and_skipped() {
         let mut input = Vec::new();

@@ -112,6 +112,8 @@ fn running(exe: &Path) -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
+/// Concurrent starts are serialized to one daemon, and stop signals exactly that
+/// daemon.
 #[test]
 fn parallel_starts_are_serialized_and_stop_is_exact() {
     let fixture = fixture();
@@ -155,6 +157,8 @@ fn parallel_starts_are_serialized_and_stop_is_exact() {
     assert!(!stop(&fixture.home, &fixture.state, Component::Relay).unwrap());
 }
 
+/// A socket held by another process refuses start, is left in place and no record
+/// is written.
 #[test]
 fn a_foreign_endpoint_is_never_taken_for_ours() {
     let fixture = fixture();
@@ -177,6 +181,8 @@ fn a_foreign_endpoint_is_never_taken_for_ours() {
     drop(foreign);
 }
 
+/// If the pid record cannot be written, start fails and the spawned daemon is
+/// stopped.
 #[test]
 fn a_record_write_failure_stops_the_spawned_child() {
     let fixture = fixture();
@@ -200,6 +206,8 @@ fn a_record_write_failure_stops_the_spawned_child() {
     assert!(!fixture.state.join("relay.pid").exists());
 }
 
+/// A record naming a live process that is not the managed daemon is kept, and
+/// stop signals nothing.
 #[test]
 fn a_forged_record_is_preserved_and_nothing_is_signalled() {
     let fixture = fixture();
@@ -224,6 +232,7 @@ fn a_forged_record_is_preserved_and_nothing_is_signalled() {
     let _ = &fixture.scratch;
 }
 
+/// Start is refused while the install state disagrees with the active release.
 #[test]
 fn an_interrupted_activation_is_never_started() {
     let fixture = fixture();
@@ -261,6 +270,8 @@ fn pid_file(fixture: &Fixture, bytes: &[u8], mode: u32) -> PathBuf {
     path
 }
 
+/// Record files that are group/other readable, malformed or foreign are never
+/// overwritten, signalled or read as not running.
 #[test]
 fn untrusted_pid_records_are_preserved_and_refuse_start_and_stop() {
     let fixture = fixture();
@@ -309,6 +320,7 @@ fn untrusted_pid_records_are_preserved_and_refuse_start_and_stop() {
     }
 }
 
+/// A valid private record of a dead managed daemon is replaced by a fresh start.
 #[test]
 fn a_valid_dead_record_of_ours_is_replaced() {
     let fixture = fixture();
@@ -336,6 +348,8 @@ fn a_valid_dead_record_of_ours_is_replaced() {
     assert!(!running(&fixture.exe));
 }
 
+/// A group/other-writable state directory refuses start and stop and keeps its
+/// mode.
 #[test]
 fn a_group_or_world_writable_state_directory_is_refused_unchanged() {
     let fixture = fixture();

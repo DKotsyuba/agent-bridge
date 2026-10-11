@@ -768,6 +768,8 @@ mod tests {
         (out, hex(&Sha256::digest(sums.as_bytes())))
     }
 
+    /// A bundle verifies only against its attested digest; changed bytes and
+    /// extra files are refused.
     #[test]
     fn tampered_or_unattested_bundles_are_refused() {
         let scratch = TestDir::new("itamper");
@@ -782,6 +784,9 @@ mod tests {
         assert!(verify_bundle(&extra, None).is_err(), "extra file refused");
     }
 
+    /// Install, no-op reinstall, upgrade and rollback work; an unattested digest,
+    /// a same-id different-content bundle and a core-schema downgrade are
+    /// refused.
     #[test]
     fn install_activate_rollback_and_refusals() {
         let scratch = TestDir::new("icycle");
@@ -824,6 +829,8 @@ mod tests {
         assert!(error.contains("downgrade"), "{error}");
     }
 
+    /// A pre-existing foreign launcher file refuses the install and is left
+    /// unchanged with no release activated.
     #[test]
     fn foreign_launcher_files_are_preserved() {
         let scratch = TestDir::new("iforeign");
@@ -840,6 +847,8 @@ mod tests {
         assert!(std::fs::symlink_metadata(dir.join("home/current")).is_err());
     }
 
+    /// A non-empty home the installer does not own refuses install and rollback
+    /// and gains no entries.
     #[test]
     fn a_foreign_nonempty_home_is_refused_untouched() {
         let scratch = TestDir::new("ihome");
@@ -867,6 +876,8 @@ mod tests {
         current_link(home).unwrap()
     }
 
+    /// After an interrupted switch the schema floor is already recorded; rollback
+    /// completes the recorded activation and then refuses to go below the floor.
     #[test]
     fn an_interrupted_activation_keeps_the_floor_and_is_completed_not_downgraded() {
         let scratch = TestDir::new("iint");
@@ -892,6 +903,8 @@ mod tests {
         assert_eq!(load_state(&home).unwrap().max_core_schema, 5);
     }
 
+    /// Repeating an interrupted install completes it as a reuse and keeps the
+    /// previous release for rollback.
     #[test]
     fn retrying_an_interrupted_install_completes_it() {
         let scratch = TestDir::new("iretry");
@@ -909,6 +922,8 @@ mod tests {
         assert_eq!(rollback(&home).unwrap().current, "0.1.0+a");
     }
 
+    /// State naming a path outside the home, or a release link that is not a
+    /// directory, is refused without changing the active release.
     #[test]
     fn escaping_or_mismatched_state_is_refused() {
         let scratch = TestDir::new("istate");

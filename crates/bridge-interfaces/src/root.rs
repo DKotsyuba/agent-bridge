@@ -794,6 +794,7 @@ mod tests {
 
     use super::*;
 
+    /// Request ids must be non-empty, plain and at most 128 bytes.
     #[test]
     fn request_ids_are_bounded_and_plain() {
         assert!(check_request_id("req-1.a:b_c").is_ok());
@@ -802,6 +803,8 @@ mod tests {
         assert!(check_request_id(&"x".repeat(129)).is_err());
     }
 
+    /// An event never handed to a native carrier reports `not_handed` and
+    /// `not_available` with no uncertainty.
     #[test]
     fn unhanded_events_report_no_native_or_context_tier() {
         let view = status_view(None);
@@ -810,6 +813,8 @@ mod tests {
         assert!(view["uncertainty"].is_null());
     }
 
+    /// Caller attestation failures map to a single `caller_` class carrying the
+    /// detail.
     #[test]
     fn refusal_classes_are_prefixed_once() {
         assert_eq!(

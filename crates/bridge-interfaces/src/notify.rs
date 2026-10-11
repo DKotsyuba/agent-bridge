@@ -392,6 +392,8 @@ mod tests {
         }
     }
 
+    /// After an uncertain send the incident is marked `possible_send` and no
+    /// second request is ever made.
     #[test]
     fn possible_send_is_never_repeated() {
         let setup = setup("possible");
@@ -403,6 +405,8 @@ mod tests {
         assert_eq!(*transport.1.borrow(), 1, "exactly one request ever");
     }
 
+    /// A ledger entry left in `Sending` by a crash is reported as `possible_send`
+    /// without a request.
     #[test]
     fn interrupted_send_counts_as_possible_send() {
         let setup = setup("crash");
@@ -428,6 +432,8 @@ mod tests {
         assert_eq!(*transport.1.borrow(), 0);
     }
 
+    /// Known-unsent failures are retried only up to the attempt bound and then
+    /// give up; without Telegram configuration nothing is sent.
     #[test]
     fn known_unsent_retries_are_bounded_and_unconfigured_never_notifies() {
         let setup = setup("bounded");
@@ -460,6 +466,8 @@ mod tests {
         assert_eq!(*transport.1.borrow(), 2);
     }
 
+    /// A provider rate-limit hint delays the retry until its deadline, after
+    /// which acceptance is recorded with the owner read state unknown.
     #[test]
     fn rate_limit_hint_delays_the_retry() {
         let setup = setup("rate");
@@ -481,6 +489,9 @@ mod tests {
         assert_eq!(later[0]["owner_read"], "unknown");
     }
 
+    /// A reused incident number with a different identity replaces the stale
+    /// entry and is reported again, and a ledger bound to one core refuses
+    /// another.
     #[test]
     fn a_reused_incident_number_is_reported_again_and_cores_are_fenced() {
         let setup = setup("identity");
@@ -510,6 +521,8 @@ mod tests {
     /// A valid ledger with no entries and no bound core.
     const EMPTY_LEDGER: &str = r#"{"backend":"","entries":{}}"#;
 
+    /// A symlinked or shared ledger file and out-of-range attempt bounds are
+    /// refused without any request.
     #[test]
     fn linked_or_shared_ledger_files_and_bad_attempt_bounds_are_refused() {
         let setup = setup("links");

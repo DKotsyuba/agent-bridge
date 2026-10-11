@@ -339,6 +339,8 @@ mod tests {
 
     use super::*;
 
+    /// Unknown, overdue, held and refused states keep separate classes, and
+    /// unknown handoffs are never resent.
     #[test]
     fn unknown_overdue_and_held_stay_distinct() {
         assert_eq!(classify("unknown_handoff").0, "unknown");
@@ -349,6 +351,8 @@ mod tests {
         assert!(classify("unknown_handoff").1.contains("Never resent"));
     }
 
+    /// Lost lineage authority is its own class with only conditional, audited
+    /// next steps and no automatic replay.
     #[test]
     fn lineage_loss_is_its_own_class_without_replay() {
         let (category, next) = classify("lineage_authority_lost");
@@ -362,6 +366,8 @@ mod tests {
         assert!(!next.contains("never dispatched"));
     }
 
+    /// A lineage transfer needs a valid scope, a new publisher and a non-blank
+    /// note, and is checked before any request is made.
     #[test]
     fn transfers_are_checked_before_any_request() {
         let scope = LineageScope {
@@ -412,6 +418,8 @@ mod tests {
         assert!(read.contains("read failed") && !read.contains("may have been applied"));
     }
 
+    /// Known evidence tier names parse to their tier and unknown names are
+    /// rejected.
     #[test]
     fn tier_names_round_trip() {
         assert_eq!(
