@@ -13,7 +13,7 @@ use bridge_core::{
     EventId, ExpiresAt, Harness, Limits, Mode, NativeAddress, Policy, PublisherId, Storage,
     StreamId,
 };
-use common::TempDir;
+use common::{TempDir, short_socket};
 
 /// A fixed synthetic grant token; test fixture data only.
 const GRANT_TOKEN: &str = "6f6f-test-grant-token-0001";
@@ -26,20 +26,6 @@ fn recipient_text() -> String {
     NativeAddress::new("host-1", Harness::Codex, "default", "thread-7")
         .unwrap()
         .to_canonical_string()
-}
-
-/// A short, unique socket path: macOS limits AF_UNIX paths to ~104 bytes,
-/// so test sockets cannot live inside the deep per-test temp directory.
-fn short_socket(tag: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from(format!(
-        "/tmp/bridge-svc-{}-{}-{}.sock",
-        tag,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ))
 }
 
 /// A minimal daemon config with a publisher grant and an admin grant.
@@ -644,4 +630,21 @@ fn connection_flood_is_admission_bounded() {
 
     running.shutdown();
     running.join();
+}
+
+/// Parallel calls with the same label must produce distinct socket names;
+/// the real clock may return the same timestamp to several calls. This owns
+/// no sockets or filesystem state and joins every synthetic worker thread.
+#[test]
+fn socket_paths_are_unique_when_created_concurrently() {
+    let workers: Vec<_> = (0..16)
+        .map(|_| {
+            std::thread::spawn(|| (0..256).map(|_| short_socket("unique")).collect::<Vec<_>>())
+        })
+        .collect();
+    let paths: std::collections::HashSet<_> = workers
+        .into_iter()
+        .flat_map(|worker| worker.join().expect("fixture worker"))
+        .collect();
+    assert_eq!(paths.len(), 16 * 256);
 }

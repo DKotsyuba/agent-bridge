@@ -13,6 +13,9 @@ use bridge_core::{
     PublisherId, Storage, StreamId,
 };
 
+/// Monotonic per-process fixture identity; clock granularity cannot collide paths.
+static NEXT_PATH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Guard that removes its directory when dropped.
 ///
 /// Every test owns a fresh directory under the system temp dir; no shared
@@ -23,18 +26,22 @@ pub struct TempDir(std::path::PathBuf);
 
 #[allow(dead_code)]
 impl TempDir {
-    /// Creates a unique directory for one test.
+    /// Creates a fresh directory for the literal short test label `tag`.
+    /// PID, time and a process counter distinguish concurrent calls even on
+    /// coarse clocks. Panics rather than reusing an existing path; the guard
+    /// owns this new directory until drop.
     pub fn new(tag: &str) -> TempDir {
         let path = std::env::temp_dir().join(format!(
-            "bridge-core-{}-{}-{}",
+            "bridge-core-{}-{}-{}-{}",
             tag,
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_PATH_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        std::fs::create_dir_all(&path).expect("create temp dir");
+        std::fs::create_dir(&path).expect("create fresh temp dir");
         TempDir(path)
     }
 
@@ -51,18 +58,22 @@ impl Drop for TempDir {
     }
 }
 
-/// A short, unique socket path: macOS limits AF_UNIX paths to ~104 bytes,
-/// so test sockets cannot live inside the deep per-test temp directory.
+/// Builds a short unique socket path for literal static test label `tag`.
+/// The process counter prevents clock-resolution collisions between parallel
+/// calls. No path is created; the caller owns socket creation and cleanup.
+/// macOS AF_UNIX paths are limited to about 104 bytes, so these paths avoid
+/// the deep per-test temporary directory.
 #[allow(dead_code)]
 pub fn short_socket(tag: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!(
-        "/tmp/bridge-life-{}-{}-{}.sock",
+        "/tmp/bridge-life-{}-{}-{}-{}.sock",
         tag,
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT_PATH_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ))
 }
 
