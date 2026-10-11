@@ -26,18 +26,30 @@
  * any configuration file or installs anything, and the probe's own threads
  * are archived (reversible) at cleanup.
  *
- * Isolation, all before the first model call (the proven Q3 machinery from
- * `codex-native-probe.cjs`, reused unchanged): a paired loopback fence
+ * Isolation, all before the first model call. The Q3 gate machinery from
+ * `codex-native-probe.cjs` is reused unchanged: a paired loopback fence
  * witness for the confined gate policy; a confined hooks/config gate that
  * trusts only this probe's own hooks by hash and disables every other hook
  * per launch (`hooks.state`); the exact-tool MCP approval parsed back; every
  * foreign MCP server of the user configuration disabled per launch and read
  * back as disabled; plugins, apps, memories, browser and goals disabled.
+ * The Q3 MODEL launches (`codex exec`) also pass `--ignore-user-config` and
+ * `--ignore-rules`; `codex app-server` has no such flags in the installed
+ * 0.162.0-alpha.17.2 (its `--help` is read at run time and each flag is
+ * passed if and only if that help lists it, `isolation_flags_supported`).
+ * Where unsupported, user configuration is NOT ignored: the launch neutralises
+ * what it can by explicit per-launch overrides (`notify=[]`,
+ * `project_doc_max_bytes=0`, empty `instructions` and `developer_instructions`)
+ * and `config/read` is read back under the SAME flags: both instruction
+ * fields must be empty (`config_residual_closed`) and the names of the
+ * remaining non-session setting origins are recorded. `notify`, config
+ * profiles, global AGENTS files and execution-policy rules are not exposed by
+ * `config/read`; their neutralisation is NOT read back and stays a residual
+ * surface, as do the built-in Codex tools under a read-only sandbox with
+ * approval `never`.
  * Only the read-only fixture tools `bridge_me` (approved) and
- * `bridge_unlisted` (the host negative boundary: the host must refuse it and
- * the fixture must never see it) exist. Built-in Codex tools remain under a
- * read-only sandbox with approval `never`, as in Q3; that residual surface
- * is not claimed closed.
+ * `bridge_unlisted` (the host negative boundary: the host must refuse it with
+ * an approval refusal and the fixture must never see it) are added.
  *
  * One backend process "A" (an unconfined `codex app-server` over stdio, the
  * supported frontend) starts a thread T1 BEFORE the daemon so the daemon's
@@ -66,7 +78,9 @@
  * Native `sessionId` equality or difference between a thread and its fork is
  * recorded as an observed fact only, never as a role signal.
  *
- * Daemon build requirement (observed, read-only trace): the registry hashes
+ * Daemon build requirement, HISTORICAL f2 finding (observed, read-only trace;
+ * the production fix is a separate candidate not contained in this checkout and
+ * applies once the root pins that production): the f2 registry hashes
  * the harness executable on the FIRST hook it admits, inside the hook request
  * and under the registry lock (`verify_loaded`). An unoptimized `sha2` takes
  * 27-35 s on the 246 MB Codex build (measured here with the registry's own
@@ -145,6 +159,11 @@ const MAX_TURNS = 3;
  */
 const TOKEN_STOP = 150_000;
 /**
+ * Longest wait for a turn's native `turn/completed`, in milliseconds; a turn without it is interrupted and the run aborts.
+ * @type {number}
+ */
+const TURN_TIMEOUT_MS = 240_000;
+/**
  * Largest tolerated retained response line, in characters.
  * @type {number}
  */
@@ -154,13 +173,13 @@ const MAX_LINE = 60_000;
  * @type {RegExp}
  */
 const NOISY = /\/(delta|outputDelta|progress)$|^account\/|^mcpServer\/startupStatus|^thread\/status\/changed$/;
-/** Hold reasons of a recipient no carrier can attest: a gone harness process or ended session (the Codex carrier's own refusals) or the Core carrier-chain
- * text. A daemon with both carriers reports only the LAST carrier's refusal, so for a dead Codex harness the observed text is the generic
- * "no carrier attests this endpoint: ..." (not a Codex-specific reason); causation by the death therefore rests on the ordering and the verified exit, and the
- * check below also forbids the no-wake text.
+/** Actionable hold reasons of a recipient whose harness is dead (the Codex carrier's own attestation refusals, `registry.rs` attest_recipient). The
+ * generic Core carrier-chain fallback ("no carrier attests this endpoint: ...", which at f2 carries the LAST carrier's unrelated refusal) is deliberately
+ * NOT accepted: absence of a hand-off qualifies only when the actual dead-incarnation reason is present, so the check fails against a core that
+ * overwrites it. Case-sensitive on purpose.
  * @type {RegExp}
  */
-const DEAD_REASON = /(harness process is gone|the recipient session ended|no attested binding|no carrier attests this endpoint)/;
+const DEAD_REASON = /(harness process is gone|the recipient session ended|no attested binding)/;
 /**
  * Canonical lowercase/uppercase UUID (the only form interpolated into SQL).
  * @type {RegExp}
@@ -172,14 +191,14 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
  */
 const REQUIRED = [
   'versions_recorded', 'model_in_catalog', 'network_fence_witnessed', 'hooks_isolated', 'approval_config_effective', 'foreign_mcp_disabled',
-  'daemon_started', 't1_thread_started', 'turn1_completed', 't1_root_attested', 't1_binding_matches_caller', 't1_hooks_observed',
+  'config_residual_closed', 'daemon_started', 't1_thread_started', 'turn1_completed', 't1_root_attested', 't1_binding_matches_caller', 't1_hooks_observed', 't1_hooks_clean',
   'unlisted_refused_by_host', 'unlisted_not_executed', 'loaded_process_identified',
   'archive_ok', 'archived_inject_pending_without_pause', 'unarchive_ok',
   'backend_a_dead', 'dead_message_held_fail_closed', 'dead_message_disposed_unsent', 'inject_pending_through_disconnect', 'old_epoch_retained_while_dead',
   'restart_new_process', 'restart_resumed_same_thread', 'fork_new_thread_id', 'turn2_completed', 'fork_caller_is_fork_thread', 'fork_binding_distinct',
   'fork_event_stays_on_original', 'fork_reply_lacks_marker',
   'turn3_completed', 't1_resumed_user_prompt_hook_positive', 'epoch_renewed_on_restart', 't1_caller_after_restart', 'inject_handed_by_original_hook', 'marker_in_original_reply',
-  'only_own_hooks_ran', 'turns_within_budget', 'tokens_measured', 'no_daemon_refusals', 'threads_archived_cleanup',
+  'only_own_hooks_ran', 'no_owned_hook_failures', 'turns_within_budget', 'tokens_measured', 'no_daemon_refusals', 'threads_archived_cleanup',
 ];
 
 /** Hook runs the frontend reported for one thread, from its
@@ -227,6 +246,48 @@ function daemonWarnings(stderr) {
     }
   }
   return found;
+}
+
+/** Whether a hook sequence is positive: no run of the thread failed (or was blocked, stopped or still running) AND every required event has at
+ * least one completed run. One completed run of an event never excuses another failed one.
+ * @param {HookRun[]} runs Hook runs from `hookRuns`.
+ * @param {{event: string}[]} failures Non-completed runs from `hookFailures`.
+ * @param {string[]} required Required camelCase event names.
+ * @returns {boolean}
+ */
+function hooksPositive(runs, failures, required) {
+  return failures.length === 0 && required.every(event => runs.some(run => run.event === event && run.status === 'completed'));
+}
+
+/** Whether a completed MCP tool-call item is the HOST's explicit approval refusal: it failed AND its error message names an approval. A
+ * connection, parser, transport or tool-runtime error, a missing error, or a successful call is not the host boundary (the Q3 classification:
+ * failed with an approval error).
+ * @param {{status: string, error: JsonValue}} call One item from `toolCalls`.
+ * @returns {boolean}
+ */
+function approvalRefusal(call) {
+  const text = call.error && typeof call.error === 'object' && !Array.isArray(call.error) ? call.error.message : call.error;
+  return call.status === 'failed' && typeof text === 'string' && /approval/i.test(text);
+}
+
+/** Whether a help text lists a command-line flag as an option (an exact whitespace- or comma-delimited token, so `--ignore-user-config` is not found
+ * inside a longer flag).
+ * @param {string} help The `--help` output.
+ * @param {string} flag The flag, for example `--ignore-rules`.
+ * @returns {boolean}
+ */
+function supportsFlag(help, flag) {
+  return help.split(/[\s,]+/).includes(flag);
+}
+
+/** Whether the read-back effective configuration shows both instruction
+ * fields empty (absent, null or empty string): the one place `config/read`
+ * can confirm the per-launch neutralisation of global instructions.
+ * @param {{instructions: boolean|null, developer_instructions: boolean|null}|null} read Presence flags of the read-back (true = non-empty text), null when not answered.
+ * @returns {boolean}
+ */
+function instructionsClosed(read) {
+  return Boolean(read) && read.instructions === false && read.developer_instructions === false;
 }
 
 /** Whether EVERY observed hook run came from the probe's own per-launch
@@ -363,6 +424,29 @@ function selfTest() {
   const runs = hookRuns([hook('userPromptSubmit', 'completed', 'sessionFlags'), hook('stop', 'completed', 'sessionFlags'), { method: 'hook/completed', params: { threadId: 'U', run: { eventName: 'stop', status: 'completed', source: 'user' } } }], 'T');
   assert.equal(runs.length, 2);
   assert.equal(ownHooksOnly(runs), true);
+  const ok4 = ['sessionStart', 'userPromptSubmit', 'preToolUse', 'postToolUse'].map(event => ({ event, status: 'completed', source: 'sessionFlags' }));
+  assert.equal(hooksPositive(ok4, [], ['sessionStart', 'userPromptSubmit', 'preToolUse', 'postToolUse']), true);
+  assert.equal(hooksPositive([...ok4, { event: 'userPromptSubmit', status: 'failed', source: 'sessionFlags' }], [{ event: 'userPromptSubmit' }], ['userPromptSubmit']), false); // one completed run never excuses a failed one
+  assert.equal(hooksPositive(ok4.slice(1), [], ['sessionStart', 'userPromptSubmit']), false); // a required event never observed
+  assert.equal(hooksPositive([], [], []), true);
+  const refusal = { status: 'failed', error: { message: 'tool call requires approval and none is available' } };
+  assert.equal(approvalRefusal(refusal), true);
+  assert.equal(approvalRefusal({ status: 'failed', error: 'approval denied' }), true);
+  assert.equal(approvalRefusal({ status: 'failed', error: { message: 'MCP transport closed' } }), false); // connection error
+  assert.equal(approvalRefusal({ status: 'failed', error: { message: 'failed to parse tool result' } }), false); // parser error
+  assert.equal(approvalRefusal({ status: 'failed', error: { message: 'tool runtime error: exit 1' } }), false);
+  assert.equal(approvalRefusal({ status: 'failed', error: null }), false);
+  assert.equal(approvalRefusal({ status: 'completed', error: { message: 'approval' } }), false); // not a failed call
+  assert.equal(approvalRefusal({ status: 'failed', error: { message: 42 } }), false);
+  const help = '  -c, --config <key=value>\n      --enable <FEATURE>\n      --ignore-user-config\n      --ignore-rules  Skip rules\n';
+  assert.equal(supportsFlag(help, '--ignore-user-config'), true);
+  assert.equal(supportsFlag(help, '--ignore-rules'), true);
+  assert.equal(supportsFlag('      --ignore-user-config-extra\n', '--ignore-user-config'), false); // longer flag is not the flag
+  assert.equal(supportsFlag('  --enable <FEATURE>\n  --strict-config\n', '--ignore-rules'), false);
+  assert.equal(instructionsClosed({ instructions: false, developer_instructions: false }), true);
+  assert.equal(instructionsClosed({ instructions: true, developer_instructions: false }), false);
+  assert.equal(instructionsClosed({ instructions: false, developer_instructions: null }), false); // not answered is unproven
+  assert.equal(instructionsClosed(null), false);
   assert.deepEqual(hookFailures([hook('userPromptSubmit', 'completed', 'sessionFlags'), { method: 'hook/completed', params: { threadId: 'T', run: { eventName: 'sessionStart', status: 'failed', source: 'sessionFlags', startedAt: 10, completedAt: 15, durationMs: 5004, entries: [{ kind: 'error', text: 'hook timed out after 5s' }] } } }], 'T'),
     [{ event: 'sessionStart', status: 'failed', started_at: 10, completed_at: 15, duration_ms: 5004, entries: ['hook timed out after 5s'] }]); // a timeout is kept, with its timing
   assert.deepEqual(hookFailures(runs.map(() => hook('stop', 'completed', 'sessionFlags')), 'T'), []);
@@ -424,7 +508,7 @@ function selfTest() {
   assert.equal(pendingUntouched(null, first), false); // unreadable is unproven
   const dead = { attempts_made: 0, attempt_state: 'none', hold_reason: "the recipient's harness process is gone (disconnected, not inactive)" };
   assert.equal(heldByDeadIncarnation(dead), true);
-  assert.equal(heldByDeadIncarnation({ ...dead, hold_reason: 'no carrier attests this endpoint: not a Claude recipient' }), true); // the generic text the real daemon gives a dead Codex harness
+  assert.equal(heldByDeadIncarnation({ ...dead, hold_reason: 'no carrier attests this endpoint: not a Claude recipient' }), false); // the generic fallback (another carrier's refusal) never qualifies absence
   assert.equal(heldByDeadIncarnation({ ...dead, hold_reason: 'no-wake policy active: paused' }), false); // pause masking
   assert.equal(heldByDeadIncarnation({ ...dead, hold_reason: 'capability message is not loaded for this recipient' }), false); // some other hold
   assert.equal(heldByDeadIncarnation({ ...dead, attempts_made: 1 }), false);
@@ -494,7 +578,20 @@ async function main(probe) {
     ...EVENTS.flatMap(e => ['-c', `hooks.${e}=${hook}`]),
   ];
 
-  // Isolation gate (before any model call), exactly the Q3 sequence.
+  // Per-launch configuration hygiene. The Q3 model launches pass
+  // --ignore-user-config and --ignore-rules; the app-server takes them only if
+  // its own --help lists them (decided at run time, never assumed). Otherwise
+  // the launch neutralises what it can by explicit overrides and the gate
+  // reads the instruction fields back (the only ones config/read exposes).
+  const serverHelp = probe.local(codex, ['app-server', '--help']);
+  const flagsSupported = { ignore_user_config: supportsFlag(serverHelp, '--ignore-user-config'), ignore_rules: supportsFlag(serverHelp, '--ignore-rules') };
+  probe.checks.isolation_flags_supported = flagsSupported;
+  const hygiene = [
+    ...(flagsSupported.ignore_user_config ? ['--ignore-user-config'] : []), ...(flagsSupported.ignore_rules ? ['--ignore-rules'] : []),
+    '-c', 'notify=[]', '-c', 'project_doc_max_bytes=0', '-c', 'instructions=""', '-c', 'developer_instructions=""',
+  ];
+
+  // Isolation gate (before any model call): the Q3 sequence plus the hygiene flags.
   let effective = null, rejected = true;
   /** One confined gate listing with the probe's own overrides plus `extra`.
    * @param {string} label Log label of the gate session.
@@ -502,7 +599,7 @@ async function main(probe) {
    * @returns {Promise<GateHook[]|null>} Projected hooks, or null when not answered.
    */
   const list = async (label, extra) => {
-    const read = await gateRead(probe, codex, store, label, [...DISABLED, '--enable', 'hooks', ...own, ...extra], hookCommand);
+    const read = await gateRead(probe, codex, store, label, [...DISABLED, '--enable', 'hooks', ...hygiene, ...own, ...extra], hookCommand);
     effective = read.effective;
     rejected = read.overrideRejected;
     return read.hooks;
@@ -515,7 +612,7 @@ async function main(probe) {
    * command, argument, environment or URL), in one confined session.
    * @param {string} label Log label.
    * @param {string[]} flags App Server flags.
-   * @returns {Promise<{servers: Record<string, boolean|null>|null, rejected: boolean}>} Name to enabled flag (null when not answered) and the stderr verdict.
+   * @returns {Promise<{servers: Record<string, boolean|null>|null, instructions: boolean|null, developer_instructions: boolean|null, foreign_origins: string[]|null, rejected: boolean}>} Name to enabled flag (null when not answered), whether each instruction field holds text (true) or not (false; null when not answered), the first 50 setting keys whose origin is not this launch's session flags (key names only, never values), and the stderr verdict.
    */
   const mcpRead = async (label, flags) => {
     /** Projects one stdout line to names and booleans only.
@@ -529,7 +626,13 @@ async function main(probe) {
       if (message.method !== undefined) return JSON.stringify({ method: String(message.method).slice(0, 64) });
       if (message.id === 1 && message.result && message.result.config) {
         const servers = message.result.config.mcp_servers || {};
-        return JSON.stringify({ id: 1, result: { servers: Object.fromEntries(Object.entries(servers).map(([name, value]) => [name, value && typeof value.enabled === 'boolean' ? value.enabled : null])) } });
+        const origins = message.result.origins && typeof message.result.origins === 'object' ? message.result.origins : {};
+        return JSON.stringify({ id: 1, result: {
+          servers: Object.fromEntries(Object.entries(servers).map(([name, value]) => [name, value && typeof value.enabled === 'boolean' ? value.enabled : null])),
+          instructions: typeof message.result.config.instructions === 'string' && message.result.config.instructions.length > 0,
+          developer_instructions: typeof message.result.config.developer_instructions === 'string' && message.result.config.developer_instructions.length > 0,
+          foreign_origins: Object.entries(origins).filter(([, origin]) => !(origin && origin.name && origin.name.type === 'sessionFlags')).map(([key]) => String(key).slice(0, 80)).slice(0, 50),
+        } });
       }
       return JSON.stringify({ id: typeof message.id === 'number' ? message.id : null, result: {} });
     };
@@ -539,9 +642,10 @@ async function main(probe) {
     const settled = await Promise.race([child.closed, new Promise(r => { timer = setTimeout(() => r(false), 2000); })]);
     clearTimeout(timer);
     const reduced = child.child.stderrSummary;
-    return { servers: config && config.result ? config.result.servers : null, rejected: !probe.checks[`${label}_exit`] || settled !== true || !reduced || reduced.matched };
+    const answered = config && config.result && config.result.servers ? config.result : null;
+    return { servers: answered ? answered.servers : null, instructions: answered ? answered.instructions : null, developer_instructions: answered ? answered.developer_instructions : null, foreign_origins: answered ? answered.foreign_origins : null, rejected: !probe.checks[`${label}_exit`] || settled !== true || !reduced || reduced.matched };
   };
-  const base = [...DISABLED, '--enable', 'hooks', ...own, ...state];
+  const base = [...DISABLED, '--enable', 'hooks', ...hygiene, ...own, ...state];
   const names = await mcpRead('mcp-read-1', base);
   const foreign = Object.keys(names.servers || {}).filter(name => name !== 'bridge_probe');
   const safeNames = foreign.every(name => /^[A-Za-z0-9_-]+$/.test(name));
@@ -549,6 +653,8 @@ async function main(probe) {
   const liveFlags = [...base, ...mcpOff, '-c', 'analytics.enabled=false'];
   const second = first ? await list('hooks-gate-2', [...state, ...mcpOff]) : null;
   const afterMcp = await mcpRead('mcp-read-2', liveFlags);
+  probe.checks.config_foreign_origins = afterMcp.foreign_origins;
+  probe.checks.config_residual_closed = Boolean(!afterMcp.rejected && instructionsClosed(afterMcp));
   const ownAfter = (second || []).filter(h => h.own);
   probe.checks.hooks_before = (first || []).map(h => ({ source: h.source, event: h.eventName, enabled: h.enabled, trust: h.trustStatus, own: h.own }));
   probe.checks.hooks_after = (second || []).map(h => ({ source: h.source, event: h.eventName, enabled: h.enabled, trust: h.trustStatus, own: h.own }));
@@ -561,6 +667,7 @@ async function main(probe) {
   if (!probe.checks.hooks_isolated) { probe.fail('isolation_unavailable'); return; }
   if (!probe.checks.approval_config_effective) { probe.fail('approval_config_unavailable'); return; }
   if (!probe.checks.foreign_mcp_disabled || !probe.checks.network_fence_witnessed) { probe.fail('tool_isolation_unavailable'); return; }
+  if (!probe.checks.config_residual_closed) { probe.fail('config_isolation_unavailable'); return; }
 
   // ------------------------------------------------------------------
   // Live backends (unconfined stock `codex app-server` over stdio).
@@ -676,8 +783,11 @@ async function main(probe) {
   };
 
   /** Turns run so far: native ids and status, plus each turn's correlated usage (`usageIncrement`, null when unavailable or invalid). Published on the probe's checks at once so a fail-closed exit still leaves it.
-   * @type {{label: string, thread: string, turn_id: string, status: string, usage: {baseline: number, increment: number, raw_total: number, snapshots: number}|null}[]} */
+   * @type {{label: string, thread: string, turn_id: string, status: string, usage: {baseline: number, increment: number, raw_total: number, snapshots: number}|null, partial_usage?: {baseline: number, increment: number, raw_total: number, snapshots: number}|null, interrupt?: {accepted: boolean, ended: boolean}}[]} */
   const turnLog = [];
+  /** Whether a turn ended in anything but a native `completed`; no further paid turn may start once set.
+   * @type {boolean} */
+  let halted = false;
   probe.checks.turn_log = turnLog;
   /** Runs one prompted native turn and waits for its native completion.
    * @param {Backend} backend The backend that owns the thread.
@@ -685,10 +795,11 @@ async function main(probe) {
    * @param {string} label Step label.
    * @param {string} text Short prompt.
    * @returns {Promise<{turnId: string, status: string, text: string}>} The native turn status and reply text.
-   * @throws {Error} The turn budget or token ceiling is exhausted, an earlier turn's usage was unavailable or invalid (no further paid turn), or no turn started.
+   * @throws {Error} The turn budget or token ceiling is exhausted, an earlier turn did not complete natively or its usage was unavailable or invalid (no further paid turn), no turn started, or this turn produced no native `turn/completed` within 240 s (the exact own thread+turn is interrupted, the owned backend is stopped, the turn is logged with `status: timeout` and no usable usage, and the run aborts).
    */
   const turn = async (backend, thread, label, text) => {
     const spent = turnLog.reduce((sum, t) => sum + (t.usage ? t.usage.increment : 0), 0);
+    if (halted) { probe.fail(`turn_not_completed_before:${label}`); throw new Error(`an earlier turn did not complete; no further paid turn before ${label}`); }
     if (turnLog.some(t => t.usage === null)) { probe.fail(`usage_unavailable_before:${label}`); throw new Error(`an earlier turn's usage is unavailable; no further paid turn before ${label}`); }
     if (turnLog.length >= MAX_TURNS || spent > TOKEN_STOP) { probe.fail(`turn_budget:${label}`); throw new Error(`turn budget exhausted before ${label}`); }
     const started = await backend.request('turn/start', {
@@ -697,13 +808,30 @@ async function main(probe) {
     });
     const turnId = started && started.result && started.result.turn && started.result.turn.id;
     if (!turnId) { probe.fail(`turn_start_failed:${label}`); throw new Error(`turn/start failed for ${label}`); }
-    await probe.until(() => backend.events.some(e => e.method === 'turn/completed' && e.params && e.params.turn && e.params.turn.id === turnId), 240000);
-    const done = backend.events.find(e => e.method === 'turn/completed' && e.params && e.params.turn && e.params.turn.id === turnId);
+    /** The native completion of this exact turn.
+     * @returns {Notification|undefined}
+     */
+    const completion = () => backend.events.find(e => e.method === 'turn/completed' && e.params && e.params.turn && e.params.turn.id === turnId);
+    await probe.until(() => completion() !== undefined, TURN_TIMEOUT_MS);
+    const done = completion();
+    if (!done) {
+      // No native completion: fail closed. Interrupt exactly this thread+turn,
+      // stop the owned backend, keep the turn (with partial usage kept apart,
+      // never usable) and abort so no later paid turn can start.
+      probe.fail(`turn_timeout:${label}`);
+      const interrupt = await backend.request('turn/interrupt', { threadId: thread, turnId }, 15000);
+      const ended = await probe.until(() => completion() !== undefined, 15000);
+      turnLog.push({ label, thread, turn_id: turnId, status: 'timeout', usage: null, partial_usage: usageIncrement(backend.events, thread, turnId), interrupt: { accepted: Boolean(interrupt && interrupt.result), ended } });
+      halted = true;
+      await stop(backend);
+      throw new Error(`no turn/completed for ${label} within ${TURN_TIMEOUT_MS / 1000} s; backend stopped`);
+    }
     await new Promise(r => setTimeout(r, 1500)); // late token-usage notifications
     const usage = usageIncrement(backend.events, thread, turnId);
-    const status = done ? done.params.turn.status : 'timeout';
+    const status = String(done.params.turn.status);
     turnLog.push({ label, thread, turn_id: turnId, status, usage });
     if (!usage) probe.fail(`usage_unavailable:${label}`);
+    if (status !== 'completed') { halted = true; probe.fail(`turn_not_completed:${label}:${status}`); }
     return { turnId, status, text: agentText(backend.events, thread, turnId) };
   };
 
@@ -759,10 +887,14 @@ async function main(probe) {
   const runs1 = hookRuns(backendA.events, t1);
   probe.checks.t1_hook_runs = runs1;
   probe.checks.t1_hook_failures = hookFailures(backendA.events, t1);
-  probe.checks.t1_hooks_observed = ['userPromptSubmit', 'preToolUse', 'postToolUse'].every(event => runs1.some(r => r.event === event && r.status === 'completed'));
+  // Every owned hook of A's first turn is positive: SessionStart, UserPromptSubmit, PreToolUse and PostToolUse each completed, and NO run
+  // of the thread failed (a timeout is never waived, nor excused by another completed run of the same event).
+  probe.checks.t1_hooks_observed = hooksPositive(runs1, probe.checks.t1_hook_failures, ['sessionStart', 'userPromptSubmit', 'preToolUse', 'postToolUse']);
+  probe.checks.t1_hooks_clean = probe.checks.t1_hook_failures.length === 0;
   const unlisted = toolCalls(backendA.events, t1, 'bridge_unlisted');
   probe.checks.unlisted_calls = unlisted;
-  probe.checks.unlisted_refused_by_host = unlisted.length > 0 && unlisted.every(c => c.status === 'failed' || Boolean(c.error));
+  // The host boundary is the host's explicit approval refusal (Q3 classification), never any MCP failure.
+  probe.checks.unlisted_refused_by_host = unlisted.length > 0 && unlisted.every(approvalRefusal);
   probe.checks.unlisted_not_executed = !records().some(r => r.unlisted_called);
   probe.checks.loaded_process_identified = Number.isInteger(backendA.child.pid) && alive(backendA);
   probe.checks.backend_a_facts = { pid: backendA.child.pid, os: processFacts(backendA.child.pid), epoch: epoch1 };
@@ -855,6 +987,7 @@ async function main(probe) {
   const allRuns = [...hookRuns(everyEvent, t1), ...hookRuns(everyEvent, t2)];
   probe.checks.hook_runs_total = allRuns.length;
   probe.checks.only_own_hooks_ran = ownHooksOnly(allRuns);
+  probe.checks.no_owned_hook_failures = hookFailures(everyEvent, t1).length === 0 && hookFailures(everyEvent, t2).length === 0;
   probe.checks.turn_started_notifications = everyEvent.filter(e => e.method === 'turn/started').length;
   probe.checks.turns_within_budget = turnLog.length <= MAX_TURNS && probe.checks.turn_started_notifications === turnLog.length;
   probe.checks.tokens_measured = turnLog.length === MAX_TURNS && turnLog.every(t => t.usage !== null && t.usage.increment > 0);
@@ -877,4 +1010,4 @@ if (require.main === module) {
     process.exitCode = 2;
   } else run('m2q4x', 15 * 60_000, REQUIRED, main);
 }
-module.exports = { hookRuns, ownHooksOnly, agentText, toolCalls, usageIncrement, hookFailures, daemonWarnings, pendingUntouched, heldByDeadIncarnation, handedByHook, keepLive };
+module.exports = { hookRuns, ownHooksOnly, agentText, toolCalls, usageIncrement, hookFailures, daemonWarnings, hooksPositive, approvalRefusal, supportsFlag, instructionsClosed, pendingUntouched, heldByDeadIncarnation, handedByHook, keepLive };

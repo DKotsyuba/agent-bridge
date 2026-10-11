@@ -13,7 +13,9 @@
  * are recorded exactly — id, observed status and marker — and must show no
  * model output (`modelFree`), instead of being denied. The no-model-effect
  * check is derived from the confinement (every native process under the
- * policy, plus a control that the policy refuses a remote connect) and
+ * policy, plus a paired OWNED-loopback control: an own listener accepts an
+ * unconfined connect and the same connect under the policy is denied with
+ * EPERM/EACCES; no external address is contacted) and
  * those observed turns, never set by a comment. Short `--version`/`--help`/schema-export
  * local commands cannot create turns. The probe never extracts, copies or
  * writes any credential, and makes no claim about what the CLI itself
@@ -205,6 +207,18 @@ function unmaterializedEmpty(turnsReply, queueReply, start, id) {
   return fresh && queueEmpty && refused;
 }
 
+/** Whether a `thread/queue/add` response to an ARCHIVED thread is the build's
+ * native archive refusal: a JSON-RPC error with code -32600 whose message
+ * says the thread "is archived" (observed on 0.162.0-alpha.17.2), and NO
+ * result. Any other error (including an internal error after which a queue
+ * effect is possible), a success, or a missing response is not the refusal.
+ * @param {RpcResponse|undefined} reply The response to the add.
+ * @returns {boolean}
+ */
+function archiveRefusal(reply) {
+  return Boolean(reply && reply.result === undefined && reply.error && reply.error.code === -32600 && /is archived/.test(String(reply.error.message)));
+}
+
 /** Pure-logic assertion check (`--self-test`): no native process. */
 function selfTest() {
   const assert = require('node:assert/strict');
@@ -243,6 +257,12 @@ function selfTest() {
   assert.equal(emptyAnswer({ error: { message: `no rollout found for thread id ${id}` } }, id), true);
   assert.equal(emptyAnswer({ error: { message: 'no rollout found for thread id other' } }, id), false);
   assert.equal(emptyAnswer(undefined, id), false);
+  assert.equal(archiveRefusal({ id: 1, error: { code: -32600, message: `thread ${id} is archived` } }), true);
+  assert.equal(archiveRefusal({ id: 1, error: { code: -32603, message: `thread ${id} is archived` } }), false); // internal error: a queue effect is possible
+  assert.equal(archiveRefusal({ id: 1, error: { code: -32600, message: 'invalid request' } }), false); // another validation error
+  assert.equal(archiveRefusal({ id: 1, error: { code: -32600, message: 'thread is archived' }, result: {} }), false);
+  assert.equal(archiveRefusal({ id: 1, result: { queuedSubmission: {} } }), false); // accepted
+  assert.equal(archiveRefusal(undefined), false);
   const fresh = { id, status: { type: 'idle' }, preview: '', forkedFromId: null };
   const emptyQueue = { id: 3, result: { data: [] } };
   const unmaterialized = { id: 2, error: { code: -32600, message: `thread ${id} is not materialized yet; thread/turns/list is unavailable before first user message` } };
@@ -355,18 +375,16 @@ else if (require.main === module) run('m2q4', 15 * 60_000, REQUIRED, async probe
   let threadReady = false; // whether the fixture thread exists in the private store (cleanup guard)
 
   /**
-   * Runs one confined, network-denied app-server session against the
-   * isolated store, logging only bounded projected lines.
+   * Opens one confined, network-denied app-server owner process against the
+   * isolated store and performs the initialize handshake; the process stays
+   * alive (and its loaded state with it) until `close`. Logs only bounded
+   * projected lines.
    * @param {string} label Log label.
-   * @param {[string, RpcParams|((responses: (RpcResponse|undefined)[]) => RpcParams)][]} requests Requests after
-   *   `initialize`; a params value may be a function of the responses so far
-   *   (all requests of one call share ONE owner process, so a thread the
-   *   first request created is still loaded for the later ones).
-   * @param {boolean} [cleanup] Registered-cleanup invocation (allowed past
-   *   the lifecycle fence).
-   * @returns {Promise<(RpcResponse|undefined)[]>} Responses in order (undefined where none arrived in 20 s).
+   * @param {boolean} [cleanup] Registered-cleanup invocation (allowed past the lifecycle fence).
+   * @returns {Promise<{child: import('node:child_process').ChildProcess, ready: boolean, request: (method: string, params: RpcParams) => Promise<RpcResponse|undefined>, close: () => Promise<{code: number|null, signal: string|null}|{error: string}|null>}>}
+   *   The owner: its process, whether the handshake was answered, a sequential request sender (undefined when the owner is not ready or no response arrived in 20 s) and a closer that ends stdin, terminates the process group and returns its exit.
    */
-  async function q4session(label, requests, cleanup = false) {
+  async function openOwner(label, cleanup = false) {
     const lines = [];
     /** Pre-write projection of one stdout line: notifications keep their
      * method (and thread id), responses pass through unless huge (then
@@ -400,14 +418,46 @@ else if (require.main === module) run('m2q4', 15 * 60_000, REQUIRED, async probe
      */
     const answer = async id => { await probe.until(() => lines.some(l => l.id === id && l.method === undefined), 20000); return lines.find(l => l.id === id && l.method === undefined); };
     send(0, 'initialize', { clientInfo: { name: 'agent_bridge_q4', version: '0' }, capabilities: { experimentalApi: true } });
+    const ready = Boolean(await answer(0));
+    if (ready) child.stdin.write(JSON.stringify({ method: 'initialized', params: {} }) + '\n');
+    let nextId = 1;
+    return {
+      child, ready,
+      request: async (method, params) => {
+        if (!ready) return undefined;
+        const id = nextId; nextId += 1;
+        send(id, method, params);
+        return answer(id);
+      },
+      close: async () => {
+        child.stdin.end();
+        try { process.kill(-child.pid, 'SIGTERM'); } catch {}
+        const exit = await probe.exited(child, 5000);
+        probe.checks[`${label}_exit`] = exit;
+        return exit;
+      },
+    };
+  }
+
+  /**
+   * Runs one confined, network-denied app-server session against the
+   * isolated store: opens an owner, sends the requests in order and closes it.
+   * @param {string} label Log label.
+   * @param {[string, RpcParams|((responses: (RpcResponse|undefined)[]) => RpcParams)][]} requests Requests after
+   *   `initialize`; a params value may be a function of the responses so far
+   *   (all requests of one call share ONE owner process, so a thread the
+   *   first request created is still loaded for the later ones).
+   * @param {boolean} [cleanup] Registered-cleanup invocation (allowed past
+   *   the lifecycle fence).
+   * @returns {Promise<(RpcResponse|undefined)[]>} Responses in order (undefined where none arrived in 20 s).
+   */
+  async function q4session(label, requests, cleanup = false) {
+    const owner = await openOwner(label, cleanup);
     const responses = [];
-    if (await answer(0)) {
-      child.stdin.write(JSON.stringify({ method: 'initialized', params: {} }) + '\n');
-      for (const [index, [method, params]] of requests.entries()) { send(index + 1, method, typeof params === 'function' ? params(responses) : params); responses.push(await answer(index + 1)); }
+    if (owner.ready) {
+      for (const [method, params] of requests) responses.push(await owner.request(method, typeof params === 'function' ? params(responses) : params));
     }
-    child.stdin.end();
-    try { process.kill(-child.pid, 'SIGTERM'); } catch {}
-    probe.checks[`${label}_exit`] = await probe.exited(child, 5000);
+    await owner.close();
     return responses;
   }
 
@@ -547,7 +597,7 @@ else if (require.main === module) run('m2q4', 15 * 60_000, REQUIRED, async probe
   const archivedAdd = await q4session('queue-add-archived', [['thread/queue/add', { threadId, clientUserMessageId: clientX, input: [{ type: 'text', text: 'must be refused on an archived thread' }] }]]);
   const archivedAddError = (archivedAdd[0] || {}).error || null;
   probe.checks.archived_queue_add_result = archivedAddError || (archivedAdd[0] || {}).result || null;
-  probe.checks.archived_queue_add_refused = Boolean(archivedAddError && (archivedAddError.code !== undefined || archivedAddError.message !== undefined));
+  probe.checks.archived_queue_add_refusal_class = archiveRefusal(archivedAdd[0]); // the exact native class; absence is read back below
   const unarchived = await q4session('unarchive', [['thread/unarchive', { threadId }]]);
   probe.checks.unarchive_result = (unarchived[0] || {}).error || 'ok';
   probe.checks.archive_roundtrip = probe.checks.archive_result === 'ok' && probe.checks.unarchive_result === 'ok';
@@ -565,6 +615,13 @@ else if (require.main === module) run('m2q4', 15 * 60_000, REQUIRED, async probe
   }
   const archiveTurns = await collectTurns('turns-after-archive');
   if (!archiveTurns.complete) throw new Error('turn collection did not complete after the archive case');
+  // The refused add must have left NO trace: the exact marker is absent from
+  // the own queue and from the complete native turn list (an error after a
+  // possible write is never accepted as a refusal on its own).
+  const queueAfterArchive = await ownItems('queue-list-clientx');
+  probe.checks.archived_queue_add_absent = Array.isArray(queueAfterArchive) && !queueAfterArchive.some(i => i.clientUserMessageId === clientX)
+    && !archiveTurns.turns.some(t => hasMarker(t, clientX));
+  probe.checks.archived_queue_add_refused = probe.checks.archived_queue_add_refusal_class === true && probe.checks.archived_queue_add_absent === true;
   const stillPendingA = ((await ownItems('queue-list-after-archive')) || []).some(i => i.clientUserMessageId === clientA);
   const archiveVerdict = disposition(stillPendingA, archiveTurns.turns, baselineIds, clientA);
   probe.checks.archive_pending_disposition = { disposition: archiveVerdict.disposition, turns: archiveVerdict.consumed.map(t => ({ id: t.id, status: t.status })), unrelated_new_turns: archiveVerdict.others.length };
@@ -582,20 +639,37 @@ else if (require.main === module) run('m2q4', 15 * 60_000, REQUIRED, async probe
   if (!baseline2.complete) throw new Error('turn collection did not complete before the restart case');
   const baseline2Ids = new Set(baseline2.turns.map(t => t.id));
 
-  // A fresh pending item carries the disconnect/restart case; its pending
-  // state is proven by an own-item readback before any process ends.
-  const queued2 = await q4session('queue-add-b', [['thread/queue/add', { threadId, clientUserMessageId: clientB, input: [{ type: 'text', text: `Q4 restart persistence item ${clientB}` }] }]]);
-  const addItem2 = (queued2[0] || {}).result || (queued2[0] || {}).error || null;
+  // A fresh pending item carries the disconnect/restart case. It is added
+  // and read back through a LIVE owner process that stays up (its PID alive)
+  // until the explicit disconnect below; if the build consumes the item in
+  // that live owner the readback is not pending, the check fails and the
+  // outcome stays recorded (nothing is passed on a process that was never live).
+  const liveOwner = await openOwner('live-owner');
+  const livePid = liveOwner.child.pid;
+  /** Whether a process id is alive.
+   * @param {number} pid Process id.
+   * @returns {boolean}
+   */
+  const pidAlive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const aliveBeforeAdd = liveOwner.ready && pidAlive(livePid);
+  const queued2 = await liveOwner.request('thread/queue/add', { threadId, clientUserMessageId: clientB, input: [{ type: 'text', text: `Q4 restart persistence item ${clientB}` }] });
+  const addItem2 = (queued2 || {}).result || (queued2 || {}).error || null;
   probe.checks.queue_add_b_result = addItem2 && addItem2.queuedSubmission ? 'ok' : addItem2;
-  const readbackB = await ownItems('queue-readback-b');
-  probe.checks.restart_item_pending_before_disconnect = Array.isArray(readbackB) && readbackB.some(i => i.clientUserMessageId === clientB);
+  const readbackReply = await liveOwner.request('thread/queue/list', { threadId });
+  const readbackB = (((readbackReply || {}).result || {}).data || []).filter(i => i.clientUserMessageId === clientB);
+  const aliveAtReadback = pidAlive(livePid);
+  probe.checks.live_owner_readback = { pid: livePid, alive_before_add: aliveBeforeAdd, alive_at_readback: aliveAtReadback, rows: readbackB.length };
+  probe.checks.restart_item_pending_before_disconnect = aliveBeforeAdd && aliveAtReadback && readbackB.length === 1
+    && JSON.stringify(readbackB[0].input || []).includes(clientB);
 
-  // Disconnect: end every session process and confirm they are gone. The
-  // pending state's persistence is proven after restart by own-item
-  // readback in a NEW process, not by a file listing.
-  for (const entry of [...probe.children]) { try { process.kill(-entry.child.pid, 'SIGTERM'); } catch {} }
-  await probe.until(() => probe.children.every(c => c.child.exitCode !== null || c.child.signalCode !== null), 10000);
-  probe.checks.disconnect_sessions_ended = probe.children.every(c => c.child.exitCode !== null || c.child.signalCode !== null);
+  // Explicit disconnect of that live owner: its exit and liveness are
+  // recorded. The pending state's persistence is proven after restart by
+  // own-item readback in a NEW process, not by a file listing.
+  const aliveAtDisconnect = pidAlive(livePid);
+  const liveExit = await liveOwner.close();
+  probe.checks.live_owner_disconnect = { pid: livePid, alive_at_disconnect: aliveAtDisconnect, exit: liveExit, alive_after: pidAlive(livePid) };
+  probe.checks.disconnect_sessions_ended = aliveAtDisconnect && liveExit !== null && !pidAlive(livePid)
+    && probe.children.every(c => c.child.exitCode !== null || c.child.signalCode !== null);
 
   // Full restart of the owned client: a fresh app-server resumes the same
   // thread id. Exactly two outcomes are accepted: the item still pending
@@ -636,7 +710,7 @@ else if (require.main === module) run('m2q4', 15 * 60_000, REQUIRED, async probe
     codex_fork_while_queue_pending: { state: probe.checks.fork_new_thread_id && probe.checks.fork_item_stays_on_original && probe.checks.fork_item_absent_on_fork ? 'qualified' : 'failed', evidence: 'fork returns a new thread id; the pending item stays on the original thread and is absent on the fork (mechanism evidence only, no Bridge component involved)' },
     codex_fork_session_id_not_role: { state: probe.checks.fork_session_id_recorded ? 'qualified' : 'failed', evidence: `fork sessionId ${probe.checks.fork_shares_session_id ? 'equals' : 'differs from'} the original's — recorded, never a role signal; role comes only from the protected agent_id hook join` },
     codex_archive_unarchive: { state: probe.checks.archive_roundtrip && probe.checks.archived_queue_add_refused && probe.checks.archive_pending_disposition_recorded ? 'qualified' : 'failed', evidence: `round-trip on the loaded build; queue add to the archived thread refused; pending-item disposition by exact marker over the complete turn list: ${JSON.stringify(probe.checks.archive_pending_disposition)}` },
-    codex_disconnect: { state: probe.checks.disconnect_sessions_ended && probe.checks.restart_state_readback ? 'qualified' : 'failed', evidence: 'client processes ended; the own item was read back pending before the disconnect and its disposition read back in a new process after restart' },
+    codex_disconnect: { state: probe.checks.disconnect_sessions_ended && probe.checks.restart_state_readback ? 'qualified' : 'failed', evidence: 'a LIVE confined owner process (pid recorded, alive at the queue add and readback) held the own item pending with its exact marker, was explicitly disconnected (exit and liveness recorded), and the item\'s disposition and the complete new-turn set were read back in a NEW process after restart' },
     codex_full_client_restart: { state: probe.checks.restart_state_readback && probe.checks.restart_no_unexpected_turns ? 'qualified' : 'failed', evidence: `fresh process resumed the same thread id; disposition: ${probe.checks.restart_item_disposition}; every new turn correlated to the probe marker` },
     bridge_composition_codex: { state: 'pending_model', reason: 'Codex hooks fire only on turns, which need a model; the Bridge-composition lifecycle seam (protected hook binding, new incarnation epoch after restart, stale-binding fail-closed) is NOT proven by this probe and awaits the root-run model-bearing driver' },
     scope_note: { state: 'unsupported_in_scope', reason: 'this probe launches no Bridge component; results are loaded-frontend MECHANISM evidence for an owned session, not Bridge-composition proof and not working-GUI qualification; bridge digests recorded are disk digests only' },
