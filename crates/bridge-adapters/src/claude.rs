@@ -10,6 +10,13 @@
 //! current work and `shouldQuery = false` still wakes a peer, so peer
 //! inject is prohibited here; quiet inject is the root hook drain.
 //!
+//! The descriptor also decides whether the message path exists at all: a
+//! descriptor of exactly this session and PID without an inbox is positive
+//! runtime disablement (a restricted Claude session ignores
+//! `--messaging-socket-path`), so the message capability is withdrawn and
+//! recorded in core before any further acceptance; a descriptor not yet
+//! written is only a transient hold.
+//!
 //! Receipts: the user frame names a long-lived callback socket this daemon
 //! keeps in the inbox's directory (the native reply-address rule). A
 //! receipt is correlated by the attempt's unguessable message id (known
@@ -26,9 +33,12 @@
 //! the ordinary `written_no_receipt`. Later receipts are recorded straight
 //! into core: release after hold is acceptance; any negative after a hold
 //! is an unknown outcome (no proof the loaded native classification means
-//! no context acceptance). A written-without-receipt hand-off is closed
-//! positively only when the session's own transcript contains the exact
-//! manifest as a user message; an absent marker never retries. A daemon
+//! no context acceptance). A written-without-receipt hand-off is
+//! reconciled against the addressed session's own native transcript: an
+//! `enqueue` of the exact manifest is native acceptance, and a peer-origin
+//! user entry naming this hand-off's callback and containing the exact
+//! manifest is context evidence (shapes observed on Claude 2.1.296; no
+//! message id is assumed in the transcript). Absent evidence never retries. A daemon
 //! restart forgets callbacks: core's recheck deadlines turn those attempts
 //! into retained incidents, never replays.
 
@@ -42,6 +52,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bridge_core::dispatch::{AttemptFence, AttemptRecord, Attestation, DispatchCarrier, Outcome};
+use bridge_core::recovery::EvidenceTier;
 use bridge_core::service::{current_unix_millis, log_event};
 use bridge_core::{Harness, NativeAddress};
 use serde_json::{Value, json};
@@ -101,6 +112,17 @@ enum Waiting {
         manifest: String,
         /// The session transcript, when the hooks reported one.
         transcript: Option<PathBuf>,
+        /// The addressed native session id (transcript entries must match).
+        session: String,
+        /// This hand-off's `from` value (`uds:<callback>`); a peer entry
+        /// must name it to count as this daemon's delivery.
+        from: String,
+        /// One member `(publisher, event_id)` of the frozen manifest, the
+        /// handle core evidence is recorded against (it applies to the
+        /// whole manifest).
+        member: (String, String),
+        /// Whether native queue acceptance was already recorded.
+        enqueued: bool,
         /// Closure deadline (Unix epoch ms).
         deadline_ms: u64,
     },
@@ -194,8 +216,26 @@ fn registry_entries(store: &Path) -> Vec<PathBuf> {
     paths
 }
 
-/// Finds the inbox socket of `session` owned by exactly `pid`.
-fn inbox_socket(store: &Path, session: &str, pid: u32, uid: u32) -> Option<PathBuf> {
+/// What the session descriptor of the attested harness process says about
+/// its native inbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboxState {
+    /// The descriptor names an absolute inbox socket.
+    Socket(PathBuf),
+    /// The descriptor of exactly this session and PID exists but advertises
+    /// no inbox: the loaded harness runs with messaging disabled (Claude
+    /// 2.1.296 writes such a descriptor in a restricted session, where it
+    /// ignores `--messaging-socket-path`). Positive runtime disablement.
+    Disabled,
+    /// No descriptor of this session and PID (not written yet, or the
+    /// process is gone): transient or unknown, never "disabled" and never
+    /// inactive.
+    Absent,
+}
+
+/// Reads the inbox state of `session` owned by exactly `pid` from the
+/// store's session registry (owned, regular, bounded files only).
+pub fn inbox_state(store: &Path, session: &str, pid: u32, uid: u32) -> InboxState {
     registry_entries(store)
         .into_iter()
         .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
@@ -204,11 +244,16 @@ fn inbox_socket(store: &Path, session: &str, pid: u32, uid: u32) -> Option<PathB
             let map = owned_json(&path, uid)?;
             let matches = map.get("sessionId").and_then(Value::as_str) == Some(session)
                 && map.get("pid").and_then(Value::as_u64) == Some(u64::from(pid));
-            matches
-                .then(|| map.get("messagingSocketPath")?.as_str().map(PathBuf::from))
-                .flatten()
-                .filter(|socket| socket.is_absolute())
+            matches.then(|| match map.get("messagingSocketPath") {
+                Some(Value::String(socket)) if Path::new(socket).is_absolute() => {
+                    InboxState::Socket(PathBuf::from(socket))
+                }
+                None | Some(Value::Null) => InboxState::Disabled,
+                // A malformed value is not a positive disablement.
+                Some(_) => InboxState::Absent,
+            })
         })
+        .unwrap_or(InboxState::Absent)
 }
 
 /// Reads the recipient process's own peer token (never logged).
@@ -398,13 +443,55 @@ impl Hub {
         }
     }
 
-    /// One closure pass over written-without-receipt hand-offs: a transcript
-    /// containing the exact manifest as a user message closes positively;
-    /// past the deadline the entry is forgotten (core already holds the
-    /// recheck and raises the incident).
+    /// Records one positive evidence tier for an attempt in core.
+    fn evidence(
+        &self,
+        fence: &AttemptFence,
+        member: &(String, String),
+        tier: EvidenceTier,
+        detail: &str,
+    ) {
+        let recorded = with_custody(self.custody.as_ref(), |storage| {
+            storage.record_evidence(
+                &member.0,
+                &member.1,
+                fence.attempt_seq,
+                tier,
+                detail,
+                current_unix_millis(),
+            )
+        });
+        if !matches!(recorded, Some(Ok(_))) {
+            log_event("warn", "claude_transcript_evidence_unrecorded", &[]);
+        }
+    }
+
+    /// One reconciliation pass over written-without-receipt hand-offs against
+    /// the addressed session's own native transcript.
+    ///
+    /// A user entry of that session whose native peer origin names this
+    /// hand-off's `from` and whose content contains the exact manifest is
+    /// context evidence (the manifest entered the conversation); it settles
+    /// the attempt. A queue `enqueue` of that session whose content is the
+    /// exact manifest is native acceptance; it is recorded once and the
+    /// pass keeps looking for context until the deadline. Past the deadline
+    /// the entry is forgotten (core holds the recheck and raises the
+    /// incident). No message id is assumed to appear in the transcript, and
+    /// absence never causes a resend.
     fn close_pass(&self) {
         let now = current_unix_millis();
-        let candidates: Vec<(String, AttemptFence, String, Option<PathBuf>, u64)> = {
+        type Candidate = (
+            String,
+            AttemptFence,
+            String,
+            Option<PathBuf>,
+            String,
+            String,
+            (String, String),
+            bool,
+            u64,
+        );
+        let candidates: Vec<Candidate> = {
             let pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
             pending
                 .iter()
@@ -412,35 +499,61 @@ impl Hub {
                     Waiting::NoReceipt {
                         manifest,
                         transcript,
+                        session,
+                        from,
+                        member,
+                        enqueued,
                         deadline_ms,
                     } => Some((
                         id.clone(),
                         entry.fence.clone(),
                         manifest.clone(),
                         transcript.clone(),
+                        session.clone(),
+                        from.clone(),
+                        member.clone(),
+                        *enqueued,
                         *deadline_ms,
                     )),
                     _ => None,
                 })
                 .collect()
         };
-        for (id, fence, manifest, transcript, deadline) in candidates {
+        for (id, fence, manifest, transcript, session, from, member, enqueued, deadline) in
+            candidates
+        {
             let found = transcript
                 .as_deref()
-                .is_some_and(|path| transcript_contains(path, &manifest, self.uid));
-            if found {
+                .map(|path| transcript_evidence(path, &manifest, self.uid, &session, &from))
+                .unwrap_or_default();
+            if found.context {
                 self.pending
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .remove(&id);
-                self.record(
+                self.evidence(
                     &fence,
-                    Outcome::NativeAccepted {
-                        evidence: format!(
-                            "exact-session transcript holds the manifest {} as a user message",
-                            &fence.manifest_hash[..16.min(fence.manifest_hash.len())]
-                        ),
-                    },
+                    &member,
+                    EvidenceTier::ContextObserved,
+                    "native transcript of the attested session holds this daemon's peer message (origin from its callback) containing the exact manifest as conversation input",
+                );
+            } else if found.enqueued && !enqueued {
+                if let Some(Pending {
+                    waiting: Waiting::NoReceipt { enqueued, .. },
+                    ..
+                }) = self
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get_mut(&id)
+                {
+                    *enqueued = true;
+                }
+                self.evidence(
+                    &fence,
+                    &member,
+                    EvidenceTier::NativeAccepted,
+                    "native transcript of the attested session records an inbox enqueue of the exact manifest",
                 );
             } else if now > deadline {
                 self.pending
@@ -452,48 +565,94 @@ impl Hub {
     }
 }
 
-/// Whether the transcript's bounded tail holds `manifest` as the exact
-/// content of a user message.
-pub fn transcript_contains(path: &Path, manifest: &str, uid: u32) -> bool {
+/// Positive transcript evidence for one hand-off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TranscriptEvidence {
+    /// A peer-origin user entry from this hand-off's callback contains the
+    /// exact manifest (the manifest entered the conversation).
+    pub context: bool,
+    /// A queue `enqueue` entry carries exactly the manifest (native inbox
+    /// acceptance).
+    pub enqueued: bool,
+}
+
+/// Scans the bounded tail of an owned transcript file for positive evidence
+/// of one hand-off, using the entry shapes Claude 2.1.296 writes.
+///
+/// Context: `type == "user"`, `sessionId == session`,
+/// `origin == {kind: "peer", from}` with this hand-off's `from`, and message
+/// content (a string or text parts) containing the exact manifest (the
+/// native inbox wraps it in its own peer framing). Enqueued:
+/// `type == "queue-operation"`, `operation == "enqueue"`,
+/// `sessionId == session`, content equal to the manifest (trailing
+/// whitespace ignored). Anything else, including a matching text without
+/// the peer origin, is no evidence. Unreadable, foreign-owned or non-regular
+/// files yield none.
+pub fn transcript_evidence(
+    path: &Path,
+    manifest: &str,
+    uid: u32,
+    session: &str,
+    from: &str,
+) -> TranscriptEvidence {
+    let mut found = TranscriptEvidence::default();
     let Ok(metadata) = std::fs::symlink_metadata(path) else {
-        return false;
+        return found;
     };
-    if !metadata.is_file() || metadata.uid() != uid {
-        return false;
+    if !metadata.is_file() || metadata.uid() != uid || manifest.is_empty() {
+        return found;
     }
     let Ok(mut file) = std::fs::File::open(path) else {
-        return false;
+        return found;
     };
     let start = metadata.len().saturating_sub(MAX_TRANSCRIPT_TAIL);
-    if file.seek(SeekFrom::Start(start)).is_err() {
-        return false;
-    }
     let mut text = String::new();
-    if file
-        .take(MAX_TRANSCRIPT_TAIL)
-        .read_to_string(&mut text)
-        .is_err()
+    if file.seek(SeekFrom::Start(start)).is_err()
+        || file
+            .take(MAX_TRANSCRIPT_TAIL)
+            .read_to_string(&mut text)
+            .is_err()
     {
-        return false;
+        return found;
     }
-    text.lines().any(|line| {
+    for line in text.lines() {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
-            return false;
+            continue;
         };
-        let Some(message) = entry.get("message") else {
-            return false;
-        };
-        if message.get("role").and_then(Value::as_str) != Some("user") {
-            return false;
+        if entry.get("sessionId").and_then(Value::as_str) != Some(session) {
+            continue;
         }
-        match message.get("content") {
-            Some(Value::String(text)) => text == manifest,
-            Some(Value::Array(parts)) => parts
-                .iter()
-                .any(|part| part.get("text").and_then(Value::as_str) == Some(manifest)),
-            _ => false,
+        match entry.get("type").and_then(Value::as_str) {
+            Some("user") => {
+                let origin = &entry["origin"];
+                if origin.get("kind").and_then(Value::as_str) != Some("peer")
+                    || origin.get("from").and_then(Value::as_str) != Some(from)
+                {
+                    continue;
+                }
+                let content = &entry["message"]["content"];
+                let contains = match content {
+                    Value::String(text) => text.contains(manifest),
+                    Value::Array(parts) => parts.iter().any(|part| {
+                        part.get("text")
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| text.contains(manifest))
+                    }),
+                    _ => false,
+                };
+                found.context |= contains;
+            }
+            Some("queue-operation") => {
+                found.enqueued |= entry.get("operation").and_then(Value::as_str) == Some("enqueue")
+                    && entry
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|content| content.trim_end() == manifest.trim_end());
+            }
+            _ => {}
         }
-    })
+    }
+    found
 }
 
 impl ClaudeLaterCarrier {
@@ -591,13 +750,43 @@ impl Drop for ClaudeLaterCarrier {
 impl DispatchCarrier for ClaudeLaterCarrier {
     /// Attests Claude recipients from the registry; anything else is not
     /// this carrier's.
+    ///
+    /// The attested process's session descriptor decides the message path:
+    /// a positively disabled inbox withdraws the message capability (also
+    /// recorded in core, so later message publications refuse before
+    /// acceptance) and is returned as such, so core holds visibly instead of
+    /// treating the path as supported; a descriptor not yet written (absent)
+    /// is a transient condition reported as an attestation error (a hold),
+    /// never as disabled or inactive.
     fn attest(&mut self, recipient: &NativeAddress) -> Result<Attestation, String> {
         if recipient.harness != Harness::ClaudeCode {
             return Err("not a Claude recipient".into());
         }
-        lock_registry(&self.registry)
-            .attest_recipient(recipient)
-            .map(|(attestation, _)| attestation)
+        let (attestation, binding) = lock_registry(&self.registry).attest_recipient(recipient)?;
+        match inbox_state(
+            &binding.store,
+            &recipient.native_session_id,
+            binding.harness.0,
+            self.hub.uid,
+        ) {
+            InboxState::Socket(_) => Ok(attestation),
+            InboxState::Absent => Err(
+                "the recipient has not advertised its native inbox yet (transient, not inactive)"
+                    .into(),
+            ),
+            InboxState::Disabled => {
+                let disabled = lock_registry(&self.registry)
+                    .disable_message_for(recipient)
+                    .ok_or_else(|| "recipient binding vanished".to_string())?;
+                let observed = with_custody(self.hub.custody.as_ref(), |storage| {
+                    storage.observe_binding(&disabled, current_unix_millis())
+                });
+                if !matches!(observed, Some(Ok(()))) {
+                    log_event("warn", "claude_inbox_disablement_unrecorded", &[]);
+                }
+                Ok(disabled)
+            }
+        }
     }
 
     /// One `later` hand-off of the frozen manifest.
@@ -622,8 +811,16 @@ impl DispatchCarrier for ClaudeLaterCarrier {
         }
         let pid = binding.harness.0;
         let session = &address.native_session_id;
-        let Some(socket) = inbox_socket(&binding.store, session, pid, self.hub.uid) else {
-            return unsent("no inbox descriptor for the attested harness process".into());
+        let socket = match inbox_state(&binding.store, session, pid, self.hub.uid) {
+            InboxState::Socket(socket) => socket,
+            InboxState::Disabled => {
+                return unsent(
+                    "the attested harness process runs with its native inbox disabled".into(),
+                );
+            }
+            InboxState::Absent => {
+                return unsent("no inbox descriptor for the attested harness process".into());
+            }
         };
         let Some(token) = peer_token(&binding.store, pid, self.hub.uid) else {
             return unsent("the attested harness process has no peer token".into());
@@ -709,6 +906,14 @@ impl DispatchCarrier for ClaudeLaterCarrier {
                     entry.waiting = Waiting::NoReceipt {
                         manifest: attempt.manifest.clone(),
                         transcript: binding.transcript.clone(),
+                        session: session.clone(),
+                        from: format!("uds:{}", callback.display()),
+                        member: attempt
+                            .members
+                            .first()
+                            .map(|member| (member.publisher.clone(), member.event_id.clone()))
+                            .unwrap_or_default(),
+                        enqueued: false,
                         deadline_ms,
                     };
                 }

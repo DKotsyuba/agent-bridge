@@ -20,6 +20,8 @@
 //!     key into `$CLAUDE_CONFIG_DIR/sessions`. Behaviors: `held`,
 //!     `delivered`, `refused`, `none`.
 //!   - `{"cmd":"frames"}` answers the user frames the inbox received.
+//!   - `{"cmd":"descriptor_disabled","session_id":..}` writes this process's
+//!     session descriptor without any inbox (messaging disabled).
 //!   - `{"cmd":"receipt","msg_id":..,"status":..,"close":bool}` sends a late
 //!     receipt to the frame's callback from this process, staying connected
 //!     until read unless `close` (disconnect at once: unverifiable sender).
@@ -189,6 +191,21 @@ fn harness() {
                 command["behavior"].as_str().unwrap_or("none").to_string(),
             ),
             "frames" => json!({"frames": inbox.lock().unwrap().frames}),
+            "descriptor_disabled" => {
+                // A session descriptor of this process that advertises no
+                // inbox (as a restricted Claude session writes).
+                let store =
+                    PathBuf::from(std::env::var_os("CLAUDE_CONFIG_DIR").expect("store env"));
+                let sessions = store.join("sessions");
+                std::fs::create_dir_all(&sessions).expect("sessions dir");
+                let pid = std::process::id();
+                std::fs::write(
+                    sessions.join(format!("{pid}.json")),
+                    json!({"sessionId": command["session_id"], "pid": pid}).to_string(),
+                )
+                .expect("descriptor");
+                json!({"ok": true})
+            }
             "receipt" => {
                 let msg_id = command["msg_id"].as_str().unwrap_or_default();
                 let from = inbox
@@ -544,17 +561,23 @@ fn status(core: &str, token: &str, event_id: &str) -> Value {
     )
 }
 
-/// A minimal MCP stdio server with one tool, `bridge_probe`, for root-run
-/// native probes.
+/// A minimal MCP stdio server for root-run native probes, with three tools:
 ///
-/// Each call attests its caller from the request's `_meta` through the
-/// registry (this process must be the harness-launched MCP server). When
-/// the caller may act as its address, it publishes one `inject` event with
-/// a fresh marker to that address, so the call's own `PostToolUse` hook can
-/// hand it to the model. The marker is written only to the evidence file
-/// (`evidence`, JSON lines), never into the tool result, so a model that
-/// reports it saw it through the hook context. Model arguments are
-/// recorded but never used as identity.
+/// - `bridge_probe` (not read-only: it publishes): attests its caller from
+///   the request's `_meta` through the registry (this process must be the
+///   harness-launched MCP server); when the caller may act as its address,
+///   publishes one `inject` event with a fresh marker to that address, so
+///   the call's own `PostToolUse` hook can hand it to the model.
+/// - `bridge_me` (`readOnlyHint: true`): attests its caller and records it;
+///   it publishes nothing, so a probe controls publication externally.
+/// - `bridge_unlisted` (`readOnlyHint: false`, `destructiveHint: true`): a
+///   negative control for host tool approval. It does nothing but record
+///   `unlisted_called`; a probe that expects the host to refuse it fails if
+///   that record ever appears.
+///
+/// Every call appends one JSON line with the tool name to `evidence`. A
+/// marker is written only there, never into the tool result. Model
+/// arguments are recorded but never used as identity.
 fn mcp_server(channel: &str, core: &str, token: &str, evidence: &str) {
     let attestor = RegistryAttestor::new(Path::new(channel), Duration::from_secs(5), 600_000);
     let mut log = std::fs::OpenOptions::new()
@@ -576,12 +599,36 @@ fn mcp_server(channel: &str, core: &str, token: &str, evidence: &str) {
                 "serverInfo": {"name": "bridge-probe", "version": env!("CARGO_PKG_VERSION")}
             }),
             "ping" => json!({}),
-            "tools/list" => json!({"tools": [{
-                "name": "bridge_probe",
-                "description": "Agent Bridge native qualification probe. Call with an empty object.",
-                "inputSchema": {"type": "object", "properties": {}}
-            }]}),
+            "tools/list" => json!({"tools": [
+                {
+                    "name": "bridge_probe",
+                    "description": "Agent Bridge native qualification probe. Call with an empty object.",
+                    "inputSchema": {"type": "object", "properties": {}},
+                    "annotations": {"readOnlyHint": false, "destructiveHint": false, "openWorldHint": false}
+                },
+                {
+                    "name": "bridge_me",
+                    "description": "Agent Bridge caller attestation (read-only). Call with an empty object.",
+                    "inputSchema": {"type": "object", "properties": {}},
+                    "annotations": {"readOnlyHint": true, "destructiveHint": false, "openWorldHint": false}
+                },
+                {
+                    "name": "bridge_unlisted",
+                    "description": "Agent Bridge approval negative control. Call with an empty object.",
+                    "inputSchema": {"type": "object", "properties": {}},
+                    "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": false}
+                }
+            ]}),
+            "tools/call" if message["params"]["name"] == "bridge_unlisted" => {
+                let record = json!({"at": bridge_core::service::current_unix_millis(), "tool": "bridge_unlisted", "unlisted_called": true});
+                let _ = writeln!(log, "{record}");
+                json!({"content": [{"type": "text", "text": "bridge_unlisted ran"}]})
+            }
             "tools/call" => {
+                let tool = message["params"]["name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
                 let meta = message["params"]["_meta"]
                     .as_object()
                     .cloned()
@@ -591,6 +638,7 @@ fn mcp_server(channel: &str, core: &str, token: &str, evidence: &str) {
                     .and_then(|meta| attestor.attest(&meta, now));
                 let mut record = json!({
                     "at": now,
+                    "tool": tool,
                     "meta_keys": meta.keys().collect::<Vec<_>>(),
                     "arguments_ignored": message["params"]["arguments"],
                 });
@@ -603,7 +651,7 @@ fn mcp_server(channel: &str, core: &str, token: &str, evidence: &str) {
                             "epoch": caller.epoch(),
                             "may_act_as_address": caller.may_act_as_address(),
                         });
-                        if caller.may_act_as_address() {
+                        if caller.may_act_as_address() && tool == "bridge_probe" {
                             let marker = format!(
                                 "BRIDGE_CTX_{}",
                                 bridge_adapters::os::random_bytes().expect("random")[..6]
@@ -623,11 +671,11 @@ fn mcp_server(channel: &str, core: &str, token: &str, evidence: &str) {
                                 &format!("Synthetic Bridge qualification context marker {marker}."),
                             );
                         }
-                        format!("bridge_probe attested role={}", record["caller"]["role"])
+                        format!("{tool} attested role={}", record["caller"]["role"])
                     }
                     Err(error) => {
                         record["refused"] = json!(error.class());
-                        format!("bridge_probe refused: {}", error.class())
+                        format!("{tool} refused: {}", error.class())
                     }
                 };
                 let _ = writeln!(log, "{record}");

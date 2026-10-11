@@ -479,13 +479,115 @@ fn claude_later_held_release_receipts_and_transcript_closure() {
         AttemptState::WrittenNoReceipt
     );
     let manifest = lab.attempt("evt-quiet").unwrap().manifest;
-    let line = json!({"type": "user", "message": {"role": "user", "content": manifest}});
-    std::fs::write(&transcript, format!("{line}\n")).unwrap();
-    assert!(eventually(6_000, || lab
-        .attempt("evt-quiet")
-        .unwrap()
-        .state
-        == AttemptState::NativeAccepted));
+    let frames = harness.cmd(json!({"cmd": "frames"}));
+    let from = frames["frames"][1]["from"].as_str().unwrap().to_string();
+    let tiers = |event: &str| -> Vec<String> {
+        let evidence = lab
+            .storage
+            .lock()
+            .unwrap()
+            .delivery_evidence(PUBLISHER, event)
+            .unwrap()
+            .unwrap();
+        evidence
+            .tiers
+            .iter()
+            .map(|entry| entry.tier.as_str().to_string())
+            .collect()
+    };
+    // Native shapes (Claude 2.1.296) that are NOT this hand-off's evidence:
+    // the manifest without a peer origin, a peer origin from another sender,
+    // another session's entry.
+    let wrapped = format!(
+        "Another Claude session sent a message:\n{manifest}\n\nThis came from another Claude session."
+    );
+    let decoys = [
+        json!({"type": "user", "sessionId": "sess-8", "message": {"role": "user", "content": wrapped}}),
+        json!({"type": "user", "sessionId": "sess-8", "origin": {"kind": "peer", "from": "uds:/elsewhere.sock"}, "message": {"role": "user", "content": wrapped}}),
+        json!({"type": "user", "sessionId": "other", "origin": {"kind": "peer", "from": from}, "message": {"role": "user", "content": wrapped}}),
+    ];
+    let text: String = decoys.iter().map(|line| format!("{line}\n")).collect();
+    std::fs::write(&transcript, &text).unwrap();
+    std::thread::sleep(Duration::from_millis(2_500));
+    assert_eq!(
+        lab.attempt("evt-quiet").unwrap().state,
+        AttemptState::WrittenNoReceipt
+    );
+    // The native enqueue of the exact manifest is native acceptance; the
+    // peer-origin entry from this hand-off's callback is context.
+    let enqueue = json!({"type": "queue-operation", "operation": "enqueue", "sessionId": "sess-8", "content": manifest});
+    std::fs::write(&transcript, format!("{text}{enqueue}\n")).unwrap();
+    assert!(eventually(6_000, || tiers("evt-quiet")
+        .contains(&"native_accepted".to_string())));
+    assert!(!tiers("evt-quiet").contains(&"context_observed".to_string()));
+    let peer = json!({"type": "user", "sessionId": "sess-8", "isMeta": true, "origin": {"kind": "peer", "from": from}, "message": {"role": "user", "content": wrapped}});
+    std::fs::write(&transcript, format!("{text}{enqueue}\n{peer}\n")).unwrap();
+    assert!(eventually(6_000, || tiers("evt-quiet")
+        .contains(&"context_observed".to_string())));
+    harness.stop();
+}
+
+/// A recipient whose loaded harness positively runs without a native inbox
+/// loses the message capability: the waiting message holds visibly (no
+/// attempt) and later message publications are refused before acceptance.
+/// A not-yet-written descriptor is only a transient hold, never disabled.
+#[test]
+fn disabled_inbox_refuses_before_acceptance_and_absent_inbox_only_holds() {
+    let lab = Lab::new("di");
+    let address = lab.claude_address("sess-di");
+    let custody = Arc::clone(&lab.storage) as Arc<dyn Custody>;
+    let mut carrier =
+        ClaudeLaterCarrier::new(Arc::clone(&lab.registry), custody, ClaudeTiming::default())
+            .unwrap();
+    let mut harness = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    harness.hook(
+        &lab.socket,
+        Harness::ClaudeCode,
+        hook("SessionStart", "sess-di"),
+    );
+    harness.hook(&lab.socket, Harness::ClaudeCode, hook("Stop", "sess-di"));
+
+    // Absent descriptor: held, nothing invoked, capability kept.
+    lab.publish("evt-absent", &address, Mode::Message, "absent payload");
+    let report = dispatch_message(
+        &lab.storage,
+        &mut carrier,
+        &address,
+        &now,
+        &DispatchTiming::default(),
+    )
+    .unwrap();
+    assert!(matches!(report, DispatchReport::Held(_)), "{report:?}");
+    assert!(lab.attempt("evt-absent").is_none());
+    lab.try_publish("evt-still-accepted", &address, Mode::Message)
+        .unwrap();
+
+    // Positively disabled: the descriptor of this session and PID exists
+    // without an inbox.
+    harness.cmd(json!({"cmd": "descriptor_disabled", "session_id": "sess-di"}));
+    let report = dispatch_message(
+        &lab.storage,
+        &mut carrier,
+        &address,
+        &now,
+        &DispatchTiming::default(),
+    )
+    .unwrap();
+    assert!(
+        matches!(report, DispatchReport::Held(ref reason) if reason.contains("capability")),
+        "{report:?}"
+    );
+    assert!(lab.attempt("evt-absent").is_none());
+    let refused = lab
+        .try_publish("evt-after-disable", &address, Mode::Message)
+        .unwrap_err();
+    assert!(
+        refused.contains("unsupported") || refused.contains("capab"),
+        "{refused}"
+    );
+    // inject stays supported.
+    lab.try_publish("evt-inject-ok", &address, Mode::Inject)
+        .unwrap();
     harness.stop();
 }
 
@@ -1095,6 +1197,57 @@ message = true
         tool_hook("PostToolUse", "sess-d", "tu-d1", None),
     );
     assert!(post["stdout"].as_str().unwrap().contains(&marker), "{post}");
+    // Tool annotations: only bridge_me claims to be read-only.
+    let tools = reply["responses"][1]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let read_only = |name: &str| {
+        tools.iter().find(|tool| tool["name"] == name).unwrap()["annotations"]["readOnlyHint"]
+            .clone()
+    };
+    assert_eq!(read_only("bridge_me"), json!(true));
+    assert_eq!(read_only("bridge_probe"), json!(false));
+    assert_eq!(read_only("bridge_unlisted"), json!(false));
+    // bridge_me attests the root without publishing; bridge_unlisted only
+    // records that it ran (what a host refusal must prevent).
+    harness.hook(
+        &channel,
+        Harness::ClaudeCode,
+        tool_hook("PreToolUse", "sess-d", "tu-d2", None),
+    );
+    let second = harness.cmd(json!({
+        "cmd": "mcp_server",
+        "args": [channel, core, token_file, evidence],
+        "requests": [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "bridge_me", "arguments": {}, "_meta": {"claudecode/toolUseId": "tu-d2"}}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "bridge_unlisted", "arguments": {}}}
+        ]
+    }));
+    assert!(
+        second["responses"][1]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("root"),
+        "{second}"
+    );
+    let records: Vec<serde_json::Value> = std::fs::read_to_string(&evidence)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let me = records.iter().find(|r| r["tool"] == "bridge_me").unwrap();
+    assert_eq!(me["caller"]["role"], "root");
+    assert!(
+        me.get("marker").is_none() && me.get("publish").is_none(),
+        "{me}"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|r| r["tool"] == "bridge_unlisted" && r["unlisted_called"] == true)
+    );
     let event = record["event_id"].as_str().unwrap();
     let status = std::process::Command::new(fixture_exe())
         .args([

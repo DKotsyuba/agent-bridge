@@ -93,8 +93,15 @@ Codex / Claude qualification is **not** established (see the end).
   ignored and logged `claude_receipt_unverifiable` — fail closed, the
   attempt stays held/unreceipted until core's overdue incident. `held` is non-terminal, `delivered` is acceptance, a refusal
   before any hold is known-unsent, any negative after a hold is unknown, and
-  silence is `written_no_receipt`, closed positively only when the session's
-  own transcript holds the exact manifest as a user message. A daemon restart
+  silence is `written_no_receipt`. That hand-off is reconciled against the
+  addressed session's own native transcript (shapes observed on 2.1.296): an
+  `enqueue` of the exact manifest records `native_accepted`, a peer-origin user
+  entry naming this hand-off's callback and containing the exact manifest
+  records `context_observed`; no message id is assumed and absence never
+  retries. A session descriptor without an inbox (restricted session) is
+  positive disablement: the message capability is withdrawn and recorded in
+  core, so later message publications refuse before acceptance; a missing
+  descriptor is only a transient hold. A daemon restart
   forgets callbacks; core's recheck deadlines then raise incidents, never
   replays (a stopped carrier removes its own callback sockets). Manifests
   over 4096 bytes are refused before any write.
@@ -153,9 +160,9 @@ Build first: `cargo +1.98.1 build --offline -p bridge-adapters --bins`.
 | Probe | Model | Command | Passing evidence |
 |---|---|---|---|
 | Q1 Codex helper classification | no | `BRIDGE_QUALIFY_CODEX_EXE=<codex> cargo +1.98.1 test --offline -p bridge-adapters --test qualify_codex -- --ignored --nocapture` | conservative classification only: native errors after the write (model-less unpersisted thread, missing thread) are never known-unsent; any acceptance has a native readback. Not positive queue qualification |
-| Q2 Claude hooks, caller, inject, `later`, pause | haiku, low, 0.5 USD cap | `node qualification/claude-native-probe.cjs` | `checks.json` with no failures: root/child attested from the real `toolUseId`, the hook-injected marker quoted while the planted project-memory canary is absent, a message answered in a distinct unprompted turn, pause applied with the paused event held (no attempt, no-wake hold reason) and no turn while the receiver was alive with budget, then a distinct turn after resume; `daemon_events` shows whether real receipts were verifiable |
-| Q3 Codex gate only | no | `CODEX_PROBE_GATE_ONLY=1 node qualification/codex-native-probe.cjs` | `hooks_isolated: true` (ends with `gate_only_run` by design) |
-| Q3 Codex hooks, caller, inject, child, queue | gpt-6-luna, low | `node qualification/codex-native-probe.cjs` | `checks.json` with no failures: model in the build catalog, hooks isolated, root join succeeded (shows callId = tool_use_id for that build), marker in the reply, child attested on its own thread, the helper's correlated `native_accepted` with native readback on the persisted thread, and the probe's own queue item removed and verified gone |
+| Q2 Claude hooks, caller, inject, `later`, pause | haiku, low, 0.5 USD cap | `node qualification/claude-native-probe.cjs` | `checks.json` with no failures: closed native tool inventory and manual/default permissions, root/child attested from the real `toolUseId`, the hook-injected marker quoted while the planted project-memory canary is absent, the background child's native completion (and any follow-up turn) before the idle steps, a message answered in a distinct unprompted turn with actor-bound transcript evidence (`context_observed` or `native_accepted`), pause applied with the paused event held (no attempt, no-wake hold reason) and no turn start or result in the paused window while the receiver was alive with budget, then a distinct turn after resume |
+| Q3 Codex gate only | no | `CODEX_PROBE_GATE_ONLY=1 node qualification/codex-native-probe.cjs` | `hooks_isolated` and `approval_config_effective` true (ends with `gate_only_run` by design) |
+| Q3 Codex hooks, caller, inject, child, queue | gpt-6-luna, low | `node qualification/codex-native-probe.cjs` | `checks.json` with no failures: model in the build catalog, hooks isolated, exact-tool approval effective, the read-only `bridge_me` root join succeeded (shows callId = tool_use_id for that build), the externally published marker in the reply, the unapproved `bridge_unlisted` refused by the host and never executed, child attested on its own thread, the helper's correlated `native_accepted` with native readback on the persisted thread, and the probe's own queue item removed and verified gone |
 
 Shared lifecycle (`qualification/probe-lib.cjs`): one absolute total budget
 (a local command is refused once it is spent); a lifecycle fence refuses any
@@ -172,7 +179,10 @@ not exactly `true` is a failure. `node qualification/probe-lib.cjs
 --self-test` exercises all of this without any model and passes only on its
 exact expected failure set.
 
-Isolation: Q2 uses `--setting-sources ''`, `--restricted`, `--no-chrome`,
+Isolation: Q2 uses `--setting-sources ''`, only the Agent tool (native `Task`)
+plus the fixture MCP tool checked against the native inventory, an explicit
+private `--messaging-socket-path` (not `--restricted`: the 2.1.296 bundle
+ignores the messaging socket in a restricted session), `--no-chrome`,
 `--permission-prompts none`, `--strict-mcp-config`, its own settings/agent,
 and the installed build's memory switches (`CLAUDE_CODE_DISABLE_CLAUDE_MDS`,
 `CLAUDE_CODE_DISABLE_AUTO_MEMORY`, `CLAUDE_CODE_DISABLE_ORG_MEMORY`), checked

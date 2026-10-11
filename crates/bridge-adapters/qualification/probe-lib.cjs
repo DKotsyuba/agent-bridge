@@ -178,8 +178,13 @@ class Probe {
     const entry = this.children.find(c => c.child === child);
     const bound = Math.min(ms, this.remaining());
     if (bound <= 0) { this.fail('budget_exhausted'); return null; }
-    const timer = new Promise(r => setTimeout(() => r(null), bound));
-    return Promise.race([entry.exit, timer]);
+    // Dispose the losing timer so a completed child does not keep the probe
+    // alive until the bound expires (root-observed 8-minute wrapper hang).
+    let timeout;
+    try {
+      const timer = new Promise(r => { timeout = setTimeout(() => r(null), bound); });
+      return await Promise.race([entry.exit, timer]);
+    } finally { clearTimeout(timeout); }
   }
 
   /** Runs a short local command (no model) and returns trimmed stdout.
@@ -310,7 +315,57 @@ function run(name, budgetMs, required, main) {
     .then(() => { clearTimeout(timer); return done(); });
 }
 
-module.exports = { Probe, run };
+/** Tracks native turn and background-task state from a Claude stream-json
+ * receiver, so a probe can wait for an *authoritative* idle state instead
+ * of trusting model text.
+ *
+ * A turn starts with `system/init` and ends with `result`; a background
+ * child starts with `system/task_started` and ends with
+ * `system/task_notification` (its `status`), both carrying the same
+ * `task_id`. The receiver is idle when every started turn has a result,
+ * no task is still running, and no event arrived for `quietMs` (a
+ * completion notification can start a follow-up turn shortly after).
+ */
+class TurnTracker {
+  /** @param {() => number} [clock] Millisecond clock (injectable for the control). */
+  constructor(clock = Date.now) {
+    /** @type {() => number} Clock. */
+    this.clock = clock;
+    /** @type {number} Turns started (`system/init`). */
+    this.started = 0;
+    /** @type {number} Turns finished (`result`). */
+    this.finished = 0;
+    /** @type {Map<string, string>} Background task id -> `running` or its final status. */
+    this.tasks = new Map();
+    /** @type {number} Time of the latest turn/task event. */
+    this.lastEventAt = clock();
+  }
+
+  /** Feeds one parsed stream-json event.
+   * @param {{type?: string, subtype?: string, task_id?: string, status?: string}} event Event.
+   */
+  observe(event) {
+    if (event.type === 'system' && event.subtype === 'init') this.started++;
+    else if (event.type === 'result') this.finished++;
+    else if (event.type === 'system' && event.subtype === 'task_started' && event.task_id) this.tasks.set(event.task_id, 'running');
+    else if (event.type === 'system' && event.subtype === 'task_notification' && event.task_id) this.tasks.set(event.task_id, String(event.status || 'unknown'));
+    else return;
+    this.lastEventAt = this.clock();
+  }
+
+  /** Task ids still running. @returns {string[]} */
+  running() { return [...this.tasks].filter(([, state]) => state === 'running').map(([id]) => id); }
+
+  /** Whether the receiver is authoritatively idle for at least `quietMs`.
+   * @param {number} quietMs Required quiet interval in milliseconds.
+   * @returns {boolean}
+   */
+  idle(quietMs) {
+    return this.started === this.finished && this.running().length === 0 && this.clock() - this.lastEventAt >= quietMs;
+  }
+}
+
+module.exports = { Probe, run, TurnTracker };
 
 /** The exact failure set the lifecycle self-test must produce. */
 const SELF_TEST_EXPECTED = ['cleanup_failed:boom', 'late_spawn:unmarked', 'spawn_error:missing', 'unclosed:escaper', 'orphan_processes',
@@ -325,6 +380,32 @@ const SELF_TEST_EXPECTED = ['cleanup_failed:boom', 'late_spawn:unmarked', 'spawn
 // the written result; a missing required check fails; an exhausted budget
 // refuses a local command before running it; registered cleanups run and a
 // throwing one is reported; after cleanup no process or command starts.
+/** Child-completion sequencing control, modelled on the native Q2 stream
+ * (task started in the child turn, completion notification arriving
+ * during a later turn, then a follow-up turn): idle must not be reported
+ * before the follow-up turn ended and the quiet interval passed.
+ * @returns {boolean} Whether the tracker sequenced the stream correctly.
+ */
+function turnTrackerControl() {
+  let now = 0;
+  const tracker = new TurnTracker(() => now);
+  const feed = (event, at) => { now = at; tracker.observe(event); };
+  feed({ type: 'system', subtype: 'init' }, 1); feed({ type: 'result' }, 2);
+  feed({ type: 'system', subtype: 'init' }, 3);
+  feed({ type: 'system', subtype: 'task_started', task_id: 't1' }, 4);
+  feed({ type: 'result' }, 5); // the model says the child is in the background
+  now = 30; const whileChildRuns = tracker.idle(10);
+  feed({ type: 'system', subtype: 'init' }, 31);
+  feed({ type: 'system', subtype: 'task_notification', task_id: 't1', status: 'completed' }, 32);
+  feed({ type: 'result' }, 33);
+  feed({ type: 'system', subtype: 'init' }, 36); // follow-up turn reporting the child
+  now = 40; const duringFollowUp = tracker.idle(1);
+  feed({ type: 'result' }, 41);
+  now = 45; const tooSoon = tracker.idle(10);
+  now = 52; const quiet = tracker.idle(10);
+  return !whileChildRuns && !duringFollowUp && !tooSoon && quiet;
+}
+
 if (require.main === module && process.argv[2] === '--self-test') {
   const keep = 'setInterval(() => {}, 1000)';
   run('m2st', 30000, ['spawned', 'never_set'], async probe => {
@@ -366,8 +447,9 @@ if (require.main === module && process.argv[2] === '--self-test') {
     let lateRefused = false;
     try { probe.spawn('late', process.execPath, ['-e', '0', probe.dir]); } catch { lateRefused = probe.failures.includes('late_spawn:late'); }
     const localRefused = probe.local('/bin/echo', ['x']) === 'error:probe_closing';
-    const pass = JSON.stringify(failures) === JSON.stringify(SELF_TEST_EXPECTED) && trailing && leakRedacted && resultRedacted && refused && cleanupRan && lateRefused && localRefused && probe.checks.unmarked_refused === true;
-    console.log(JSON.stringify({ self_test: pass ? 'PASS' : 'FAIL', failures, expected: SELF_TEST_EXPECTED, trailing, leakRedacted, resultRedacted, refused, cleanupRan, lateRefused, localRefused }));
+    const sequencing = turnTrackerControl();
+    const pass = JSON.stringify(failures) === JSON.stringify(SELF_TEST_EXPECTED) && trailing && leakRedacted && resultRedacted && refused && cleanupRan && lateRefused && localRefused && probe.checks.unmarked_refused === true && sequencing;
+    console.log(JSON.stringify({ self_test: pass ? 'PASS' : 'FAIL', failures, expected: SELF_TEST_EXPECTED, trailing, leakRedacted, resultRedacted, refused, cleanupRan, lateRefused, localRefused, sequencing }));
     process.exitCode = pass ? 0 : 1;
   });
 }

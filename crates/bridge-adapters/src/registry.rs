@@ -1341,6 +1341,36 @@ impl Registry {
         Ok(sealed.caller.into_relayed())
     }
 
+    /// Withdraws the message capability of a bound recipient whose loaded
+    /// harness positively reports its native inbox as disabled (a carrier
+    /// observed it), and returns the attestation to record in core so that
+    /// later message publications are refused before acceptance.
+    ///
+    /// Positive disablement only: an absent or not-yet-advertised channel is
+    /// a transient condition and must not call this. The withdrawal lasts
+    /// until the binding is renewed (a new `SessionStart` or incarnation
+    /// takes capabilities from the profile again). Returns `None` when the
+    /// address has no live binding.
+    pub fn disable_message_for(&mut self, address: &NativeAddress) -> Option<Attestation> {
+        let binding = self.bindings.get_mut(&address.to_canonical_string())?;
+        if binding.retired {
+            return None;
+        }
+        binding.capabilities.message = false;
+        Attestation::verified(
+            binding.address.clone(),
+            binding.address.native_session_id.clone(),
+            binding.epoch,
+            binding.lifecycle,
+            binding.capabilities,
+            proof(format!(
+                "message-disabled:{}@{}:{}:epoch{}",
+                binding.harness.0, binding.harness.1, binding.version, binding.epoch
+            )),
+        )
+        .ok()
+    }
+
     /// Attests a recipient endpoint for a message carrier right now.
     ///
     /// Errors (core holds visibly, never treats as inactive) when no

@@ -45,8 +45,23 @@
  *    `isolation_unavailable` before phase 1.
  *    The `HookStateToml { enabled, trusted_hash }` keys were read from the
  *    0.162.0-alpha.17.2 binary; the second listing is the proof.
- * 3. Phase 1 (thread creation) additionally disables hooks entirely;
+ * 3. The same gate reads the effective config (`config/read`) and keeps
+ *    only this probe's own server subtree: `enabled_tools` must be exactly
+ *    `["bridge_me","bridge_unlisted"]`, only `bridge_me` may carry a
+ *    per-launch `approval_mode` (ME_APPROVAL) and no server-wide default may
+ *    be set (`approval_config_effective`), else `approval_config_unavailable`
+ *    before any model call. Exec keeps its approval policy `never`; no global
+ *    approval setting is changed.
+ * 4. Phase 1 (thread creation) additionally disables hooks entirely;
  *    phase 2 uses the verified overrides.
+ *
+ * Caller attestation uses the read-only `bridge_me` tool (attests, never
+ * publishes). The inject marker is published by the probe itself to the
+ * root thread before phase 2 and must come back through the root's own
+ * `PostToolUse` context. Negative control: the model is asked to call the
+ * unapproved `bridge_unlisted`; the host must refuse it with an approval
+ * error (`unlisted_refused_by_host`) and the fixture server must never see
+ * it (`unlisted_not_executed`). A missing attempt is a failure, not a pass.
  *
  * Phase 3 queues one item with the product helper, then reads the queue
  * back natively. A registered cleanup removes exactly this probe's item
@@ -81,8 +96,15 @@ const DISABLED = ['plugins', 'apps', 'memories', 'browser_use', 'computer_use', 
 const ISOLATION = ['--ignore-user-config', '--ignore-rules', '--skip-git-repo-check', '--sandbox', 'read-only',
   '-m', MODEL, '-c', `model_reasoning_effort="${EFFORT}"`, ...DISABLED];
 /** Checks that must all be exactly true. */
-const REQUIRED = ['versions_recorded', 'model_in_catalog', 'hooks_isolated', 'phase1_completed', 'phase2_completed',
-  'root_attested', 'inject_marker_in_reply', 'child_attested_own_thread', 'queue_native_accepted', 'queue_readback', 'queue_cleanup'];
+const REQUIRED = ['versions_recorded', 'model_in_catalog', 'hooks_isolated', 'approval_config_effective', 'phase1_completed', 'phase2_completed',
+  'root_attested', 'inject_published', 'inject_marker_in_reply', 'unlisted_refused_by_host', 'unlisted_not_executed',
+  'child_attested_own_thread', 'queue_native_accepted', 'queue_readback', 'queue_cleanup'];
+/** Per-launch approval of exactly the read-only `bridge_me` tool. The value
+ * is a member of the loaded build's `AppToolApproval` schema enum
+ * (`auto`, `prompt`, `writes`, `approve`); the enum string alone is not
+ * its semantics: phase 2 must show `bridge_me` executed while the unlisted
+ * `bridge_unlisted` is refused by the host and never reaches the server. */
+const ME_APPROVAL = 'approve';
 /** Hook events the probe installs. */
 const EVENTS = ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop'];
 
@@ -113,13 +135,20 @@ run('m2xp', 20 * 60_000, REQUIRED, async probe => {
   const own = [
     '-c', `mcp_servers.bridge_probe.command=${JSON.stringify(fixture)}`,
     '-c', `mcp_servers.bridge_probe.args=${JSON.stringify(['mcp-server', channel, core, publisher.file, evidence])}`,
+    '-c', 'mcp_servers.bridge_probe.enabled_tools=["bridge_me","bridge_unlisted"]',
+    '-c', `mcp_servers.bridge_probe.tools.bridge_me.approval_mode="${ME_APPROVAL}"`,
     ...EVENTS.flatMap(e => ['-c', `hooks.${e}=${hook}`]),
   ];
 
   // Isolation gate (before any model call): list, derive per-launch state
   // overrides, re-list and verify.
+  let effective = null;
   const list = async (label, extra) => {
-    const [answer] = await appServer(probe, codex, store, label, [...DISABLED, '--enable', 'hooks', ...own, ...extra], [['hooks/list', { cwds: [probe.dir] }]]);
+    const [answer, config] = await appServer(probe, codex, store, label, [...DISABLED, '--enable', 'hooks', ...own, ...extra],
+      [['hooks/list', { cwds: [probe.dir] }], ['config/read', { cwd: probe.dir }]]);
+    // Only this probe's own server subtree is kept (the user config may hold secrets).
+    effective = config && config.result && config.result.config && config.result.config.mcp_servers
+      ? config.result.config.mcp_servers.bridge_probe || null : null;
     return answer && answer.result ? answer.result.data.flatMap(e => e.hooks || []) : null;
   };
   const isOwn = h => h.source === 'sessionFlags' && String(h.command || '') === hookCommand;
@@ -143,7 +172,19 @@ run('m2xp', 20 * 60_000, REQUIRED, async probe => {
     && second.filter(h => !isOwn(h)).every(h => !h.enabled)
     && ownAfter.length === EVENTS.length
     && ownAfter.every(h => h.enabled && h.trustStatus === 'trusted'));
+  // The loaded build must parse the exact-tool approval as given.
+  probe.checks.approval_config = effective ? {
+    enabled_tools: effective.enabled_tools || null,
+    tools: effective.tools || null,
+    default_tools_approval_mode: effective.default_tools_approval_mode || null,
+  } : null;
+  probe.checks.approval_config_effective = Boolean(effective && probe.checks.gate_overrides_accepted
+    && JSON.stringify(effective.enabled_tools) === JSON.stringify(['bridge_me', 'bridge_unlisted'])
+    && effective.tools && effective.tools.bridge_me && effective.tools.bridge_me.approval_mode === ME_APPROVAL
+    && !(effective.tools.bridge_unlisted && effective.tools.bridge_unlisted.approval_mode)
+    && !effective.default_tools_approval_mode);
   if (!probe.checks.hooks_isolated) { probe.fail('isolation_unavailable'); return; }
+  if (!probe.checks.approval_config_effective) { probe.fail('approval_config_unavailable'); return; }
   if (process.env.CODEX_PROBE_GATE_ONLY === '1') { probe.fail('gate_only_run'); return; }
 
   /** Runs one bounded `codex exec --json` phase; records events and usage. */
@@ -179,20 +220,36 @@ run('m2xp', 20 * 60_000, REQUIRED, async probe => {
   const daemon = probe.spawn('daemon', path.join(bin, 'bridge-native-daemon'), [config]);
   if (!await probe.until(() => fs.existsSync(channel) && fs.existsSync(core), 10000)) throw new Error('daemon did not start');
 
+  // Publication is controlled here, not by any tool: one inject event for
+  // the root thread, handed out by its own PostToolUse hook.
+  const marker = 'BRIDGE_CTX_' + crypto.randomBytes(6).toString('hex');
+  let publishLine = '';
+  const publisher_ = probe.spawn('inject-publish', fixture, ['publish', core, publisher.file, recipient, 'inject', 'probe-inject-root', `Synthetic Bridge qualification context marker ${marker}.`], {}, line => { publishLine = line; });
+  await probe.exited(publisher_, 20000);
+  probe.checks.inject_publish = publishLine.slice(0, 400);
+  probe.checks.inject_published = publishLine.includes('Published');
+
   const phase2 = await exec('phase2', [...ISOLATION, '--enable', 'multi_agent', '--enable', 'hooks', ...own, ...state, 'resume', thread,
-    'This is an isolated Agent Bridge qualification run. First call the bridge_probe MCP tool exactly once with {}. Then create exactly one native child agent whose only task is to call the same bridge_probe tool once with {} and finish CHILD_DONE; wait for it. Finally reply with every BRIDGE_CTX_ marker you can see in your context, or NONE. Do not read files or run commands.']);
+    'This is an isolated Agent Bridge qualification run. First call the bridge_me MCP tool exactly once with {}. Then call the bridge_unlisted MCP tool exactly once with {}; it is expected to be refused, do not retry it. Then create exactly one native child agent whose only task is to call the bridge_me tool once with {} and finish CHILD_DONE; wait for it. Finally reply with every BRIDGE_CTX_ marker you can see in your context, or NONE. Do not read files or run commands.']);
   probe.checks.phase2_completed = phase2.completed;
   process.kill(-daemon.pid, 'SIGTERM');
   probe.checks.daemon_exit = await probe.exited(daemon, 15000);
 
   const records = fs.existsSync(evidence) ? fs.readFileSync(evidence, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) : [];
-  const root = records.find(r => r.caller && r.caller.role === 'root');
-  const child = records.find(r => r.caller && r.caller.role === 'child');
+  const root = records.find(r => r.tool === 'bridge_me' && r.caller && r.caller.role === 'root');
+  const child = records.find(r => r.tool === 'bridge_me' && r.caller && r.caller.role === 'child');
   const replies = phase2.events.filter(e => e.type === 'item.completed' && e.item && e.item.type === 'agent_message').map(e => e.item.text || '').join('\n');
   probe.checks.meta_keys_seen = records.map(r => r.meta_keys);
   probe.checks.refusals = records.filter(r => r.refused).map(r => r.refused);
   probe.checks.root_attested = Boolean(root && root.caller.native_id === thread && root.caller.may_act_as_address);
-  probe.checks.inject_marker_in_reply = Boolean(root && root.marker && replies.includes(root.marker));
+  probe.checks.inject_marker_in_reply = Boolean(probe.checks.inject_published && replies.includes(marker));
+  // Negative control: the host must refuse the unapproved tool, and the
+  // fixture server must never see it.
+  const unlistedItems = phase2.events.filter(e => JSON.stringify(e).includes('bridge_unlisted') && e.item && e.item.type !== 'agent_message');
+  probe.checks.unlisted_items = unlistedItems.map(e => JSON.stringify(e).slice(0, 400));
+  probe.checks.unlisted_refused_by_host = unlistedItems.some(e => e.type === 'item.completed'
+    && (e.item.status === 'failed' || Boolean(e.item.error)) && /approval/i.test(JSON.stringify(e.item)));
+  probe.checks.unlisted_not_executed = !records.some(r => r.unlisted_called);
   probe.checks.child_attested_own_thread = Boolean(child && child.caller.native_id !== thread && child.caller.address.endsWith('/' + child.caller.native_id));
   const stderr = fs.readFileSync(path.join(probe.dir, 'daemon.stderr'), 'utf8');
   probe.checks.daemon_events = Object.fromEntries([...stderr.matchAll(/"event":"([a-z_]+)"/g)].map(m => m[1]).reduce((map, e) => map.set(e, (map.get(e) || 0) + 1), new Map()));
