@@ -2729,7 +2729,9 @@ fn every_positive_global_cap_reserves_at_least_one_keep_all_slot() {
 /// incidents raised earlier, and every such dependent stays blocked.
 #[test]
 fn bounded_maintenance_exposes_every_blocked_dependent_and_hold_across_passes() {
+    /// Items per scenario: more than one 500-row maintenance batch.
     const TOTAL: usize = 520;
+    /// Maintenance instant, past the hold-escalation threshold of every item.
     const NOW: u64 = 800_000;
     // Asserts the multi-pass progression for one kind and returns nothing:
     // 500 new incidents, then the remaining 20, then none, all distinct.
@@ -2841,4 +2843,74 @@ fn bounded_maintenance_exposes_every_blocked_dependent_and_hold_across_passes() 
             .unwrap();
     }
     check(&mut storage, "recipient_held");
+}
+
+/// An audited disposition of the EXPIRED predecessor makes its dependent
+/// eligible (the same rule the dispatch selection applies), so the dependent's
+/// `predecessor_expired` incident closes as resolved and is never reopened;
+/// nothing is released or replayed by maintenance itself.
+#[test]
+fn disposing_the_expired_predecessor_closes_the_dependent_incident_without_reopening() {
+    let mut storage = store();
+    let recipient = codex("thread-expired-disposed");
+    let inactive = attest(&recipient, Lifecycle::Inactive, 1);
+    let mut predecessor = keep_all("agent-run", "pred-d", &recipient, Mode::Message);
+    predecessor.expires_at = Some(ExpiresAt::from_unix_millis(2_000).unwrap());
+    storage.publish(&predecessor, 1_000).unwrap();
+    storage
+        .publish(
+            &with_meta(
+                keep_all("agent-run", "dep-d", &recipient, Mode::Message),
+                "predecessor",
+                "pred-d",
+            ),
+            1_001,
+        )
+        .unwrap();
+    assert_eq!(storage.run_maintenance(3_000).unwrap().escalated_holds, 1);
+    assert_eq!(storage.open_incidents(3_000, 10).unwrap().len(), 1);
+
+    storage
+        .dispose_event(
+            "agent-run",
+            "pred-d",
+            "ops-1",
+            "the source canceled it",
+            4_000,
+        )
+        .unwrap();
+    assert_eq!(
+        storage.run_maintenance(5_000).unwrap().escalated_holds,
+        0,
+        "the disposed predecessor no longer blocks, so nothing is raised"
+    );
+    assert!(storage.open_incidents(5_000, 10).unwrap().is_empty());
+    let closed = storage.incidents(true, 5_000, 10).unwrap();
+    let incident = closed
+        .iter()
+        .find(|incident| incident.event_id == "dep-d")
+        .unwrap();
+    assert_eq!(incident.state, IncidentState::Resolved);
+    let resolution = incident.resolution.as_deref().unwrap();
+    assert!(
+        resolution.contains("dispatch dependency rule"),
+        "{resolution}"
+    );
+    assert!(
+        !resolution.contains("audited"),
+        "the text claims no particular decision: {resolution}"
+    );
+    // A further pass neither reopens it nor opens a duplicate.
+    assert_eq!(storage.run_maintenance(6_000).unwrap().escalated_holds, 0);
+    assert_eq!(
+        storage.incidents(true, 6_000, 10).unwrap().len(),
+        closed.len()
+    );
+    // The existing eligibility rule, not maintenance, releases the dependent.
+    let released = attempt(
+        storage
+            .reserve_next(&inactive, EffectiveMode::Message, 7_000, &timing())
+            .unwrap(),
+    );
+    assert_eq!(released.members[0].event_id, "dep-d");
 }

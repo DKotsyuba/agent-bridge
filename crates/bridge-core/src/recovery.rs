@@ -1635,7 +1635,11 @@ impl Storage {
     /// `predecessor_expired` for one whose predecessor expired before
     /// delivery (at once; expiry is final). Neither releases the dependent;
     /// both close when the dependent is waived, disposed or no longer
-    /// waiting. Returns how many incidents were newly opened.
+    /// waiting, and `predecessor_expired` also closes (and is not raised
+    /// again) once the predecessor reaches a state that satisfies the dispatch
+    /// dependency rule (accepted, hook-submitted or disposed),
+    /// with a neutral resolution text that claims no particular decision.
+    /// Returns how many incidents were newly opened.
     ///
     /// Each candidate query is bounded by `MAINTENANCE_BATCH` and skips
     /// items that already have an open incident of its kind, so a backlog
@@ -1707,6 +1711,7 @@ impl Storage {
                  JOIN events p ON p.publisher_id = e.publisher_id AND p.event_id = e.predecessor
                  WHERE e.state = 'pending' AND e.delivery = 'unhanded'
                    AND e.predecessor_waived = 0 AND p.state = 'expired'
+                   AND p.delivery NOT IN ('accepted', 'hook_submitted', 'disposed')
                    AND NOT EXISTS (SELECT 1 FROM incidents i
                                    WHERE i.publisher_id = e.publisher_id
                                      AND i.event_id = e.event_id
@@ -1740,6 +1745,20 @@ impl Storage {
                              ON p.publisher_id = e.publisher_id AND p.event_id = e.predecessor
                            WHERE e.publisher_id = incidents.publisher_id
                              AND e.event_id = incidents.event_id)",
+            params![to_sql(now_ms)?],
+        )?;
+        // Once the predecessor reaches a releasing delivery state, the
+        // dispatch eligibility rule releases its dependent on its own; the
+        // incident closes without asserting which outcome satisfied the rule.
+        tx.execute(
+            "UPDATE incidents SET state = 'resolved', resolved_ms = ?1, updated_ms = ?1,
+                 resolution = 'the predecessor now satisfies the dispatch dependency rule (accepted, hook-submitted or disposed)'
+             WHERE kind = 'predecessor_expired' AND state = 'open'
+               AND EXISTS (SELECT 1 FROM events e JOIN events p
+                             ON p.publisher_id = e.publisher_id AND p.event_id = e.predecessor
+                           WHERE e.publisher_id = incidents.publisher_id
+                             AND e.event_id = incidents.event_id
+                             AND p.delivery IN ('accepted', 'hook_submitted', 'disposed'))",
             params![to_sql(now_ms)?],
         )?;
         // A dependent that expired, was disposed or was waived no longer waits.

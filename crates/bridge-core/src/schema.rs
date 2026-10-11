@@ -352,12 +352,14 @@ pub fn ensure(tx: &Transaction<'_>) -> Result<(), CoreError> {
 /// and timestamps; only the new columns are added and backfilled from the
 /// stored canonical envelope. Version 3 single-event attempts (which froze
 /// no manifest) are kept in `attempts_v3` for audit; an event whose newest
-/// attempt may have reached a carrier is marked `review` with an open
-/// incident, an event whose attempt positively finished keeps that delivery
-/// tier, and only a never-invoked or known-unsent event becomes dispatchable.
+/// attempt may have reached a carrier, or that has an open `unknown_handoff`
+/// incident, is marked `review` with an open incident, an event whose
+/// attempt positively finished keeps that delivery tier, and only a
+/// never-invoked or known-unsent event without such an incident becomes
+/// dispatchable.
 /// The version 3 `incidents` table is renamed to `incidents_v3` and kept as
-/// historical custody; see [`migrate_v3_attempts`] for how open uncertainty
-/// stays visible.
+/// history; every row is also carried into the live table (see
+/// [`migrate_v3_attempts`]).
 fn migrate(tx: &Transaction<'_>, from: u32) -> Result<(), CoreError> {
     if from == 3 {
         tx.execute_batch(
@@ -467,17 +469,76 @@ fn backfill_events(tx: &Transaction<'_>) -> Result<(), CoreError> {
 }
 
 /// Maps each event's newest version 3 attempt onto the version 4 delivery
-/// state and keeps unresolved uncertainty visible.
+/// state and carries every version 3 incident into the live table.
 ///
-/// Open version 3 incidents are not copied row by row: version 3 only
-/// raised `unknown_handoff` incidents, always for an event whose newest
-/// attempt is unresolved. Every such event (and every other event whose
-/// newest attempt may have reached a carrier) is put in `review` with one
-/// new live `migrated_unverified` incident that needs a reviewed
-/// disposition. The old incident rows, with their original reason and
-/// dates, remain in `incidents_v3`, and the incident counter is advanced
-/// past them so numbers are never reused.
+/// Version 3 (commit 58c0740, `Storage::open_incident`) let any code write an
+/// incident of any `kind`; its own sources wrote `unknown_handoff` (an
+/// `outcome_unknown` attempt or an expired invoking lease) and
+/// `held_unknown_lifecycle`, and only an open `unknown_handoff` incident
+/// blocked a new attempt (a kind's name proves nothing about what happened,
+/// so no kind is closed or reinterpreted by the migration). Each `incidents_v3` row
+/// is therefore copied to the live `incidents` table with its number, kind,
+/// reason, state, dates, resolution and (when a manual retry was recorded)
+/// its duplicate risk:
+/// - an open row of any kind (including `held_unknown_lifecycle`) stays open,
+///   so operators still see and resolve it with the original identity;
+///   whether its event may be dispatched is decided only by the event's
+///   current attempt evidence and by an open `unknown_handoff` incident;
+/// - a further open row of the same event and kind becomes `resolved`,
+///   pointing at the lowest-numbered open one (the live table allows one open
+///   incident per event and kind); its original reason stays on the row.
+///
+/// An event whose newest attempt may have reached a carrier, or that has an
+/// open `unknown_handoff` incident (even with no attempt record, which the
+/// version 3 API allowed), is put in `review` and never becomes dispatchable
+/// unreviewed. An event with a carried open `unknown_handoff` incident gets
+/// no extra `migrated_unverified` incident; any other review event gets one.
+/// The `incidents_v3` rows remain as history, and the incident counter
+/// stays ahead of every carried number.
 fn migrate_v3_attempts(tx: &Transaction<'_>) -> Result<(), CoreError> {
+    // Keep the incident sequence ahead of every carried-over number first,
+    // so newly synthesized incidents can never collide with an old one.
+    let max_incident: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(incident_seq), 0) FROM incidents_v3",
+        [],
+        |row| row.get(0),
+    )?;
+    let counter: i64 = tx.query_row(
+        "SELECT value FROM counters WHERE name = 'incident_seq'",
+        [],
+        |row| row.get(0),
+    )?;
+    if max_incident > counter {
+        tx.execute(
+            "UPDATE counters SET value = ?1 WHERE name = 'incident_seq'",
+            params![max_incident],
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO incidents
+             (incident_seq, publisher_id, event_id, attempt_seq, kind, reason, state,
+              created_ms, updated_ms, next_check_ms, review_deadline_ms, responsible,
+              resolution, resolved_ms, duplicate_risk)
+         SELECT incident_seq, publisher_id, event_id, NULL, kind, reason,
+                CASE WHEN NOT is_open THEN state
+                     WHEN first_open < incident_seq THEN 'resolved'
+                     ELSE 'open' END,
+                created_ms, updated_ms, next_check_ms, review_deadline_ms,
+                'source:' || publisher_id || '; operator',
+                CASE WHEN NOT is_open THEN resolution
+                     WHEN first_open < incident_seq THEN
+                          'migration: duplicate of open incident ' || first_open
+                          || ' (same event and kind); the original reason is kept on this row'
+                     ELSE resolution END,
+                CASE WHEN NOT is_open OR first_open < incident_seq THEN updated_ms END,
+                COALESCE(resolution LIKE 'manual retry authorized%', 0)
+         FROM (SELECT *, state NOT IN ('resolved', 'disposed') AS is_open,
+                      MIN(incident_seq) OVER (
+                          PARTITION BY publisher_id, event_id, kind,
+                                       state NOT IN ('resolved', 'disposed')) AS first_open
+               FROM incidents_v3)",
+        [],
+    )?;
     // Newest attempt state per event.
     let mut select = tx.prepare(
         "SELECT a.publisher_id, a.event_id, a.state FROM attempts_v3 a
@@ -509,7 +570,7 @@ fn migrate_v3_attempts(tx: &Transaction<'_>) -> Result<(), CoreError> {
              WHERE publisher_id = ?2 AND event_id = ?3",
             params![delivery, publisher, event],
         )?;
-        if delivery == "review" {
+        if delivery == "review" && !has_carried_unknown(tx, &publisher, &event)? {
             tx.execute(
                 "INSERT OR IGNORE INTO incidents
                      (incident_seq, publisher_id, event_id, attempt_seq, kind, reason, state,
@@ -526,24 +587,40 @@ fn migrate_v3_attempts(tx: &Transaction<'_>) -> Result<(), CoreError> {
             )?;
         }
     }
-    // Keep the incident sequence ahead of every carried-over number.
-    let max_incident: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(incident_seq), 0) FROM incidents_v3",
+    // An open `unknown_handoff` incident blocked version 3 dispatch whether
+    // or not a newest attempt is recorded: that event must stay out of
+    // rotation.
+    tx.execute(
+        "UPDATE events SET delivery = 'review'
+         WHERE state = 'pending' AND delivery = 'unhanded'
+           AND EXISTS (SELECT 1 FROM incidents i
+                       WHERE i.publisher_id = events.publisher_id
+                         AND i.event_id = events.event_id
+                         AND i.kind = 'unknown_handoff' AND i.state = 'open')",
         [],
-        |row| row.get(0),
     )?;
-    let counter: i64 = tx.query_row(
-        "SELECT value FROM counters WHERE name = 'incident_seq'",
-        [],
-        |row| row.get(0),
-    )?;
-    if max_incident > counter {
-        tx.execute(
-            "UPDATE counters SET value = ?1 WHERE name = 'incident_seq'",
-            params![max_incident],
-        )?;
-    }
     Ok(())
+}
+
+/// Whether the event already carries an open `unknown_handoff` incident
+/// copied from version 3, which then stands in for the synthesized
+/// `migrated_unverified` incident so the same uncertainty is not reported
+/// twice.
+///
+/// `publisher` and `event` identify the event. Returns a storage error only
+/// if the query fails.
+fn has_carried_unknown(
+    tx: &Transaction<'_>,
+    publisher: &str,
+    event: &str,
+) -> Result<bool, CoreError> {
+    Ok(tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM incidents
+                        WHERE publisher_id = ?1 AND event_id = ?2
+                          AND kind = 'unknown_handoff' AND state = 'open')",
+        params![publisher, event],
+        |row| row.get(0),
+    )?)
 }
 
 /// Opens a diagnostic read of the stored schema version (for tests and

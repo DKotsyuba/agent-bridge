@@ -67,6 +67,10 @@ const RECIPIENTS_PER_PASS: usize = 16;
 /// Attempts driven per recipient per maintenance pass.
 const ATTEMPTS_PER_RECIPIENT: usize = 4;
 
+/// Longest part of one carrier's attestation refusal, in characters, kept in
+/// a recipient hold; the joined hold text is bounded again by the store.
+const REFUSAL_REASON_CHARS: usize = 120;
+
 /// Daemon and service configuration, usually loaded from a TOML file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -1492,6 +1496,11 @@ fn maintenance_pass(state: &ServiceState) {
 /// attesting is treated as a failed attestation for that recipient only: a
 /// visible hold, never an acceptance, and the remaining recipients are
 /// still served.
+///
+/// When no carrier attests, the hold text lists every carrier's refusal
+/// (each bounded, in carrier order) rather than only the last one. Nothing is
+/// attempted for that recipient and nothing is guessed about what a refusal
+/// means.
 fn dispatch_pass(state: &ServiceState) {
     let mut carriers = state
         .carriers
@@ -1531,18 +1540,21 @@ fn dispatch_pass(state: &ServiceState) {
         if !state.running.load(Ordering::SeqCst) {
             return;
         }
-        let mut last_reason = String::from("no carrier is registered for this recipient");
+        // Every refusing carrier's reason is kept (each bounded), in carrier
+        // order, so a matching carrier's specific refusal is not hidden by a
+        // later unrelated carrier's answer.
+        let mut reasons: Vec<String> = Vec::new();
         let serving = carriers.iter_mut().find_map(|carrier| {
             match attest_guarded(carrier.as_mut(), &recipient) {
                 Ok(_) => Some(carrier),
                 Err(reason) => {
-                    last_reason = reason;
+                    reasons.push(reason.chars().take(REFUSAL_REASON_CHARS).collect());
                     None
                 }
             }
         });
         let Some(carrier) = serving else {
-            let reason = format!("no carrier attests this endpoint: {last_reason}");
+            let reason = format!("no carrier attests this endpoint: {}", reasons.join("; "));
             if let Err(error) =
                 lock_storage(&state.storage).record_hold(&recipient, &reason, current_unix_millis())
             {

@@ -10,7 +10,7 @@
 mod common;
 
 use bridge_core::dispatch::{DispatchTiming, EffectiveMode, Lifecycle, Selection};
-use bridge_core::recovery::DeliveryState;
+use bridge_core::recovery::{DeliveryState, IncidentState};
 use bridge_core::types::{
     EventId, Harness, Kind, Metadata, NativeAddress, Payload, PublisherId, StreamId,
 };
@@ -791,79 +791,275 @@ fn version_four_single_legacy_owner_fences_a_new_producer_immediately() {
     storage.publish(&owner, 2_100).unwrap();
 }
 
-/// An open version 3 `unknown_handoff` incident is never lost to the
-/// migration: its event stays in review under a live `migrated_unverified`
-/// incident (so operators still see and must resolve it), while the original
-/// row and its detail stay in `incidents_v3` as historical custody, and new
-/// incident numbers continue after the old ones.
-#[test]
-fn an_open_version_three_incident_stays_visible_as_a_live_incident_with_history_kept() {
-    let dir = TempDir::new("migrate-v3-incident");
-    let path = dir.path("bridge.db");
-    let recipient = codex("thread-v3-incident");
-    {
-        let connection = Connection::open(&path).unwrap();
-        connection.execute_batch(V3_DDL).unwrap();
-        connection
-            .execute("INSERT INTO schema_meta VALUES ('schema_version', '3')", [])
-            .unwrap();
-        connection
-            .execute("INSERT INTO counters VALUES ('acceptance_seq', 1)", [])
-            .unwrap();
-        connection
-            .execute("INSERT INTO counters VALUES ('attempt_seq', 1)", [])
-            .unwrap();
-        connection
-            .execute("INSERT INTO counters VALUES ('incident_seq', 7)", [])
-            .unwrap();
-        let envelope = keep_all("agent-run", "evt-lost", &recipient, Mode::Message);
-        insert_event(&connection, &envelope, 1, 1_000, true);
-        connection
-            .execute(
-                "INSERT INTO attempts (attempt_seq, publisher_id, event_id, state,
-                     effective_mode, manifest_hash, lease_expires_ms, created_ms, updated_ms)
-                 VALUES (1, 'agent-run', 'evt-lost', 'outcome_unknown', 'message', 'h', NULL,
-                         1000, 2000)",
-                [],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO incidents (incident_seq, publisher_id, event_id, kind, reason,
-                     state, created_ms, updated_ms, next_check_ms, review_deadline_ms)
-                 VALUES (7, 'agent-run', 'evt-lost', 'unknown_handoff', 'old reason', 'open',
-                         2000, 2000, 2000, 9000)",
-                [],
-            )
-            .unwrap();
-    }
-    let storage = Storage::open(&path, Limits::new(100)).unwrap();
-    let open = storage.open_incidents(5_000, 10).unwrap();
-    assert_eq!(open.len(), 1);
-    assert_eq!(open[0].event_id, "evt-lost");
-    assert_eq!(open[0].kind, "migrated_unverified");
-    assert!(
-        open[0].incident_seq > 7,
-        "new numbers continue after old ones"
-    );
-    assert_eq!(
-        storage
-            .delivery_evidence("agent-run", "evt-lost")
-            .unwrap()
-            .unwrap()
-            .delivery,
-        DeliveryState::Review
-    );
-    let (kind, reason): (String, String) = Connection::open(&path)
-        .unwrap()
-        .query_row(
-            "SELECT kind, reason FROM incidents_v3 WHERE incident_seq = 7",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+/// Inserts one raw version 3 incident exactly as the historical
+/// `Storage::open_incident` wrote it (the `blocked_dependents` column keeps
+/// its default).
+fn insert_v3_incident(
+    connection: &Connection,
+    seq: i64,
+    event: &str,
+    kind: &str,
+    reason: &str,
+    state: &str,
+    resolution: Option<&str>,
+) {
+    connection
+        .execute(
+            "INSERT INTO incidents (incident_seq, publisher_id, event_id, kind, reason, state,
+                 created_ms, updated_ms, next_check_ms, review_deadline_ms, resolution)
+             VALUES (?1, 'agent-run', ?2, ?3, ?4, ?5, 1500, 1600, 1500, 9000, ?6)",
+            params![seq, event, kind, reason, state, resolution],
         )
         .unwrap();
-    assert_eq!(
-        (kind.as_str(), reason.as_str()),
-        ("unknown_handoff", "old reason")
+}
+
+/// One raw version 3 incident: number, event, kind, reason, state and
+/// resolution (publisher is always `agent-run`).
+type V3IncidentRow<'a> = (i64, &'a str, &'a str, &'a str, &'a str, Option<&'a str>);
+
+/// Builds a version 3 database from `(event, newest attempt state)` rows and
+/// raw incident inserts, with counters matching the highest incident number.
+fn v3_database_with_incidents(
+    path: &std::path::Path,
+    events: &[(&str, Option<&str>)],
+    incidents: &[V3IncidentRow<'_>],
+) {
+    let recipient = codex("thread-v3-incidents");
+    let connection = Connection::open(path).unwrap();
+    connection.execute_batch(V3_DDL).unwrap();
+    connection
+        .execute("INSERT INTO schema_meta VALUES ('schema_version', '3')", [])
+        .unwrap();
+    let highest = incidents.iter().map(|row| row.0).max().unwrap_or(0);
+    for (name, value) in [
+        ("acceptance_seq", events.len() as i64),
+        ("attempt_seq", events.len() as i64),
+        ("incident_seq", highest),
+    ] {
+        connection
+            .execute("INSERT INTO counters VALUES (?1, ?2)", params![name, value])
+            .unwrap();
+    }
+    for (index, (id, attempt)) in events.iter().enumerate() {
+        let envelope = keep_all("agent-run", id, &recipient, Mode::Message);
+        insert_event(&connection, &envelope, index as i64 + 1, 1_000, true);
+        if let Some(state) = attempt {
+            connection
+                .execute(
+                    "INSERT INTO attempts (attempt_seq, publisher_id, event_id, state,
+                         effective_mode, manifest_hash, lease_expires_ms, created_ms, updated_ms)
+                     VALUES (?1, 'agent-run', ?2, ?3, 'message', 'h', NULL, 1000, 2000)",
+                    params![index as i64 + 1, id, state],
+                )
+                .unwrap();
+        }
+    }
+    for (seq, event, kind, reason, state, resolution) in incidents {
+        insert_v3_incident(&connection, *seq, event, kind, reason, state, *resolution);
+    }
+}
+
+/// Every legal open version 3 incident survives the migration with its
+/// identity (number, kind, reason, dates) as a live incident, whatever its
+/// kind: `unknown_handoff` incidents (which version 3 itself treated as
+/// blocking, with or without an attempt record) keep their event in review
+/// instead of making it dispatchable, a duplicate open row of the same kind
+/// stays visible as a resolved pointer to the kept one, a
+/// `held_unknown_lifecycle` incident stays open with no claim about what
+/// happened (its event is review under an ambiguous attempt, dispatchable
+/// only when it has no attempt evidence against it), and closed history keeps
+/// its duplicate-risk record.
+/// The old rows also stay in `incidents_v3`; no uncertain event is
+/// dispatched and no duplicate `migrated_unverified` incident is added.
+#[test]
+fn every_open_version_three_incident_stays_visible_and_uncertain_events_stay_undispatchable() {
+    let dir = TempDir::new("migrate-v3-all-incidents");
+    let path = dir.path("bridge.db");
+    v3_database_with_incidents(
+        &path,
+        &[
+            ("evt-lifecycle", None),
+            ("evt-api-unknown", None),
+            ("evt-unsent-unknown", Some("known_unsent")),
+            ("evt-note", None),
+            ("evt-lost", Some("invoking")),
+            ("evt-done", Some("native_accepted")),
+            ("evt-hist", Some("known_unsent")),
+            ("evt-plain", None),
+            ("evt-held-lost", Some("invoking")),
+        ],
+        &[
+            (
+                1,
+                "evt-lifecycle",
+                "held_unknown_lifecycle",
+                "lifecycle unknown",
+                "open",
+                None,
+            ),
+            (
+                2,
+                "evt-api-unknown",
+                "unknown_handoff",
+                "api reason",
+                "open",
+                None,
+            ),
+            (
+                3,
+                "evt-unsent-unknown",
+                "unknown_handoff",
+                "unsent reason",
+                "open",
+                None,
+            ),
+            (4, "evt-note", "operator_note", "custom note", "open", None),
+            (
+                5,
+                "evt-lost",
+                "unknown_handoff",
+                "lease expired",
+                "open",
+                None,
+            ),
+            (
+                6,
+                "evt-lost",
+                "unknown_handoff",
+                "second report",
+                "open",
+                None,
+            ),
+            (
+                7,
+                "evt-done",
+                "unknown_handoff",
+                "late report",
+                "open",
+                None,
+            ),
+            (
+                8,
+                "evt-hist",
+                "unknown_handoff",
+                "old unknown",
+                "disposed",
+                Some("manual retry authorized: host log inconclusive"),
+            ),
+            (
+                9,
+                "evt-held-lost",
+                "held_unknown_lifecycle",
+                "ambiguous hold",
+                "open",
+                None,
+            ),
+        ],
     );
+    for pass in 0..2 {
+        let mut storage = Storage::open(&path, Limits::new(100)).unwrap();
+        register_tags(&mut storage);
+        let delivery = |storage: &Storage, id: &str| {
+            storage
+                .delivery_evidence("agent-run", id)
+                .unwrap()
+                .map_or(DeliveryState::Unhanded, |evidence| evidence.delivery)
+        };
+        for (id, expected) in [
+            ("evt-lifecycle", DeliveryState::Unhanded),
+            ("evt-api-unknown", DeliveryState::Review),
+            ("evt-unsent-unknown", DeliveryState::Review),
+            ("evt-note", DeliveryState::Unhanded),
+            ("evt-lost", DeliveryState::Review),
+            ("evt-done", DeliveryState::Accepted),
+            ("evt-hist", DeliveryState::Unhanded),
+            ("evt-plain", DeliveryState::Unhanded),
+            ("evt-held-lost", DeliveryState::Review),
+        ] {
+            assert_eq!(delivery(&storage, id), expected, "{id}");
+        }
+        let all = storage.incidents(true, 5_000, 50).unwrap();
+        let by_seq = |seq: u64| all.iter().find(|incident| incident.incident_seq == seq);
+        let mut open: Vec<_> = all
+            .iter()
+            .filter(|incident| incident.state == IncidentState::Open)
+            .map(|incident| {
+                (
+                    incident.incident_seq,
+                    incident.kind.as_str(),
+                    incident.reason.as_str(),
+                )
+            })
+            .collect();
+        open.sort_unstable();
+        assert_eq!(
+            open,
+            [
+                (1, "held_unknown_lifecycle", "lifecycle unknown"),
+                (2, "unknown_handoff", "api reason"),
+                (3, "unknown_handoff", "unsent reason"),
+                (4, "operator_note", "custom note"),
+                (5, "unknown_handoff", "lease expired"),
+                (7, "unknown_handoff", "late report"),
+                (9, "held_unknown_lifecycle", "ambiguous hold"),
+                (
+                    10,
+                    "migrated_unverified",
+                    "a version 3 attempt may have reached a carrier; reviewed disposition required",
+                ),
+            ],
+            "old numbers, kinds and reasons stay live; no migrated_unverified duplicate"
+        );
+        // Held rows are carried open and unreinterpreted: no resolution text
+        // claims anything about what was or was not handed off.
+        assert!(by_seq(1).unwrap().resolution.is_none());
+        assert!(by_seq(9).unwrap().resolution.is_none());
+        let duplicate = by_seq(6).unwrap();
+        assert_eq!(duplicate.state, IncidentState::Resolved);
+        assert_eq!(duplicate.reason, "second report");
+        assert!(
+            duplicate
+                .resolution
+                .as_deref()
+                .unwrap()
+                .contains("incident 5")
+        );
+        let history = by_seq(8).unwrap();
+        assert_eq!(history.state, IncidentState::Disposed);
+        assert!(
+            history.duplicate_risk,
+            "the recorded duplicate risk survives"
+        );
+        assert!(by_seq(2).unwrap().created_ms == 1_500 && by_seq(2).unwrap().attempt_seq.is_none());
+
+        let archived: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM incidents_v3", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(archived, 9, "the original rows stay as history");
+        if pass == 0 {
+            // The second open proves the migrated state is stable.
+            continue;
+        }
+
+        // Only never-handed-off, non-uncertain events can be dispatched.
+        let inactive = attest(&codex("thread-v3-incidents"), Lifecycle::Inactive, 1);
+        let mut taken = Vec::new();
+        while let Selection::Attempt(record) = storage
+            .reserve_next(
+                &inactive,
+                EffectiveMode::Message,
+                10_000,
+                &DispatchTiming::default(),
+            )
+            .unwrap()
+        {
+            taken.push(record.members[0].event_id.clone());
+        }
+        taken.sort();
+        assert_eq!(
+            taken,
+            ["evt-hist", "evt-lifecycle", "evt-note", "evt-plain"]
+        );
+    }
 }

@@ -1205,3 +1205,62 @@ fn a_persistently_panicking_attestation_is_isolated_to_its_recipient() {
     running.shutdown();
     running.join();
 }
+
+/// A carrier whose attestation always refuses with one fixed reason.
+struct Refusing {
+    /// The refusal text this carrier reports for every recipient.
+    reason: &'static str,
+}
+
+impl DispatchCarrier for Refusing {
+    /// Always refuses to attest, with the fixed reason.
+    fn attest(&mut self, _recipient: &NativeAddress) -> Result<Attestation, String> {
+        Err(self.reason.to_string())
+    }
+
+    /// Never reached: a refused attestation must not lead to a hand-off.
+    fn send(&mut self, _attempt: &AttemptRecord) -> Outcome {
+        unreachable!("a refusing carrier is never asked to send")
+    }
+}
+
+/// When several carriers refuse a recipient, the visible hold keeps every
+/// carrier's reason (bounded), not only the last one, so the meaningful
+/// refusal of the matching carrier ("the harness process is gone") is not
+/// hidden by an unrelated carrier's "not my harness" answer. Nothing is
+/// attempted for the recipient.
+#[test]
+fn a_hold_keeps_every_carriers_refusal_reason_and_attempts_nothing() {
+    let dir = TempDir::new("life-reasons");
+    let running = service::start_with_carriers(
+        config(&dir, "reasons"),
+        vec![
+            Box::new(Refusing {
+                reason: "harness process is gone",
+            }),
+            Box::new(Refusing {
+                reason: "not a Claude recipient",
+            }),
+        ],
+    )
+    .unwrap();
+    let mut client = BridgeClient::connect(running.socket_path()).unwrap();
+    client.publish(RUN_TOKEN, &body("evt-dead")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let reason = loop {
+        if let Some(hold) = client.holds(OPS_TOKEN, None).unwrap().first() {
+            break hold.reason.clone();
+        }
+        assert!(Instant::now() < deadline, "no hold was recorded");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    running.shutdown();
+    running.join();
+    assert!(reason.contains("harness process is gone"), "{reason}");
+    assert!(reason.contains("not a Claude recipient"), "{reason}");
+    let connection = rusqlite::Connection::open(dir.path("bridge.db")).unwrap();
+    let attempts: i64 = connection
+        .query_row("SELECT COUNT(*) FROM attempts", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(attempts, 0, "a refused endpoint is never handed anything");
+}

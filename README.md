@@ -57,10 +57,16 @@ automatically repeated after a possible handoff.
     retained events and watermarks; a lineage with several historical
     producers migrates as *ambiguous* and fences publication and dispatch
     until an operator resolves it), a version-3 attempt that may have
-    reached a carrier becomes a `review` event with a live
-    `migrated_unverified` incident (open version-3 incident rows stay in
-    `incidents_v3` as history), and unknown/newer/foreign databases are
-    refused untouched.
+    reached a carrier, or that has an open version-3 `unknown_handoff`
+    incident, becomes a `review` event; every version-3 incident (any kind) is
+    carried into the live table with its number, kind, reason and dates, open
+    ones stay open whatever their kind (including `held_unknown_lifecycle`; the
+    event is dispatchable only if its attempt evidence and any open
+    `unknown_handoff` allow it), a same-kind duplicate open row is resolved with
+    a pointer to the kept one, a
+    `migrated_unverified` incident is added only where no carried open
+    `unknown_handoff` already reports the uncertainty, the old rows stay in
+    `incidents_v3`, and unknown/newer/foreign databases are refused untouched.
   - `framing`: allowlisted source-tag wrappers with escaped, bounded
     manifests, a separate source block per member, forbidden-control
     rejection and the fixed external-data/no-authority statement. An event
