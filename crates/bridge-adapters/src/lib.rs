@@ -1,0 +1,44 @@
+//! Agent Bridge native adapters: protected caller registry, quiet root
+//! hooks and qualified Codex/Claude message carriers.
+//!
+//! This crate owns the `bridge-native-host` and `bridge-root-caller`
+//! boundaries. It consumes core's one authoritative custody and attempt
+//! state — [`bridge_core::dispatch::DispatchCarrier`], `observe_binding`,
+//! `drain_inject` and `record_outcome` — and keeps no second attempt or
+//! hook database.
+//!
+//! Module layout:
+//! - [`os`]: kernel-observed peer credentials and process facts.
+//! - [`registry`]: harness incarnations, fenced endpoint epochs, owner
+//!   lifecycle from the session's own hooks, single-use call records, and
+//!   the root-caller ABI ([`registry::CallerAttestor`],
+//!   [`registry::PresentedMeta`], [`registry::VerifiedCaller`]).
+//! - [`server`]: the daemon-side private channel (hook events, manifest-
+//!   first inject drain, caller attestation).
+//! - [`client`]: the hook command's client and the cross-process
+//!   [`client::RegistryAttestor`].
+//! - [`codex`]: the queue-only, OS-confined Codex message carrier.
+//! - [`claude`]: the Claude `later` message carrier with a stable callback.
+//!
+//! Binaries: `bridge-hook` (installed as the harness hook command) and
+//! `bridge-native-daemon` (core service + carriers + channel).
+//!
+//! Boundary: capabilities are qualified support of an exact loaded harness
+//! build, not liveness. Same-user code running inside a harness's own tool
+//! sandbox shares its process ancestry and is outside the claimed
+//! isolation (see [`registry`]). Library tests use owned fixture processes
+//! and do not establish delivery to, or context in, a real model.
+
+pub mod claude;
+pub mod client;
+pub mod codex;
+pub mod os;
+pub mod registry;
+pub mod server;
+
+pub use client::{ChannelClient, HookRun, RegistryAttestor};
+pub use registry::{
+    ActorRole, CallerAttestor, CallerChannel, CorrelationError, PresentedMeta, Registry,
+    RegistryConfig, Unattested, VerifiedCaller,
+};
+pub use server::{ChannelServer, Custody, LateCustody};

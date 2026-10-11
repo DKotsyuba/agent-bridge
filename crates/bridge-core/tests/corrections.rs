@@ -143,51 +143,104 @@ fn native_component_boundaries_are_lossless() {
     assert!(NativeAddress::parse("host/codex/ok/x/extra").is_err());
 }
 
-/// F08: out-of-range revision values are refused (or would need unsigned
-/// ordering); 1<<63 must never wrap into apparent staleness.
+/// F08: out-of-range revision values are refused at construction, at
+/// canonical decode and at raw deserialization; 1<<63 must never wrap into
+/// apparent staleness, and the boundary value itself stays admissible.
 #[test]
 fn unsigned_revision_never_wraps_to_stale() {
     let mut store = Storage::open_in_memory(Limits::new(10)).unwrap();
     store
         .publish(&event("publisher", "recipient", "first", 1), 1)
         .unwrap();
-    // Either outcome is compliant: explicit refusal at the cast bound, or
-    // acceptance-as-newer; silently stale or wrapped is not.
-    if let Ok(second) = store.publish(&event("publisher", "recipient", "second", 1 << 63), 2) {
-        assert_eq!(
-            second.receipt.state,
-            bridge_core::EventState::Pending,
-            "accepted newer revision wrapped to stale"
-        );
-    }
-    // The bound is explicit at the admission edge, and the boundary value
-    // itself stays admissible as a newer revision.
+    let mut oversized = event("publisher", "recipient", "second", 1);
+    oversized.policy = Policy::Latest {
+        stream: StreamId::new("same-local-stream").unwrap(),
+        revision: 1 << 63,
+    };
     assert!(
-        store
-            .publish(&event("publisher", "recipient", "bounded", 1 << 63), 3)
-            .is_err(),
-        "revision above the SQLite-safe bound must be refused before the cast"
+        oversized.validate().is_err(),
+        "a revision above the SQLite-safe bound is refused"
     );
+    assert!(
+        store.publish(&oversized, 2).is_err(),
+        "and never reaches the signed cast"
+    );
+    // The same value is refused when it arrives as bytes.
+    let mut value = serde_json::to_value(event("publisher", "recipient", "third", 1)).unwrap();
+    value["policy"]["Latest"]["revision"] = serde_json::json!(1u64 << 63);
+    assert!(serde_json::from_value::<Envelope>(value.clone()).is_err());
+    assert!(Envelope::from_canonical_bytes(&serde_json::to_vec(&value).unwrap()).is_err());
+    // The boundary value itself stays admissible as a newer revision.
     let admitted = store
         .publish(&event("publisher", "recipient", "edge", MAX_SQLITE_INT), 4)
         .unwrap();
     assert_eq!(admitted.receipt.state, bridge_core::EventState::Pending);
 }
 
-/// F08: expiry above the SQLite-safe bound is refused before any cast.
+/// F08: expiry above the SQLite-safe bound is refused before any cast, at
+/// construction and at deserialization; the boundary value keeps ordering.
 #[test]
 fn expiry_bound_is_enforced_before_cast() {
-    // Construction keeps unbounded u64; admission refuses above the bound.
-    let oversized = ExpiresAt::from_unix_millis(1 << 63).unwrap();
-    assert_eq!(oversized.unix_millis(), 1 << 63);
+    assert!(ExpiresAt::from_unix_millis(1 << 63).is_err());
+    assert!(ExpiresAt::from_unix_millis(0).is_err());
+    assert!(serde_json::from_value::<ExpiresAt>(serde_json::json!(1u64 << 63)).is_err());
+    assert!(serde_json::from_value::<ExpiresAt>(serde_json::json!(0)).is_err());
     let mut envelope = event("publisher", "recipient", "expiry-bound", 1);
-    envelope.expires_at = Some(oversized);
     let mut store = Storage::open_in_memory(Limits::new(10)).unwrap();
-    assert!(
-        store.publish(&envelope, 1).is_err(),
-        "oversized expiry must be refused at admission"
-    );
-    // At the boundary value, ordering stays correct.
     envelope.expires_at = Some(ExpiresAt::from_unix_millis(MAX_SQLITE_INT).unwrap());
     assert!(store.publish(&envelope, 1).is_ok());
+}
+
+/// Deserialized receipts, hashes, addresses and delivery evidence pass the
+/// same validation as their constructors: no field range or shape is
+/// trusted because it arrived over a socket or from a file.
+#[test]
+fn deserialized_status_and_receipts_are_revalidated() {
+    let mut store = Storage::open_in_memory(Limits::new(10)).unwrap();
+    let good = serde_json::to_value(
+        store
+            .publish(&event("publisher", "recipient", "receipt", 1), 5)
+            .unwrap()
+            .receipt,
+    )
+    .unwrap();
+    assert!(serde_json::from_value::<bridge_core::CustodyReceipt>(good.clone()).is_ok());
+    for (field, value) in [
+        ("acceptance_seq", serde_json::json!(0)),
+        ("acceptance_seq", serde_json::json!(1u64 << 63)),
+        ("accepted_at_ms", serde_json::json!(1u64 << 63)),
+        ("envelope_hash", serde_json::json!("not-a-hash")),
+        ("envelope_hash", serde_json::json!("A".repeat(64))),
+        ("publisher", serde_json::json!("")),
+        ("event_id", serde_json::json!("bad\u{1}id")),
+        ("state", serde_json::json!("delivered")),
+    ] {
+        let mut malformed = good.clone();
+        malformed[field] = value;
+        assert!(
+            serde_json::from_value::<bridge_core::CustodyReceipt>(malformed).is_err(),
+            "receipt field {field} must be revalidated"
+        );
+    }
+    // Addresses cannot skip the component rules either.
+    assert!(
+        serde_json::from_value::<NativeAddress>(serde_json::json!({
+            "host_id": "", "harness": "Codex",
+            "native_store_namespace": "n", "native_session_id": "s"
+        }))
+        .is_err()
+    );
+    // Delivery evidence accepts only known names and bounded lists.
+    let evidence = serde_json::json!({
+        "attempt_state": "native_accepted", "effective_mode": "message", "note": null
+    });
+    assert!(serde_json::from_value::<bridge_core::DeliveryEvidence>(evidence).is_ok());
+    for malformed in [
+        serde_json::json!({"attempt_state": "delivered", "effective_mode": "message", "note": null}),
+        serde_json::json!({"attempt_state": "none", "effective_mode": "teleport", "note": null}),
+        serde_json::json!({"attempt_state": "none", "effective_mode": "none", "note": null,
+            "delivery": "teleported"}),
+    ] {
+        assert!(serde_json::from_value::<bridge_core::DeliveryEvidence>(malformed).is_err());
+    }
 }

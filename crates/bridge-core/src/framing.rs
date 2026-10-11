@@ -9,10 +9,16 @@
 //! text trustworthy. Event ids and manifest metadata are rendered by this
 //! module, never interpolated as raw tags by callers.
 
-use crate::{CoreError, Envelope, MAX_FIELD_BYTES};
+use crate::{CoreError, Envelope};
 
-/// Maximum rendered size of one framed block, in bytes of UTF-8.
+/// Maximum rendered size of one framed manifest, in bytes of UTF-8.
 pub const MAX_FRAMED_BYTES: usize = 96 * 1024;
+
+/// Maximum length of an allowlisted source tag.
+///
+/// Fixed (rather than the general field bound) so the worst-case rendered
+/// size of an event is known at admission, before any tag is chosen.
+pub const MAX_TAG_BYTES: usize = 64;
 
 /// The fixed provenance statement appended to every framed block.
 pub const PROVENANCE_STATEMENT: &str =
@@ -53,12 +59,27 @@ fn escape(value: &str) -> String {
     out
 }
 
+/// Renders one member block without any size bound.
+///
+/// Callers validate the tag and bound the result; the payload's forbidden
+/// controls are rejected here so no rendering path can skip the check.
+fn render_member(source_tag: &str, envelope: &Envelope) -> Result<String, CoreError> {
+    reject_forbidden_controls("payload", envelope.payload.as_str())?;
+    Ok(format!(
+        "<{tag} event=\"{event}\" kind=\"{kind}\">\n{payload}\n</{tag}>\n",
+        tag = escape(source_tag),
+        event = escape(envelope.event_id.as_str()),
+        kind = escape(envelope.kind.as_str()),
+        payload = escape(envelope.payload.as_str()),
+    ))
+}
+
 /// Frames one event's payload under its authenticated source tag.
 ///
-/// The tag must come from the integration's allowlist (the service checks
-/// it against grant configuration; this function only validates shape:
-/// non-empty, bounded, no controls, and no characters that could break out
-/// of the wrapper). Produces one block:
+/// The tag must come from the integration's allowlist (the dispatcher takes
+/// it from the registered publisher tag; this function only validates
+/// shape: non-empty, bounded, and no characters that could break out of the
+/// wrapper). Produces one block:
 ///
 /// ```text
 /// <agent-run event="evt-1" kind="worker.completed">
@@ -70,57 +91,62 @@ fn escape(value: &str) -> String {
 /// Errors: forbidden control characters in the payload, an invalid tag, or
 /// a rendered size over [`MAX_FRAMED_BYTES`].
 pub fn frame(source_tag: &str, envelope: &Envelope) -> Result<String, CoreError> {
-    validate_tag(source_tag)?;
-    reject_forbidden_controls("payload", envelope.payload.as_str())?;
-    let block = format!(
-        "<{tag} event=\"{event}\" kind=\"{kind}\">\n{payload}\n</{tag}>\n[bridge] {statement}\n",
-        tag = escape(source_tag),
-        event = escape(envelope.event_id.as_str()),
-        kind = escape(envelope.kind.as_str()),
-        payload = escape(envelope.payload.as_str()),
-        statement = PROVENANCE_STATEMENT,
-    );
-    if block.len() > MAX_FRAMED_BYTES {
-        return Err(CoreError::InvalidEnvelope(format!(
-            "framed payload exceeds {MAX_FRAMED_BYTES} bytes"
-        )));
-    }
-    Ok(block)
+    frame_manifest(&[(source_tag, envelope)])
 }
 
-/// Frames a batch of events with one source block per member.
+/// Frames an ordered manifest of events, one source block per member.
 ///
-/// Members keep their original order, ids and per-member wrappers; the
-/// batch wrapper only groups them. Every member is framed and bounded
-/// individually, and the whole batch is bounded again.
-pub fn frame_batch(source_tag: &str, members: &[Envelope]) -> Result<String, CoreError> {
-    validate_tag(source_tag)?;
-    let mut batch = format!("<{tag}-batch>\n", tag = escape(source_tag));
-    for envelope in members {
-        let member = frame(source_tag, envelope)?;
-        batch.push_str(&member);
-        batch.push('\n');
+/// Each member carries its own authenticated source tag, so a mixed-source
+/// manifest keeps a separate source block per member; members keep their
+/// original order, ids and content, and the batch wrapper only groups
+/// them. A single member renders without a wrapper. The whole result is
+/// bounded by [`MAX_FRAMED_BYTES`]: an oversize manifest is refused, never
+/// truncated. An empty member list is refused.
+pub fn frame_manifest(members: &[(&str, &Envelope)]) -> Result<String, CoreError> {
+    if members.is_empty() {
+        return Err(CoreError::InvalidEnvelope("manifest has no members".into()));
     }
-    batch.push_str(&format!(
-        "</{tag}-batch>\n[bridge] {statement}\n",
-        tag = escape(source_tag),
-        statement = PROVENANCE_STATEMENT
-    ));
-    if batch.len() > MAX_FRAMED_BYTES {
+    let mut body = String::new();
+    for (tag, envelope) in members {
+        validate_tag(tag)?;
+        body.push_str(&render_member(tag, envelope)?);
+    }
+    let framed = if members.len() == 1 {
+        format!("{body}[bridge] {PROVENANCE_STATEMENT}\n")
+    } else {
+        format!(
+            "<bridge-batch count=\"{}\">\n{body}</bridge-batch>\n[bridge] {PROVENANCE_STATEMENT}\n",
+            members.len()
+        )
+    };
+    if framed.len() > MAX_FRAMED_BYTES {
         return Err(CoreError::InvalidEnvelope(format!(
-            "framed batch exceeds {MAX_FRAMED_BYTES} bytes"
+            "framed manifest exceeds {MAX_FRAMED_BYTES} bytes"
         )));
     }
-    Ok(batch)
+    Ok(framed)
+}
+
+/// Checks at admission that an event can always be rendered.
+///
+/// An accepted event that could never be framed (forbidden controls, or
+/// escaping growth past [`MAX_FRAMED_BYTES`] even alone) would sit in
+/// custody forever; refusing it before acceptance keeps that failure with
+/// the producer. The size check uses the longest possible tag, so a later
+/// tag choice cannot make an admitted event unframeable.
+pub fn check_renderable(envelope: &Envelope) -> Result<(), CoreError> {
+    let widest_tag = "a".repeat(MAX_TAG_BYTES);
+    frame(&widest_tag, envelope).map(|_| ())
 }
 
 /// Validates an allowlisted source tag's shape.
 ///
-/// Letters, digits, hyphens and single interior dots only; anything that
-/// could break out of a wrapper or smuggle attributes refuses.
+/// Letters, digits, hyphens and single interior dots only, at most
+/// [`MAX_TAG_BYTES`]; anything that could break out of a wrapper or smuggle
+/// attributes refuses.
 pub fn validate_tag(tag: &str) -> Result<(), CoreError> {
     let valid = !tag.is_empty()
-        && tag.len() <= MAX_FIELD_BYTES
+        && tag.len() <= MAX_TAG_BYTES
         && tag
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
@@ -138,19 +164,18 @@ pub fn validate_tag(tag: &str) -> Result<(), CoreError> {
 
 #[cfg(test)]
 mod tests {
-    //! Framing checks: escaping, controls, bounds, batch integrity.
+    //! Framing checks: escaping, controls, bounds, manifest integrity.
 
     use super::*;
     use crate::types::{
-        EventId, ExpiresAt, Harness, Kind, Metadata, Mode, NativeAddress, Payload, Policy,
-        PublisherId,
+        EventId, Harness, Kind, Metadata, Mode, NativeAddress, Payload, Policy, PublisherId,
     };
 
     /// A minimal valid envelope for framing tests.
-    fn envelope(payload: &str) -> Envelope {
+    fn envelope(id: &str, payload: &str) -> Envelope {
         Envelope::new(
             PublisherId::new("agent-run").unwrap(),
-            EventId::new("evt-1").unwrap(),
+            EventId::new(id).unwrap(),
             NativeAddress::new("host", Harness::Codex, "default", "thread-1").unwrap(),
             Kind::new("worker.completed").unwrap(),
             Mode::Auto,
@@ -164,7 +189,7 @@ mod tests {
 
     #[test]
     fn escapes_hostile_content() {
-        let framed = frame("agent-run", &envelope("<script>\"&'")).unwrap();
+        let framed = frame("agent-run", &envelope("evt-1", "<script>\"&'")).unwrap();
         assert!(framed.contains("&lt;script&gt;"));
         assert!(framed.contains("&amp;"));
         assert!(!framed.contains("<script>"));
@@ -173,26 +198,31 @@ mod tests {
 
     #[test]
     fn rejects_forbidden_controls_and_bad_tags() {
-        assert!(frame("agent-run", &envelope("bad\u{1}char")).is_err());
-        assert!(frame("agent-run", &envelope("del\u{7f}")).is_err());
-        assert!(frame("agent run", &envelope("ok")).is_err());
-        assert!(frame("agent-run=x", &envelope("ok")).is_err());
-        assert!(frame("agent-run", &envelope("tab\tand\nnewline ok")).is_ok());
+        assert!(frame("agent-run", &envelope("e", "bad\u{1}char")).is_err());
+        assert!(frame("agent-run", &envelope("e", "del\u{7f}")).is_err());
+        assert!(frame("agent run", &envelope("e", "ok")).is_err());
+        assert!(frame("agent-run=x", &envelope("e", "ok")).is_err());
+        assert!(frame(&"t".repeat(MAX_TAG_BYTES + 1), &envelope("e", "ok")).is_err());
+        assert!(frame("agent-run", &envelope("e", "tab\tand\nnewline ok")).is_ok());
     }
 
     #[test]
-    fn bounds_rendered_result() {
-        // 64 KiB of payload plus escaping growth stays under 96 KiB, but a
-        // payload of mostly escapable characters overflows and must refuse.
-        assert!(frame("agent-run", &envelope(&"a".repeat(64 * 1024))).is_ok());
-        assert!(frame("agent-run", &envelope(&"&".repeat(64 * 1024))).is_err());
+    fn bounds_rendered_result_without_truncating() {
+        assert!(frame("agent-run", &envelope("e", &"a".repeat(64 * 1024))).is_ok());
+        assert!(frame("agent-run", &envelope("e", &"&".repeat(64 * 1024))).is_err());
+        assert!(check_renderable(&envelope("e", &"&".repeat(64 * 1024))).is_err());
+        assert!(check_renderable(&envelope("e", "fine")).is_ok());
     }
 
     #[test]
-    fn batch_keeps_per_member_blocks() {
-        let batch = frame_batch("agent-ide", &[envelope("one"), envelope("two")]).unwrap();
-        assert_eq!(batch.matches("<agent-ide event=\"evt-1\"").count(), 2);
-        assert!(batch.starts_with("<agent-ide-batch>"));
-        assert!(batch.contains("</agent-ide-batch>"));
+    fn manifest_keeps_a_separate_source_block_per_member() {
+        let one = envelope("evt-1", "one");
+        let two = envelope("evt-2", "two");
+        let batch = frame_manifest(&[("agent-ide", &one), ("agent-run", &two)]).unwrap();
+        assert_eq!(batch.matches("<agent-ide event=\"evt-1\"").count(), 1);
+        assert_eq!(batch.matches("<agent-run event=\"evt-2\"").count(), 1);
+        assert!(batch.starts_with("<bridge-batch count=\"2\">"));
+        assert!(batch.find("evt-1").unwrap() < batch.find("evt-2").unwrap());
+        assert!(frame_manifest(&[]).is_err());
     }
 }

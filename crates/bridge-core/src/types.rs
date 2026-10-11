@@ -103,6 +103,7 @@ impl Harness {
 /// project name. Fork, `/clear` or a new native id produces a different
 /// recipient; display names never participate in routing.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "RawNativeAddress")]
 pub struct NativeAddress {
     /// Identifier of the OS host owning the native store.
     pub host_id: String,
@@ -112,6 +113,34 @@ pub struct NativeAddress {
     pub native_store_namespace: String,
     /// Native session identifier (Codex thread id or Claude session id).
     pub native_session_id: String,
+}
+
+/// Unvalidated wire shape of [`NativeAddress`]; deserialization converts it
+/// through [`NativeAddress::validate`] so no address skips the field rules.
+#[derive(Deserialize)]
+struct RawNativeAddress {
+    /// Host identifier as received.
+    host_id: String,
+    /// Harness as received.
+    harness: Harness,
+    /// Native store namespace as received.
+    native_store_namespace: String,
+    /// Native session id as received.
+    native_session_id: String,
+}
+
+impl TryFrom<RawNativeAddress> for NativeAddress {
+    type Error = CoreError;
+
+    /// Validates every component of a deserialized address.
+    fn try_from(raw: RawNativeAddress) -> Result<Self, CoreError> {
+        NativeAddress::new(
+            raw.host_id,
+            raw.harness,
+            raw.native_store_namespace,
+            raw.native_session_id,
+        )
+    }
 }
 
 impl NativeAddress {
@@ -247,7 +276,17 @@ fn decode_component(component: &str) -> Result<String, CoreError> {
 /// custody deduplication keys on `(publisher, event id)`. Not a UUID
 /// freshness signal and not a recipient-visible delivery correlation id.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String")]
 pub struct EventId(String);
+
+impl TryFrom<String> for EventId {
+    type Error = CoreError;
+
+    /// Validates a deserialized EventId through its constructor rules.
+    fn try_from(value: String) -> Result<Self, CoreError> {
+        EventId::new(value)
+    }
+}
 
 impl EventId {
     /// Validates and wraps an event id (non-empty, bounded, no controls).
@@ -274,7 +313,17 @@ impl EventId {
 /// The storage layer trusts this value; the publisher protocol task owns how
 /// it is authenticated and which grants it carries.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String")]
 pub struct PublisherId(String);
+
+impl TryFrom<String> for PublisherId {
+    type Error = CoreError;
+
+    /// Validates a deserialized PublisherId through its constructor rules.
+    fn try_from(value: String) -> Result<Self, CoreError> {
+        PublisherId::new(value)
+    }
+}
 
 impl PublisherId {
     /// Validates and wraps a publisher id (non-empty, bounded, no controls).
@@ -301,7 +350,17 @@ impl PublisherId {
 /// Kinds are agreed per publisher contract; the core treats them as bounded
 /// opaque labels and never interprets their meaning.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String")]
 pub struct Kind(String);
+
+impl TryFrom<String> for Kind {
+    type Error = CoreError;
+
+    /// Validates a deserialized Kind through its constructor rules.
+    fn try_from(value: String) -> Result<Self, CoreError> {
+        Kind::new(value)
+    }
+}
 
 impl Kind {
     /// Validates and wraps a kind (non-empty, bounded, no controls).
@@ -325,7 +384,17 @@ impl Kind {
 
 /// An authoritative replaceable snapshot stream identifier for `latest`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String")]
 pub struct StreamId(String);
+
+impl TryFrom<String> for StreamId {
+    type Error = CoreError;
+
+    /// Validates a deserialized StreamId through its constructor rules.
+    fn try_from(value: String) -> Result<Self, CoreError> {
+        StreamId::new(value)
+    }
+}
 
 impl StreamId {
     /// Validates and wraps a stream id (non-empty, bounded, no controls).
@@ -418,14 +487,22 @@ impl Policy {
     /// Validates the policy's own fields (stream/group shape and bounds).
     ///
     /// For `Latest` this re-checks the stream id (covering deserialized
-    /// values). The revision itself is an unbounded u64 at the type level:
-    /// values above [`MAX_SQLITE_INT`] are refused explicitly at the
-    /// storage cast site, never wrapped. For `Batch` the group text is
-    /// checked. Returns [`CoreError::InvalidEnvelope`] on failure.
+    /// values) and refuses a revision above [`MAX_SQLITE_INT`], which
+    /// could not be stored without wrapping into an apparently stale
+    /// value. For `Batch` the group text is checked. Returns
+    /// [`CoreError::InvalidEnvelope`] on failure.
     pub fn validate(&self) -> Result<(), CoreError> {
         match self {
             Policy::KeepAll => Ok(()),
-            Policy::Latest { stream, .. } => stream.validate(),
+            Policy::Latest { stream, revision } => {
+                stream.validate()?;
+                if *revision > MAX_SQLITE_INT {
+                    return Err(CoreError::InvalidEnvelope(format!(
+                        "latest revision {revision} exceeds the supported bound {MAX_SQLITE_INT}"
+                    )));
+                }
+                Ok(())
+            }
             Policy::Batch { group } => validate_field("group", group, MAX_FIELD_BYTES),
         }
     }
@@ -446,21 +523,35 @@ impl Policy {
 /// turned into an envelope ([`ExpiresAt::relative`]); the envelope stores
 /// only the absolute value, so a later retry cannot extend expiry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "u64")]
 pub struct ExpiresAt(u64);
+
+impl TryFrom<u64> for ExpiresAt {
+    type Error = CoreError;
+
+    /// Validates a deserialized expiry through the constructor rules.
+    fn try_from(millis: u64) -> Result<Self, CoreError> {
+        ExpiresAt::from_unix_millis(millis)
+    }
+}
 
 impl ExpiresAt {
     /// Wraps an absolute Unix-epoch-milliseconds expiry.
     ///
     /// Refuses zero (an unset expiry is represented by `None` on the
-    /// envelope, not by a sentinel value). Values above
-    /// [`MAX_SQLITE_INT`] are an unbounded u64 at the type level and are
-    /// refused explicitly at the storage cast site.
+    /// envelope, not by a sentinel value) and values above
+    /// [`MAX_SQLITE_INT`], which could not be stored without a wrapping
+    /// signed cast.
     pub fn from_unix_millis(millis: u64) -> Result<Self, CoreError> {
         if millis == 0 {
             return Err(CoreError::InvalidEnvelope(
                 "expires_at must be a non-zero absolute timestamp".into(),
             ));
+        }
+        if millis > MAX_SQLITE_INT {
+            return Err(CoreError::InvalidEnvelope(format!(
+                "expires_at {millis} exceeds the supported bound {MAX_SQLITE_INT}"
+            )));
         }
         Ok(ExpiresAt(millis))
     }
@@ -495,7 +586,17 @@ impl ExpiresAt {
 /// source wrappers and render budgets are applied later at framing time and
 /// are not this type's concern.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String")]
 pub struct Payload(String);
+
+impl TryFrom<String> for Payload {
+    type Error = CoreError;
+
+    /// Validates a deserialized payload through the constructor rules.
+    fn try_from(value: String) -> Result<Self, CoreError> {
+        Payload::new(value)
+    }
+}
 
 impl Payload {
     /// Validates and wraps a payload.
@@ -556,6 +657,7 @@ pub fn validate_metadata(metadata: &Metadata) -> Result<(), CoreError> {
 /// deterministic, so the same logical envelope always produces the same
 /// [`EnvelopeHash`] no matter how or in which order it was constructed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawEnvelope")]
 pub struct Envelope {
     /// Envelope schema version ([`SCHEMA_VERSION`] for this build).
     pub schema_version: u16,
@@ -577,6 +679,55 @@ pub struct Envelope {
     pub metadata: Metadata,
     /// Absolute expiry in Unix epoch milliseconds, if any.
     pub expires_at: Option<ExpiresAt>,
+}
+
+/// Unvalidated wire shape of [`Envelope`]; deserialization converts it
+/// through [`Envelope::validate`], so a value built by `Deserialize` has
+/// passed exactly the constructor rules (schema version, bounds, ranges).
+#[derive(Deserialize)]
+struct RawEnvelope {
+    /// Schema version as received.
+    schema_version: u16,
+    /// Publisher as received.
+    publisher: PublisherId,
+    /// Event id as received.
+    event_id: EventId,
+    /// Recipient as received.
+    recipient: NativeAddress,
+    /// Kind as received.
+    kind: Kind,
+    /// Mode as received.
+    mode: Mode,
+    /// Policy as received.
+    policy: Policy,
+    /// Payload as received.
+    payload: Payload,
+    /// Metadata as received.
+    metadata: Metadata,
+    /// Expiry as received.
+    expires_at: Option<ExpiresAt>,
+}
+
+impl TryFrom<RawEnvelope> for Envelope {
+    type Error = CoreError;
+
+    /// Validates a deserialized envelope as a whole.
+    fn try_from(raw: RawEnvelope) -> Result<Self, CoreError> {
+        let envelope = Envelope {
+            schema_version: raw.schema_version,
+            publisher: raw.publisher,
+            event_id: raw.event_id,
+            recipient: raw.recipient,
+            kind: raw.kind,
+            mode: raw.mode,
+            policy: raw.policy,
+            payload: raw.payload,
+            metadata: raw.metadata,
+            expires_at: raw.expires_at,
+        };
+        envelope.validate()?;
+        Ok(envelope)
+    }
 }
 
 impl Envelope {
@@ -681,22 +832,48 @@ impl Envelope {
 /// layer's replay test; a mismatch under the same `(publisher, event id)`
 /// key is a conflict, never an overwrite.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String")]
 pub struct EnvelopeHash(
-    /// Lowercase hex text; visible crate-wide for storage round-trips only.
-    pub(crate) String,
+    /// Lowercase hex text; private so every value passed a hex check.
+    String,
 );
 
+impl TryFrom<String> for EnvelopeHash {
+    type Error = CoreError;
+
+    /// Accepts exactly 64 lowercase hexadecimal characters.
+    fn try_from(value: String) -> Result<Self, CoreError> {
+        if value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            Ok(EnvelopeHash(value))
+        } else {
+            Err(CoreError::InvalidEnvelope(
+                "envelope hash must be 64 lowercase hex characters".into(),
+            ))
+        }
+    }
+}
+
 impl EnvelopeHash {
-    /// Wrips raw canonical bytes through SHA-256 into a hex hash.
-    fn from_canonical_bytes(bytes: &[u8]) -> Self {
-        let digest = Sha256::digest(bytes);
-        EnvelopeHash(hex_encode(&digest))
+    /// Hashes raw canonical bytes through SHA-256 into a hex hash.
+    pub(crate) fn from_canonical_bytes(bytes: &[u8]) -> Self {
+        EnvelopeHash(sha256_hex(bytes))
     }
 
     /// The 64-character lowercase hex text.
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// SHA-256 of `bytes` as 64 lowercase hex characters.
+///
+/// Shared by envelope identity hashing and frozen manifest hashing.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    hex_encode(&Sha256::digest(bytes))
 }
 
 /// Lowercase-hex encodes a byte slice without external dependencies.
@@ -745,6 +922,22 @@ pub enum CoreError {
     /// A fenced dispatch transition was refused (stale fence, foreign
     /// state, unresolved uncertainty or missing event); nothing was invoked.
     Fence(String),
+    /// The recipient is known not to support the requested mode (its
+    /// attested capabilities lack the needed path). Permanent, unlike a
+    /// transient hold: the producer keeps its intent and its own compatible
+    /// route, and nothing was accepted.
+    Unsupported(String),
+    /// The database was busy, locked or out of space; the transaction was
+    /// rolled back and changed nothing, so the operation may be retried with
+    /// the same key. An I/O failure during COMMIT is reported as
+    /// [`CoreError::Storage`] instead: its outcome is uncertain and the
+    /// caller reconciles through the idempotent key.
+    Busy(String),
+    /// Stored data violated an invariant this build wrote (foreign or
+    /// corrupted rows, a hash that no longer matches its bytes, a counter
+    /// out of range). The affected record is never used; nothing was
+    /// changed by the failing call.
+    Integrity(String),
     /// A SQLite-level failure; transaction state is reported by SQLite.
     Storage(rusqlite::Error),
 }
@@ -767,6 +960,9 @@ impl fmt::Display for CoreError {
                 write!(f, "recipient {recipient} is held: {reason}")
             }
             CoreError::Fence(detail) => write!(f, "dispatch fence refused: {detail}"),
+            CoreError::Unsupported(detail) => write!(f, "unsupported: {detail}"),
+            CoreError::Busy(detail) => write!(f, "storage busy: {detail}"),
+            CoreError::Integrity(detail) => write!(f, "storage integrity violation: {detail}"),
             CoreError::Storage(error) => write!(f, "storage failure: {error}"),
         }
     }
@@ -783,8 +979,19 @@ impl std::error::Error for CoreError {
 }
 
 impl From<rusqlite::Error> for CoreError {
-    /// Converts a raw SQLite error into [`CoreError::Storage`].
+    /// Converts a raw SQLite error: lock contention and a full disk become
+    /// retryable [`CoreError::Busy`], everything else [`CoreError::Storage`].
     fn from(error: rusqlite::Error) -> Self {
+        if let rusqlite::Error::SqliteFailure(failure, _) = &error
+            && matches!(
+                failure.code,
+                rusqlite::ErrorCode::DatabaseBusy
+                    | rusqlite::ErrorCode::DatabaseLocked
+                    | rusqlite::ErrorCode::DiskFull
+            )
+        {
+            return CoreError::Busy(error.to_string());
+        }
         CoreError::Storage(error)
     }
 }
@@ -902,5 +1109,37 @@ mod tests {
         assert_eq!(address, parsed);
         assert!(NativeAddress::parse("host/codex").is_err());
         assert!(Harness::parse("Codex").is_err());
+    }
+
+    #[test]
+    fn busy_locked_and_full_storage_map_to_retryable_busy_only() {
+        for code in [
+            rusqlite::ffi::SQLITE_BUSY,
+            rusqlite::ffi::SQLITE_LOCKED,
+            rusqlite::ffi::SQLITE_FULL,
+        ] {
+            let error = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
+            assert!(
+                matches!(CoreError::from(error), CoreError::Busy(_)),
+                "{code}"
+            );
+        }
+        let io = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+            None,
+        );
+        assert!(
+            matches!(CoreError::from(io), CoreError::Storage(_)),
+            "an I/O failure is not a retryable busy condition"
+        );
+    }
+
+    #[test]
+    fn deserialized_values_are_validated() {
+        assert!(serde_json::from_str::<EventId>("\"\"").is_err());
+        assert!(serde_json::from_str::<Payload>(&format!("\"{}\"", "x".repeat(70_000))).is_err());
+        assert!(serde_json::from_str::<EnvelopeHash>("\"abc\"").is_err());
+        assert!(serde_json::from_str::<ExpiresAt>("0").is_err());
+        assert!(serde_json::from_str::<ExpiresAt>("1700000000000").is_ok());
     }
 }

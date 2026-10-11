@@ -1,753 +1,2314 @@
-//! Integration checks for fenced dispatch, evidence tiers, no-wake
-//! policy, fairness, compaction and restart recovery.
+//! Integration checks for fenced dispatch over a frozen manifest: auth of
+//! the endpoint, reservation and invocation fencing, evidence tiers,
+//! uncertainty custody, ordering, coalescing, expiry and restart recovery.
 //!
 //! All carriers are synthetic; all state is isolated (fresh temporary
-//! databases, unique sockets never used here). No native host is touched.
+//! databases or in-memory stores). No native host is touched.
 
 mod common;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 
 use bridge_core::dispatch::{
-    AttemptFence, AttemptState, CarrierOutcome, DispatchCarrier, Lifecycle, Outcome, dispatch_one,
+    AttemptFence, AttemptState, Attestation, Capabilities, DispatchCarrier, DispatchReport,
+    DispatchTiming, EffectiveMode, Invoked, Lifecycle, Outcome, Selection, dispatch_message,
     resolve_mode,
 };
-use bridge_core::{
-    CoreError, Envelope, EventId, Harness, Kind, Limits, Metadata, Mode, NativeAddress, Payload,
-    Policy, PublisherId, Storage, StreamId,
+use bridge_core::framing::PROVENANCE_STATEMENT;
+use bridge_core::recovery::{DeliveryState, EvidenceEffect, EvidenceTier, IncidentState};
+use bridge_core::{CoreError, EventState, Limits, Mode, NativeAddress, Storage};
+use common::{
+    ScriptedCarrier, TempDir, attest, batched, codex, keep_all, latest, register_tags, store,
+    with_meta,
 };
-use common::TempDir;
+use sha2::{Digest, Sha256};
 
-/// A scripted synthetic carrier standing in for the native adapter.
-struct ScriptedCarrier {
-    /// Lifecycle each observe call reports.
-    lifecycle: Lifecycle,
-    /// Outcome each send call returns.
-    outcome: CarrierOutcome,
-    /// Recorded (mode, hash) hand-offs.
-    sends: Vec<(String, String)>,
+/// Default windows used by most checks.
+fn timing() -> DispatchTiming {
+    DispatchTiming::default()
 }
 
-impl ScriptedCarrier {
-    /// A carrier that always reports one lifecycle and one outcome.
-    fn new(lifecycle: Lifecycle, outcome: CarrierOutcome) -> Self {
-        ScriptedCarrier {
-            lifecycle,
-            outcome,
-            sends: Vec::new(),
-        }
+/// Unwraps a reserved or invoking attempt from a selection.
+fn attempt(selection: Selection) -> bridge_core::dispatch::AttemptRecord {
+    match selection {
+        Selection::Attempt(record) => *record,
+        other => panic!("expected an attempt, got {other:?}"),
     }
 }
 
-impl DispatchCarrier for ScriptedCarrier {
-    fn observe(&mut self, _recipient: &NativeAddress) -> Result<Lifecycle, String> {
-        Ok(self.lifecycle)
-    }
-
-    fn send(
-        &mut self,
-        mode: bridge_core::dispatch::EffectiveMode,
-        hash: &str,
-        _framed: &str,
-    ) -> CarrierOutcome {
-        self.sends
-            .push((mode.as_str().to_string(), hash.to_string()));
-        self.outcome.clone()
-    }
-}
-
-/// A keep_all envelope addressed to one synthetic recipient.
-fn keep_all(event: &str, recipient: &str) -> Envelope {
-    Envelope::new(
-        PublisherId::new("agent-run").unwrap(),
-        EventId::new(event).unwrap(),
-        NativeAddress::new("host-1", Harness::Codex, "default", recipient).unwrap(),
-        Kind::new("worker.completed").unwrap(),
-        Mode::Auto,
-        Policy::KeepAll,
-        Payload::new("synthetic result").unwrap(),
-        Metadata::new(),
-        None,
-    )
-    .unwrap()
-}
-
-/// A latest-snapshot envelope for one stream/revision.
-fn latest(event: &str, recipient: &str, stream: &str, revision: u64) -> Envelope {
-    Envelope::new(
-        PublisherId::new("agent-ide").unwrap(),
-        EventId::new(event).unwrap(),
-        NativeAddress::new("host-1", Harness::ClaudeCode, "default", recipient).unwrap(),
-        Kind::new("diagnostics.view").unwrap(),
-        Mode::Auto,
-        Policy::Latest {
-            stream: StreamId::new(stream).unwrap(),
-            revision,
-        },
-        Payload::new("{\"view\":\"ok\"}").unwrap(),
-        Metadata::new(),
-        None,
-    )
-    .unwrap()
-}
-
-/// Minimal framing closure for the driver.
-fn frame(
-    _envelope: &Envelope,
-    _mode: bridge_core::dispatch::EffectiveMode,
-) -> Result<String, CoreError> {
-    Ok("framed".to_string())
+/// Runs one message-path dispatch at a fixed instant.
+fn drive(
+    storage: &Mutex<Storage>,
+    carrier: &mut ScriptedCarrier,
+    recipient: &NativeAddress,
+    now: u64,
+) -> DispatchReport {
+    dispatch_message(storage, carrier, recipient, &|| now, &timing()).unwrap()
 }
 
 #[test]
-fn auto_resolves_from_lifecycle_and_never_both_paths() {
+fn reserved_attempt_freezes_recipient_actor_epoch_path_manifest_and_deadline() {
+    let mut storage = store();
+    let recipient = codex("thread-1");
+    let envelope = keep_all("agent-run", "evt-1", &recipient, Mode::Auto);
+    storage.publish(&envelope, 1_000).unwrap();
+
+    let record = attempt(
+        storage
+            .reserve_next(
+                &attest(&recipient, Lifecycle::Inactive, 7),
+                EffectiveMode::Message,
+                2_000,
+                &timing(),
+            )
+            .unwrap(),
+    );
+    assert_eq!(record.state, AttemptState::Reserved);
+    assert_eq!(record.fence.recipient, recipient.to_canonical_string());
+    assert_eq!(record.fence.endpoint_epoch, 7);
+    assert_eq!(record.actor, "thread-1", "the exact native actor is frozen");
+    assert_eq!(record.proof_ref, "fixture-proof");
+    assert_eq!(record.granted, "inject,message");
+    assert_eq!(record.effective_mode, EffectiveMode::Message);
+    assert_eq!(record.requested_mode, Mode::Auto, "requested mode is kept");
+    assert_eq!(record.deadline_ms, 62_000);
+    assert_eq!(record.lease_expires_ms, Some(32_000));
+    assert_eq!(record.members.len(), 1);
+    assert_eq!(
+        record.members[0].envelope_hash,
+        envelope.envelope_hash().as_str()
+    );
+    assert!(
+        record
+            .manifest
+            .contains("<agent-run event=\"evt-1\" kind=\"worker.completed\">")
+    );
+    assert!(record.manifest.contains(PROVENANCE_STATEMENT));
+    assert_eq!(
+        record.fence.manifest_hash,
+        format!("{:x}", Sha256::digest(record.manifest.as_bytes()))
+    );
+    // The stored row is exactly what the reservation returned.
+    assert_eq!(
+        storage.attempt(record.fence.attempt_seq).unwrap().unwrap(),
+        record
+    );
+    assert_eq!(
+        storage.count_delivery(DeliveryState::Reserved).unwrap(),
+        1,
+        "the event is owned by the attempt"
+    );
+}
+
+#[test]
+fn auto_resolves_from_lifecycle_and_never_takes_both_paths() {
     assert_eq!(
         resolve_mode(Mode::Auto, Lifecycle::Active),
-        Some(bridge_core::dispatch::EffectiveMode::Inject)
+        Some(EffectiveMode::Inject)
     );
     assert_eq!(
         resolve_mode(Mode::Auto, Lifecycle::Inactive),
-        Some(bridge_core::dispatch::EffectiveMode::Message)
+        Some(EffectiveMode::Message)
     );
     assert_eq!(resolve_mode(Mode::Auto, Lifecycle::Unknown), None);
+    assert_eq!(resolve_mode(Mode::Auto, Lifecycle::AwaitingInput), None);
 
-    let mut storage = Storage::open_in_memory(Limits::new(10)).unwrap();
-    let envelope = keep_all("evt-1", "thread-1");
-    storage.publish(&envelope, 1_000).unwrap();
+    let mut storage = store();
+    let recipient = codex("thread-a");
+    storage
+        .publish(
+            &keep_all("agent-run", "auto-1", &recipient, Mode::Auto),
+            1_000,
+        )
+        .unwrap();
 
-    let mut carrier = ScriptedCarrier::new(
-        Lifecycle::Active,
-        CarrierOutcome::Accepted {
-            evidence: "queue id 1".into(),
-        },
+    // An active recipient's auto event waits for its natural hook: the
+    // message path finds nothing and never wakes the recipient.
+    assert_eq!(
+        storage
+            .reserve_next(
+                &attest(&recipient, Lifecycle::Active, 1),
+                EffectiveMode::Message,
+                2_000,
+                &timing()
+            )
+            .unwrap(),
+        Selection::Idle
     );
-    let result = dispatch_one(&mut storage, &mut carrier, &envelope, &frame, 2_000, 5_000).unwrap();
-    assert_eq!(result.state, AttemptState::NativeAccepted);
-    assert_eq!(carrier.sends.len(), 1, "exactly one hand-off per attempt");
-    assert_eq!(carrier.sends[0].0, "inject");
+    // The hook drains it on the inject path, already invoking.
+    let drained = attempt(
+        storage
+            .drain_inject(&attest(&recipient, Lifecycle::Active, 1), 3_000, &timing())
+            .unwrap(),
+    );
+    assert_eq!(drained.effective_mode, EffectiveMode::Inject);
+    assert_eq!(drained.state, AttemptState::Invoking);
+    // Once taken, the other path can never take the same event.
+    assert_eq!(
+        storage
+            .reserve_next(
+                &attest(&recipient, Lifecycle::Inactive, 1),
+                EffectiveMode::Message,
+                4_000,
+                &timing()
+            )
+            .unwrap(),
+        Selection::Idle
+    );
 
-    let attempt = storage
-        .latest_attempt("agent-run", "evt-1")
+    // An inactive recipient gets message, and a hook claiming inject for an
+    // inactive recipient is held, not served.
+    storage
+        .publish(
+            &keep_all("agent-run", "auto-2", &recipient, Mode::Auto),
+            5_000,
+        )
+        .unwrap();
+    match storage
+        .drain_inject(
+            &attest(&recipient, Lifecycle::Inactive, 1),
+            6_000,
+            &timing(),
+        )
+        .unwrap()
+    {
+        Selection::Held(reason) => assert!(reason.contains("active"), "{reason}"),
+        other => panic!("inject for an inactive recipient must hold, got {other:?}"),
+    }
+    let message = attempt(
+        storage
+            .reserve_next(
+                &attest(&recipient, Lifecycle::Inactive, 1),
+                EffectiveMode::Message,
+                6_000,
+                &timing(),
+            )
+            .unwrap(),
+    );
+    assert_eq!(message.effective_mode, EffectiveMode::Message);
+    assert_eq!(message.members[0].event_id, "auto-2");
+}
+
+#[test]
+fn unknown_awaiting_or_unloaded_recipients_hold_visibly_without_invoking() {
+    let shared = Mutex::new(store());
+    let recipient = codex("thread-hold");
+    shared
+        .lock()
+        .unwrap()
+        .publish(
+            &keep_all("agent-run", "held-1", &recipient, Mode::Auto),
+            1_000,
+        )
+        .unwrap();
+
+    for lifecycle in [Lifecycle::Unknown, Lifecycle::AwaitingInput] {
+        let mut carrier = ScriptedCarrier::new(lifecycle, ScriptedCarrier::accepted());
+        match drive(&shared, &mut carrier, &recipient, 2_000) {
+            DispatchReport::Held(reason) => {
+                assert!(
+                    reason.contains("unknown") || reason.contains("approval"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected a hold for {lifecycle:?}, got {other:?}"),
+        }
+        assert!(carrier.sends.is_empty(), "never invoked for {lifecycle:?}");
+    }
+    let storage = shared.lock().unwrap();
+    assert_eq!(storage.holds(10).unwrap().len(), 1, "the hold is visible");
+    let evidence = storage
+        .delivery_evidence("agent-run", "held-1")
         .unwrap()
         .unwrap();
-    assert_eq!(attempt.state, AttemptState::NativeAccepted);
-    assert_eq!(attempt.effective_mode.as_str(), "inject");
-}
-
-#[test]
-fn inactive_selects_message_and_unknown_holds_without_invoking() {
-    let mut storage = Storage::open_in_memory(Limits::new(10)).unwrap();
-    let envelope = keep_all("evt-2", "thread-2");
-    storage.publish(&envelope, 1_000).unwrap();
-
-    let mut carrier = ScriptedCarrier::new(
-        Lifecycle::Inactive,
-        CarrierOutcome::Accepted {
-            evidence: "queue id 2".into(),
-        },
-    );
-    let result = dispatch_one(&mut storage, &mut carrier, &envelope, &frame, 2_000, 5_000).unwrap();
-    assert_eq!(result.state, AttemptState::NativeAccepted);
-    assert_eq!(carrier.sends[0].0, "message");
-
-    // Unknown lifecycle: hold visibly, never invoke, never wake.
-    let held = keep_all("evt-3", "thread-3");
-    storage.publish(&held, 1_000).unwrap();
-    let mut unknown = ScriptedCarrier::new(
-        Lifecycle::Unknown,
-        CarrierOutcome::Accepted {
-            evidence: "must not happen".into(),
-        },
-    );
-    let result = dispatch_one(&mut storage, &mut unknown, &held, &frame, 2_000, 5_000).unwrap();
-    assert!(!result.possibly_handed_off);
-    assert!(unknown.sends.is_empty(), "no carrier call on unknown state");
-    let incidents = storage.open_incidents().unwrap();
+    assert!(evidence.hold_reason.is_some());
+    assert_eq!(evidence.delivery, DeliveryState::Unhanded);
     assert!(
-        incidents
-            .iter()
-            .any(|incident| incident.kind == "held_unknown_lifecycle"
-                && incident.event_id == "evt-3"),
-        "held recipient must surface a retained incident"
+        storage
+            .latest_attempt("agent-run", "held-1")
+            .unwrap()
+            .is_none()
     );
+    drop(storage);
+
+    // A failed attestation is a hold too, never an assumption of idleness.
+    let mut broken = ScriptedCarrier::new(Lifecycle::Inactive, ScriptedCarrier::accepted());
+    broken.attest_error = Some("endpoint unreachable".into());
+    assert!(matches!(
+        drive(&shared, &mut broken, &recipient, 3_000),
+        DispatchReport::Held(reason) if reason.contains("attestation failed")
+    ));
+    assert!(broken.sends.is_empty());
+
+    // An unloaded capability holds as well (message path not granted).
+    let limited = Attestation::verified(
+        recipient.clone(),
+        "thread-hold",
+        1,
+        Lifecycle::Inactive,
+        Capabilities {
+            inject: true,
+            message: false,
+        },
+        "fixture-proof",
+    )
+    .unwrap();
+    assert!(matches!(
+        shared
+            .lock()
+            .unwrap()
+            .reserve_next(&limited, EffectiveMode::Message, 4_000, &timing())
+            .unwrap(),
+        Selection::Held(reason) if reason.contains("not loaded")
+    ));
 }
 
 #[test]
-fn invoking_is_durable_before_any_handoff() {
-    // A second connection reads the attempt state DURING the carrier call:
-    // it must already be 'invoking', proving the write happens before the
-    // possible side effect.
-    let dir = TempDir::new("dispatch-crash");
+fn invoking_is_durable_before_the_carrier_can_act_and_carries_the_frozen_bytes() {
+    // A second connection reads the attempt DURING the carrier call: it must
+    // already be invoking with exactly the manifest the carrier receives.
+    let dir = TempDir::new("dispatch-probe");
     let db = dir.path("bridge.db");
     let mut storage = Storage::open(&db, Limits::new(10)).unwrap();
-    let envelope = keep_all("evt-crash", "thread-9");
-    storage.publish(&envelope, 1_000).unwrap();
-    let db_path = db.clone();
+    register_tags(&mut storage);
+    let recipient = codex("thread-9");
+    storage
+        .publish(
+            &keep_all("agent-run", "evt-probe", &recipient, Mode::Message),
+            1_000,
+        )
+        .unwrap();
+    let shared = Mutex::new(storage);
 
-    struct ProbingCarrier {
+    struct Probing {
         db: std::path::PathBuf,
-        state_seen: Arc<Mutex<Option<String>>>,
+        seen: Arc<Mutex<Option<(String, String)>>>,
     }
-    impl DispatchCarrier for ProbingCarrier {
-        fn observe(&mut self, _recipient: &NativeAddress) -> Result<Lifecycle, String> {
-            Ok(Lifecycle::Active)
+    impl DispatchCarrier for Probing {
+        fn attest(&mut self, recipient: &NativeAddress) -> Result<Attestation, String> {
+            Ok(attest(recipient, Lifecycle::Inactive, 1))
         }
-        fn send(
-            &mut self,
-            _mode: bridge_core::dispatch::EffectiveMode,
-            _hash: &str,
-            _framed: &str,
-        ) -> CarrierOutcome {
+        fn send(&mut self, attempt: &bridge_core::dispatch::AttemptRecord) -> Outcome {
             let connection = rusqlite::Connection::open(&self.db).unwrap();
-            let state: String = connection
+            let row: (String, String) = connection
                 .query_row(
-                    "SELECT state FROM attempts ORDER BY attempt_seq DESC LIMIT 1",
+                    "SELECT state, manifest FROM attempts ORDER BY attempt_seq DESC LIMIT 1",
                     [],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .unwrap();
-            *self.state_seen.lock().unwrap() = Some(state);
-            CarrierOutcome::Accepted {
-                evidence: "probed".into(),
-            }
+            assert_eq!(row.1, attempt.manifest, "stored bytes == sent bytes");
+            *self.seen.lock().unwrap() = Some(row);
+            ScriptedCarrier::accepted()
         }
     }
-
     let seen = Arc::new(Mutex::new(None));
-    let mut carrier = ProbingCarrier {
-        db: db_path,
-        state_seen: Arc::clone(&seen),
+    let mut carrier = Probing {
+        db: db.clone(),
+        seen: Arc::clone(&seen),
     };
-    dispatch_one(&mut storage, &mut carrier, &envelope, &frame, 2_000, 5_000).unwrap();
+    let report = dispatch_message(&shared, &mut carrier, &recipient, &|| 2_000, &timing()).unwrap();
+    assert!(matches!(
+        report,
+        DispatchReport::Sent {
+            state: AttemptState::NativeAccepted,
+            events: 1
+        }
+    ));
     assert_eq!(
-        seen.lock().unwrap().as_deref(),
+        seen.lock().unwrap().as_ref().map(|row| row.0.as_str()),
         Some("invoking"),
         "invoking must be committed before the carrier can act"
     );
 }
 
 #[test]
-fn unknown_outcome_is_retained_and_never_auto_retried() {
-    let mut storage = Storage::open_in_memory(Limits::new(10)).unwrap();
-    let envelope = keep_all("evt-unknown", "thread-4");
-    storage.publish(&envelope, 1_000).unwrap();
+fn hook_drain_commits_invoking_before_payload_and_other_actors_cannot_drain() {
+    let dir = TempDir::new("hook-drain");
+    let db = dir.path("bridge.db");
+    let mut storage = Storage::open(&db, Limits::new(10)).unwrap();
+    register_tags(&mut storage);
+    let recipient = codex("root-1");
+    storage
+        .publish(
+            &keep_all("agent-run", "evt-hook", &recipient, Mode::Inject),
+            1_000,
+        )
+        .unwrap();
+
+    // A child actor sharing the root session is refused and nothing changes.
+    let child = Attestation::verified(
+        recipient.clone(),
+        "child-agent-9",
+        1,
+        Lifecycle::Active,
+        Capabilities {
+            inject: true,
+            message: true,
+        },
+        "fixture-proof",
+    )
+    .unwrap();
+    match storage.drain_inject(&child, 2_000, &timing()) {
+        Err(CoreError::Fence(detail)) => assert!(detail.contains("child-agent-9"), "{detail}"),
+        other => panic!("a child must not drain root data, got {other:?}"),
+    }
+    assert!(
+        storage
+            .latest_attempt("agent-run", "evt-hook")
+            .unwrap()
+            .is_none()
+    );
+
+    // The verified addressed actor drains; the commit is visible to another
+    // connection before the payload is returned to the caller.
+    let drained = attempt(
+        storage
+            .drain_inject(&attest(&recipient, Lifecycle::Active, 3), 3_000, &timing())
+            .unwrap(),
+    );
+    let other = rusqlite::Connection::open(&db).unwrap();
+    let state: String = other
+        .query_row(
+            "SELECT state FROM attempts WHERE attempt_seq = ?1",
+            [i64::try_from(drained.fence.attempt_seq).unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "invoking");
+    assert!(drained.manifest.contains("evt-hook"));
+
+    // A hook that never reports is NOT re-offered: the deadline turns the
+    // silent attempt into an unknown outcome with a retained incident.
+    let report = storage.run_maintenance(3_000 + 60_000).unwrap();
+    assert_eq!(report.unknown_handoffs, 1);
+    assert_eq!(
+        storage
+            .drain_inject(&attest(&recipient, Lifecycle::Active, 3), 70_000, &timing())
+            .unwrap(),
+        Selection::Idle
+    );
+    let incidents = storage.open_incidents(70_000, 10).unwrap();
+    assert_eq!(incidents.len(), 1);
+    assert_eq!(incidents[0].kind, "unknown_handoff");
+}
+
+#[test]
+fn hook_submission_after_flush_is_hook_tier_evidence_only() {
+    let mut storage = store();
+    let recipient = codex("root-2");
+    storage
+        .publish(
+            &keep_all("agent-run", "evt-flush", &recipient, Mode::Inject),
+            1_000,
+        )
+        .unwrap();
+    let drained = attempt(
+        storage
+            .drain_inject(&attest(&recipient, Lifecycle::Active, 1), 2_000, &timing())
+            .unwrap(),
+    );
+    let settled = storage
+        .record_outcome(
+            &drained.fence,
+            Outcome::HookSubmitted {
+                evidence: "stdout fully flushed".into(),
+            },
+            2_500,
+        )
+        .unwrap();
+    assert_eq!(settled.state, AttemptState::HookSubmitted);
+    let evidence = storage
+        .delivery_evidence("agent-run", "evt-flush")
+        .unwrap()
+        .unwrap();
+    assert_eq!(evidence.delivery, DeliveryState::HookSubmitted);
+    assert_eq!(evidence.tiers.len(), 1);
+    assert_eq!(evidence.tiers[0].tier, EvidenceTier::HookEmitted);
+    assert!(
+        evidence
+            .tiers
+            .iter()
+            .all(|tier| tier.tier != EvidenceTier::ContextObserved),
+        "hook emission is never context evidence"
+    );
+}
+
+#[test]
+fn unknown_outcome_is_retained_and_never_auto_retried_until_audited_authorization() {
+    let shared = Mutex::new(store());
+    let recipient = codex("thread-4");
+    shared
+        .lock()
+        .unwrap()
+        .publish(
+            &keep_all("agent-run", "evt-unknown", &recipient, Mode::Message),
+            1_000,
+        )
+        .unwrap();
 
     let mut carrier = ScriptedCarrier::new(
-        Lifecycle::Active,
-        CarrierOutcome::Unknown {
+        Lifecycle::Inactive,
+        Outcome::OutcomeUnknown {
             reason: "socket write may have landed".into(),
         },
     );
-    let result = dispatch_one(&mut storage, &mut carrier, &envelope, &frame, 2_000, 5_000).unwrap();
-    assert_eq!(result.state, AttemptState::OutcomeUnknown);
-
-    // A second drive of the same event refuses without audited manual
-    // authorization — no automatic replay after a possible hand-off.
-    let mut retry = ScriptedCarrier::new(
-        Lifecycle::Active,
-        CarrierOutcome::Accepted {
-            evidence: "must not happen".into(),
-        },
-    );
-    match dispatch_one(&mut storage, &mut retry, &envelope, &frame, 9_000, 5_000) {
-        Err(CoreError::Fence(detail)) => {
-            assert!(detail.contains("unknown-handoff"), "unexpected: {detail}")
+    assert!(matches!(
+        drive(&shared, &mut carrier, &recipient, 2_000),
+        DispatchReport::Sent {
+            state: AttemptState::OutcomeUnknown,
+            ..
         }
-        other => panic!("expected fence refusal, got {other:?}"),
+    ));
+
+    // Neither time nor another drive replays it.
+    let mut retry = ScriptedCarrier::new(Lifecycle::Inactive, ScriptedCarrier::accepted());
+    for now in [3_000, 9_000_000] {
+        shared.lock().unwrap().run_maintenance(now).unwrap();
+        assert_eq!(
+            drive(&shared, &mut retry, &recipient, now),
+            DispatchReport::Idle
+        );
     }
     assert!(retry.sends.is_empty());
 
-    // The incident is retained with reason and review deadline.
-    let incidents = storage.open_incidents().unwrap();
+    let mut storage = shared.lock().unwrap();
+    let incidents = storage.open_incidents(5_000, 10).unwrap();
     assert_eq!(incidents.len(), 1);
     assert_eq!(incidents[0].kind, "unknown_handoff");
+    assert_eq!(incidents[0].state, IncidentState::Open);
+    assert_eq!(incidents[0].responsible, "source:agent-run; operator");
     assert!(incidents[0].review_deadline_ms.is_some());
-
-    // Audited manual authorization unblocks exactly one more attempt and
-    // keeps the duplicate risk recorded.
-    storage
-        .authorize_manual_retry("agent-run", "evt-unknown", "operator reviewed", 10_000)
+    assert_eq!(incidents[0].age_ms, 3_000);
+    let evidence = storage
+        .delivery_evidence("agent-run", "evt-unknown")
+        .unwrap()
         .unwrap();
-    let mut manual = ScriptedCarrier::new(
-        Lifecycle::Active,
-        CarrierOutcome::Accepted {
-            evidence: "accepted on manual retry".into(),
+    assert_eq!(evidence.delivery, DeliveryState::Review);
+
+    // The operator authorizes another attempt of the SAME event; the
+    // duplicate risk stays recorded on the incident and the next attempt.
+    storage
+        .authorize_manual_retry(
+            "agent-run",
+            "evt-unknown",
+            "ops-1",
+            "reviewed the host log",
+            10_000,
+        )
+        .unwrap();
+    drop(storage);
+    let mut manual = ScriptedCarrier::new(Lifecycle::Inactive, ScriptedCarrier::accepted());
+    assert!(matches!(
+        drive(&shared, &mut manual, &recipient, 11_000),
+        DispatchReport::Sent {
+            state: AttemptState::NativeAccepted,
+            ..
+        }
+    ));
+    assert!(
+        manual.sends[0].duplicate_risk,
+        "possible duplicate recorded"
+    );
+    let storage = shared.lock().unwrap();
+    let all = storage.incidents(true, 12_000, 10).unwrap();
+    assert_eq!(all[0].state, IncidentState::Authorized);
+    assert!(all[0].duplicate_risk);
+    assert!(all[0].resolution.as_deref().unwrap().contains("ops-1"));
+}
+
+#[test]
+fn known_unsent_closes_the_attempt_then_retries_with_a_bounded_budget() {
+    let shared = Mutex::new(store());
+    let recipient = codex("thread-5");
+    shared
+        .lock()
+        .unwrap()
+        .publish(
+            &keep_all("agent-run", "evt-unsent", &recipient, Mode::Message),
+            1_000,
+        )
+        .unwrap();
+    let mut carrier = ScriptedCarrier::new(
+        Lifecycle::Inactive,
+        Outcome::KnownUnsent {
+            evidence: "carrier proved no write happened".into(),
         },
     );
-    let result = dispatch_one(&mut storage, &mut manual, &envelope, &frame, 11_000, 5_000).unwrap();
-    assert_eq!(result.state, AttemptState::NativeAccepted);
-}
 
-#[test]
-fn known_unsent_closes_attempt_and_allows_bounded_retry() {
-    let mut storage = Storage::open_in_memory(Limits::new(10)).unwrap();
-    let envelope = keep_all("evt-unsent", "thread-5");
-    storage.publish(&envelope, 1_000).unwrap();
-
-    let reserved = storage
-        .reserve_attempt(
-            "agent-run",
-            "evt-unsent",
-            bridge_core::dispatch::EffectiveMode::Message,
-            envelope.envelope_hash().as_str(),
-            1_000,
-            60_000,
-        )
-        .unwrap();
-    storage.mark_invoking(&reserved.fence, 1_100).unwrap();
-    storage
-        .record_outcome(
-            &reserved.fence,
-            Outcome::KnownUnsent {
-                evidence: "carrier proved no write".into(),
-            },
-            1_200,
-        )
-        .unwrap()
-        .state;
-    let attempt = storage
-        .latest_attempt("agent-run", "evt-unsent")
-        .unwrap()
-        .unwrap();
-    assert_eq!(attempt.state, AttemptState::KnownUnsent);
-
-    // Positively known-unsent follows the ordinary bounded retry policy.
-    let second = storage
-        .reserve_attempt(
-            "agent-run",
-            "evt-unsent",
-            bridge_core::dispatch::EffectiveMode::Message,
-            envelope.envelope_hash().as_str(),
-            2_000,
-            60_000,
-        )
-        .unwrap();
-    assert_ne!(second.fence.attempt_seq, reserved.fence.attempt_seq);
-}
-
-#[test]
-fn expired_leases_reclaim_only_uninvoked_reservations() {
-    let mut storage = Storage::open_in_memory(Limits::new(10)).unwrap();
-    let reclaimable = keep_all("evt-res", "thread-6");
-    let uncertain = keep_all("evt-unc", "thread-7");
-    storage.publish(&reclaimable, 1_000).unwrap();
-    storage.publish(&uncertain, 1_000).unwrap();
-
-    // Reserved but never invoked: reclaimable by lease expiry.
-    storage
-        .reserve_attempt(
-            "agent-run",
-            "evt-res",
-            bridge_core::dispatch::EffectiveMode::Message,
-            "h",
-            1_000,
-            1_000,
-        )
-        .unwrap();
-    // Invoking with a lease: expiry means possible hand-off.
-    let invoking = storage
-        .reserve_attempt(
-            "agent-run",
-            "evt-unc",
-            bridge_core::dispatch::EffectiveMode::Message,
-            "h",
-            1_000,
-            1_000,
-        )
-        .unwrap();
-    storage.mark_invoking(&invoking.fence, 1_100).unwrap();
-
-    assert_eq!(storage.expire_attempt_leases(5_000).unwrap(), 2);
-
-    let reclaimed = storage
-        .latest_attempt("agent-run", "evt-res")
+    // Attempt times follow the doubling delay: 1s, 2s, 4s, 8s.
+    let mut now = 2_000;
+    let mut first_seq = None;
+    for expected_delay in [1_000, 2_000, 4_000, 8_000] {
+        assert!(matches!(
+            drive(&shared, &mut carrier, &recipient, now),
+            DispatchReport::Sent {
+                state: AttemptState::KnownUnsent,
+                ..
+            }
+        ));
+        let storage = shared.lock().unwrap();
+        let latest_attempt = storage
+            .latest_attempt("agent-run", "evt-unsent")
+            .unwrap()
+            .unwrap();
+        // The old attempt is closed (known-unsent) BEFORE any retry exists.
+        assert_eq!(latest_attempt.state, AttemptState::KnownUnsent);
+        first_seq.get_or_insert(latest_attempt.fence.attempt_seq);
+        drop(storage);
+        // Not before its delay...
+        assert_eq!(
+            drive(&shared, &mut carrier, &recipient, now + expected_delay - 1),
+            DispatchReport::Idle
+        );
+        now += expected_delay;
+    }
+    // The fifth known-unsent exhausts the automatic budget: the event is
+    // refused with a retained incident instead of looping forever.
+    assert!(matches!(
+        drive(&shared, &mut carrier, &recipient, now),
+        DispatchReport::Sent {
+            state: AttemptState::KnownUnsent,
+            ..
+        }
+    ));
+    let storage = shared.lock().unwrap();
+    let evidence = storage
+        .delivery_evidence("agent-run", "evt-unsent")
         .unwrap()
         .unwrap();
-    assert_eq!(reclaimed.state, AttemptState::Closed);
-    let unknown = storage
-        .latest_attempt("agent-run", "evt-unc")
-        .unwrap()
-        .unwrap();
-    assert_eq!(unknown.state, AttemptState::OutcomeUnknown);
+    assert_eq!(evidence.delivery, DeliveryState::Refused);
+    assert_eq!(evidence.attempts_made, 5);
+    assert_eq!(carrier.sends.len(), 5);
     assert!(
         storage
-            .open_incidents()
+            .open_incidents(now, 10)
             .unwrap()
             .iter()
-            .any(|incident| incident.event_id == "evt-unc")
+            .any(|incident| incident.kind == "retries_exhausted")
     );
+    assert_ne!(
+        first_seq.unwrap(),
+        carrier.sends.last().unwrap().fence.attempt_seq
+    );
+}
 
-    // The reclaimed event may reserve again; the uncertain one may not.
+#[test]
+fn known_unsent_requires_positive_proof() {
+    let mut storage = store();
+    let recipient = codex("thread-proof");
+    storage
+        .publish(
+            &keep_all("agent-run", "evt-proof", &recipient, Mode::Message),
+            1_000,
+        )
+        .unwrap();
+    let reserved = attempt(
+        storage
+            .reserve_next(
+                &attest(&recipient, Lifecycle::Inactive, 1),
+                EffectiveMode::Message,
+                2_000,
+                &timing(),
+            )
+            .unwrap(),
+    );
+    storage
+        .mark_invoking(
+            &reserved.fence,
+            &attest(&recipient, Lifecycle::Inactive, 1),
+            2_100,
+        )
+        .unwrap();
     assert!(
         storage
-            .reserve_attempt(
-                "agent-run",
-                "evt-res",
-                bridge_core::dispatch::EffectiveMode::Message,
-                "h",
-                6_000,
-                60_000
+            .record_outcome(
+                &reserved.fence,
+                Outcome::KnownUnsent {
+                    evidence: "  ".into()
+                },
+                2_200
             )
-            .is_ok()
+            .is_err(),
+        "silence is not proof of non-delivery"
     );
-    assert!(matches!(
-        storage.reserve_attempt(
-            "agent-run",
-            "evt-unc",
-            bridge_core::dispatch::EffectiveMode::Message,
-            "h",
-            6_000,
-            60_000
-        ),
-        Err(CoreError::Fence(_))
-    ));
+    assert_eq!(
+        storage
+            .latest_attempt("agent-run", "evt-proof")
+            .unwrap()
+            .unwrap()
+            .state,
+        AttemptState::Invoking
+    );
 }
 
 #[test]
-fn stale_fences_refuse_without_new_invocation() {
-    let mut storage = Storage::open_in_memory(Limits::new(10)).unwrap();
-    let envelope = keep_all("evt-fence", "thread-8");
-    storage.publish(&envelope, 1_000).unwrap();
-    let reserved = storage
-        .reserve_attempt(
-            "agent-run",
-            "evt-fence",
-            bridge_core::dispatch::EffectiveMode::Message,
-            "h",
-            1_000,
-            60_000,
-        )
-        .unwrap();
-
-    // A forged fence with the wrong event id refuses.
-    let forged = AttemptFence {
-        attempt_seq: reserved.fence.attempt_seq,
-        publisher: "agent-run".into(),
-        event_id: "other-event".into(),
-    };
-    assert!(matches!(
-        storage.mark_invoking(&forged, 1_100),
-        Err(CoreError::Fence(_))
-    ));
-    // A fabricated attempt number refuses.
-    let fabricated = AttemptFence {
-        attempt_seq: 999_999,
-        publisher: "agent-run".into(),
-        event_id: "evt-fence".into(),
-    };
-    assert!(matches!(
-        storage.mark_invoking(&fabricated, 1_100),
-        Err(CoreError::Fence(_))
-    ));
-    // Expired lease refuses to invoke.
-    let expired_envelope = keep_all("evt-expired", "thread-8b");
-    storage.publish(&expired_envelope, 1_000).unwrap();
-    let _ = storage
-        .reserve_attempt(
-            "agent-run",
-            "evt-expired",
-            bridge_core::dispatch::EffectiveMode::Message,
-            "h",
-            1_000,
-            100,
-        )
-        .unwrap();
-    assert!(storage.expire_attempt_leases(2_000).unwrap() >= 1);
-    let envelope_expired = keep_all("evt-expired2", "thread-8b");
-    storage.publish(&envelope_expired, 1_000).unwrap();
-    let short_lease = storage
-        .reserve_attempt(
-            "agent-run",
-            "evt-expired2",
-            bridge_core::dispatch::EffectiveMode::Message,
-            "h",
-            2_100,
-            100,
-        )
-        .unwrap();
-    assert!(matches!(
-        storage.mark_invoking(&short_lease.fence, 5_000),
-        Err(CoreError::Fence(_))
-    ));
-}
-
-#[test]
-fn no_wake_policy_blocks_auto_and_message() {
-    let mut storage = Storage::open_in_memory(Limits::new(10)).unwrap();
-    let envelope = keep_all("evt-pause", "thread-p");
-    let recipient = envelope.recipient.to_canonical_string();
-    storage.publish(&envelope, 1_000).unwrap();
-
-    storage
-        .set_no_wake(&recipient, true, Some("owner paused the session"), 1_500)
-        .unwrap();
-    for mode in [Mode::Auto, Mode::Message, Mode::Inject] {
-        let mut paused_envelope = keep_all("evt-pause", "thread-p");
-        paused_envelope.mode = mode;
-        let mut carrier = ScriptedCarrier::new(
-            Lifecycle::Active,
-            CarrierOutcome::Accepted {
-                evidence: "must not happen".into(),
-            },
-        );
-        match dispatch_one(
-            &mut storage,
-            &mut carrier,
-            &paused_envelope,
-            &frame,
-            2_000,
-            5_000,
-        ) {
-            Err(CoreError::PolicyHold { reason, .. }) => {
-                assert!(reason.contains("paused"), "unexpected reason: {reason}")
-            }
-            other => panic!("expected policy hold for {mode:?}, got {other:?}"),
-        }
-        assert!(carrier.sends.is_empty());
+fn leases_reclaim_only_uninvoked_reservations_and_invoking_expires_to_unknown() {
+    let mut storage = store();
+    let recipient = codex("thread-6");
+    for id in ["evt-res", "evt-inv"] {
+        storage
+            .publish(&keep_all("agent-run", id, &recipient, Mode::Message), 1_000)
+            .unwrap();
     }
-
-    storage.set_no_wake(&recipient, false, None, 3_000).unwrap();
-    let mut carrier = ScriptedCarrier::new(
-        Lifecycle::Active,
-        CarrierOutcome::Accepted {
-            evidence: "queue id".into(),
-        },
+    let short = DispatchTiming {
+        lease_ms: 1_000,
+        handoff_ms: 1_000,
+    };
+    let inactive = attest(&recipient, Lifecycle::Inactive, 1);
+    // Two separate reservations: the first stays reserved, the second is
+    // invoked.
+    let reserved = attempt(
+        storage
+            .reserve_next(&inactive, EffectiveMode::Message, 1_000, &short)
+            .unwrap(),
     );
-    let result = dispatch_one(&mut storage, &mut carrier, &envelope, &frame, 3_100, 5_000).unwrap();
-    assert_eq!(result.state, AttemptState::NativeAccepted);
+    let invoking = attempt(
+        storage
+            .reserve_next(&inactive, EffectiveMode::Message, 1_000, &short)
+            .unwrap(),
+    );
+    storage
+        .mark_invoking(&invoking.fence, &inactive, 1_100)
+        .unwrap();
+
+    let report = storage.run_maintenance(5_000).unwrap();
+    assert_eq!(report.reclaimed_reservations, 1);
+    assert_eq!(report.unknown_handoffs, 1);
+
+    assert_eq!(
+        storage
+            .attempt(reserved.fence.attempt_seq)
+            .unwrap()
+            .unwrap()
+            .state,
+        AttemptState::Closed
+    );
+    assert_eq!(
+        storage
+            .attempt(invoking.fence.attempt_seq)
+            .unwrap()
+            .unwrap()
+            .state,
+        AttemptState::OutcomeUnknown
+    );
+    let reclaimed_id = &reserved.members[0].event_id;
+    let unknown_id = &invoking.members[0].event_id;
+    let reclaimed = storage
+        .delivery_evidence("agent-run", reclaimed_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reclaimed.delivery,
+        DeliveryState::Unhanded,
+        "a reclaimed reservation is simply unhanded again"
+    );
+    assert_eq!(reclaimed.attempt_state, "closed");
+    assert_eq!(reclaimed.attempts_made, 0, "the retry budget is restored");
+    assert_eq!(
+        storage
+            .delivery_evidence("agent-run", unknown_id)
+            .unwrap()
+            .unwrap()
+            .delivery,
+        DeliveryState::Review
+    );
+    // Idempotent reconciliation.
+    assert_eq!(storage.run_maintenance(6_000).unwrap().unknown_handoffs, 0);
+    // The reclaimed event may be reserved again; the uncertain one never.
+    let again = attempt(
+        storage
+            .reserve_next(&inactive, EffectiveMode::Message, 6_000, &timing())
+            .unwrap(),
+    );
+    assert_eq!(&again.members[0].event_id, reclaimed_id);
+    assert_eq!(
+        storage
+            .reserve_next(&inactive, EffectiveMode::Message, 6_000, &timing())
+            .unwrap(),
+        Selection::Idle
+    );
 }
 
 #[test]
-fn keep_all_has_priority_and_snapshot_quota_reserves_capacity() {
+fn stale_and_forged_fences_refuse_without_new_invocation() {
+    let mut storage = store();
+    let recipient = codex("thread-8");
+    storage
+        .publish(
+            &keep_all("agent-run", "evt-fence", &recipient, Mode::Message),
+            1_000,
+        )
+        .unwrap();
+    let inactive = attest(&recipient, Lifecycle::Inactive, 4);
+    let reserved = attempt(
+        storage
+            .reserve_next(&inactive, EffectiveMode::Message, 1_000, &timing())
+            .unwrap(),
+    );
+
+    let forgeries = [
+        AttemptFence {
+            recipient: "host-1/codex/default/other".into(),
+            ..reserved.fence.clone()
+        },
+        AttemptFence {
+            endpoint_epoch: 5,
+            ..reserved.fence.clone()
+        },
+        AttemptFence {
+            manifest_hash: "0".repeat(64),
+            ..reserved.fence.clone()
+        },
+        AttemptFence {
+            attempt_seq: 999_999,
+            ..reserved.fence.clone()
+        },
+    ];
+    for forged in &forgeries {
+        assert!(
+            matches!(
+                storage.mark_invoking(forged, &inactive, 1_100),
+                Err(CoreError::Fence(_))
+            ),
+            "forged fence {forged:?} must refuse"
+        );
+        assert!(matches!(
+            storage.record_outcome(forged, ScriptedCarrier::accepted(), 1_100),
+            Err(CoreError::Fence(_))
+        ));
+    }
+    assert_eq!(
+        storage
+            .attempt(reserved.fence.attempt_seq)
+            .unwrap()
+            .unwrap()
+            .state,
+        AttemptState::Reserved,
+        "no forged call changed the attempt"
+    );
+    // A reserved attempt cannot take an outcome: nothing was invoked.
+    assert!(matches!(
+        storage.record_outcome(&reserved.fence, ScriptedCarrier::accepted(), 1_100),
+        Err(CoreError::Fence(_))
+    ));
+    // An expired lease refuses to invoke.
+    assert!(matches!(
+        storage.mark_invoking(&reserved.fence, &inactive, 1_000 + 30_000),
+        Err(CoreError::Fence(detail)) if detail.contains("lease expired")
+    ));
+}
+
+#[test]
+fn stale_endpoint_epochs_and_changed_conditions_release_the_reservation_untouched() {
+    let mut storage = store();
+    let recipient = codex("thread-epoch");
+    storage
+        .publish(
+            &keep_all("agent-run", "evt-epoch", &recipient, Mode::Auto),
+            1_000,
+        )
+        .unwrap();
+    let inactive = attest(&recipient, Lifecycle::Inactive, 3);
+    let reserved = attempt(
+        storage
+            .reserve_next(&inactive, EffectiveMode::Message, 2_000, &timing())
+            .unwrap(),
+    );
+
+    // A stale endpoint (older epoch) cannot reserve anything.
+    assert!(matches!(
+        storage.reserve_next(
+            &attest(&recipient, Lifecycle::Inactive, 2),
+            EffectiveMode::Message,
+            2_100,
+            &timing()
+        ),
+        Err(CoreError::Fence(detail)) if detail.contains("stale endpoint epoch")
+    ));
+
+    // A renewed endpoint (newer epoch) fences the old reservation: it is
+    // released and nothing is invoked.
+    let renewed = attest(&recipient, Lifecycle::Inactive, 4);
+    match storage
+        .mark_invoking(&reserved.fence, &renewed, 2_200)
+        .unwrap()
+    {
+        Invoked::Released(reason) => assert!(reason.contains("epoch"), "{reason}"),
+        other => panic!("expected release, got {other:?}"),
+    }
+    assert!(matches!(
+        storage.mark_invoking(&reserved.fence, &renewed, 2_300),
+        Err(CoreError::Fence(detail)) if detail.contains("not reserved")
+    ));
+
+    // The recipient became active between reservation and invocation: auto
+    // waits for its hook instead of messaging an active recipient.
+    let second = attempt(
+        storage
+            .reserve_next(&renewed, EffectiveMode::Message, 3_000, &timing())
+            .unwrap(),
+    );
+    assert!(matches!(
+        storage
+            .mark_invoking(&second.fence, &attest(&recipient, Lifecycle::Active, 4), 3_100)
+            .unwrap(),
+        Invoked::Released(reason) if reason.contains("no longer inactive")
+    ));
+
+    // A pause between reservation and invocation blocks the invocation.
+    let third = attempt(
+        storage
+            .reserve_next(&renewed, EffectiveMode::Message, 4_000, &timing())
+            .unwrap(),
+    );
+    storage
+        .set_no_wake(
+            &recipient.to_canonical_string(),
+            true,
+            Some("owner is working"),
+            "ops-1",
+            4_050,
+        )
+        .unwrap();
+    assert!(matches!(
+        storage.mark_invoking(&third.fence, &renewed, 4_100).unwrap(),
+        Invoked::Released(reason) if reason.contains("no-wake")
+    ));
+    let evidence = storage
+        .delivery_evidence("agent-run", "evt-epoch")
+        .unwrap()
+        .unwrap();
+    assert_eq!(evidence.delivery, DeliveryState::Unhanded);
+    assert_eq!(evidence.attempt_state, "closed");
+    assert_eq!(
+        evidence.attempts_made, 0,
+        "releases restore the retry budget"
+    );
+}
+
+#[test]
+fn no_wake_policy_blocks_the_message_path_but_not_a_hook_drain() {
+    let mut storage = store();
+    let recipient = codex("thread-p");
+    storage
+        .publish(
+            &keep_all("agent-run", "evt-msg", &recipient, Mode::Message),
+            1_000,
+        )
+        .unwrap();
+    storage
+        .publish(
+            &keep_all("agent-run", "evt-auto", &recipient, Mode::Auto),
+            1_000,
+        )
+        .unwrap();
+    storage
+        .publish(
+            &keep_all("agent-run", "evt-inject", &recipient, Mode::Inject),
+            1_000,
+        )
+        .unwrap();
+    storage
+        .set_no_wake(
+            &recipient.to_canonical_string(),
+            true,
+            Some("owner paused the session"),
+            "ops-1",
+            1_500,
+        )
+        .unwrap();
+
+    // Message and auto-as-message are held with the recorded reason.
+    match storage
+        .reserve_next(
+            &attest(&recipient, Lifecycle::Inactive, 1),
+            EffectiveMode::Message,
+            2_000,
+            &timing(),
+        )
+        .unwrap()
+    {
+        Selection::Held(reason) => assert!(reason.contains("paused"), "{reason}"),
+        other => panic!("expected a pause hold, got {other:?}"),
+    }
+    // A natural hook never wakes anyone, so it is not blocked.
+    let drained = attempt(
+        storage
+            .drain_inject(&attest(&recipient, Lifecycle::Active, 1), 2_100, &timing())
+            .unwrap(),
+    );
+    assert_eq!(drained.effective_mode, EffectiveMode::Inject);
+
+    // Resuming releases the held message events.
+    storage
+        .set_no_wake(
+            &recipient.to_canonical_string(),
+            false,
+            None,
+            "ops-1",
+            3_000,
+        )
+        .unwrap();
+    let message = attempt(
+        storage
+            .reserve_next(
+                &attest(&recipient, Lifecycle::Inactive, 1),
+                EffectiveMode::Message,
+                3_100,
+                &timing(),
+            )
+            .unwrap(),
+    );
+    assert_eq!(message.effective_mode, EffectiveMode::Message);
+}
+
+#[test]
+fn keep_all_wins_among_similar_age_but_aged_snapshots_are_not_starved() {
+    let recipient = codex("thread-q");
+    // Similar age: keep_all first.
+    let mut storage = store();
+    storage
+        .publish(&latest("agent-ide", "view-1", &recipient, "diag", 1), 1_000)
+        .unwrap();
+    storage
+        .publish(
+            &keep_all("agent-run", "critical-1", &recipient, Mode::Message),
+            1_001,
+        )
+        .unwrap();
+    let inactive = attest(&recipient, Lifecycle::Inactive, 1);
+    let first = attempt(
+        storage
+            .reserve_next(&inactive, EffectiveMode::Message, 2_000, &timing())
+            .unwrap(),
+    );
+    assert_eq!(first.members[0].event_id, "critical-1");
+
+    // A snapshot that has waited longer than the aging boost beats newer
+    // keep_all traffic.
+    let mut storage = store();
+    storage
+        .publish(
+            &latest("agent-ide", "view-old", &recipient, "diag", 1),
+            1_000,
+        )
+        .unwrap();
+    storage
+        .publish(
+            &keep_all("agent-run", "critical-late", &recipient, Mode::Message),
+            100_000,
+        )
+        .unwrap();
+    let first = attempt(
+        storage
+            .reserve_next(&inactive, EffectiveMode::Message, 101_000, &timing())
+            .unwrap(),
+    );
+    assert_eq!(first.members[0].event_id, "view-old");
+}
+
+#[test]
+fn snapshot_quota_reserves_admission_capacity_for_keep_all() {
     let mut limits = Limits::new(100);
     limits.max_pending_latest_per_recipient = 3;
     let mut storage = Storage::open_in_memory(limits).unwrap();
-
-    // A flood of replaceable snapshots for one recipient.
+    register_tags(&mut storage);
+    let recipient = codex("thread-quota");
     for revision in 1..=3 {
+        // Distinct streams so none supersedes another.
         storage
             .publish(
-                &latest(&format!("view-{revision}"), "thread-q", "diag", revision),
+                &latest(
+                    "agent-ide",
+                    &format!("view-{revision}"),
+                    &recipient,
+                    &format!("s{revision}"),
+                    1,
+                ),
                 1_000,
             )
             .unwrap();
     }
     assert!(matches!(
-        storage.publish(&latest("view-4", "thread-q", "diag", 4), 1_000),
+        storage.publish(&latest("agent-ide", "view-4", &recipient, "s4", 1), 1_000),
         Err(CoreError::Capacity { .. })
     ));
     // keep_all is exempt from the snapshot reserve and still admitted.
     storage
-        .publish(&keep_all("critical-1", "thread-q"), 1_000)
+        .publish(
+            &keep_all("agent-run", "critical-1", &recipient, Mode::Message),
+            1_000,
+        )
         .unwrap();
     // A different recipient's snapshot stream is independent.
     storage
-        .publish(&latest("other-1", "thread-q2", "diag", 1), 1_000)
-        .unwrap();
-
-    // Selection returns keep_all before replaceable snapshots. The views
-    // were published under the Claude-Code fixture recipient; keep_all
-    // under the Codex one; each address selects its own queue with
-    // keep_all first inside it.
-    let codex_queue = storage
-        .next_pending(
-            &NativeAddress::new("host-1", Harness::Codex, "default", "thread-q")
-                .unwrap()
-                .to_canonical_string(),
-            10,
+        .publish(
+            &latest("agent-ide", "other-1", &codex("thread-other"), "s1", 1),
+            1_000,
         )
         .unwrap();
-    assert_eq!(codex_queue[0].event_id, "critical-1");
-    assert_eq!(codex_queue[0].policy_class, "keep_all");
+    let queue = storage
+        .next_pending(&recipient.to_canonical_string(), 10)
+        .unwrap();
+    assert_eq!(queue[0].event_id, "critical-1");
+    assert_eq!(queue.len(), 4);
+}
 
-    let claude_queue = storage
-        .next_pending(
-            &NativeAddress::new("host-1", Harness::ClaudeCode, "default", "thread-q")
-                .unwrap()
-                .to_canonical_string(),
-            10,
+#[test]
+fn dependents_wait_for_predecessor_evidence_and_unrelated_traffic_progresses() {
+    let mut storage = store();
+    let recipient = codex("thread-dep");
+    let inactive = attest(&recipient, Lifecycle::Inactive, 1);
+    // The dependent arrives BEFORE its predecessor: accepted and held.
+    storage
+        .publish(
+            &with_meta(
+                keep_all("agent-run", "cmd-2", &recipient, Mode::Message),
+                "predecessor",
+                "cmd-1",
+            ),
+            1_000,
         )
         .unwrap();
-    assert_eq!(claude_queue.len(), 3);
-    assert!(
-        claude_queue
-            .iter()
-            .all(|event| event.event_id.starts_with("view-"))
+    let held = storage
+        .delivery_evidence("agent-run", "cmd-2")
+        .unwrap()
+        .unwrap();
+    assert_eq!(held.blocked_by.as_deref(), Some("cmd-1"));
+
+    // Unrelated traffic is not blocked behind the dependent.
+    storage
+        .publish(
+            &keep_all("agent-run", "other", &recipient, Mode::Message),
+            1_100,
+        )
+        .unwrap();
+    let first = attempt(
+        storage
+            .reserve_next(&inactive, EffectiveMode::Message, 2_000, &timing())
+            .unwrap(),
+    );
+    assert_eq!(first.members[0].event_id, "other");
+    storage
+        .mark_invoking(&first.fence, &inactive, 2_001)
+        .unwrap();
+    storage
+        .record_outcome(&first.fence, ScriptedCarrier::accepted(), 2_002)
+        .unwrap();
+
+    // The predecessor arrives; the dependent still waits for evidence.
+    storage
+        .publish(
+            &keep_all("agent-run", "cmd-1", &recipient, Mode::Message),
+            3_000,
+        )
+        .unwrap();
+    let cmd1 = attempt(
+        storage
+            .reserve_next(&inactive, EffectiveMode::Message, 3_100, &timing())
+            .unwrap(),
+    );
+    assert_eq!(cmd1.members[0].event_id, "cmd-1");
+    // While the predecessor is reserved, invoking, held, unknown... the
+    // dependent never overtakes it.
+    assert_eq!(
+        storage
+            .reserve_next(&inactive, EffectiveMode::Message, 3_200, &timing())
+            .unwrap(),
+        Selection::Idle
+    );
+    storage
+        .mark_invoking(&cmd1.fence, &inactive, 3_300)
+        .unwrap();
+    storage
+        .record_outcome(
+            &cmd1.fence,
+            Outcome::OutcomeUnknown {
+                reason: "may have landed".into(),
+            },
+            3_400,
+        )
+        .unwrap();
+    assert_eq!(
+        storage
+            .reserve_next(&inactive, EffectiveMode::Message, 9_000_000, &timing())
+            .unwrap(),
+        Selection::Idle,
+        "time alone never releases a dependent behind an uncertain command"
+    );
+    let incidents = storage.open_incidents(9_000_000, 10).unwrap();
+    assert_eq!(incidents[0].blocked_dependents, vec!["cmd-2".to_string()]);
+
+    // Positive late evidence for the predecessor releases the dependent.
+    storage
+        .record_evidence(
+            "agent-run",
+            "cmd-1",
+            cmd1.fence.attempt_seq,
+            EvidenceTier::NativeAccepted,
+            "queue entry found with the exact client id",
+            9_000_100,
+        )
+        .unwrap();
+    let released = attempt(
+        storage
+            .reserve_next(&inactive, EffectiveMode::Message, 9_000_200, &timing())
+            .unwrap(),
+    );
+    assert_eq!(released.members[0].event_id, "cmd-2");
+}
+
+#[test]
+fn audited_disposition_or_waiver_releases_dependents_and_cycles_are_refused() {
+    let mut storage = store();
+    let recipient = codex("thread-gap");
+    let inactive = attest(&recipient, Lifecycle::Inactive, 1);
+    storage
+        .publish(
+            &with_meta(
+                keep_all("agent-run", "dep-a", &recipient, Mode::Message),
+                "predecessor",
+                "never-arrives",
+            ),
+            1_000,
+        )
+        .unwrap();
+    assert_eq!(
+        storage
+            .reserve_next(&inactive, EffectiveMode::Message, 2_000, &timing())
+            .unwrap(),
+        Selection::Idle
+    );
+    // A long wait for a predecessor that never arrived becomes an incident.
+    let report = storage.run_maintenance(1_000 + 700_000).unwrap();
+    assert_eq!(report.escalated_holds, 1);
+    assert_eq!(
+        storage.open_incidents(800_000, 10).unwrap()[0].kind,
+        "predecessor_missing"
+    );
+    // An audited waiver (never time) releases the dependent.
+    storage
+        .waive_predecessor(
+            "agent-run",
+            "dep-a",
+            "ops-1",
+            "the source confirmed it was canceled",
+            800_000,
+        )
+        .unwrap();
+    assert!(storage.open_incidents(800_001, 10).unwrap().is_empty());
+    let released = attempt(
+        storage
+            .reserve_next(&inactive, EffectiveMode::Message, 800_100, &timing())
+            .unwrap(),
+    );
+    assert_eq!(released.members[0].event_id, "dep-a");
+
+    // Cycles through accepted events are refused at publication.
+    storage
+        .publish(
+            &with_meta(
+                keep_all("agent-run", "cyc-a", &recipient, Mode::Message),
+                "predecessor",
+                "cyc-b",
+            ),
+            900_000,
+        )
+        .unwrap();
+    assert!(matches!(
+        storage.publish(
+            &with_meta(keep_all("agent-run", "cyc-b", &recipient, Mode::Message), "predecessor", "cyc-a"),
+            900_001,
+        ),
+        Err(CoreError::InvalidEnvelope(detail)) if detail.contains("cycle")
+    ));
+    assert!(matches!(
+        storage.publish(
+            &with_meta(
+                keep_all("agent-run", "self", &recipient, Mode::Message),
+                "predecessor",
+                "self"
+            ),
+            900_002,
+        ),
+        Err(CoreError::InvalidEnvelope(_))
+    ));
+}
+
+#[test]
+fn batch_manifests_are_ordered_lossless_and_scopes_stay_isolated() {
+    let mut storage = store();
+    let recipient = codex("thread-batch");
+    let inactive = attest(&recipient, Lifecycle::Inactive, 1);
+    for id in ["b-1", "b-2", "b-3"] {
+        storage
+            .publish(&batched("agent-run", id, &recipient, "group-a"), 1_000)
+            .unwrap();
+    }
+    // Other scopes must never join the manifest: another group, another
+    // project, another publisher with the same group name.
+    storage
+        .publish(&batched("agent-run", "g2-1", &recipient, "group-b"), 1_001)
+        .unwrap();
+    storage
+        .publish(
+            &with_meta(
+                batched("agent-run", "proj-1", &recipient, "group-a"),
+                "project",
+                "other",
+            ),
+            1_002,
+        )
+        .unwrap();
+    storage
+        .publish(&batched("agent-ide", "ide-1", &recipient, "group-a"), 1_003)
+        .unwrap();
+
+    let first = attempt(
+        storage
+            .reserve_next(&inactive, EffectiveMode::Message, 2_000, &timing())
+            .unwrap(),
+    );
+    let ids: Vec<&str> = first.members.iter().map(|m| m.event_id.as_str()).collect();
+    assert_eq!(ids, ["b-1", "b-2", "b-3"], "ordered, lossless, one scope");
+    assert!(first.manifest.starts_with("<bridge-batch count=\"3\">"));
+    for id in ids {
+        assert!(first.manifest.contains(&format!("event=\"{id}\"")));
+    }
+    // The rest follow as their own manifests.
+    let mut remaining = Vec::new();
+    while let Selection::Attempt(record) = storage
+        .reserve_next(&inactive, EffectiveMode::Message, 2_100, &timing())
+        .unwrap()
+    {
+        assert_eq!(record.members.len(), 1, "each other scope is alone");
+        remaining.push(record.members[0].event_id.clone());
+    }
+    remaining.sort();
+    assert_eq!(remaining, ["g2-1", "ide-1", "proj-1"]);
+}
+
+#[test]
+fn latest_supersedes_only_pending_snapshots_and_inflight_manifests_are_immutable() {
+    let mut storage = store();
+    let recipient = codex("thread-latest");
+    let inactive = attest(&recipient, Lifecycle::Inactive, 1);
+    storage
+        .publish(&latest("agent-ide", "v1", &recipient, "diag", 1), 1_000)
+        .unwrap();
+    let receipt = storage
+        .publish(&latest("agent-ide", "v2", &recipient, "diag", 2), 1_001)
+        .unwrap()
+        .receipt;
+    assert_eq!(receipt.state, EventState::Pending);
+    // v1 was replaced while still known-unhanded.
+    let v1 = storage
+        .lookup(
+            &bridge_core::PublisherId::new("agent-ide").unwrap(),
+            &bridge_core::EventId::new("v1").unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(v1.state, EventState::Superseded);
+
+    // v2 goes in flight; its frozen manifest does not change when v3 lands.
+    let inflight = attempt(
+        storage
+            .reserve_next(&inactive, EffectiveMode::Message, 2_000, &timing())
+            .unwrap(),
+    );
+    assert_eq!(inflight.members[0].event_id, "v2");
+    storage
+        .publish(&latest("agent-ide", "v3", &recipient, "diag", 3), 2_100)
+        .unwrap();
+    let stored = storage
+        .attempt(inflight.fence.attempt_seq)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.manifest, inflight.manifest);
+    assert_eq!(stored.state, AttemptState::Reserved);
+
+    // If the in-flight snapshot is positively known unsent it is replaced
+    // by the newer revision instead of being retried.
+    storage
+        .mark_invoking(&inflight.fence, &inactive, 2_200)
+        .unwrap();
+    storage
+        .record_outcome(
+            &inflight.fence,
+            Outcome::KnownUnsent {
+                evidence: "no write was issued".into(),
+            },
+            2_300,
+        )
+        .unwrap();
+    let v2 = storage
+        .lookup(
+            &bridge_core::PublisherId::new("agent-ide").unwrap(),
+            &bridge_core::EventId::new("v2").unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(v2.state, EventState::Superseded);
+    let next = attempt(
+        storage
+            .reserve_next(&inactive, EffectiveMode::Message, 2_400, &timing())
+            .unwrap(),
+    );
+    assert_eq!(next.members[0].event_id, "v3");
+}
+
+#[test]
+fn stale_revision_never_revives_across_restart() {
+    let dir = TempDir::new("latest-restart");
+    let db = dir.path("bridge.db");
+    let recipient = codex("thread-restart-latest");
+    {
+        let mut storage = Storage::open(&db, Limits::new(10)).unwrap();
+        storage
+            .publish(&latest("agent-ide", "v12", &recipient, "diag", 12), 1_000)
+            .unwrap();
+    }
+    let mut reopened = Storage::open(&db, Limits::new(10)).unwrap();
+    let stale = reopened
+        .publish(&latest("agent-ide", "v11", &recipient, "diag", 11), 2_000)
+        .unwrap();
+    assert_eq!(stale.receipt.state, EventState::Superseded);
+    assert!(matches!(
+        reopened.publish(&latest("agent-ide", "v12b", &recipient, "diag", 12), 2_001),
+        Err(CoreError::Conflict { .. })
+    ));
+}
+
+#[test]
+fn expiry_applies_only_before_hand_off() {
+    let mut storage = store();
+    let recipient = codex("thread-expiry");
+    let inactive = attest(&recipient, Lifecycle::Inactive, 1);
+    let mut expiring = keep_all("agent-run", "exp-pending", &recipient, Mode::Message);
+    expiring.expires_at = Some(bridge_core::ExpiresAt::from_unix_millis(5_000).unwrap());
+    storage.publish(&expiring, 1_000).unwrap();
+    // An expired event is never selected, even before maintenance runs.
+    assert_eq!(
+        storage
+            .reserve_next(&inactive, EffectiveMode::Message, 6_000, &timing())
+            .unwrap(),
+        Selection::Idle
+    );
+    assert_eq!(storage.run_maintenance(6_000).unwrap().expired_events, 1);
+
+    // Reserved but not yet invoked when it expires: released, then expired.
+    let mut racing = keep_all("agent-run", "exp-race", &recipient, Mode::Message);
+    racing.expires_at = Some(bridge_core::ExpiresAt::from_unix_millis(9_000).unwrap());
+    storage.publish(&racing, 7_000).unwrap();
+    let reserved = attempt(
+        storage
+            .reserve_next(&inactive, EffectiveMode::Message, 7_100, &timing())
+            .unwrap(),
+    );
+    assert!(matches!(
+        storage
+            .mark_invoking(&reserved.fence, &inactive, 9_500)
+            .unwrap(),
+        Invoked::Released(_)
+    ));
+    assert_eq!(storage.expire_due(9_600).unwrap(), 1);
+
+    // Once invoking, an event never expires: a possible hand-off is not
+    // recalled by the clock.
+    let mut inflight = keep_all("agent-run", "exp-inflight", &recipient, Mode::Message);
+    inflight.expires_at = Some(bridge_core::ExpiresAt::from_unix_millis(12_000).unwrap());
+    storage.publish(&inflight, 10_000).unwrap();
+    let reserved = attempt(
+        storage
+            .reserve_next(&inactive, EffectiveMode::Message, 10_100, &timing())
+            .unwrap(),
+    );
+    storage
+        .mark_invoking(&reserved.fence, &inactive, 10_200)
+        .unwrap();
+    assert_eq!(storage.expire_due(50_000).unwrap(), 0);
+}
+
+#[test]
+fn held_and_unreceipted_hand_offs_are_nonterminal_with_overdue_incidents_and_positive_closure() {
+    let shared = Mutex::new(store());
+    let recipient = codex("thread-held");
+    for id in ["held-1", "noreceipt-1"] {
+        shared
+            .lock()
+            .unwrap()
+            .publish(&keep_all("agent-run", id, &recipient, Mode::Message), 1_000)
+            .unwrap();
+    }
+    let mut held = ScriptedCarrier::new(
+        Lifecycle::Inactive,
+        Outcome::NativeHeld { recheck_ms: 10_000 },
+    );
+    assert!(matches!(
+        drive(&shared, &mut held, &recipient, 2_000),
+        DispatchReport::Sent {
+            state: AttemptState::NativeHeld,
+            ..
+        }
+    ));
+    let mut written = ScriptedCarrier::new(
+        Lifecycle::Inactive,
+        Outcome::WrittenNoReceipt {
+            evidence: "idle session accepted the write".into(),
+            receipt_deadline_ms: 20_000,
+        },
+    );
+    assert!(matches!(
+        drive(&shared, &mut written, &recipient, 2_100),
+        DispatchReport::Sent {
+            state: AttemptState::WrittenNoReceipt,
+            ..
+        }
+    ));
+
+    let mut storage = shared.lock().unwrap();
+    // Neither is an alarm before its deadline; neither is delivered.
+    assert_eq!(storage.run_maintenance(9_999).unwrap().overdue_rechecks, 0);
+    for id in ["held-1", "noreceipt-1"] {
+        assert_eq!(
+            storage
+                .delivery_evidence("agent-run", id)
+                .unwrap()
+                .unwrap()
+                .delivery,
+            DeliveryState::Held
+        );
+    }
+    // Past its recheck deadline the held event becomes ONE incident, once.
+    assert_eq!(storage.run_maintenance(10_000).unwrap().overdue_rechecks, 1);
+    assert_eq!(storage.run_maintenance(10_500).unwrap().overdue_rechecks, 0);
+    // Past the receipt deadline the unreceipted write is a separate class.
+    assert_eq!(storage.run_maintenance(20_000).unwrap().overdue_rechecks, 1);
+    let kinds: Vec<String> = storage
+        .open_incidents(20_000, 10)
+        .unwrap()
+        .into_iter()
+        .map(|incident| incident.kind)
+        .collect();
+    assert!(kinds.contains(&"held_overdue".to_string()));
+    assert!(kinds.contains(&"receipt_overdue".to_string()));
+
+    // Nothing is replayed while held; positive evidence closes both.
+    let held_attempt = storage
+        .latest_attempt("agent-run", "held-1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        storage
+            .record_evidence(
+                "agent-run",
+                "held-1",
+                held_attempt.fence.attempt_seq,
+                EvidenceTier::NativeAccepted,
+                "queue entry confirmed",
+                21_000
+            )
+            .unwrap(),
+        EvidenceEffect::Applied(DeliveryState::Accepted)
+    );
+    let written_attempt = storage
+        .latest_attempt("agent-run", "noreceipt-1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        storage
+            .record_evidence(
+                "agent-run",
+                "noreceipt-1",
+                written_attempt.fence.attempt_seq,
+                EvidenceTier::NativeAccepted,
+                "exact-session marker and digest found",
+                21_100
+            )
+            .unwrap(),
+        EvidenceEffect::Applied(DeliveryState::Accepted)
+    );
+    assert!(storage.open_incidents(22_000, 10).unwrap().is_empty());
+    // Idempotent: the same tier is recorded once.
+    assert_eq!(
+        storage
+            .record_evidence(
+                "agent-run",
+                "held-1",
+                held_attempt.fence.attempt_seq,
+                EvidenceTier::NativeAccepted,
+                "queue entry confirmed",
+                21_200
+            )
+            .unwrap(),
+        EvidenceEffect::AlreadyRecorded
     );
 }
 
 #[test]
-fn compaction_keeps_dedup_identity() {
-    let mut storage = Storage::open_in_memory(Limits::new(100)).unwrap();
-    storage
-        .publish(&latest("new", "thread-c", "diag", 2), 1_000)
+fn late_evidence_resolves_unknown_without_resend_and_never_rewrites_a_newer_attempt() {
+    let shared = Mutex::new(store());
+    let recipient = codex("thread-late");
+    shared
+        .lock()
+        .unwrap()
+        .publish(
+            &keep_all("agent-run", "evt-late", &recipient, Mode::Message),
+            1_000,
+        )
         .unwrap();
-    storage
-        .publish(&latest("old", "thread-c", "diag", 1), 1_000)
-        .unwrap();
-    assert_eq!(storage.compact_payloads(0).unwrap(), 1);
+    let mut unknown = ScriptedCarrier::new(
+        Lifecycle::Inactive,
+        Outcome::OutcomeUnknown {
+            reason: "helper exited without a result".into(),
+        },
+    );
+    drive(&shared, &mut unknown, &recipient, 2_000);
 
-    // The compacted superseded entry still dedups identical replays and
-    // still reports its original disposition.
-    let replay = storage
-        .publish(&latest("old", "thread-c", "diag", 1), 9_000)
+    // Case A: positive late evidence settles it at the declared tier.
+    let mut storage = shared.lock().unwrap();
+    let first = storage
+        .latest_attempt("agent-run", "evt-late")
+        .unwrap()
         .unwrap();
-    assert!(replay.receipt.replayed);
-    assert_eq!(replay.receipt.state, bridge_core::EventState::Superseded);
+    // Receipt-token possession is an annotation only: it never settles.
+    assert_eq!(
+        storage
+            .record_evidence(
+                "agent-run",
+                "evt-late",
+                first.fence.attempt_seq,
+                EvidenceTier::ReceiptTokenPossession,
+                "actor presented the recipient-only token",
+                2_500
+            )
+            .unwrap(),
+        EvidenceEffect::Recorded
+    );
+    assert_eq!(
+        storage
+            .delivery_evidence("agent-run", "evt-late")
+            .unwrap()
+            .unwrap()
+            .delivery,
+        DeliveryState::Review
+    );
+    // A model-claimed or unsupported tier cannot be recorded as late evidence.
+    assert!(
+        storage
+            .record_evidence(
+                "agent-run",
+                "evt-late",
+                first.fence.attempt_seq,
+                EvidenceTier::Unknown,
+                "x",
+                2_600
+            )
+            .is_err()
+    );
+    // Evidence for another event's attempt is refused.
+    assert!(
+        storage
+            .record_evidence(
+                "agent-run",
+                "someone-else",
+                first.fence.attempt_seq,
+                EvidenceTier::NativeAccepted,
+                "x",
+                2_600
+            )
+            .is_err()
+    );
+
+    // Case B: the operator already authorized a retry; the older attempt's
+    // late evidence is kept but does not rewrite the newer attempt's state.
+    storage
+        .authorize_manual_retry(
+            "agent-run",
+            "evt-late",
+            "ops-2",
+            "host log inconclusive",
+            3_000,
+        )
+        .unwrap();
+    drop(storage);
+    let mut manual = ScriptedCarrier::new(
+        Lifecycle::Inactive,
+        Outcome::NativeHeld {
+            recheck_ms: 500_000,
+        },
+    );
+    drive(&shared, &mut manual, &recipient, 4_000);
+    let mut storage = shared.lock().unwrap();
+    assert_eq!(
+        storage
+            .record_evidence(
+                "agent-run",
+                "evt-late",
+                first.fence.attempt_seq,
+                EvidenceTier::NativeAccepted,
+                "found the first message in the queue",
+                5_000
+            )
+            .unwrap(),
+        EvidenceEffect::Recorded
+    );
+    let evidence = storage
+        .delivery_evidence("agent-run", "evt-late")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        evidence.delivery,
+        DeliveryState::Held,
+        "newer attempt owns the event"
+    );
+    assert!(evidence.tiers.iter().any(|entry| {
+        entry.attempt_seq == first.fence.attempt_seq && entry.tier == EvidenceTier::NativeAccepted
+    }));
 }
 
 #[test]
-fn restart_resumes_held_and_uncertain_state() {
-    let dir = TempDir::new("dispatch-restart");
-    let db = dir.path("bridge.db");
-    let envelope = keep_all("evt-restart", "thread-r");
-    {
-        let mut storage = Storage::open(&db, Limits::new(10)).unwrap();
-        storage.publish(&envelope, 1_000).unwrap();
-        let reserved = storage
-            .reserve_attempt(
+fn late_positive_evidence_settles_an_unknown_without_any_second_send() {
+    let shared = Mutex::new(store());
+    let recipient = codex("thread-settle");
+    shared
+        .lock()
+        .unwrap()
+        .publish(
+            &keep_all("agent-run", "evt-settle", &recipient, Mode::Message),
+            1_000,
+        )
+        .unwrap();
+    let mut unknown = ScriptedCarrier::new(
+        Lifecycle::Inactive,
+        Outcome::OutcomeUnknown {
+            reason: "lost acknowledgement".into(),
+        },
+    );
+    drive(&shared, &mut unknown, &recipient, 2_000);
+    let mut storage = shared.lock().unwrap();
+    let seq = storage
+        .latest_attempt("agent-run", "evt-settle")
+        .unwrap()
+        .unwrap()
+        .fence
+        .attempt_seq;
+    assert_eq!(
+        storage
+            .record_evidence(
                 "agent-run",
-                "evt-restart",
-                bridge_core::dispatch::EffectiveMode::Message,
-                envelope.envelope_hash().as_str(),
+                "evt-settle",
+                seq,
+                EvidenceTier::NativeAccepted,
+                "queue entry confirmed",
+                3_000
+            )
+            .unwrap(),
+        EvidenceEffect::Applied(DeliveryState::Accepted)
+    );
+    assert!(storage.open_incidents(3_000, 10).unwrap().is_empty());
+    let closed = storage.incidents(true, 3_000, 10).unwrap();
+    assert_eq!(closed[0].state, IncidentState::Resolved);
+    assert!(
+        closed[0]
+            .resolution
+            .as_deref()
+            .unwrap()
+            .contains("native accepted")
+    );
+    drop(storage);
+    let mut again = ScriptedCarrier::new(Lifecycle::Inactive, ScriptedCarrier::accepted());
+    assert_eq!(
+        drive(&shared, &mut again, &recipient, 4_000),
+        DispatchReport::Idle
+    );
+    assert!(
+        again.sends.is_empty(),
+        "settled evidence never causes a resend"
+    );
+}
+
+#[test]
+fn a_panicking_carrier_is_recorded_as_an_unknown_outcome() {
+    let shared = Mutex::new(store());
+    let recipient = codex("thread-panic");
+    shared
+        .lock()
+        .unwrap()
+        .publish(
+            &keep_all("agent-run", "evt-panic", &recipient, Mode::Message),
+            1_000,
+        )
+        .unwrap();
+    let mut carrier = ScriptedCarrier::new(Lifecycle::Inactive, ScriptedCarrier::accepted());
+    carrier.panic_on_send = true;
+    assert!(matches!(
+        drive(&shared, &mut carrier, &recipient, 2_000),
+        DispatchReport::Sent {
+            state: AttemptState::OutcomeUnknown,
+            ..
+        }
+    ));
+    assert_eq!(
+        shared
+            .lock()
+            .unwrap()
+            .open_incidents(2_000, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn a_permanent_refusal_blocks_dependents_until_an_audited_disposition() {
+    let shared = Mutex::new(store());
+    let recipient = codex("thread-refuse");
+    {
+        let mut storage = shared.lock().unwrap();
+        storage
+            .publish(
+                &keep_all("agent-run", "ref-1", &recipient, Mode::Message),
                 1_000,
-                500,
             )
             .unwrap();
-        storage.mark_invoking(&reserved.fence, 1_100).unwrap();
+        storage
+            .publish(
+                &with_meta(
+                    keep_all("agent-run", "ref-2", &recipient, Mode::Message),
+                    "predecessor",
+                    "ref-1",
+                ),
+                1_001,
+            )
+            .unwrap();
     }
+    let mut carrier = ScriptedCarrier::new(
+        Lifecycle::Inactive,
+        Outcome::PermanentRefusal {
+            reason: "the thread is archived".into(),
+        },
+    );
+    drive(&shared, &mut carrier, &recipient, 2_000);
+    assert_eq!(
+        drive(&shared, &mut carrier, &recipient, 3_000),
+        DispatchReport::Idle
+    );
+    let mut storage = shared.lock().unwrap();
+    assert_eq!(
+        storage
+            .delivery_evidence("agent-run", "ref-1")
+            .unwrap()
+            .unwrap()
+            .delivery,
+        DeliveryState::Refused
+    );
+    assert_eq!(
+        storage.open_incidents(3_000, 10).unwrap()[0].kind,
+        "permanent_refusal"
+    );
+    storage
+        .dispose_event(
+            "agent-run",
+            "ref-1",
+            "ops-1",
+            "recipient retired; drop the pair",
+            4_000,
+        )
+        .unwrap();
+    drop(storage);
+    let mut next = ScriptedCarrier::new(Lifecycle::Inactive, ScriptedCarrier::accepted());
+    assert!(matches!(
+        drive(&shared, &mut next, &recipient, 5_000),
+        DispatchReport::Sent { .. }
+    ));
+    assert_eq!(next.sends[0].members[0].event_id, "ref-2");
+}
 
-    // A later daemon reopens the same database: nothing was lost, and the
-    // reconciliation pass converts the expired invoking lease into a
-    // retained unknown with an incident — never a blind retry.
+#[test]
+fn corrupted_stored_bytes_are_quarantined_and_other_traffic_progresses() {
+    let dir = TempDir::new("corrupt");
+    let db = dir.path("bridge.db");
+    let mut storage = Storage::open(&db, Limits::new(10)).unwrap();
+    register_tags(&mut storage);
+    let recipient = codex("thread-corrupt");
+    storage
+        .publish(
+            &keep_all("agent-run", "bad", &recipient, Mode::Message),
+            1_000,
+        )
+        .unwrap();
+    storage
+        .publish(
+            &keep_all("agent-run", "forged", &recipient, Mode::Message),
+            1_001,
+        )
+        .unwrap();
+    storage
+        .publish(
+            &keep_all("agent-run", "good", &recipient, Mode::Message),
+            1_002,
+        )
+        .unwrap();
+    // A foreign writer damages the stored bytes of one event and rewrites
+    // the content of another into perfectly valid JSON: the frozen hash,
+    // not the syntax, is what protects accepted bytes.
+    let foreign = rusqlite::Connection::open(&db).unwrap();
+    foreign
+        .execute(
+            "UPDATE events SET envelope_json = CAST('{}' AS BLOB) WHERE event_id = 'bad'",
+            [],
+        )
+        .unwrap();
+    foreign
+        .execute(
+            "UPDATE events SET envelope_json = CAST(REPLACE(CAST(envelope_json AS TEXT),
+                 'synthetic result of forged', 'FORGED CONTENT') AS BLOB)
+             WHERE event_id = 'forged'",
+            [],
+        )
+        .unwrap();
+    let inactive = attest(&recipient, Lifecycle::Inactive, 1);
+    for _ in 0..2 {
+        match storage
+            .reserve_next(&inactive, EffectiveMode::Message, 2_000, &timing())
+            .unwrap()
+        {
+            Selection::Held(reason) => assert!(reason.contains("quarantined"), "{reason}"),
+            other => panic!("expected quarantine, got {other:?}"),
+        }
+    }
+    for id in ["bad", "forged"] {
+        assert_eq!(
+            storage
+                .delivery_evidence("agent-run", id)
+                .unwrap()
+                .unwrap()
+                .delivery,
+            DeliveryState::Refused
+        );
+    }
+    let incidents = storage.open_incidents(2_000, 10).unwrap();
+    assert_eq!(incidents.len(), 2);
+    assert!(incidents.iter().all(|i| i.kind == "storage_integrity"));
+    let next = attempt(
+        storage
+            .reserve_next(&inactive, EffectiveMode::Message, 2_100, &timing())
+            .unwrap(),
+    );
+    assert_eq!(next.members[0].event_id, "good");
+    assert!(!next.manifest.contains("FORGED"));
+}
+
+#[test]
+fn unregistered_source_tag_holds_instead_of_guessing_a_wrapper() {
+    let mut storage = Storage::open_in_memory(Limits::new(10)).unwrap();
+    let recipient = codex("thread-tag");
+    storage
+        .publish(
+            &keep_all("agent-run", "evt-tag", &recipient, Mode::Message),
+            1_000,
+        )
+        .unwrap();
+    match storage
+        .reserve_next(
+            &attest(&recipient, Lifecycle::Inactive, 1),
+            EffectiveMode::Message,
+            2_000,
+            &timing(),
+        )
+        .unwrap()
+    {
+        Selection::Held(reason) => assert!(reason.contains("source tag"), "{reason}"),
+        other => panic!("expected a hold, got {other:?}"),
+    }
+    // A publisher can never be re-attributed to another tag.
+    storage
+        .register_source_tag("agent-run", "agent-run")
+        .unwrap();
+    assert!(
+        storage
+            .register_source_tag("agent-run", "agent-ide")
+            .is_err()
+    );
+}
+
+#[test]
+fn long_holds_escalate_to_an_incident_that_clears_with_the_hold() {
+    let mut storage = store();
+    let recipient = codex("thread-longhold");
+    storage
+        .publish(
+            &keep_all("agent-run", "evt-longhold", &recipient, Mode::Message),
+            1_000,
+        )
+        .unwrap();
+    assert!(matches!(
+        storage
+            .reserve_next(
+                &attest(&recipient, Lifecycle::Unknown, 1),
+                EffectiveMode::Message,
+                1_000,
+                &timing()
+            )
+            .unwrap(),
+        Selection::Held(_)
+    ));
+    assert_eq!(
+        storage
+            .run_maintenance(1_000 + 599_000)
+            .unwrap()
+            .escalated_holds,
+        0
+    );
+    assert_eq!(
+        storage
+            .run_maintenance(1_000 + 600_000)
+            .unwrap()
+            .escalated_holds,
+        1
+    );
+    assert_eq!(
+        storage
+            .run_maintenance(1_000 + 600_500)
+            .unwrap()
+            .escalated_holds,
+        0
+    );
+    assert_eq!(
+        storage.open_incidents(700_000, 10).unwrap()[0].kind,
+        "recipient_held"
+    );
+    // Recovery of the recipient clears the hold and its incident.
+    let reserved = attempt(
+        storage
+            .reserve_next(
+                &attest(&recipient, Lifecycle::Inactive, 1),
+                EffectiveMode::Message,
+                700_000,
+                &timing(),
+            )
+            .unwrap(),
+    );
+    assert_eq!(reserved.members[0].event_id, "evt-longhold");
+    assert!(storage.holds(10).unwrap().is_empty());
+    assert!(storage.open_incidents(700_001, 10).unwrap().is_empty());
+}
+
+#[test]
+fn unsupported_modes_are_refused_before_acceptance_but_unknown_recipients_are_accepted() {
+    let mut storage = store();
+    let recipient = codex("thread-caps");
+    // Before any attestation nothing is known: accepted.
+    storage
+        .publish(
+            &keep_all("agent-run", "caps-0", &recipient, Mode::Auto),
+            1_000,
+        )
+        .unwrap();
+    // The adapter attests that only message is loaded.
+    let message_only = Attestation::verified(
+        recipient.clone(),
+        "thread-caps",
+        1,
+        Lifecycle::Inactive,
+        Capabilities {
+            inject: false,
+            message: true,
+        },
+        "fixture-proof",
+    )
+    .unwrap();
+    storage.observe_binding(&message_only, 2_000).unwrap();
+    for mode in [Mode::Inject, Mode::Auto] {
+        assert!(
+            matches!(
+                storage.publish(
+                    &keep_all("agent-run", &format!("caps-{mode:?}"), &recipient, mode),
+                    3_000
+                ),
+                Err(CoreError::Unsupported(_))
+            ),
+            "{mode:?} needs the inject path"
+        );
+    }
+    storage
+        .publish(
+            &keep_all("agent-run", "caps-msg", &recipient, Mode::Message),
+            3_000,
+        )
+        .unwrap();
+    // Unsupported is permanent and distinct from a transient hold: the
+    // adapter re-attesting with the inject path loaded lifts the refusal.
+    storage
+        .observe_binding(&attest(&recipient, Lifecycle::Active, 1), 4_000)
+        .unwrap();
+    assert!(
+        storage
+            .publish(
+                &keep_all("agent-run", "caps-after", &recipient, Mode::Auto),
+                5_000
+            )
+            .is_ok()
+    );
+}
+
+#[test]
+fn exactly_one_of_two_racing_reservations_wins() {
+    let dir = TempDir::new("race");
+    let db = dir.path("bridge.db");
+    let recipient = codex("thread-race");
+    {
+        let mut storage = Storage::open(&db, Limits::new(10)).unwrap();
+        register_tags(&mut storage);
+        storage
+            .publish(
+                &keep_all("agent-run", "evt-race", &recipient, Mode::Message),
+                1_000,
+            )
+            .unwrap();
+    }
+    let barrier = Arc::new(Barrier::new(2));
+    let handles: Vec<_> = (0..2)
+        .map(|_| {
+            let db = db.clone();
+            let recipient = recipient.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let mut storage = Storage::open(&db, Limits::new(10)).unwrap();
+                barrier.wait();
+                storage
+                    .reserve_next(
+                        &attest(&recipient, Lifecycle::Inactive, 1),
+                        EffectiveMode::Message,
+                        2_000,
+                        &DispatchTiming::default(),
+                    )
+                    .unwrap()
+            })
+        })
+        .collect();
+    let results: Vec<Selection> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let winners = results
+        .iter()
+        .filter(|selection| matches!(selection, Selection::Attempt(_)))
+        .count();
+    assert_eq!(
+        winners, 1,
+        "one possibly-handed-off attempt per event: {results:?}"
+    );
+}
+
+#[test]
+fn restart_resumes_held_and_uncertain_state_without_replay() {
+    let dir = TempDir::new("dispatch-restart");
+    let db = dir.path("bridge.db");
+    let recipient = codex("thread-r");
+    let inactive = attest(&recipient, Lifecycle::Inactive, 1);
+    {
+        let mut storage = Storage::open(&db, Limits::new(10)).unwrap();
+        register_tags(&mut storage);
+        storage
+            .publish(
+                &keep_all("agent-run", "evt-restart", &recipient, Mode::Message),
+                1_000,
+            )
+            .unwrap();
+        let short = DispatchTiming {
+            lease_ms: 500,
+            handoff_ms: 500,
+        };
+        let reserved = attempt(
+            storage
+                .reserve_next(&inactive, EffectiveMode::Message, 1_000, &short)
+                .unwrap(),
+        );
+        storage
+            .mark_invoking(&reserved.fence, &inactive, 1_100)
+            .unwrap();
+        // The process dies here: invoking is durable, no outcome recorded.
+    }
     let mut reopened = Storage::open(&db, Limits::new(10)).unwrap();
-    assert_eq!(reopened.expire_attempt_leases(5_000).unwrap(), 1);
-    let attempt = reopened
+    assert_eq!(reopened.run_maintenance(5_000).unwrap().unknown_handoffs, 1);
+    let attempt_record = reopened
         .latest_attempt("agent-run", "evt-restart")
         .unwrap()
         .unwrap();
-    assert_eq!(attempt.state, AttemptState::OutcomeUnknown);
-    assert_eq!(reopened.open_incidents().unwrap().len(), 1);
-    // Re-running reconciliation is idempotent.
-    assert_eq!(reopened.expire_attempt_leases(6_000).unwrap(), 0);
-
+    assert_eq!(attempt_record.state, AttemptState::OutcomeUnknown);
+    assert_eq!(reopened.open_incidents(5_000, 10).unwrap().len(), 1);
+    assert_eq!(reopened.run_maintenance(6_000).unwrap().unknown_handoffs, 0);
+    assert_eq!(
+        reopened
+            .reserve_next(&inactive, EffectiveMode::Message, 7_000, &timing())
+            .unwrap(),
+        Selection::Idle
+    );
     // Custody itself survived the restart untouched.
-    let replay = reopened.publish(&envelope, 7_000).unwrap();
+    let replay = reopened
+        .publish(
+            &keep_all("agent-run", "evt-restart", &recipient, Mode::Message),
+            8_000,
+        )
+        .unwrap();
     assert!(replay.receipt.replayed);
 }
 
 #[test]
-fn concurrent_publishers_on_one_database() {
-    use std::sync::Barrier;
+fn compaction_keeps_dedup_identity_and_never_touches_delivered_or_uncertain_events() {
+    let mut storage = store();
+    let recipient = codex("thread-c");
+    storage
+        .publish(&latest("agent-ide", "new", &recipient, "diag", 2), 1_000)
+        .unwrap();
+    storage
+        .publish(&latest("agent-ide", "old", &recipient, "diag", 1), 1_001)
+        .unwrap();
+    storage
+        .publish(
+            &keep_all("agent-run", "kept", &recipient, Mode::Message),
+            1_002,
+        )
+        .unwrap();
+    assert_eq!(storage.compact_payloads(0).unwrap(), 1);
+    // The compacted superseded entry still dedups identical replays and
+    // still reports its original disposition.
+    let replay = storage
+        .publish(&latest("agent-ide", "old", &recipient, "diag", 1), 9_000)
+        .unwrap();
+    assert!(replay.receipt.replayed);
+    assert_eq!(replay.receipt.state, EventState::Superseded);
+    // A different body under the compacted id is still a conflict.
+    assert!(matches!(
+        storage.publish(&latest("agent-ide", "old", &recipient, "diag", 5), 9_001),
+        Err(CoreError::Conflict { .. })
+    ));
+}
+
+#[test]
+fn held_recipients_cannot_starve_healthy_ones_in_the_dispatch_listing() {
+    let mut storage = store();
+    // Twenty recipients that stay held (oldest work), one healthy newcomer.
+    for index in 0..20 {
+        let held = codex(&format!("held-{index}"));
+        storage
+            .publish(
+                &keep_all("agent-run", &format!("old-{index}"), &held, Mode::Message),
+                1_000,
+            )
+            .unwrap();
+        assert!(matches!(
+            storage
+                .reserve_next(
+                    &attest(&held, Lifecycle::Unknown, 1),
+                    EffectiveMode::Message,
+                    2_000 + index,
+                    &timing()
+                )
+                .unwrap(),
+            Selection::Held(_)
+        ));
+    }
+    let healthy = codex("healthy");
+    storage
+        .publish(
+            &keep_all("agent-run", "new-1", &healthy, Mode::Message),
+            50_000,
+        )
+        .unwrap();
+
+    let listed = storage.recipients_with_work(60_000, 5).unwrap();
+    assert_eq!(
+        listed[0], healthy,
+        "a healthy recipient is served before held ones"
+    );
+    // Held recipients rotate: the least recently rechecked comes first.
+    assert_eq!(listed[1], codex("held-0"));
+    assert_eq!(listed.len(), 5, "the listing is bounded");
+}
+
+#[test]
+fn concurrent_publishers_and_dispatch_share_one_database_without_losing_events() {
     let dir = TempDir::new("dispatch-concurrent");
     let db = dir.path("bridge.db");
-    Storage::open(&db, Limits::new(1000)).unwrap();
-
-    let barrier = Arc::new(Barrier::new(2));
-    let handles: Vec<_> = ["publisher-a", "publisher-b"]
-        .iter()
+    {
+        let mut storage = Storage::open(&db, Limits::new(1_000)).unwrap();
+        register_tags(&mut storage);
+    }
+    let barrier = Arc::new(Barrier::new(3));
+    let recipient = codex("thread-cc");
+    let publishers: Vec<_> = ["agent-run", "agent-ide"]
+        .into_iter()
         .map(|publisher| {
             let db = db.clone();
             let barrier = Arc::clone(&barrier);
-            let publisher = publisher.to_string();
+            let recipient = recipient.clone();
             std::thread::spawn(move || {
-                let mut storage = Storage::open(&db, Limits::new(1000)).unwrap();
+                let mut storage = Storage::open(&db, Limits::new(1_000)).unwrap();
                 barrier.wait();
-                for index in 0..10 {
-                    let envelope = Envelope::new(
-                        PublisherId::new(publisher.clone()).unwrap(),
-                        EventId::new(format!("evt-{index}")).unwrap(),
-                        NativeAddress::new("host-1", Harness::Codex, "default", "thread-cc")
-                            .unwrap(),
-                        Kind::new("worker.completed").unwrap(),
-                        Mode::Message,
-                        Policy::KeepAll,
-                        Payload::new("x").unwrap(),
-                        Metadata::new(),
-                        None,
-                    )
-                    .unwrap();
-                    storage.publish(&envelope, 1_000).unwrap();
+                for index in 0..20 {
+                    storage
+                        .publish(
+                            &keep_all(
+                                publisher,
+                                &format!("evt-{index}"),
+                                &recipient,
+                                Mode::Message,
+                            ),
+                            1_000 + index,
+                        )
+                        .unwrap();
                 }
             })
         })
         .collect();
-    for handle in handles {
+    let dispatcher = {
+        let db = db.clone();
+        let barrier = Arc::clone(&barrier);
+        let recipient = recipient.clone();
+        std::thread::spawn(move || {
+            let shared = Mutex::new(Storage::open(&db, Limits::new(1_000)).unwrap());
+            let mut carrier =
+                ScriptedCarrier::new(Lifecycle::Inactive, ScriptedCarrier::accepted());
+            barrier.wait();
+            for tick in 0..200 {
+                let _ = dispatch_message(
+                    &shared,
+                    &mut carrier,
+                    &recipient,
+                    &|| 100_000 + tick,
+                    &timing(),
+                );
+            }
+            carrier.sends
+        })
+    };
+    for handle in publishers {
         handle.join().expect("publisher thread panicked");
     }
+    let mut sends = dispatcher.join().expect("dispatcher thread panicked");
 
-    let storage = Storage::open(&db, Limits::new(1000)).unwrap();
-    for publisher in ["publisher-a", "publisher-b"] {
-        for index in 0..10 {
-            let row = storage
-                .lookup(
-                    &PublisherId::new(publisher).unwrap(),
-                    &EventId::new(format!("evt-{index}")).unwrap(),
-                )
-                .unwrap();
-            assert!(row.is_some(), "{publisher}/evt-{index} lost");
-        }
-    }
-}
-
-/// A dependent command waits for its declared predecessor's resolution.
-#[test]
-fn dependent_ordering_waits_for_predecessor() {
-    let mut storage = Storage::open_in_memory(Limits::new(10)).unwrap();
-    let mut predecessor = keep_all("cmd-1", "thread-dep");
-    let mut dependent = keep_all("cmd-2", "thread-dep");
-    dependent
-        .metadata
-        .insert("predecessor".into(), "cmd-1".into());
-    storage.publish(&predecessor, 1_000).unwrap();
-    storage.publish(&dependent, 1_000).unwrap();
-
-    // The predecessor is still pending: the dependent must hold.
-    match storage.reserve_attempt(
-        "agent-run",
-        "cmd-2",
-        bridge_core::dispatch::EffectiveMode::Message,
-        "h",
-        2_000,
-        60_000,
-    ) {
-        Err(CoreError::PolicyHold { reason, .. }) => {
-            assert!(reason.contains("cmd-1"), "unexpected reason: {reason}")
-        }
-        other => panic!("expected dependency hold, got {other:?}"),
-    }
-
-    // Once the predecessor carries positive evidence, the dependent may go.
-    let fence = storage
-        .reserve_attempt(
-            "agent-run",
-            "cmd-1",
-            bridge_core::dispatch::EffectiveMode::Message,
-            "h",
-            2_000,
-            60_000,
-        )
-        .unwrap();
-    storage.mark_invoking(&fence.fence, 2_100).unwrap();
-    storage
-        .record_outcome(
-            &fence.fence,
-            Outcome::NativeAccepted {
-                evidence: "queue id".into(),
-            },
-            2_200,
-        )
-        .unwrap();
-    assert!(
-        storage
-            .reserve_attempt(
-                "agent-run",
-                "cmd-2",
-                bridge_core::dispatch::EffectiveMode::Message,
-                "h",
-                3_000,
-                60_000
-            )
-            .is_ok()
-    );
+    // Drain whatever the racing dispatcher did not reach.
+    let shared = Mutex::new(Storage::open(&db, Limits::new(1_000)).unwrap());
+    let mut carrier = ScriptedCarrier::new(Lifecycle::Inactive, ScriptedCarrier::accepted());
+    while matches!(
+        drive(&shared, &mut carrier, &recipient, 500_000),
+        DispatchReport::Sent { .. }
+    ) {}
+    sends.extend(carrier.sends);
+    let mut delivered: Vec<(String, String)> = sends
+        .iter()
+        .flat_map(|record| {
+            record
+                .members
+                .iter()
+                .map(|member| (member.publisher.clone(), member.event_id.clone()))
+        })
+        .collect();
+    delivered.sort();
+    let unique = delivered.len();
+    delivered.dedup();
+    assert_eq!(delivered.len(), 40, "every event was handed off");
+    assert_eq!(unique, 40, "and exactly once");
 }
