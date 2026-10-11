@@ -598,6 +598,118 @@ fn the_client_distrusts_invalid_oversized_and_malformed_responses() {
     let _ = std::fs::remove_file(&socket);
 }
 
+/// Public clients reject structurally invalid or request-misbound operator replies.
+///
+/// Owned fake sockets return otherwise valid pages/retention records. Correct
+/// controls pass; wrong bounds/order/filter/limit/identity and contradictory
+/// GC/compaction facts fail as transport errors, without trusting sender state.
+#[test]
+fn operator_responses_are_validated_and_bound_to_exact_queries() {
+    let incident = serde_json::json!({
+        "incident_seq": 1, "publisher": "agent-run", "event_id": "e",
+        "attempt_seq": null, "kind": "unknown_handoff", "state": "open", "reason": "r",
+        "created_ms": 1, "updated_ms": 1, "age_ms": 0, "next_check_ms": null,
+        "review_deadline_ms": null, "responsible": "operator", "blocked_dependents": [],
+        "duplicate_risk": false, "resolution": null
+    });
+    let mut second = incident.clone();
+    second["incident_seq"] = 2.into();
+    let page = serde_json::json!({"IncidentsPage": {"page": {
+        "incidents": [incident.clone(), second.clone()], "through_seq": 3, "next_after_seq": 2
+    }}});
+    let mut unordered = page.clone();
+    unordered["IncidentsPage"]["page"]["incidents"] = serde_json::json!([second, incident]);
+    let mut closed = page.clone();
+    closed["IncidentsPage"]["page"]["incidents"][0]["state"] = "disposed".into();
+    let mut bad_cursor = page.clone();
+    bad_cursor["IncidentsPage"]["page"]["next_after_seq"] = 1.into();
+    let mut overflow = page.clone();
+    overflow["IncidentsPage"]["page"]["through_seq"] = (1u64 << 63).into();
+    for (answer, after, through, include_closed, limit, valid) in [
+        (page.clone(), 0, 3, true, 2, true),
+        (page.clone(), 1, 3, true, 2, false),
+        (page.clone(), 0, 4, true, 2, false),
+        (page, 0, 3, true, 1, false),
+        (closed.clone(), 0, 3, true, 2, true),
+        (closed, 0, 3, false, 2, false),
+        (unordered, 0, 3, true, 2, false),
+        (bad_cursor, 0, 3, true, 2, false),
+        (overflow, 0, 3, true, 2, false),
+    ] {
+        let mut line = serde_json::to_vec(&answer).unwrap();
+        line.push(b'\n');
+        let socket = short_socket("fake-operator-page");
+        let server = fake_daemon(&socket, line);
+        let result = BridgeClient::connect(&socket).unwrap().incidents_page(
+            OPS_TOKEN,
+            include_closed,
+            Some(limit),
+            after,
+            Some(through),
+        );
+        server.join().unwrap();
+        std::fs::remove_file(&socket).unwrap();
+        assert_eq!(result.is_ok(), valid, "{answer}: {result:?}");
+        if !valid {
+            assert_eq!(result.unwrap_err().class, "transport");
+        }
+    }
+
+    let request = body("retained");
+    let envelope = bridge_core::Envelope::new(
+        bridge_core::PublisherId::new("agent-run").unwrap(),
+        bridge_core::EventId::new(&request.event_id).unwrap(),
+        request.recipient.clone(),
+        bridge_core::Kind::new(&request.kind).unwrap(),
+        request.mode,
+        request.policy.clone(),
+        bridge_core::Payload::new(&request.payload).unwrap(),
+        request.metadata.clone(),
+        request.expires_at,
+    )
+    .unwrap();
+    let mut storage = Storage::open_in_memory(Limits::new(10)).unwrap();
+    storage.publish(&envelope, 1).unwrap();
+    let retention = storage.retention("agent-run", "retained").unwrap().unwrap();
+    let valid = serde_json::json!({"Retention": {"retention": retention}});
+    let mut absent = valid.clone();
+    absent["Retention"]["retention"] = serde_json::Value::Null;
+    let mut foreign = valid.clone();
+    foreign["Retention"]["retention"]["receipt"]["event_id"] = "other-event".into();
+    let mut foreign_publisher = valid.clone();
+    foreign_publisher["Retention"]["retention"]["receipt"]["publisher"] = "other-publisher".into();
+    let mut compacted = valid.clone();
+    compacted["Retention"]["retention"]["payload_compacted"] = true.into();
+    let mut eligible = valid.clone();
+    eligible["Retention"]["retention"]["gc_eligible"] = true.into();
+    let mut invalid_range = valid.clone();
+    invalid_range["Retention"]["retention"]["envelope_bytes"] = (1u64 << 63).into();
+    for (answer, accepted) in [
+        (valid, true),
+        (absent, true),
+        (foreign, false),
+        (foreign_publisher, false),
+        (compacted, false),
+        (eligible, false),
+        (invalid_range, false),
+    ] {
+        let mut line = serde_json::to_vec(&answer).unwrap();
+        line.push(b'\n');
+        let socket = short_socket("fake-operator-retention");
+        let server = fake_daemon(&socket, line);
+        let result =
+            BridgeClient::connect(&socket)
+                .unwrap()
+                .retention(OPS_TOKEN, "agent-run", "retained");
+        server.join().unwrap();
+        std::fs::remove_file(&socket).unwrap();
+        assert_eq!(result.is_ok(), accepted, "{answer}: {result:?}");
+        if !accepted {
+            assert_eq!(result.unwrap_err().class, "transport");
+        }
+    }
+}
+
 /// Unsupported modes are refused over the wire before acceptance, with
 /// no custody row created.
 #[test]

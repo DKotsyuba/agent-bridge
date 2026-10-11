@@ -165,9 +165,32 @@ status disclosure. Two disjoint realms:
   forcing `keep_all` and its exact recipients; an external root token is never
   a core credential.
 - **operator grants** (`admin = true`, empty allowlists, cannot publish):
-  `incidents`, `holds`, `counts`, `authorize_retry`, `dispose`,
+  `incidents`, `incidents_page`, `retention`, `holds`, `counts`, `authorize_retry`, `dispose`,
   `waive_predecessor`, `evidence`, `pause`, `resume`, `transfer_lineage`,
   `shutdown`; every decision is audited with the grant's identity.
+
+Operator reads preserve the existing `incidents` and `counts` shapes.
+`BridgeClient::incidents_page(token, include_closed, limit, after_seq, through_seq)`
+starts with `after_seq = 0`, `through_seq = None`, then carries the returned
+fixed high-water and `next_after_seq`. Pages contain at most 200 incidents in
+stable sequence order; a final page has no next cursor. Row states are live,
+so restart the finite scan to include newly inserted or reopened incidents.
+Invalid, reversed or out-of-range cursors are refused. Reading a page neither
+closes an incident nor reports it to an owner.
+
+`BridgeClient::retention(token, publisher, event_id)` returns an exact nullable
+storage view: retained custody identity, bounded delivery evidence, original
+expiry, envelope byte count, compacted/tombstone flag, logical payload GC
+eligibility and the event's exact-scoped latest watermark. It loads no payload
+bytes. An absent key returns `None`; publisher and ordinary root grants cannot
+read it. Expiry and collection describe storage dispositions, never recall of
+a possible or accepted native effect. GC eligibility uses the existing
+terminal superseded/expired, unhanded, nonempty-payload guard; keep-newest may
+still retain eligible bytes. Reads do not trigger expiry or collection, and
+dedup rows, hashes and watermarks remain retained after payload compaction.
+The canonical revision-2 boundary is `docs/operator-queries-v2.md` in the
+registered Agent Tasks project. Interface presentation and notification ledger
+traversal belong to M-006 and require separate composition verification.
 
 Lifecycle: socket ownership refuses a live endpoint, preserves every foreign
 path (regular file, symlink, directory, unprovable socket) and removes a stale

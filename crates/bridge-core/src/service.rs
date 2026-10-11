@@ -39,7 +39,9 @@ use serde::{Deserialize, Serialize};
 use crate::dispatch::{
     DispatchCarrier, DispatchReport, DispatchTiming, attest_guarded, dispatch_message, lock_storage,
 };
-use crate::recovery::{DeliveryState, EvidenceTier, HoldView, IncidentView, LineageScope};
+use crate::recovery::{
+    DeliveryState, EvidenceTier, HoldView, IncidentPage, IncidentView, LineageScope, RetentionView,
+};
 use crate::storage::{CustodyReceipt, Limits, Storage};
 use crate::types::{
     CoreError, Envelope, EventId, ExpiresAt, Kind, Metadata, Mode, NativeAddress, Payload, Policy,
@@ -268,7 +270,10 @@ impl std::fmt::Debug for Token {
     }
 }
 
-/// One request line as it arrives on the socket.
+/// One bounded request line received on the local socket.
+///
+/// New operator page/retention reads remain separate from legacy listings,
+/// publisher status and all mutations; each operation authenticates its realm.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -300,6 +305,30 @@ pub enum Request {
         include_closed: bool,
         /// Maximum rows (default 100, at most 200).
         limit: Option<usize>,
+    },
+    /// Read a stable-number incident page without modifying recovery state.
+    IncidentsPage {
+        /// Operator-grant bearer token; authenticated before cursor validation.
+        token: Token,
+        /// Include positively closed rows too; defaults to open rows only.
+        #[serde(default)]
+        include_closed: bool,
+        /// Row bound: default 100, clamped to 1..200.
+        limit: Option<usize>,
+        /// Exclusive lower incident number; defaults to zero for a first page.
+        #[serde(default)]
+        after_seq: u64,
+        /// Fixed high-water number; absent only when starting at zero.
+        through_seq: Option<u64>,
+    },
+    /// Inspect exact retained storage facts without reading payload bytes.
+    Retention {
+        /// Operator-grant bearer token; publisher/root grants are refused.
+        token: Token,
+        /// Exact validated publisher identity.
+        publisher: String,
+        /// Exact validated event identity; unaccepted keys return no view.
+        event_id: String,
     },
     /// List visible recipient holds.
     Holds {
@@ -412,7 +441,10 @@ pub enum Request {
     },
 }
 
-/// One response line as it is written back.
+/// One bounded response line written to the local client.
+///
+/// Operator pages and nullable retention facts are distinct additive variants;
+/// existing response shapes keep their meaning and never establish native recall.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
     /// Custody accepted (freshly or as an identical replay).
@@ -433,6 +465,16 @@ pub enum Response {
     Incidents {
         /// The incidents, bounded by the request limit.
         incidents: Vec<IncidentView>,
+    },
+    /// Finite operator scan page; all rows retain their live incident meaning.
+    IncidentsPage {
+        /// At most 200 ascending rows and the fixed scan/continuation bounds.
+        page: IncidentPage,
+    },
+    /// Exact operator storage facts, never payload content or a recall claim.
+    Retention {
+        /// Absent only for an unaccepted exact identity.
+        retention: Option<Box<RetentionView>>,
     },
     /// Visible recipient holds.
     Holds {
@@ -469,6 +511,10 @@ impl Response {
         match self {
             Response::Incidents { incidents } => {
                 incidents.iter().try_for_each(IncidentView::validate)
+            }
+            Response::IncidentsPage { page } => page.validate(),
+            Response::Retention { retention } => {
+                retention.as_ref().map_or(Ok(()), |view| view.validate())
             }
             Response::Holds { holds } => holds.iter().try_for_each(HoldView::validate),
             _ => Ok(()),
@@ -1087,7 +1133,11 @@ fn respond(
     )
 }
 
-/// Authenticates and serves one parsed request.
+/// Authenticates each parsed request before reading or changing shared state.
+///
+/// Publisher operations stay scoped to their grant. New operator pages and exact
+/// retention reads cannot mutate recovery state or disclose payload bytes;
+/// invalid input/storage failures become structured refusals.
 fn serve(state: &ServiceState, request: Request) -> Result<Response, Refusal> {
     match request {
         Request::Publish { token, event } => serve_publish(state, &token, &event),
@@ -1115,6 +1165,36 @@ fn serve(state: &ServiceState, request: Request) -> Result<Response, Refusal> {
                     current_unix_millis(),
                     listing(limit),
                 )?,
+            })
+        }
+        Request::IncidentsPage {
+            token,
+            include_closed,
+            limit,
+            after_seq,
+            through_seq,
+        } => {
+            operator(state, &token)?;
+            let storage = lock_storage(&state.storage);
+            Ok(Response::IncidentsPage {
+                page: storage.incidents_page(
+                    include_closed,
+                    current_unix_millis(),
+                    listing(limit),
+                    after_seq,
+                    through_seq,
+                )?,
+            })
+        }
+        Request::Retention {
+            token,
+            publisher,
+            event_id,
+        } => {
+            operator(state, &token)?;
+            let storage = lock_storage(&state.storage);
+            Ok(Response::Retention {
+                retention: storage.retention(&publisher, &event_id)?.map(Box::new),
             })
         }
         Request::Holds { token, limit } => {
