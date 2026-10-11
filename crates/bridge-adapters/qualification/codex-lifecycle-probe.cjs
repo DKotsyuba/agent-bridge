@@ -309,8 +309,9 @@ function approvalRefusal(call) {
  * connection state; `starting`/`notStarted`/explicit null are waited for,
  * while missing, malformed, unsupported or unusable values are terminal), whose
  * `toolsError` is null or absent, and whose `tools` catalog holds both
- * `bridge_me` and `bridge_unlisted` (by catalog key or tool name). Any
- * malformed, errored, missing or incomplete response is terminal.
+ * `bridge_me` and `bridge_unlisted` (by catalog key or tool name). Every
+ * catalog value must be a non-null, non-array object; null, scalar and array
+ * definitions make the inventory malformed and terminal.
  * @param {string} thread The own native thread id.
  * @param {McpExchange[]} exchanges The exchanges of one read, in order.
  * @returns {McpVerdict} The verdict; `tools` lists only the two own tool names found.
@@ -349,7 +350,9 @@ function mcpInventoryVerdict(thread, exchanges) {
   if (status !== 'connected') return verdict(false, true, 'unsupported or unusable server runtime status', status);
   const catalog = row.tools && typeof row.tools === 'object' && !Array.isArray(row.tools) ? row.tools : null;
   if (!catalog) return verdict(false, true, 'tool catalog missing', status);
-  const names = new Set(Object.entries(catalog).flatMap(([key, tool]) => [key, tool && tool.name]));
+  const entries = Object.entries(catalog);
+  if (entries.some(([, tool]) => !tool || typeof tool !== 'object' || Array.isArray(tool))) return verdict(false, true, 'malformed tool catalog entry', status);
+  const names = new Set(entries.flatMap(([key, tool]) => [key, tool && tool.name]));
   const found = ['bridge_me', 'bridge_unlisted'].filter(name => names.has(name));
   if (found.length !== 2) return verdict(false, true, 'own tools not both advertised', status, found);
   return verdict(true, false, 'connected with both own tools', status, found);
@@ -574,6 +577,10 @@ function selfTest() {
   assert.equal(mcpInventoryVerdict(T, [{ params: askFor(), response: page([{ name: 'other', runtimeStatus: 'connected' }], 'c1') }, { params: askFor('c1'), response: page([goodRow]) }]).ready, true); // follows a complete chain, ignores other servers
   const keyed = { ...goodRow, tools: { bridge_me: tool('bridge_me'), x: tool('bridge_unlisted') } };
   assert.equal(mcpInventoryVerdict(T, one(keyed)).ready, true); // advertised by tool name as well as by catalog key
+  for (const invalid of [null, 'not a tool definition', []]) {
+    const malformed = mcpInventoryVerdict(T, one({ ...goodRow, tools: { bridge_me: invalid, bridge_unlisted: invalid } }));
+    assert.deepEqual([malformed.ready, malformed.terminal], [false, true]);
+  }
   const starting = mcpInventoryVerdict(T, one({ ...goodRow, runtimeStatus: 'starting' }));
   assert.deepEqual([starting.ready, starting.terminal], [false, false]); // tools present but runtime not ready: wait, never open the gate
   assert.equal(mcpInventoryVerdict(T, one({ ...goodRow, runtimeStatus: null })).ready, false);
