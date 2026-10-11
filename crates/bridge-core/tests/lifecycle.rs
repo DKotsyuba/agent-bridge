@@ -467,6 +467,67 @@ fn fake_daemon(path: &Path, answer: Vec<u8>) -> std::thread::JoinHandle<()> {
     })
 }
 
+/// Valid custody receipts acknowledge only the exact requested identity and bytes.
+/// Own fake endpoints return real storage receipts; a matching receipt passes,
+/// while unrelated publication or status receipts cannot release sender intent.
+#[test]
+fn client_acknowledgements_are_bound_to_requested_event_bytes() {
+    let request = body("requested-event");
+    let expected = bridge_core::Envelope::new(
+        bridge_core::PublisherId::new("agent-run").unwrap(),
+        bridge_core::EventId::new(request.event_id.clone()).unwrap(),
+        request.recipient.clone(),
+        bridge_core::Kind::new(request.kind.clone()).unwrap(),
+        request.mode,
+        request.policy.clone(),
+        bridge_core::Payload::new(request.payload.clone()).unwrap(),
+        request.metadata.clone(),
+        request.expires_at,
+    )
+    .unwrap();
+    let mut other_id = expected.clone();
+    other_id.event_id = bridge_core::EventId::new("other-event").unwrap();
+    let mut other_bytes = expected.clone();
+    other_bytes.payload = bridge_core::Payload::new("different immutable bytes").unwrap();
+    for (tag, envelope, valid) in [
+        ("matching-ack", expected, true),
+        ("wrong-id-ack", other_id.clone(), false),
+        ("wrong-bytes-ack", other_bytes, false),
+    ] {
+        let mut storage = Storage::open_in_memory(Limits::new(10)).unwrap();
+        let receipt = storage.publish(&envelope, 1).unwrap().receipt;
+        let mut line = serde_json::to_vec(&Response::Published { receipt }).unwrap();
+        line.push(b'\n');
+        let socket = short_socket(tag);
+        let server = fake_daemon(&socket, line);
+        let result = BridgeClient::connect(&socket)
+            .unwrap()
+            .publish(RUN_TOKEN, &request);
+        server.join().unwrap();
+        std::fs::remove_file(&socket).unwrap();
+        assert_eq!(result.is_ok(), valid, "{tag}: {result:?}");
+    }
+    let mut storage = Storage::open_in_memory(Limits::new(10)).unwrap();
+    let receipt = storage.publish(&other_id, 1).unwrap().receipt;
+    let mut line = serde_json::to_vec(&Response::Status {
+        receipt: Some(receipt),
+        delivery: None,
+    })
+    .unwrap();
+    line.push(b'\n');
+    let socket = short_socket("wrong-status-id");
+    let server = fake_daemon(&socket, line);
+    let result = BridgeClient::connect(&socket)
+        .unwrap()
+        .status(RUN_TOKEN, &request.event_id);
+    server.join().unwrap();
+    std::fs::remove_file(&socket).unwrap();
+    assert!(
+        result.is_err(),
+        "Status for another event was accepted: {result:?}"
+    );
+}
+
 #[test]
 fn the_client_distrusts_invalid_oversized_and_malformed_responses() {
     // An incident listing with a number no storage could have produced.

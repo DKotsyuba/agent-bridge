@@ -342,7 +342,10 @@ impl BridgeClient {
                         Ok(Response::Error { class, detail }) => {
                             Err(ProtocolError { class, detail })
                         }
-                        Ok(response) => match response.validate() {
+                        Ok(response) => match response
+                            .validate()
+                            .and_then(|()| validate_request_binding(request, &response))
+                        {
                             Ok(()) => Ok(response),
                             Err(error) => {
                                 self.connection = None;
@@ -376,6 +379,50 @@ impl BridgeClient {
         }
         Err(last)
     }
+}
+
+/// Checks that a structurally valid custody response acknowledges this request.
+///
+/// Publish receipts must name the requested event and hash its exact immutable
+/// body under the server-stamped publisher. Status receipts must name the queried
+/// event; delivery without custody is invalid. Other operations have no custody
+/// binding. Tokens are never inspected or included in refusal text. A mismatch
+/// returns an invalid-envelope error and must not release the caller's intent.
+fn validate_request_binding(request: &Request, response: &Response) -> Result<(), CoreError> {
+    match (request, response) {
+        (Request::Publish { event, .. }, Response::Published { receipt }) => {
+            let expected = Envelope::new(
+                PublisherId::new(receipt.publisher.clone())?,
+                EventId::new(event.event_id.clone())?,
+                event.recipient.clone(),
+                Kind::new(event.kind.clone())?,
+                event.mode,
+                event.policy.clone(),
+                Payload::new(event.payload.clone())?,
+                event.metadata.clone(),
+                event.expires_at,
+            )?;
+            if receipt.event_id != event.event_id
+                || receipt.envelope_hash != expected.envelope_hash()
+            {
+                return Err(CoreError::InvalidEnvelope(
+                    "publication receipt does not acknowledge the requested immutable event".into(),
+                ));
+            }
+        }
+        (Request::Status { event_id, .. }, Response::Status { receipt, delivery })
+            if receipt
+                .as_ref()
+                .is_some_and(|item| item.event_id != *event_id)
+                || (receipt.is_none() && delivery.is_some()) =>
+        {
+            return Err(CoreError::InvalidEnvelope(
+                "status response does not match the queried custody event".into(),
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Opens a connection and its buffered read half.
