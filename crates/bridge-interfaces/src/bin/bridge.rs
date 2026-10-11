@@ -5,6 +5,7 @@
 //! bridge operator <config> incidents [--all] [--limit N]
 //! bridge operator <config> holds [--limit N]
 //! bridge operator <config> counts
+//! bridge operator <config> retention <publisher> <event>
 //! bridge operator <config> transfer-lineage --recipient ADDR --kind K --mode M --project P --task T
 //!     --stream S --new-publisher ID --note TEXT     (project/task "" when undeclared)
 //! bridge operator <config> retry <publisher> <event> --note TEXT --accept-duplicate-risk
@@ -35,7 +36,6 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use bridge_client::{BridgeClient, LineageScope, NativeAddress};
-use bridge_core::recovery::IncidentState;
 use bridge_interfaces::config::{InterfacesConfig, read_secret};
 use bridge_interfaces::operator::{
     Decision, apply, check, check_scope, failure_text, parse_tier, read_failure_text, report,
@@ -265,6 +265,13 @@ enum Query {
     Holds,
     /// The core's complete delivery counts.
     Counts,
+    /// Protected exact custody/expiry/tombstone/GC/watermark facts; no mutation.
+    Retention {
+        /// Exact publisher identity whose retained event is read.
+        publisher: String,
+        /// Immutable event id; an absent exact identity yields a null view.
+        event_id: String,
+    },
 }
 
 /// One parsed operator action.
@@ -283,6 +290,7 @@ fn operator_shape(action: &str) -> Option<(usize, &'static [&'static str])> {
         "incidents" => (3, &["--all", "--limit"]),
         "holds" => (3, &["--limit"]),
         "counts" | "shutdown" => (3, &[]),
+        "retention" => (5, &[]),
         "retry" => (5, &["--note", "--accept-duplicate-risk"]),
         "dispose" | "waive" => (5, &["--note"]),
         "evidence" => (7, &["--detail"]),
@@ -343,6 +351,17 @@ fn operator(args: &Args) -> Result<Value, Failure> {
         "incidents" => Action::Query(Query::Incidents),
         "holds" => Action::Query(Query::Holds),
         "counts" => Action::Query(Query::Counts),
+        "retention" => {
+            let (publisher, event_id) = event()?;
+            bridge_client::PublisherId::new(publisher.clone())
+                .map_err(|error| Failure::Usage(error.to_string()))?;
+            bridge_client::EventId::new(event_id.clone())
+                .map_err(|error| Failure::Usage(error.to_string()))?;
+            Action::Query(Query::Retention {
+                publisher,
+                event_id,
+            })
+        }
         "retry" => {
             let (publisher, event_id) = event()?;
             Action::Decision(Decision::Retry {
@@ -435,6 +454,13 @@ fn operator(args: &Args) -> Result<Value, Failure> {
                     "counts": client.counts(&token).map_err(read_failed)?,
                     "coverage": "complete totals computed by the core at one instant; not a sample",
                 }),
+                Query::Retention {
+                    publisher,
+                    event_id,
+                } => json!({
+                    "retention": client.retention(&token, &publisher, &event_id).map_err(read_failed)?,
+                    "note": "exact current custody/storage facts, not native recall; expiry and compaction do not undo possible effects. GC eligibility is the storage guard, not a promise of compaction; keep-newest policy may retain bytes. Unknown identity is null.",
+                }),
             });
         }
     };
@@ -449,12 +475,11 @@ fn operator(args: &Args) -> Result<Value, Failure> {
 
 /// `bridge notify <config>`: one owner-notification pass.
 ///
-/// Lists the open incidents (at most 200) to report. Ledger entries are
-/// pruned only on positive proof: the core's own rows for incidents that are
-/// no longer open (same listing request with closed incidents included, also
-/// capped). Absence from either listing, or a failed second listing, prunes
-/// nothing, so a capped or racing listing can never
-/// make a possible or accepted send be reported again.
+/// Consumes one include-closed page (at most 200 sequence-ordered rows) under
+/// the ledger lock with a durable finite high-water cursor. Repeated passes
+/// reach the rest of the scan and then new/reopened rows. Only matching
+/// positive closed identities prune; missing rows never justify replay.
+/// Outputs partial/live page coverage, never an immutable/complete snapshot.
 fn notify_command(args: &Args) -> Result<Value, Failure> {
     args.closed(2, &[])?;
     let config = InterfacesConfig::load(&PathBuf::from(
@@ -472,30 +497,25 @@ fn notify_command(args: &Args) -> Result<Value, Failure> {
     let now_ms = bridge_core::service::current_unix_millis();
     let mut client = BridgeClient::connect(&config.core_socket)
         .map_err(|error| format!("core unreachable: {error}"))?;
-    let incidents = client
-        .incidents(&token, false, Some(200))
-        .map_err(|error| error.to_string())?;
-    let closed: Vec<_> = client
-        .incidents(&token, true, Some(200))
-        .map(|all| {
-            all.into_iter()
-                .filter(|incident| incident.state != IncidentState::Open)
-                .collect()
-        })
-        .unwrap_or_default();
-    let lines = notify::run(
+    let mut output = notify::run_paged(
         notify_config,
         &config.core_socket.display().to_string(),
         config.telegram.as_ref(),
         &telegram::CurlTransport::default(),
-        &incidents,
-        &closed,
+        |after_seq, through_seq| {
+            let page = client
+                .incidents_page(&token, true, Some(200), after_seq, through_seq)
+                .map_err(|error| error.to_string())?;
+            Ok((page.incidents, page.through_seq, page.next_after_seq))
+        },
         now_ms,
     )?;
-    Ok(json!({
-        "channel": if config.telegram.is_some() { "telegram" } else { "unconfigured" },
-        "incidents": lines,
-    }))
+    output["channel"] = json!(if config.telegram.is_some() {
+        "telegram"
+    } else {
+        "unconfigured"
+    });
+    Ok(output)
 }
 
 /// `bridge service start|stop <component> …`.

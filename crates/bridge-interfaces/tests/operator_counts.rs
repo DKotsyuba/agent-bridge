@@ -207,7 +207,9 @@ fn recovery(config: &Path) -> doctor::Check {
     .unwrap()
 }
 
-/// Checks real CLI totals, audited transfers and honest coverage beyond the 200-incident sample; owns and cleans its core fixture.
+/// Checks real CLI totals, audited transfers, honest sample coverage and
+/// durable page fairness beyond 200 terminal reports across insertion,
+/// closure and process restart; owns and cleans its real core fixture.
 #[test]
 fn counts_lineage_transfer_and_bounded_incident_samples() {
     let lab = lab();
@@ -309,6 +311,121 @@ fn counts_lineage_transfer_and_bounded_incident_samples() {
     assert_eq!(
         attention.detail["incident_sample"]["by_category"]["lineage"],
         200
+    );
+    // All first 200 already have terminal report outcomes. The CLI must
+    // persist its page cursor and reach 201 on the next invocation without
+    // touching Telegram or repeating those records.
+    let first_page = client
+        .incidents_page(OPERATOR, true, Some(200), 0, None)
+        .unwrap();
+    let ledger_path = lab.scratch.0.join("notify-ledger.json");
+    let mut ledger = bridge_interfaces::notify::Ledger {
+        backend: lab.socket.display().to_string(),
+        ..bridge_interfaces::notify::Ledger::default()
+    };
+    for incident in &first_page.incidents {
+        ledger.entries.insert(
+            incident.incident_seq,
+            bridge_interfaces::notify::Entry {
+                identity: bridge_interfaces::notify::incident_identity(incident),
+                state: if incident.incident_seq % 3 == 0 {
+                    bridge_interfaces::notify::NoteState::Sending
+                } else if incident.incident_seq % 3 == 1 {
+                    bridge_interfaces::notify::NoteState::ProviderAccepted
+                } else {
+                    bridge_interfaces::notify::NoteState::PossibleSend
+                },
+                attempts: 1,
+                updated_ms: 1,
+                detail: "prior report".into(),
+                not_before_ms: None,
+            },
+        );
+    }
+    ledger.save(&ledger_path).unwrap();
+    let notify_config = lab.scratch.0.join("notify.toml");
+    let token_file = lab.scratch.0.join("notify.token");
+    private(&token_file, OPERATOR);
+    private(
+        &notify_config,
+        &format!(
+            "core_socket = \"{}\"\n[operator]\ntoken_file = \"{}\"\n[notify]\nledger = \"{}\"\n",
+            lab.socket.display(),
+            token_file.display(),
+            ledger_path.display()
+        ),
+    );
+    let (code, page1, stderr) = cli(&["notify", notify_config.to_str().unwrap()]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(page1["coverage"]["rows"], 200);
+    assert_eq!(page1["coverage"]["scan_complete"], false);
+    assert!(
+        page1["incidents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|line| line["requested_now"] == false)
+    );
+    // Insert beyond the captured high-water and close a previously reported
+    // row between passes; it is positively pruned on the next full scan.
+    publish_latest(&mut client, "s201");
+    client
+        .transfer_lineage(OPERATOR, &scope("s201"), "producer-b", "new row")
+        .unwrap();
+    client
+        .dispose(OPERATOR, "producer-a", "a-s000", "closed row")
+        .unwrap();
+    let (code, page2, stderr) = cli(&["notify", notify_config.to_str().unwrap()]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        page2["incidents"][0]["incident_seq"], 201,
+        "backlog row must be reached"
+    );
+    assert_eq!(
+        page2["coverage"]["rows"], 1,
+        "new insertion belongs to next high-water scan"
+    );
+    assert_eq!(page2["coverage"]["scan_complete"], true);
+    let loaded = bridge_interfaces::notify::Ledger::load(&ledger_path).unwrap();
+    assert!(loaded.entries.contains_key(&201));
+    assert!(!loaded.entries.contains_key(&202));
+    assert!(
+        loaded.entries.contains_key(&1),
+        "absence from this page cannot prune a report"
+    );
+    assert_eq!((loaded.after_seq, loaded.through_seq), (0, None));
+    let (code, page3, stderr) = cli(&["notify", notify_config.to_str().unwrap()]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(page3["coverage"]["through_seq"], 202);
+    assert!(
+        !bridge_interfaces::notify::Ledger::load(&ledger_path)
+            .unwrap()
+            .entries
+            .contains_key(&1),
+        "matching authoritative closed row prunes even after a scan reset"
+    );
+    let (code, page4, stderr) = cli(&["notify", notify_config.to_str().unwrap()]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        page4["incidents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|line| line["incident_seq"] == 202)
+    );
+    let loaded = bridge_interfaces::notify::Ledger::load(&ledger_path).unwrap();
+    assert!(loaded.entries.contains_key(&202));
+    assert_eq!(
+        loaded.entries[&2].state,
+        bridge_interfaces::notify::NoteState::PossibleSend
+    );
+    assert_eq!(
+        loaded.entries[&3].state,
+        bridge_interfaces::notify::NoteState::PossibleSend
+    );
+    assert_eq!(
+        loaded.entries[&4].state,
+        bridge_interfaces::notify::NoteState::ProviderAccepted
     );
     drop(client);
     let _ = &lab.scratch;
@@ -659,9 +776,9 @@ fn notify_prunes_only_on_a_closed_row_of_the_same_incident() {
     let scratch = Scratch::new();
     let socket = scratch.0.join("capped.sock");
     let listener = UnixListener::bind(&socket).unwrap();
-    // A fake core whose capped listing shows one open incident (and a count
-    // that matches it) while another open incident, 99, is displaced from it;
-    // with closed incidents included it also reports incident 98 as disposed.
+    // A faithful partial page contains open 1 and positively closed 98;
+    // open 99 is beyond this page's cursor. Its accepted/possible report
+    // must survive absence while the matching closed identity is pruned.
     let server = std::thread::spawn(move || {
         listener.set_nonblocking(true).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -677,6 +794,13 @@ fn notify_prunes_only_on_a_closed_row_of_the_same_incident() {
             while reader.read_line(&mut line).unwrap_or(0) > 0 {
                 let op: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
                 let answer = match op["op"].as_str() {
+                    Some("incidents_page") => Response::IncidentsPage {
+                        page: bridge_client::IncidentPage {
+                            incidents: vec![open_incident(1), incident_in(98, "disposed")],
+                            through_seq: 99,
+                            next_after_seq: Some(98),
+                        },
+                    },
                     Some("incidents") if op["include_closed"] == true => Response::Incidents {
                         incidents: vec![open_incident(1), incident_in(98, "disposed")],
                     },
@@ -1144,5 +1268,175 @@ fn a_refusal_after_a_duplicate_risk_retry_never_hides_the_earlier_unknown_hand_o
         let reason = view["uncertainty"]["reason"].as_str().unwrap();
         assert!(reason.contains("earlier attempt may also"), "{view}");
         assert_eq!(view["uncertainty"]["automatic_resend"], false, "{view}");
+        let (code, incidents, stderr) = cli(&["operator", &operator, "incidents"]);
+        assert_eq!(code, 0, "{stderr}");
+        let next = incidents["incidents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|incident| incident["kind"] == scenario)
+            .unwrap()["next_action"]
+            .as_str()
+            .unwrap();
+        assert!(next.contains("Refused events cannot be retried"), "{next}");
+        assert!(next.contains("dispose"), "{next}");
+        let (code, _, stderr) = cli(&[
+            "operator",
+            &operator,
+            "dispose",
+            "producer-a",
+            "chain",
+            "--note",
+            "follow supported refusal guidance",
+        ]);
+        assert_eq!(code, 0, "{scenario}: {stderr}");
+        let disposed = status(&lab);
+        assert_eq!(disposed["delivery"]["state"], "disposed");
+        assert_eq!(
+            disposed["native"], "unknown",
+            "disposition does not recall the earlier possible effect"
+        );
     }
+}
+
+/// Protected exact retention reads expose expiry, tombstones and scoped
+/// watermarks without payloads or mutation; possible/native effects retain
+/// bytes through actual compaction, and publisher credentials refuse.
+#[test]
+fn operator_retention_reports_storage_without_recall_or_payload_disclosure() {
+    let lab = lab();
+    let mut client = BridgeClient::connect(&lab.socket).unwrap();
+    let latest = |id: &str, revision| {
+        PublishRequest::new(
+            EventId::new(id).unwrap(),
+            recipient(),
+            Kind::new("view.snapshot").unwrap(),
+            Mode::Message,
+            Policy::Latest {
+                stream: StreamId::new("retention").unwrap(),
+                revision,
+            },
+            Payload::new("private original payload").unwrap(),
+        )
+        .into_body()
+        .unwrap()
+    };
+    let old = latest("old", 1);
+    let receipt = client.publish(PRODUCER_A, &old).unwrap();
+    client.publish(PRODUCER_A, &latest("uncertain", 2)).unwrap();
+    dispatch_once(
+        &lab,
+        bridge_core::dispatch::Outcome::OutcomeUnknown {
+            reason: "lost answer".into(),
+        },
+        0,
+    );
+    let accepted = PublishRequest::new(
+        EventId::new("accepted").unwrap(),
+        recipient(),
+        Kind::new("note").unwrap(),
+        Mode::Message,
+        Policy::KeepAll,
+        Payload::new("private accepted payload").unwrap(),
+    )
+    .into_body()
+    .unwrap();
+    client.publish(PRODUCER_A, &accepted).unwrap();
+    dispatch_once(
+        &lab,
+        bridge_core::dispatch::Outcome::NativeAccepted {
+            evidence: "faithful carrier acceptance".into(),
+        },
+        0,
+    );
+    let expiry = bridge_core::service::current_unix_millis() + 60_000;
+    let expired = PublishRequest::new(
+        EventId::new("expired").unwrap(),
+        recipient(),
+        Kind::new("note").unwrap(),
+        Mode::Message,
+        Policy::KeepAll,
+        Payload::new("private expiring payload").unwrap(),
+    )
+    .with_expires_at(bridge_client::ExpiresAt::from_unix_millis(expiry).unwrap())
+    .into_body()
+    .unwrap();
+    client.publish(PRODUCER_A, &expired).unwrap();
+    lab.core
+        .as_ref()
+        .unwrap()
+        .with_storage(|storage| storage.expire_due(expiry + 1))
+        .unwrap();
+    let config = lab.operator_config.to_str().unwrap();
+    let (code, old_view, stderr) = cli(&["operator", config, "retention", "producer-a", "old"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(old_view["retention"]["receipt"]["state"], "superseded");
+    assert_eq!(old_view["retention"]["latest_watermark"], 2);
+    assert_eq!(old_view["retention"]["gc_eligible"], true);
+    assert_eq!(old_view["retention"]["payload_compacted"], false);
+    assert!(old_view["retention"]["envelope_bytes"].as_u64().unwrap() > 0);
+    assert!(!old_view.to_string().contains("private original payload"));
+    assert!(
+        old_view["note"]
+            .as_str()
+            .unwrap()
+            .contains("not native recall")
+    );
+    let (code, missing, stderr) = cli(&["operator", config, "retention", "producer-a", "missing"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(missing["retention"].is_null());
+    let (code, expired_view, stderr) =
+        cli(&["operator", config, "retention", "producer-a", "expired"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(expired_view["retention"]["expires_at_ms"], expiry);
+    assert_eq!(expired_view["retention"]["receipt"]["state"], "expired");
+    assert_eq!(expired_view["retention"]["gc_eligible"], true);
+    assert_eq!(
+        client.publish(PRODUCER_A, &old).unwrap().envelope_hash,
+        receipt.envelope_hash,
+        "reads preserve replay identity"
+    );
+    lab.core
+        .as_ref()
+        .unwrap()
+        .with_storage(|storage| storage.compact_payloads(0))
+        .unwrap();
+    for id in ["old", "expired"] {
+        let (code, compacted, stderr) = cli(&["operator", config, "retention", "producer-a", id]);
+        assert_eq!(code, 0, "{stderr}");
+        assert_eq!(compacted["retention"]["payload_compacted"], true);
+        assert_eq!(compacted["retention"]["envelope_bytes"], 0);
+        assert_eq!(compacted["retention"]["gc_eligible"], false);
+        if id == "old" {
+            assert_eq!(compacted["retention"]["latest_watermark"], 2);
+        }
+    }
+    for id in ["uncertain", "accepted"] {
+        let (code, protected, stderr) = cli(&["operator", config, "retention", "producer-a", id]);
+        assert_eq!(code, 0, "{stderr}");
+        assert_eq!(protected["retention"]["payload_compacted"], false);
+        assert_eq!(protected["retention"]["gc_eligible"], false);
+        assert!(protected["retention"]["envelope_bytes"].as_u64().unwrap() > 0);
+        assert!(!protected.to_string().contains("private accepted payload"));
+    }
+    let publisher_config = interfaces(
+        &lab.scratch.0,
+        "retention-publisher",
+        &lab.socket,
+        PRODUCER_A,
+    );
+    let (code, _, stderr) = cli(&[
+        "operator",
+        publisher_config.to_str().unwrap(),
+        "retention",
+        "producer-a",
+        "old",
+    ]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("forbidden"));
+    assert_eq!(
+        client.publish(PRODUCER_A, &old).unwrap().envelope_hash,
+        receipt.envelope_hash,
+        "compacted tombstone retains original replay"
+    );
 }

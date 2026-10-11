@@ -14,7 +14,9 @@
 //! The client reconnects once on its own when an idle connection was closed
 //! by the service, but only for requests that are safe to repeat.
 
-pub use bridge_core::recovery::{EvidenceTier, HoldView, IncidentView, LineageScope};
+pub use bridge_core::recovery::{
+    EvidenceTier, HoldView, IncidentPage, IncidentView, LineageScope, RetentionView,
+};
 pub use bridge_core::service::{DeliveryCounts, DeliveryEvidence};
 pub use bridge_core::{
     CoreError, CustodyReceipt, Envelope, EnvelopeHash, EventId, ExpiresAt, Harness, Kind, Metadata,
@@ -181,6 +183,59 @@ impl BridgeClient {
         match self.round_trip(&request, true)? {
             Response::Incidents { incidents } => Ok(incidents),
             other => Err(ProtocolError::unexpected("incidents", &other)),
+        }
+    }
+
+    /// Reads one operator-only finite incident page without changing state.
+    ///
+    /// `include_closed` controls the live state filter; `limit` defaults to
+    /// 100 and clamps to 1..200. Start with `after_seq=0, through_seq=None`,
+    /// then carry the fixed returned high-water and optional next cursor.
+    /// Final pages have no next cursor; restart to see new/reopened rows.
+    /// Invalid cursors, wrong grants or malformed/misbound replies fail;
+    /// repeating this read after transport loss never repeats a report.
+    pub fn incidents_page(
+        &mut self,
+        token: &str,
+        include_closed: bool,
+        limit: Option<usize>,
+        after_seq: u64,
+        through_seq: Option<u64>,
+    ) -> Result<IncidentPage, ProtocolError> {
+        let request = Request::IncidentsPage {
+            token: Token::new(token),
+            include_closed,
+            limit,
+            after_seq,
+            through_seq,
+        };
+        match self.round_trip(&request, true)? {
+            Response::IncidentsPage { page } => Ok(page),
+            other => Err(ProtocolError::unexpected("incidents_page", &other)),
+        }
+    }
+
+    /// Reads exact operator-only retention facts for validated event identity.
+    ///
+    /// An unaccepted `publisher/event_id` returns `None`; stored expiry,
+    /// tombstone/GC and scoped watermark facts never establish native recall.
+    /// No payload bytes, credentials or mutation are returned/performed.
+    /// Refused grants, invalid identifiers and malformed/misbound responses
+    /// fail; a lost read may reconnect/repeat safely.
+    pub fn retention(
+        &mut self,
+        token: &str,
+        publisher: &str,
+        event_id: &str,
+    ) -> Result<Option<RetentionView>, ProtocolError> {
+        let request = Request::Retention {
+            token: Token::new(token),
+            publisher: publisher.to_string(),
+            event_id: event_id.to_string(),
+        };
+        match self.round_trip(&request, true)? {
+            Response::Retention { retention } => Ok(retention.map(|view| *view)),
+            other => Err(ProtocolError::unexpected("retention", &other)),
         }
     }
 
@@ -436,13 +491,15 @@ impl BridgeClient {
     }
 }
 
-/// Checks that a structurally valid custody response acknowledges this request.
+/// Checks that a structurally valid response matches the exact requested scope.
 ///
 /// Publish receipts must name the requested event and hash its exact immutable
 /// body under the server-stamped publisher. Status receipts must name the queried
-/// event; delivery without custody is invalid. Other operations have no custody
-/// binding. Tokens are never inspected or included in refusal text. A mismatch
-/// returns an invalid-envelope error and must not release the caller's intent.
+/// event; delivery without custody is invalid. Operator pages must match the
+/// requested cursor/filter/limit; retention must name the exact requested
+/// identity. Other operations have no custody binding. Tokens are never inspected
+/// or included in refusal text. A mismatch returns an invalid-envelope error and
+/// must not release the caller's intent.
 fn validate_request_binding(request: &Request, response: &Response) -> Result<(), CoreError> {
     match (request, response) {
         (Request::Publish { event, .. }, Response::Published { receipt }) => {
@@ -473,6 +530,46 @@ fn validate_request_binding(request: &Request, response: &Response) -> Result<()
         {
             return Err(CoreError::InvalidEnvelope(
                 "status response does not match the queried custody event".into(),
+            ));
+        }
+        (
+            Request::IncidentsPage {
+                include_closed,
+                limit,
+                after_seq,
+                through_seq,
+                ..
+            },
+            Response::IncidentsPage { page },
+        ) => {
+            if page.incidents.len() > limit.unwrap_or(100).clamp(1, 200)
+                || page.through_seq < *after_seq
+                || through_seq.is_some_and(|through| through != page.through_seq)
+                || page.incidents.iter().any(|row| {
+                    row.incident_seq <= *after_seq
+                        || (!include_closed
+                            && row.state != bridge_core::recovery::IncidentState::Open)
+                })
+            {
+                return Err(CoreError::InvalidEnvelope(
+                    "incident page does not match the requested scan".into(),
+                ));
+            }
+        }
+        (
+            Request::Retention {
+                publisher,
+                event_id,
+                ..
+            },
+            Response::Retention {
+                retention: Some(view),
+            },
+        ) if view.receipt.publisher != PublisherId::new(publisher.clone())?.as_str()
+            || view.receipt.event_id != EventId::new(event_id.clone())?.as_str() =>
+        {
+            return Err(CoreError::InvalidEnvelope(
+                "retention response does not match the queried event".into(),
             ));
         }
         _ => {}
@@ -625,6 +722,8 @@ mod tests {
         )
     }
 
+    /// The builder produces a fully validated publisher-less body with the
+    /// attached metadata and expiry.
     #[test]
     fn builder_produces_validated_body() {
         let body = request("evt-42", "done")
@@ -649,6 +748,8 @@ mod tests {
     }
 
     #[test]
+    /// The builder surfaces metadata bound violations as invalid-envelope
+    /// errors.
     fn builder_surfaces_metadata_violations() {
         let mut oversized = request("evt-43", "x");
         for index in 0..17 {
@@ -663,6 +764,8 @@ mod tests {
     }
 
     #[test]
+    /// The builder refuses events whose framing could never render (bad
+    /// tag or unbounded content) before they reach the wire.
     fn builder_refuses_events_that_could_never_be_rendered() {
         assert!(request("evt-44", "bad\u{1}control").into_body().is_err());
         assert!(

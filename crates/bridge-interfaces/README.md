@@ -51,7 +51,8 @@ The frontend adds two of its own: `relay_unavailable` (the relay could not
 be reached before the request was written: nothing was sent, call the tool
 again) and `relay_outcome_unknown` (the request was written but no answer
 arrived within the frontend's finite wait of about 115 s (the relay's expected
-budget, not a hard bound: queueing behind other requests is not counted): a `bridge_send` may
+budget, not a hard bound: queueing, attestation trickle and an expired replay's
+additional custody lookup are not counted): a `bridge_send` may
 have been published, so repeat the **same** `request_id` or ask
 `bridge_status` with it; never use a new `request_id` for the same
 message).
@@ -65,7 +66,9 @@ message).
   and callers never share events (equal native ids in different stores
   stay distinct; the address is part of the id). Sender harness/session
   metadata is audit-only, never rendered or provenance. Oversize bodies and past expiries are
-  refused explicitly; nothing is truncated.
+  refused explicitly; nothing is truncated. An identical accepted request
+  still replays its original custody identity after expiry; changed content
+  conflicts and a new expired identity refuses without admission.
 - `bridge_status(request_id)` → only the caller's own events: `custody`,
   `native` (`not_handed`, `in_flight`, `native_accepted`, `native_held`,
   `written_no_receipt`, `hook_emitted`, `unknown`, `refused`),
@@ -123,6 +126,7 @@ server of the harness. The relay socket's directory must be `0700`.
 
 ```sh
 bridge operator interfaces.toml counts
+bridge operator interfaces.toml retention PUBLISHER EVENT
 bridge operator interfaces.toml incidents [--all] [--limit N]
 bridge operator interfaces.toml holds [--limit N]
 bridge operator interfaces.toml evidence PUBLISHER EVENT ATTEMPT TIER --detail TEXT
@@ -154,6 +158,13 @@ unknown`; it changed nothing.
   (`unhanded`, `reserved`, `invoking`, `held` — including written without
   receipt — `review`, `accepted`, `hook_submitted`, `refused`, `disposed`,
   `open_incidents`). They are totals, not a sample.
+- `retention PUBLISHER EVENT` is an operator-only exact nullable read of
+  custody identity/disposition, bounded delivery evidence, original expiry,
+  stored envelope byte count, compacted tombstone flag, current GC guard and
+  the event's full-scope latest watermark. Null means the identity is absent;
+  no payload or credential is disclosed. Eligibility does not promise actual
+  compaction (keep-newest may keep bytes). Expiry or compaction never recalls
+  an earlier possible effect; the read changes neither storage nor delivery.
 - `incidents` and `holds` are listings bounded by `--limit` (default 100,
   at most 200); use `counts` for totals.
 - `transfer-lineage` hands a `latest` stream lineage to another producer.
@@ -179,6 +190,12 @@ back explicitly and then decide an audited `retry` with its recorded
 duplicate risk). Routine
 written-without-receipt hand-offs within their deadline are not incidents;
 they are counted in `held`.
+
+A `refused` event supports an audited `dispose`, which closes its workflow
+without recalling or settling an earlier possible effect. The core refuses
+`retry` for this state; the duplicate-risk retry control applies only to
+`review` and `held`. Inspect all retained evidence before deciding. A new
+notification is a separate explicit decision, not recovery of the old event.
 
 Procedure for an `unknown` incident:
 
@@ -240,17 +257,21 @@ incident's identity (publisher, event, kind, creation time), so a reused
 incident number is reported again instead of being suppressed. The
 ledger drops an entry only on the core's own closed row of the same
 incident (same number and identity, state other than open); absence from a
-capped or racing listing, or a failed second listing, prunes nothing, so a
+capped or racing page, or a failed page read, prunes nothing, so a
 `possible_send` or `provider_accepted` entry is never forgotten while its
-incident may still be open. Operating
-ceiling: incidents are never deleted and the closed listing is capped at 200
-rows (open first, then next check, then number), so after about 200 closed
-incidents newer closed rows can stay outside the window and their entries
-are never pruned; entries are kept forever with no entry-count or byte
-bound, the whole file is read on load, and it is rewritten (pretty JSON,
-file and directory sync) before every send and once per pass. When this
-matters, upgrade by looking closed incidents up by number in the core; no
-unsafe pruning, bound or core API is added here. It records
+incident may still be open. Each CLI pass fetches one include-closed sequence
+page of at most 200 rows under the ledger lock. The durable
+`after_seq`/`through_seq` cursor scans a captured finite high-water range;
+final-page completion resets it for new or reopened rows. Page state is live,
+not an immutable snapshot. Outcomes are saved before advancing the cursor,
+so an interrupted pass repeats its page safely without re-sending ambiguous
+or accepted reports. With 201 open incidents behind 200 terminal report
+entries, the second pass reaches 201. Output states partial page coverage.
+Old ledgers start a fresh scan while keeping every send record.
+Operating ceiling: no entry-count or byte bound; a large/open backlog needs
+multiple passes and the whole ledger is read and rewritten (pretty JSON,
+file and directory sync) before every send and at each pass. Closure is reached
+by paging, never unsafe absence pruning. It records
 a `sending` intent before each request; a crash during a send becomes
 `possible_send`, which is never resent automatically. Only known-unsent
 reports are retried, at most `max_attempts`, then `gave_up`. Ledger and lock
@@ -318,6 +339,12 @@ bridge service stop relay|core --home H --state S
 - `doctor` exit codes: 0 no failed check, 2 a check failed, 3 invalid
   invocation. Declared adapter capabilities and Telegram are always
   `not_verified`; the overall qualification is `not_verified`.
+- `doctor` `relay.tools` lists the configured closed three-tool set and each
+  caller's exact scope, recipients, kinds and modes plus the body limit and
+  `keep_all` policy. Exact-session scopes take precedence over whole-store
+  scopes; these are configured permissions, reported `not_verified` until
+  loaded host/tool qualification is separately established. No credential
+  file contents are displayed.
 - `doctor` `recovery.pending` is `not_configured` with `state: unknown`
   when the configuration has no `[operator]` section (pending work cannot
   be read), and otherwise reads the core's complete `counts` and then,

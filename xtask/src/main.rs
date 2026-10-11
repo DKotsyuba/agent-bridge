@@ -23,7 +23,8 @@
 //! (build 30 min, product command 2 min, whole invocation 45 min); an
 //! expired command is killed and reaped. Results go to
 //! `<prefix>/qualification.json`; the exit status is 0 only when every
-//! check passed.
+//! check passed. Guard cleanup receives an independent two-minute budget per
+//! component even when the global qualification deadline has already expired.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -96,6 +97,14 @@ static DEADLINE: OnceLock<Instant> = OnceLock::new();
 fn run_within(command: &mut Command, budget: Duration) -> Result<Output, String> {
     let deadline =
         (Instant::now() + budget).min(*DEADLINE.get_or_init(|| Instant::now() + TOTAL_BUDGET));
+    run_until(command, deadline)
+}
+
+/// Runs `command` with closed stdin and captured output until the explicit
+/// monotonic `deadline`. Timeout kills and reaps its child and returns an
+/// error; this helper does not inherit the invocation deadline, so owned
+/// cleanup can still run after qualification has timed out.
+fn run_until(command: &mut Command, deadline: Instant) -> Result<Output, String> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -347,7 +356,8 @@ sha256 = "{relay_sha}"
 
 /// Stops this run's managed daemons on drop (relay, then core), through
 /// the product's own record-verified `bridge service stop`, each within the
-/// command budget; outcomes go to stderr.
+/// independent command budget even after the invocation deadline has expired;
+/// at most two command budgets in total. Outcomes go to stderr.
 struct Services {
     /// The launcher of the installed `bridge`.
     bridge: PathBuf,
@@ -361,11 +371,14 @@ impl Drop for Services {
     /// Stops both components; never panics.
     fn drop(&mut self) {
         for component in ["relay", "core"] {
-            let outcome = run(Command::new(&self.bridge)
-                .args(["service", "stop", component, "--home"])
-                .arg(&self.home)
-                .arg("--state")
-                .arg(&self.state));
+            let outcome = run_until(
+                Command::new(&self.bridge)
+                    .args(["service", "stop", component, "--home"])
+                    .arg(&self.home)
+                    .arg("--state")
+                    .arg(&self.state),
+                Instant::now() + COMMAND_BUDGET,
+            );
             match outcome {
                 Ok(output) => eprintln!(
                     "cleanup stop {component}: exit {:?} {}",
@@ -718,5 +731,85 @@ kinds = ["root.note"]
             "qualification failed; see {}/qualification.json",
             prefix.display()
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Cleanup remains usable after the qualification deadline. The stop
+    //! executable is a faithful local stand-in that terminates two owned
+    //! process fixtures; this is not installed-product/native qualification.
+
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// An expired invocation still lets the actual Services drop guard stop
+    /// both owned fixtures, and an independently stalled command is bounded.
+    #[test]
+    fn cleanup_has_an_independent_finite_budget() {
+        let dir = std::env::temp_dir().join(format!(
+            "bridge-cleanup-{}-{}",
+            std::process::id(),
+            random_token().unwrap()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let mut children = ["relay", "core"].map(|component| {
+            let child = Command::new("/bin/sleep")
+                .arg("60")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            std::fs::write(dir.join(component), child.id().to_string()).unwrap();
+            child
+        });
+        let script = dir.join("bridge");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsleep 0.1\nkill \"$(cat '{}/'$3)\"\necho \"$3\" >> '{}/stopped'\n",
+                dir.display(),
+                dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        DEADLINE
+            .set(Instant::now() - Duration::from_secs(1))
+            .unwrap();
+        let guard = Services {
+            bridge: script,
+            home: dir.clone(),
+            state: dir.clone(),
+        };
+        drop(guard);
+        let stopped = std::fs::read_to_string(dir.join("stopped")).unwrap_or_default();
+        let mut clean = true;
+        for child in &mut children {
+            for _ in 0..20 {
+                if child.try_wait().unwrap().is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if child.try_wait().unwrap().is_none() {
+                clean = false;
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(stopped, "relay\ncore\n");
+        assert!(clean, "cleanup left an owned daemon fixture alive");
+        let started = Instant::now();
+        assert!(
+            run_until(
+                Command::new("/bin/sleep").arg("5"),
+                Instant::now() + Duration::from_millis(50)
+            )
+            .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

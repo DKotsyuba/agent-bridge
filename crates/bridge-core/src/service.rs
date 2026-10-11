@@ -37,9 +37,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::dispatch::{
-    DispatchCarrier, DispatchReport, DispatchTiming, dispatch_message, lock_storage,
+    DispatchCarrier, DispatchReport, DispatchTiming, attest_guarded, dispatch_message, lock_storage,
 };
-use crate::recovery::{DeliveryState, EvidenceTier, HoldView, IncidentView, LineageScope};
+use crate::recovery::{
+    DeliveryState, EvidenceTier, HoldView, IncidentPage, IncidentView, LineageScope, RetentionView,
+};
 use crate::storage::{CustodyReceipt, Limits, Storage};
 use crate::types::{
     CoreError, Envelope, EventId, ExpiresAt, Kind, Metadata, Mode, NativeAddress, Payload, Policy,
@@ -66,6 +68,10 @@ const RECIPIENTS_PER_PASS: usize = 16;
 
 /// Attempts driven per recipient per maintenance pass.
 const ATTEMPTS_PER_RECIPIENT: usize = 4;
+
+/// Longest part of one carrier's attestation refusal, in characters, kept in
+/// a recipient hold; the joined hold text is bounded again by the store.
+const REFUSAL_REASON_CHARS: usize = 120;
 
 /// Daemon and service configuration, usually loaded from a TOML file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,7 +270,10 @@ impl std::fmt::Debug for Token {
     }
 }
 
-/// One request line as it arrives on the socket.
+/// One bounded request line received on the local socket.
+///
+/// New operator page/retention reads remain separate from legacy listings,
+/// publisher status and all mutations; each operation authenticates its realm.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -296,6 +305,30 @@ pub enum Request {
         include_closed: bool,
         /// Maximum rows (default 100, at most 200).
         limit: Option<usize>,
+    },
+    /// Read a stable-number incident page without modifying recovery state.
+    IncidentsPage {
+        /// Operator-grant bearer token; authenticated before cursor validation.
+        token: Token,
+        /// Include positively closed rows too; defaults to open rows only.
+        #[serde(default)]
+        include_closed: bool,
+        /// Row bound: default 100, clamped to 1..200.
+        limit: Option<usize>,
+        /// Exclusive lower incident number; defaults to zero for a first page.
+        #[serde(default)]
+        after_seq: u64,
+        /// Fixed high-water number; absent only when starting at zero.
+        through_seq: Option<u64>,
+    },
+    /// Inspect exact retained storage facts without reading payload bytes.
+    Retention {
+        /// Operator-grant bearer token; publisher/root grants are refused.
+        token: Token,
+        /// Exact validated publisher identity.
+        publisher: String,
+        /// Exact validated event identity; unaccepted keys return no view.
+        event_id: String,
     },
     /// List visible recipient holds.
     Holds {
@@ -408,7 +441,10 @@ pub enum Request {
     },
 }
 
-/// One response line as it is written back.
+/// One bounded response line written to the local client.
+///
+/// Operator pages and nullable retention facts are distinct additive variants;
+/// existing response shapes keep their meaning and never establish native recall.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
     /// Custody accepted (freshly or as an identical replay).
@@ -429,6 +465,16 @@ pub enum Response {
     Incidents {
         /// The incidents, bounded by the request limit.
         incidents: Vec<IncidentView>,
+    },
+    /// Finite operator scan page; all rows retain their live incident meaning.
+    IncidentsPage {
+        /// At most 200 ascending rows and the fixed scan/continuation bounds.
+        page: IncidentPage,
+    },
+    /// Exact operator storage facts, never payload content or a recall claim.
+    Retention {
+        /// Absent only for an unaccepted exact identity.
+        retention: Option<Box<RetentionView>>,
     },
     /// Visible recipient holds.
     Holds {
@@ -465,6 +511,10 @@ impl Response {
         match self {
             Response::Incidents { incidents } => {
                 incidents.iter().try_for_each(IncidentView::validate)
+            }
+            Response::IncidentsPage { page } => page.validate(),
+            Response::Retention { retention } => {
+                retention.as_ref().map_or(Ok(()), |view| view.validate())
             }
             Response::Holds { holds } => holds.iter().try_for_each(HoldView::validate),
             _ => Ok(()),
@@ -559,6 +609,10 @@ struct ServiceState {
     next_stream_id: AtomicU64,
     /// Carriers driven by the maintenance loop.
     carriers: Mutex<Vec<BoxedCarrier>>,
+    /// Last recipient of the previous dispatch window, so the next pass
+    /// continues after it; `None` starts a new rotation. Touched only by
+    /// the maintenance thread.
+    dispatch_cursor: Mutex<Option<NativeAddress>>,
     /// The advisory lock that proves exclusive ownership of the endpoint;
     /// held until the service state is dropped, i.e. past the socket's
     /// removal.
@@ -645,6 +699,7 @@ pub fn start_with_carriers(
         streams: Mutex::new(HashMap::new()),
         next_stream_id: AtomicU64::new(0),
         carriers: Mutex::new(carriers),
+        dispatch_cursor: Mutex::new(None),
         _endpoint_lock: endpoint_lock,
     });
     log_event(
@@ -1078,7 +1133,11 @@ fn respond(
     )
 }
 
-/// Authenticates and serves one parsed request.
+/// Authenticates each parsed request before reading or changing shared state.
+///
+/// Publisher operations stay scoped to their grant. New operator pages and exact
+/// retention reads cannot mutate recovery state or disclose payload bytes;
+/// invalid input/storage failures become structured refusals.
 fn serve(state: &ServiceState, request: Request) -> Result<Response, Refusal> {
     match request {
         Request::Publish { token, event } => serve_publish(state, &token, &event),
@@ -1106,6 +1165,36 @@ fn serve(state: &ServiceState, request: Request) -> Result<Response, Refusal> {
                     current_unix_millis(),
                     listing(limit),
                 )?,
+            })
+        }
+        Request::IncidentsPage {
+            token,
+            include_closed,
+            limit,
+            after_seq,
+            through_seq,
+        } => {
+            operator(state, &token)?;
+            let storage = lock_storage(&state.storage);
+            Ok(Response::IncidentsPage {
+                page: storage.incidents_page(
+                    include_closed,
+                    current_unix_millis(),
+                    listing(limit),
+                    after_seq,
+                    through_seq,
+                )?,
+            })
+        }
+        Request::Retention {
+            token,
+            publisher,
+            event_id,
+        } => {
+            operator(state, &token)?;
+            let storage = lock_storage(&state.storage);
+            Ok(Response::Retention {
+                retention: storage.retention(&publisher, &event_id)?.map(Box::new),
             })
         }
         Request::Holds { token, limit } => {
@@ -1429,9 +1518,10 @@ fn serve_status(state: &ServiceState, token: &str, event_id: &str) -> Result<Res
 ///
 /// Once per interval (checked at a fine grain so a stop is prompt): one
 /// bounded maintenance pass, then — when carriers are registered — a
-/// bounded dispatch pass over the recipients with eligible work, oldest
-/// first. Failures are logged and retried next pass; nothing here replays
-/// an uncertain hand-off.
+/// bounded dispatch pass over a rotating window of the recipients with
+/// eligible work (see [`Storage::recipients_with_work`] for what the rotation
+/// does and does not promise). Failures are logged and retried next pass;
+/// nothing here replays an uncertain hand-off.
 fn maintenance_loop(state: &ServiceState) {
     let mut next_pass = Instant::now();
     while state.running.load(Ordering::SeqCst) {
@@ -1476,7 +1566,21 @@ fn maintenance_pass(state: &ServiceState) {
     dispatch_pass(state);
 }
 
-/// Drives the registered carriers over recipients with eligible work.
+/// Drives the registered carriers over one window of recipients with
+/// eligible work.
+///
+/// The window continues after the previous pass's last recipient
+/// (`dispatch_cursor`) and wraps, so recipients that stay idle (inject-only
+/// work, an active auto recipient, a blocked predecessor) cannot keep a
+/// younger recipient out of every window while their work stays unchanged. A carrier that panics while
+/// attesting is treated as a failed attestation for that recipient only: a
+/// visible hold, never an acceptance, and the remaining recipients are
+/// still served.
+///
+/// When no carrier attests, the hold text lists every carrier's refusal
+/// (each bounded, in carrier order) rather than only the last one. Nothing is
+/// attempted for that recipient and nothing is guessed about what a refusal
+/// means.
 fn dispatch_pass(state: &ServiceState) {
     let mut carriers = state
         .carriers
@@ -1485,9 +1589,15 @@ fn dispatch_pass(state: &ServiceState) {
     if carriers.is_empty() {
         return;
     }
-    let recipients = match lock_storage(&state.storage)
-        .recipients_with_work(current_unix_millis(), RECIPIENTS_PER_PASS)
-    {
+    let mut cursor = state
+        .dispatch_cursor
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let recipients = match lock_storage(&state.storage).recipients_with_work(
+        current_unix_millis(),
+        RECIPIENTS_PER_PASS,
+        cursor.as_ref(),
+    ) {
         Ok(recipients) => recipients,
         Err(error) => {
             log_event(
@@ -1498,23 +1608,33 @@ fn dispatch_pass(state: &ServiceState) {
             return;
         }
     };
+    // A full window means more recipients may follow it; a short one has
+    // reached the end of the order, so the next pass starts over.
+    *cursor = if recipients.len() == RECIPIENTS_PER_PASS {
+        recipients.last().cloned()
+    } else {
+        None
+    };
     let timing = DispatchTiming::default();
     for recipient in recipients {
         if !state.running.load(Ordering::SeqCst) {
             return;
         }
-        let mut last_reason = String::from("no carrier is registered for this recipient");
-        let serving = carriers
-            .iter_mut()
-            .find_map(|carrier| match carrier.attest(&recipient) {
+        // Every refusing carrier's reason is kept (each bounded), in carrier
+        // order, so a matching carrier's specific refusal is not hidden by a
+        // later unrelated carrier's answer.
+        let mut reasons: Vec<String> = Vec::new();
+        let serving = carriers.iter_mut().find_map(|carrier| {
+            match attest_guarded(carrier.as_mut(), &recipient) {
                 Ok(_) => Some(carrier),
                 Err(reason) => {
-                    last_reason = reason;
+                    reasons.push(reason.chars().take(REFUSAL_REASON_CHARS).collect());
                     None
                 }
-            });
+            }
+        });
         let Some(carrier) = serving else {
-            let reason = format!("no carrier attests this endpoint: {last_reason}");
+            let reason = format!("no carrier attests this endpoint: {}", reasons.join("; "));
             if let Err(error) =
                 lock_storage(&state.storage).record_hold(&recipient, &reason, current_unix_millis())
             {

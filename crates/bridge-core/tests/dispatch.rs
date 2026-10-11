@@ -16,7 +16,7 @@ use bridge_core::dispatch::{
 };
 use bridge_core::framing::PROVENANCE_STATEMENT;
 use bridge_core::recovery::{DeliveryState, EvidenceEffect, EvidenceTier, IncidentState};
-use bridge_core::{CoreError, EventState, Limits, Mode, NativeAddress, Storage};
+use bridge_core::{CoreError, EventState, ExpiresAt, Limits, Mode, NativeAddress, Storage};
 use common::{
     ScriptedCarrier, TempDir, attest, batched, codex, keep_all, latest, register_tags, store,
     with_meta,
@@ -46,6 +46,9 @@ fn drive(
     dispatch_message(storage, carrier, recipient, &|| now, &timing()).unwrap()
 }
 
+/// A reservation freezes the recipient, actor, endpoint epoch, framing
+/// path, manifest bytes and deadline; nothing else can claim the event
+/// meanwhile.
 #[test]
 fn reserved_attempt_freezes_recipient_actor_epoch_path_manifest_and_deadline() {
     let mut storage = store();
@@ -102,6 +105,8 @@ fn reserved_attempt_freezes_recipient_actor_epoch_path_manifest_and_deadline() {
     );
 }
 
+/// `auto` resolves to exactly one effective path from the observed
+/// lifecycle and the attempt records it; the other path is never taken.
 #[test]
 fn auto_resolves_from_lifecycle_and_never_takes_both_paths() {
     assert_eq!(
@@ -191,6 +196,9 @@ fn auto_resolves_from_lifecycle_and_never_takes_both_paths() {
     assert_eq!(message.members[0].event_id, "auto-2");
 }
 
+/// Unknown, awaiting or unloaded recipients hold visibly with a
+/// retained incident and no carrier invocation: none of them counts as
+/// inactive.
 #[test]
 fn unknown_awaiting_or_unloaded_recipients_hold_visibly_without_invoking() {
     let shared = Mutex::new(store());
@@ -265,6 +273,9 @@ fn unknown_awaiting_or_unloaded_recipients_hold_visibly_without_invoking() {
     ));
 }
 
+/// The `invoking` state is committed before the carrier acts — proven
+/// by a second connection reading the attempt state during the hand-off —
+/// and the manifest bytes match the frozen reservation.
 #[test]
 fn invoking_is_durable_before_the_carrier_can_act_and_carries_the_frozen_bytes() {
     // A second connection reads the attempt DURING the carrier call: it must
@@ -282,14 +293,19 @@ fn invoking_is_durable_before_the_carrier_can_act_and_carries_the_frozen_bytes()
         .unwrap();
     let shared = Mutex::new(storage);
 
+    /// Carrier that reads the stored attempt row at the moment of the hand-off.
     struct Probing {
+        /// Path of the test's own database file, opened on a second connection.
         db: std::path::PathBuf,
+        /// The `(state, manifest)` of the newest stored attempt seen during `send`.
         seen: Arc<Mutex<Option<(String, String)>>>,
     }
     impl DispatchCarrier for Probing {
+        /// Returns this fixture's attestation for the recipient.
         fn attest(&mut self, recipient: &NativeAddress) -> Result<Attestation, String> {
             Ok(attest(recipient, Lifecycle::Inactive, 1))
         }
+        /// Applies this fixture's scripted outcome to the frozen attempt.
         fn send(&mut self, attempt: &bridge_core::dispatch::AttemptRecord) -> Outcome {
             let connection = rusqlite::Connection::open(&self.db).unwrap();
             let row: (String, String) = connection
@@ -324,6 +340,8 @@ fn invoking_is_durable_before_the_carrier_can_act_and_carries_the_frozen_bytes()
     );
 }
 
+/// A hook drain commits `invoking` before any payload is returned, and
+/// an attestation for a different actor cannot drain root-held data.
 #[test]
 fn hook_drain_commits_invoking_before_payload_and_other_actors_cannot_drain() {
     let dir = TempDir::new("hook-drain");
@@ -395,6 +413,9 @@ fn hook_drain_commits_invoking_before_payload_and_other_actors_cannot_drain() {
     assert_eq!(incidents[0].kind, "unknown_handoff");
 }
 
+/// A hook acknowledgement after a full flush is recorded as hook-tier
+/// evidence only, never as native queue acceptance or model-context
+/// proof.
 #[test]
 fn hook_submission_after_flush_is_hook_tier_evidence_only() {
     let mut storage = store();
@@ -436,6 +457,9 @@ fn hook_submission_after_flush_is_hook_tier_evidence_only() {
     );
 }
 
+/// A possibly-handed-off attempt becomes `outcome_unknown` with a
+/// retained incident; further dispatch is refused until an audited
+/// manual authorization records the duplicate risk.
 #[test]
 fn unknown_outcome_is_retained_and_never_auto_retried_until_audited_authorization() {
     let shared = Mutex::new(store());
@@ -519,6 +543,8 @@ fn unknown_outcome_is_retained_and_never_auto_retried_until_audited_authorizatio
     assert!(all[0].resolution.as_deref().unwrap().contains("ops-1"));
 }
 
+/// Positively known-unsent closes its attempt and a bounded retry
+/// budget admits later attempts, never an unbounded resend loop.
 #[test]
 fn known_unsent_closes_the_attempt_then_retries_with_a_bounded_budget() {
     let shared = Mutex::new(store());
@@ -595,6 +621,8 @@ fn known_unsent_closes_the_attempt_then_retries_with_a_bounded_budget() {
     );
 }
 
+/// Known-unsent classification requires positive proof; silence never
+/// implies non-delivery.
 #[test]
 fn known_unsent_requires_positive_proof() {
     let mut storage = store();
@@ -644,6 +672,9 @@ fn known_unsent_requires_positive_proof() {
     );
 }
 
+/// An expired reservation that never invoked is reclaimed; an expired
+/// `invoking` lease becomes `outcome_unknown` with an incident and stays
+/// non-redispatchable.
 #[test]
 fn leases_reclaim_only_uninvoked_reservations_and_invoking_expires_to_unknown() {
     let mut storage = store();
@@ -732,6 +763,8 @@ fn leases_reclaim_only_uninvoked_reservations_and_invoking_expires_to_unknown() 
     );
 }
 
+/// Stale, forged or fabricated fences refuse the transition without
+/// invoking anything.
 #[test]
 fn stale_and_forged_fences_refuse_without_new_invocation() {
     let mut storage = store();
@@ -801,6 +834,8 @@ fn stale_and_forged_fences_refuse_without_new_invocation() {
     ));
 }
 
+/// A stale endpoint epoch or changed conditions release the reservation
+/// untouched: nothing was invoked, so reclaiming it is safe.
 #[test]
 fn stale_endpoint_epochs_and_changed_conditions_release_the_reservation_untouched() {
     let mut storage = store();
@@ -889,6 +924,9 @@ fn stale_endpoint_epochs_and_changed_conditions_release_the_reservation_untouche
     );
 }
 
+/// The durable no-wake policy blocks the message path at reservation and
+/// invocation while a natural hook drain stays available; already
+/// possible effects are never undone.
 #[test]
 fn no_wake_policy_blocks_the_message_path_but_not_a_hook_drain() {
     let mut storage = store();
@@ -965,6 +1003,8 @@ fn no_wake_policy_blocks_the_message_path_but_not_a_hook_drain() {
     assert_eq!(message.effective_mode, EffectiveMode::Message);
 }
 
+/// keep_all events of similar age win the dispatch head, while aged
+/// replaceable snapshots are not starved indefinitely.
 #[test]
 fn keep_all_wins_among_similar_age_but_aged_snapshots_are_not_starved() {
     let recipient = codex("thread-q");
@@ -1010,6 +1050,8 @@ fn keep_all_wins_among_similar_age_but_aged_snapshots_are_not_starved() {
     assert_eq!(first.members[0].event_id, "view-old");
 }
 
+/// The per-recipient snapshot quota reserves admission capacity so a
+/// diagnostics flood cannot crowd out keep_all traffic.
 #[test]
 fn snapshot_quota_reserves_admission_capacity_for_keep_all() {
     let mut limits = Limits::new(100);
@@ -1057,6 +1099,8 @@ fn snapshot_quota_reserves_admission_capacity_for_keep_all() {
     assert_eq!(queue.len(), 4);
 }
 
+/// Events declaring a predecessor wait for its evidence tier or an
+/// audited disposition, while unrelated traffic keeps progressing.
 #[test]
 fn dependents_wait_for_predecessor_evidence_and_unrelated_traffic_progresses() {
     let mut storage = store();
@@ -1161,6 +1205,8 @@ fn dependents_wait_for_predecessor_evidence_and_unrelated_traffic_progresses() {
     assert_eq!(released.members[0].event_id, "cmd-2");
 }
 
+/// An audited disposition or an operator waiver releases blocked
+/// dependents, and dependency cycles are refused rather than deadlocked.
 #[test]
 fn audited_disposition_or_waiver_releases_dependents_and_cycles_are_refused() {
     let mut storage = store();
@@ -1238,6 +1284,8 @@ fn audited_disposition_or_waiver_releases_dependents_and_cycles_are_refused() {
     ));
 }
 
+/// Batch manifests keep member order, ids and content losslessly with
+/// per-member wrappers, and unrelated scopes stay isolated.
 #[test]
 fn batch_manifests_are_ordered_lossless_and_scopes_stay_isolated() {
     let mut storage = store();
@@ -1291,6 +1339,8 @@ fn batch_manifests_are_ordered_lossless_and_scopes_stay_isolated() {
     assert_eq!(remaining, ["g2-1", "ide-1", "proj-1"]);
 }
 
+/// Supersession replaces only pending snapshots; reserved or beyond,
+/// the frozen manifest keeps its bytes.
 #[test]
 fn latest_supersedes_only_pending_snapshots_and_inflight_manifests_are_immutable() {
     let mut storage = store();
@@ -1361,6 +1411,8 @@ fn latest_supersedes_only_pending_snapshots_and_inflight_manifests_are_immutable
     assert_eq!(next.members[0].event_id, "v3");
 }
 
+/// A stale revision arriving after a newer one stays superseded across a
+/// restart: the watermark is durable.
 #[test]
 fn stale_revision_never_revives_across_restart() {
     let dir = TempDir::new("latest-restart");
@@ -1383,6 +1435,8 @@ fn stale_revision_never_revives_across_restart() {
     ));
 }
 
+/// Expiry marks only never-handed-off events; an attempt that may have
+/// reached a carrier is never expired into a delivery claim.
 #[test]
 fn expiry_applies_only_before_hand_off() {
     let mut storage = store();
@@ -1433,6 +1487,9 @@ fn expiry_applies_only_before_hand_off() {
     assert_eq!(storage.expire_due(50_000).unwrap(), 0);
 }
 
+/// Held and written-no-receipt hand-offs are non-terminal tiers with
+/// overdue escalation to incidents and positive closure, never silent
+/// losses.
 #[test]
 fn held_and_unreceipted_hand_offs_are_nonterminal_with_overdue_incidents_and_positive_closure() {
     let shared = Mutex::new(store());
@@ -1549,6 +1606,8 @@ fn held_and_unreceipted_hand_offs_are_nonterminal_with_overdue_incidents_and_pos
     );
 }
 
+/// Late positive evidence resolves an unknown outcome without any
+/// resend and never rewrites a newer attempt's state.
 #[test]
 fn late_evidence_resolves_unknown_without_resend_and_never_rewrites_a_newer_attempt() {
     let shared = Mutex::new(store());
@@ -1671,6 +1730,8 @@ fn late_evidence_resolves_unknown_without_resend_and_never_rewrites_a_newer_atte
     }));
 }
 
+/// Positive late evidence settles the uncertain attempt exactly once,
+/// with no second send of the original event.
 #[test]
 fn late_positive_evidence_settles_an_unknown_without_any_second_send() {
     let shared = Mutex::new(store());
@@ -1732,6 +1793,8 @@ fn late_positive_evidence_settles_an_unknown_without_any_second_send() {
     );
 }
 
+/// A carrier panic during the hand-off is recorded as an unknown
+/// outcome with retained evidence, never as a silent failure or resend.
 #[test]
 fn a_panicking_carrier_is_recorded_as_an_unknown_outcome() {
     let shared = Mutex::new(store());
@@ -1764,6 +1827,8 @@ fn a_panicking_carrier_is_recorded_as_an_unknown_outcome() {
     );
 }
 
+/// A permanent refusal blocks the event's dependents until an audited
+/// disposition decides their fate.
 #[test]
 fn a_permanent_refusal_blocks_dependents_until_an_audited_disposition() {
     let shared = Mutex::new(store());
@@ -1829,6 +1894,8 @@ fn a_permanent_refusal_blocks_dependents_until_an_audited_disposition() {
     assert_eq!(next.sends[0].members[0].event_id, "ref-2");
 }
 
+/// Corrupted stored bytes quarantine their event while other traffic
+/// keeps progressing; the damage never spreads silently.
 #[test]
 fn corrupted_stored_bytes_are_quarantined_and_other_traffic_progresses() {
     let dir = TempDir::new("corrupt");
@@ -1904,6 +1971,8 @@ fn corrupted_stored_bytes_are_quarantined_and_other_traffic_progresses() {
     assert!(!next.manifest.contains("FORGED"));
 }
 
+/// An event whose publisher has no registered source tag holds instead
+/// of guessing a wrapper; framing authority is never invented.
 #[test]
 fn unregistered_source_tag_holds_instead_of_guessing_a_wrapper() {
     let mut storage = Storage::open_in_memory(Limits::new(10)).unwrap();
@@ -1937,6 +2006,8 @@ fn unregistered_source_tag_holds_instead_of_guessing_a_wrapper() {
     );
 }
 
+/// A hold past its escalation deadline becomes a visible incident and
+/// clears only when the hold itself clears.
 #[test]
 fn long_holds_escalate_to_an_incident_that_clears_with_the_hold() {
     let mut storage = store();
@@ -1999,6 +2070,9 @@ fn long_holds_escalate_to_an_incident_that_clears_with_the_hold() {
     assert!(storage.open_incidents(700_001, 10).unwrap().is_empty());
 }
 
+/// Modes the recipient is known not to support are refused before
+/// acceptance, while an unknown recipient is accepted pending
+/// attestation.
 #[test]
 fn unsupported_modes_are_refused_before_acceptance_but_unknown_recipients_are_accepted() {
     let mut storage = store();
@@ -2057,6 +2131,8 @@ fn unsupported_modes_are_refused_before_acceptance_but_unknown_recipients_are_ac
     );
 }
 
+/// Two racing reservations for one recipient resolve to exactly one
+/// winner; the loser is refused without invocation.
 #[test]
 fn exactly_one_of_two_racing_reservations_wins() {
     let dir = TempDir::new("race");
@@ -2103,6 +2179,9 @@ fn exactly_one_of_two_racing_reservations_wins() {
     );
 }
 
+/// A restart resumes held and uncertain state exactly as it was, with
+/// reconciliation converting expired invoking leases to retained
+/// unknowns and never replaying them.
 #[test]
 fn restart_resumes_held_and_uncertain_state_without_replay() {
     let dir = TempDir::new("dispatch-restart");
@@ -2157,6 +2236,8 @@ fn restart_resumes_held_and_uncertain_state_without_replay() {
     assert!(replay.receipt.replayed);
 }
 
+/// Payload compaction keeps dedup identity and original receipts while
+/// never touching delivered or uncertain events.
 #[test]
 fn compaction_keeps_dedup_identity_and_never_touches_delivered_or_uncertain_events() {
     let mut storage = store();
@@ -2188,6 +2269,8 @@ fn compaction_keeps_dedup_identity_and_never_touches_delivered_or_uncertain_even
     ));
 }
 
+/// A held recipient cannot starve healthy ones: the dispatch listing
+/// keeps serving other recipients.
 #[test]
 fn held_recipients_cannot_starve_healthy_ones_in_the_dispatch_listing() {
     let mut storage = store();
@@ -2220,7 +2303,7 @@ fn held_recipients_cannot_starve_healthy_ones_in_the_dispatch_listing() {
         )
         .unwrap();
 
-    let listed = storage.recipients_with_work(60_000, 5).unwrap();
+    let listed = storage.recipients_with_work(60_000, 5, None).unwrap();
     assert_eq!(
         listed[0], healthy,
         "a healthy recipient is served before held ones"
@@ -2230,6 +2313,8 @@ fn held_recipients_cannot_starve_healthy_ones_in_the_dispatch_listing() {
     assert_eq!(listed.len(), 5, "the listing is bounded");
 }
 
+/// Concurrent publishers and dispatch drives on one database lose no
+/// events and produce no torn state.
 #[test]
 fn concurrent_publishers_and_dispatch_share_one_database_without_losing_events() {
     let dir = TempDir::new("dispatch-concurrent");
@@ -2313,4 +2398,519 @@ fn concurrent_publishers_and_dispatch_share_one_database_without_losing_events()
     delivered.dedup();
     assert_eq!(delivered.len(), 40, "every event was handed off");
     assert_eq!(unique, 40, "and exactly once");
+}
+
+/// A late OUTCOME (not only late evidence) for an older attempt, delivered
+/// after an audited retry produced a newer unknown attempt, must neither
+/// close the newer attempt's incident nor open an incident or change the
+/// delivery state of the event that the newer attempt now owns.
+#[test]
+fn a_late_outcome_for_an_older_attempt_never_touches_the_newer_attempts_incident() {
+    for (index, late) in [
+        Outcome::NativeAccepted {
+            evidence: "found the first message in the queue".into(),
+        },
+        Outcome::KnownUnsent {
+            evidence: "the helper log shows no write".into(),
+        },
+        Outcome::PermanentRefusal {
+            reason: "the first host refused it".into(),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let event = format!("evt-late-outcome-{index}");
+        let shared = Mutex::new(store());
+        let recipient = codex(&format!("thread-late-outcome-{index}"));
+        shared
+            .lock()
+            .unwrap()
+            .publish(
+                &keep_all("agent-run", &event, &recipient, Mode::Message),
+                1_000,
+            )
+            .unwrap();
+        let unknown = || {
+            ScriptedCarrier::new(
+                Lifecycle::Inactive,
+                Outcome::OutcomeUnknown {
+                    reason: "helper exited without a result".into(),
+                },
+            )
+        };
+        drive(&shared, &mut unknown(), &recipient, 2_000);
+        let mut storage = shared.lock().unwrap();
+        let first = storage
+            .latest_attempt("agent-run", &event)
+            .unwrap()
+            .unwrap();
+        storage
+            .authorize_manual_retry("agent-run", &event, "ops-3", "host log inconclusive", 3_000)
+            .unwrap();
+        drop(storage);
+        drive(&shared, &mut unknown(), &recipient, 4_000);
+
+        let mut storage = shared.lock().unwrap();
+        let second = storage
+            .latest_attempt("agent-run", &event)
+            .unwrap()
+            .unwrap();
+        assert_ne!(second.fence.attempt_seq, first.fence.attempt_seq);
+        storage.record_outcome(&first.fence, late, 5_000).unwrap();
+
+        let open = storage.open_incidents(5_000, 10).unwrap();
+        assert_eq!(open.len(), 1, "only the newer attempt's incident is open");
+        assert_eq!(open[0].kind, "unknown_handoff");
+        assert_eq!(open[0].attempt_seq, Some(second.fence.attempt_seq));
+        assert_eq!(
+            storage
+                .delivery_evidence("agent-run", &event)
+                .unwrap()
+                .unwrap()
+                .delivery,
+            DeliveryState::Review,
+            "the newer unknown attempt still owns the event"
+        );
+    }
+}
+
+/// The dispatch listing is a rotating window: each call continues after the
+/// previous window, wraps at the end, and restarts when the cursor
+/// recipient has no work left.
+#[test]
+fn recipient_listing_rotates_through_every_recipient_with_work() {
+    let mut storage = store();
+    let names: Vec<NativeAddress> = (0..5).map(|index| codex(&format!("rot-{index}"))).collect();
+    for (index, recipient) in names.iter().enumerate() {
+        storage
+            .publish(
+                &keep_all(
+                    "agent-run",
+                    &format!("rot-evt-{index}"),
+                    recipient,
+                    Mode::Inject,
+                ),
+                1_000 + index as u64,
+            )
+            .unwrap();
+    }
+    let first = storage.recipients_with_work(5_000, 2, None).unwrap();
+    assert_eq!(first, names[0..2]);
+    let second = storage
+        .recipients_with_work(5_000, 2, first.last())
+        .unwrap();
+    assert_eq!(second, names[2..4]);
+    let third = storage
+        .recipients_with_work(5_000, 2, second.last())
+        .unwrap();
+    assert_eq!(third, [names[4].clone(), names[0].clone()], "wraps around");
+    let gone = codex("no-work-left");
+    assert_eq!(
+        storage.recipients_with_work(5_000, 2, Some(&gone)).unwrap(),
+        names[0..2],
+        "an unknown cursor restarts the rotation"
+    );
+}
+
+/// Snapshot floods across many recipients and publishers can never use the
+/// protected global keep_all reserve: replaceable work stops a quarter of
+/// the global cap early, keep_all still fills the cap, nothing admitted is
+/// evicted, and the total cap holds.
+#[test]
+fn global_cap_keeps_a_protected_reserve_for_keep_all_across_recipients() {
+    let mut limits = Limits::new(100);
+    limits.max_pending_latest_per_recipient = 3;
+    let mut storage = Storage::open_in_memory(limits).unwrap();
+    register_tags(&mut storage);
+    let mut snapshots = 0;
+    'flood: for round in 0..3 {
+        for index in 0..40 {
+            let publisher = if index % 2 == 0 {
+                "agent-ide"
+            } else {
+                "agent-run"
+            };
+            let recipient = codex(&format!("flood-{index}"));
+            let outcome = storage.publish(
+                &latest(
+                    publisher,
+                    &format!("flood-{index}-{round}"),
+                    &recipient,
+                    &format!("stream-{index}-{round}"),
+                    1,
+                ),
+                1_000,
+            );
+            match outcome {
+                Ok(_) => snapshots += 1,
+                Err(CoreError::Capacity { limit }) => {
+                    assert!(limit.contains("keep_all"), "{limit}");
+                    break 'flood;
+                }
+                Err(other) => panic!("unexpected refusal: {other:?}"),
+            }
+        }
+    }
+    assert_eq!(snapshots, 75, "snapshots stop at the cap minus the reserve");
+    for index in 0..25 {
+        storage
+            .publish(
+                &keep_all(
+                    "agent-run",
+                    &format!("critical-{index}"),
+                    &codex(&format!("flood-{}", index % 40)),
+                    Mode::Message,
+                ),
+                2_000,
+            )
+            .unwrap();
+    }
+    assert!(matches!(
+        storage.publish(
+            &keep_all(
+                "agent-run",
+                "critical-over",
+                &codex("flood-0"),
+                Mode::Message
+            ),
+            2_000
+        ),
+        Err(CoreError::Capacity { .. })
+    ));
+    assert_eq!(
+        storage.count_delivery(DeliveryState::Unhanded).unwrap(),
+        100,
+        "the total cap holds and no admitted event was evicted"
+    );
+}
+
+/// A dependent whose predecessor expired before delivery keeps its order
+/// (it is never released by time or by the expiry itself) but is no longer
+/// silent: maintenance raises one actionable incident that names the
+/// blocked event, and only an audited waiver releases it.
+#[test]
+fn an_expired_predecessor_raises_an_incident_and_only_a_waiver_releases_the_dependent() {
+    let mut storage = store();
+    let recipient = codex("thread-expired-dep");
+    let inactive = attest(&recipient, Lifecycle::Inactive, 1);
+    let mut predecessor = keep_all("agent-run", "pred-1", &recipient, Mode::Message);
+    predecessor.expires_at = Some(ExpiresAt::from_unix_millis(2_000).unwrap());
+    storage.publish(&predecessor, 1_000).unwrap();
+    storage
+        .publish(
+            &with_meta(
+                keep_all("agent-run", "dep-1", &recipient, Mode::Message),
+                "predecessor",
+                "pred-1",
+            ),
+            1_001,
+        )
+        .unwrap();
+
+    let report = storage.run_maintenance(3_000).unwrap();
+    assert_eq!(report.expired_events, 1);
+    assert_eq!(
+        report.escalated_holds, 1,
+        "one new incident for the dependent"
+    );
+    let incidents = storage.open_incidents(3_000, 10).unwrap();
+    assert_eq!(incidents.len(), 1);
+    assert_eq!(incidents[0].kind, "predecessor_expired");
+    assert_eq!(incidents[0].event_id, "dep-1");
+    assert!(
+        incidents[0].reason.contains("pred-1"),
+        "{}",
+        incidents[0].reason
+    );
+    // A repeat pass neither duplicates the incident nor releases the event.
+    assert_eq!(storage.run_maintenance(3_500).unwrap().escalated_holds, 0);
+    assert_eq!(
+        storage
+            .reserve_next(&inactive, EffectiveMode::Message, 4_000, &timing())
+            .unwrap(),
+        Selection::Idle,
+        "expiry alone never releases the dependent"
+    );
+    assert_eq!(
+        storage
+            .delivery_evidence("agent-run", "dep-1")
+            .unwrap()
+            .unwrap()
+            .blocked_by
+            .as_deref(),
+        Some("pred-1")
+    );
+
+    storage
+        .waive_predecessor(
+            "agent-run",
+            "dep-1",
+            "ops-1",
+            "the source confirmed the predecessor is obsolete",
+            5_000,
+        )
+        .unwrap();
+    assert!(storage.open_incidents(5_001, 10).unwrap().is_empty());
+    let released = attempt(
+        storage
+            .reserve_next(&inactive, EffectiveMode::Message, 5_100, &timing())
+            .unwrap(),
+    );
+    assert_eq!(released.members[0].event_id, "dep-1");
+}
+
+/// Every valid positive global cap keeps at least one slot for keep_all:
+/// `latest` and `batch` may take only `cap - max(1, cap / 4)` slots (none at
+/// cap 1, which refuses them before acceptance), keep_all still fills the
+/// configured cap exactly, and the cap itself is never raised.
+#[test]
+fn every_positive_global_cap_reserves_at_least_one_keep_all_slot() {
+    for (cap, snapshot_slots) in [(1, 0), (2, 1), (3, 2), (8, 6)] {
+        for policy in ["latest", "batch"] {
+            let mut storage = Storage::open_in_memory(Limits::new(cap)).unwrap();
+            register_tags(&mut storage);
+            let mut admitted = 0;
+            for index in 0..cap + 2 {
+                let recipient = codex(&format!("tiny-{index}"));
+                let id = format!("{policy}-{index}");
+                let envelope = if policy == "latest" {
+                    latest("agent-ide", &id, &recipient, &format!("s{index}"), 1)
+                } else {
+                    batched("agent-ide", &id, &recipient, &format!("g{index}"))
+                };
+                match storage.publish(&envelope, 1_000) {
+                    Ok(_) => admitted += 1,
+                    Err(CoreError::Capacity { limit }) => {
+                        assert!(limit.contains("keep_all"), "cap {cap} {policy}: {limit}");
+                    }
+                    Err(other) => panic!("cap {cap} {policy}: unexpected {other:?}"),
+                }
+            }
+            assert_eq!(admitted, snapshot_slots, "cap {cap} {policy}");
+            for index in 0..cap - snapshot_slots {
+                storage
+                    .publish(
+                        &keep_all(
+                            "agent-run",
+                            &format!("critical-{index}"),
+                            &codex("tiny-0"),
+                            Mode::Message,
+                        ),
+                        2_000,
+                    )
+                    .unwrap_or_else(|error| panic!("cap {cap} {policy}: keep_all {error:?}"));
+            }
+            assert!(matches!(
+                storage.publish(
+                    &keep_all(
+                        "agent-run",
+                        "critical-over",
+                        &codex("tiny-0"),
+                        Mode::Message
+                    ),
+                    2_000
+                ),
+                Err(CoreError::Capacity { .. })
+            ));
+            assert_eq!(
+                storage.count_delivery(DeliveryState::Unhanded).unwrap(),
+                cap as u64,
+                "cap {cap} {policy}: total capacity is exactly the configured cap"
+            );
+        }
+    }
+}
+
+/// Maintenance escalation is bounded per pass (500 candidates), so it must
+/// make progress across passes: dependents blocked behind a missing or an
+/// expired predecessor, and long recipient holds, beyond the first batch
+/// are exposed by the next passes without duplicating or reopening the
+/// incidents raised earlier, and every such dependent stays blocked.
+#[test]
+fn bounded_maintenance_exposes_every_blocked_dependent_and_hold_across_passes() {
+    /// Items per scenario: more than one 500-row maintenance batch.
+    const TOTAL: usize = 520;
+    /// Maintenance instant, past the hold-escalation threshold of every item.
+    const NOW: u64 = 800_000;
+    // Asserts the multi-pass progression for one kind and returns nothing:
+    // 500 new incidents, then the remaining 20, then none, all distinct.
+    let check = |storage: &mut Storage, kind: &str| {
+        for expected in [500, TOTAL - 500, 0] {
+            assert_eq!(
+                storage.run_maintenance(NOW).unwrap().escalated_holds,
+                expected,
+                "{kind}: new incidents in this pass"
+            );
+        }
+        let incidents: Vec<_> = storage
+            .incidents(true, NOW, 2_000)
+            .unwrap()
+            .into_iter()
+            .filter(|incident| incident.kind == kind)
+            .collect();
+        assert_eq!(incidents.len(), TOTAL, "{kind}: one incident per item");
+        assert!(
+            incidents
+                .iter()
+                .all(|incident| incident.state == IncidentState::Open),
+            "{kind}: all stay open"
+        );
+        let mut events: Vec<_> = incidents.iter().map(|i| i.event_id.clone()).collect();
+        events.sort();
+        events.dedup();
+        assert_eq!(events.len(), TOTAL, "{kind}: no duplicate incidents");
+    };
+    let recipient = codex("thread-bounded-maintenance");
+    let inactive = attest(&recipient, Lifecycle::Inactive, 1);
+
+    // Dependents of predecessors that never arrived.
+    let mut storage = Storage::open_in_memory(Limits::new(5_000)).unwrap();
+    for index in 0..TOTAL {
+        storage
+            .publish(
+                &with_meta(
+                    keep_all(
+                        "agent-run",
+                        &format!("dep-{index:04}"),
+                        &recipient,
+                        Mode::Message,
+                    ),
+                    "predecessor",
+                    &format!("never-{index:04}"),
+                ),
+                1_000,
+            )
+            .unwrap();
+    }
+    check(&mut storage, "predecessor_missing");
+    assert_eq!(
+        storage
+            .reserve_next(&inactive, EffectiveMode::Message, NOW, &timing())
+            .unwrap(),
+        Selection::Idle,
+        "every blocked dependent stays blocked"
+    );
+
+    // Dependents of one predecessor that expired before delivery.
+    let mut storage = Storage::open_in_memory(Limits::new(5_000)).unwrap();
+    let mut predecessor = keep_all("agent-run", "pred", &recipient, Mode::Message);
+    predecessor.expires_at = Some(ExpiresAt::from_unix_millis(2_000).unwrap());
+    storage.publish(&predecessor, 1_000).unwrap();
+    for index in 0..TOTAL {
+        storage
+            .publish(
+                &with_meta(
+                    keep_all(
+                        "agent-run",
+                        &format!("dep-{index:04}"),
+                        &recipient,
+                        Mode::Message,
+                    ),
+                    "predecessor",
+                    "pred",
+                ),
+                1_001,
+            )
+            .unwrap();
+    }
+    check(&mut storage, "predecessor_expired");
+    assert_eq!(
+        storage
+            .reserve_next(&inactive, EffectiveMode::Message, NOW, &timing())
+            .unwrap(),
+        Selection::Idle,
+        "every blocked dependent stays blocked"
+    );
+
+    // Long holds on many recipients.
+    let mut storage = Storage::open_in_memory(Limits::new(5_000)).unwrap();
+    for index in 0..TOTAL {
+        let held = codex(&format!("held-{index:04}"));
+        storage
+            .publish(
+                &keep_all(
+                    "agent-run",
+                    &format!("evt-{index:04}"),
+                    &held,
+                    Mode::Message,
+                ),
+                1_000,
+            )
+            .unwrap();
+        storage
+            .record_hold(&held, "no carrier attests", 1_000)
+            .unwrap();
+    }
+    check(&mut storage, "recipient_held");
+}
+
+/// An audited disposition of the EXPIRED predecessor makes its dependent
+/// eligible (the same rule the dispatch selection applies), so the dependent's
+/// `predecessor_expired` incident closes as resolved and is never reopened;
+/// nothing is released or replayed by maintenance itself.
+#[test]
+fn disposing_the_expired_predecessor_closes_the_dependent_incident_without_reopening() {
+    let mut storage = store();
+    let recipient = codex("thread-expired-disposed");
+    let inactive = attest(&recipient, Lifecycle::Inactive, 1);
+    let mut predecessor = keep_all("agent-run", "pred-d", &recipient, Mode::Message);
+    predecessor.expires_at = Some(ExpiresAt::from_unix_millis(2_000).unwrap());
+    storage.publish(&predecessor, 1_000).unwrap();
+    storage
+        .publish(
+            &with_meta(
+                keep_all("agent-run", "dep-d", &recipient, Mode::Message),
+                "predecessor",
+                "pred-d",
+            ),
+            1_001,
+        )
+        .unwrap();
+    assert_eq!(storage.run_maintenance(3_000).unwrap().escalated_holds, 1);
+    assert_eq!(storage.open_incidents(3_000, 10).unwrap().len(), 1);
+
+    storage
+        .dispose_event(
+            "agent-run",
+            "pred-d",
+            "ops-1",
+            "the source canceled it",
+            4_000,
+        )
+        .unwrap();
+    assert_eq!(
+        storage.run_maintenance(5_000).unwrap().escalated_holds,
+        0,
+        "the disposed predecessor no longer blocks, so nothing is raised"
+    );
+    assert!(storage.open_incidents(5_000, 10).unwrap().is_empty());
+    let closed = storage.incidents(true, 5_000, 10).unwrap();
+    let incident = closed
+        .iter()
+        .find(|incident| incident.event_id == "dep-d")
+        .unwrap();
+    assert_eq!(incident.state, IncidentState::Resolved);
+    let resolution = incident.resolution.as_deref().unwrap();
+    assert!(
+        resolution.contains("dispatch dependency rule"),
+        "{resolution}"
+    );
+    assert!(
+        !resolution.contains("audited"),
+        "the text claims no particular decision: {resolution}"
+    );
+    // A further pass neither reopens it nor opens a duplicate.
+    assert_eq!(storage.run_maintenance(6_000).unwrap().escalated_holds, 0);
+    assert_eq!(
+        storage.incidents(true, 6_000, 10).unwrap().len(),
+        closed.len()
+    );
+    // The existing eligibility rule, not maintenance, releases the dependent.
+    let released = attempt(
+        storage
+            .reserve_next(&inactive, EffectiveMode::Message, 7_000, &timing())
+            .unwrap(),
+    );
+    assert_eq!(released.members[0].event_id, "dep-d");
 }

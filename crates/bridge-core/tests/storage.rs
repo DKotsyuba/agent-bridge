@@ -82,6 +82,8 @@ fn latest(event: &str, stream: &str, revision: u64) -> Envelope {
     .unwrap()
 }
 
+/// Publishing the same envelope twice returns the original custody
+/// receipt with `replayed` set and consumes no new admission capacity.
 #[test]
 fn identical_replay_returns_original_receipt() {
     let mut storage = Storage::open_in_memory(Limits::new(100)).unwrap();
@@ -112,6 +114,8 @@ fn identical_replay_returns_original_receipt() {
     assert_eq!(looked_up.acceptance_seq, 1);
 }
 
+/// Republishing the same `(publisher, event id)` with different content
+/// is refused as a conflict and leaves the original event untouched.
 #[test]
 fn changed_identity_content_conflicts() {
     let mut storage = Storage::open_in_memory(Limits::new(100)).unwrap();
@@ -140,6 +144,8 @@ fn changed_identity_content_conflicts() {
     assert_eq!(replay.receipt.acceptance_seq, 1);
 }
 
+/// The admission hard cap refuses new events explicitly; replays stay
+/// admissible and terminal dispositions free capacity again.
 #[test]
 fn hard_cap_refuses_new_admission_until_capacity_frees() {
     let mut storage = Storage::open_in_memory(Limits::new(2)).unwrap();
@@ -170,6 +176,9 @@ fn hard_cap_refuses_new_admission_until_capacity_frees() {
     assert!(!admitted.receipt.replayed);
 }
 
+/// A `latest` snapshot older than the durable watermark is admitted as
+/// explicitly superseded, equal-revision content conflicts, and every
+/// dedup entry is retained.
 #[test]
 fn latest_watermark_supersedes_stale_snapshots_and_retains_entries() {
     let mut storage = Storage::open_in_memory(Limits::new(100)).unwrap();
@@ -216,6 +225,8 @@ fn latest_watermark_supersedes_stale_snapshots_and_retains_entries() {
     }
 }
 
+/// Expiry applies only to still-pending events: superseded and other
+/// dispositions are never re-marked, and expiry is not a delivery claim.
 #[test]
 fn expiry_marks_only_pending_events() {
     let mut storage = Storage::open_in_memory(Limits::new(100)).unwrap();
@@ -260,6 +271,8 @@ fn expiry_marks_only_pending_events() {
     assert_eq!(untouched.state, EventState::Superseded);
 }
 
+/// Committed custody and the monotonic acceptance order survive closing
+/// and reopening the database file.
 #[test]
 fn custody_survives_close_and_reopen() {
     let dir = TempDir::new("reopen");
@@ -290,6 +303,8 @@ const GHOST_INSERT: &str = "INSERT INTO events (publisher_id, event_id, envelope
      envelope_json, state, acceptance_seq, accepted_at_ms, expires_at_ms) \
      VALUES ('p', 'ghost', 'deadbeef', x'7b7d', 'pending', 42, 1, NULL)";
 
+/// A rolled-back transaction leaves no partial event row, and later
+/// publication starts from a clean slate.
 #[test]
 fn aborted_transaction_leaves_no_partial_row() {
     // Crash-before-commit window through SQLite's own atomicity on this
@@ -318,6 +333,8 @@ fn aborted_transaction_leaves_no_partial_row() {
     assert_eq!(clean.receipt.acceptance_seq, 1);
 }
 
+/// A child process aborted mid-transaction leaves no partial custody
+/// after WAL recovery on reopen, and new events are admitted cleanly.
 #[test]
 fn fault_kill_during_commit_recovers_on_reopen() {
     // Real crash window: a child process aborts while holding an open write

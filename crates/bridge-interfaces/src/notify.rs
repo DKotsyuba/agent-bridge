@@ -22,16 +22,15 @@
 //! closed row of the same incident, never because an incident is merely absent
 //! from a (possibly capped or racing) listing.
 //!
-//! Operating ceiling: incidents are never deleted, and the closed listing is
-//! capped at 200 rows ordered open first, then next check, then number, so
-//! after about 200 closed incidents newer closed rows can stay outside the
-//! window indefinitely and their entries are then never pruned. Entries are
-//! kept forever: there is no maximum entry count or byte bound, [`Ledger::load`]
-//! reads the whole file, and the ledger is rewritten as pretty JSON with a
+//! The CLI scans one sequence-ordered include-closed page of at most 200 rows
+//! per pass with a durable finite high-water cursor ([`run_paged`]); completing
+//! a scan resets it to reach new or reopened incidents next time. State is
+//! live, not a snapshot. Closure is observed positively even beyond the first
+//! 200 rows. Operating ceiling: there is no maximum entry count or byte bound;
+//! a large/open backlog needs multiple passes and retains its entries.
+//! [`Ledger::load`] reads the whole file, rewritten as pretty JSON with a
 //! file and directory sync before every send and once at the end of every
-//! pass. The upgrade path, when ledger size or run time matters, is a core
-//! lookup of closed incidents by number for the entries held (not built here:
-//! no unsafe absence pruning, bound or core API was added).
+//! pass. Never bound growth by forgetting a possibly sent report.
 //!
 //! Reporting an incident never touches the original event: no resend, no
 //! retry, no permission answer. Runs are serialized by an exclusive lock
@@ -97,6 +96,13 @@ pub struct Ledger {
     pub backend: String,
     /// Entries by incident sequence.
     pub entries: BTreeMap<u64, Entry>,
+    /// Last sequence consumed in the finite scan; zero starts a new scan.
+    /// Default permits upgrading an existing ledger without forgetting sends.
+    #[serde(default)]
+    pub after_seq: u64,
+    /// Captured inclusive high-water mark, or absent for the next fresh scan.
+    #[serde(default)]
+    pub through_seq: Option<u64>,
 }
 
 /// The identity of an incident beyond its number: publisher, event, kind
@@ -199,6 +205,23 @@ pub fn run(
     closed: &[IncidentView],
     now_ms: u64,
 ) -> Result<Vec<Value>, String> {
+    let (_lock, mut ledger) = locked_ledger(notify, backend)?;
+    report_page(
+        notify,
+        telegram,
+        transport,
+        incidents,
+        closed,
+        now_ms,
+        &mut ledger,
+    )
+}
+
+/// Acquires the private exclusive ledger lock and loads/binds `backend`.
+/// The returned file must stay alive for the complete read/report/save pass.
+/// Invalid configuration, unreadable ledger or a different core refuses
+/// before any send. No caller may use an unlocked cursor or ledger snapshot.
+fn locked_ledger(notify: &NotifyConfig, backend: &str) -> Result<(File, Ledger), String> {
     notify.check()?;
     let lock_path = PathBuf::from(format!("{}.lock", notify.ledger.display()));
     let lock = open_private(&lock_path).map_err(|error| format!("ledger lock: {error}"))?;
@@ -212,6 +235,74 @@ pub fn run(
             "the notification ledger belongs to another core; use a separate ledger".into(),
         );
     }
+    Ok((lock, ledger))
+}
+
+/// Consumes one protected include-closed incident page via `fetch`, invoked
+/// once under the ledger lock with its durable `(after_seq, through_seq)`.
+/// `fetch` must return the validated operator-client page as `(rows,
+/// high_water, next_cursor)`, at most 200 rows; a provider/auth/read failure
+/// is an error. The callback permits contract-faithful fixture pages while
+/// production uses the typed Core client, without duplicating Core logic.
+/// `backend` is the core socket identity bound to this private ledger;
+/// `now_ms` is Unix epoch milliseconds for timestamps and retry scheduling.
+/// `notify` supplies the protected ledger and bounded known-unsent attempts;
+/// absent `telegram` reports unconfigured without calling `transport`.
+/// Current rows are split into open reports and positive closed identities.
+/// Only after report outcomes are durable is the next cursor saved; a crash
+/// can repeat this page but never repeats a sending/possible/accepted report.
+/// The final page resets the finite scan for newer/reopened rows. Returns the
+/// current page's reports and cursor coverage, never a complete snapshot.
+/// Read/auth/cursor/ledger failures abort; no unsafe absence pruning or send
+/// occurs on a failed page read. No original event is changed by this pass.
+pub fn run_paged(
+    notify: &NotifyConfig,
+    backend: &str,
+    telegram: Option<&TelegramConfig>,
+    transport: &dyn Transport,
+    fetch: impl FnOnce(u64, Option<u64>) -> Result<(Vec<IncidentView>, u64, Option<u64>), String>,
+    now_ms: u64,
+) -> Result<Value, String> {
+    let (_lock, mut ledger) = locked_ledger(notify, backend)?;
+    let after_seq = ledger.after_seq;
+    let (rows, through_seq, next_after_seq) = fetch(after_seq, ledger.through_seq)?;
+    let (incidents, closed): (Vec<_>, Vec<_>) = rows
+        .into_iter()
+        .partition(|incident| incident.state == IncidentState::Open);
+    let lines = report_page(
+        notify,
+        telegram,
+        transport,
+        &incidents,
+        &closed,
+        now_ms,
+        &mut ledger,
+    )?;
+    ledger.after_seq = next_after_seq.unwrap_or(0);
+    ledger.through_seq = next_after_seq.map(|_| through_seq);
+    ledger.save(&notify.ledger)?;
+    Ok(json!({"incidents": lines, "coverage": {
+        "after_seq": after_seq, "through_seq": through_seq,
+        "next_after_seq": next_after_seq, "rows": incidents.len() + closed.len(),
+        "limit": 200, "snapshot": false, "scan_complete": next_after_seq.is_none(),
+    }}))
+}
+
+/// Updates `ledger` for the supplied authoritative open/closed rows while its
+/// caller holds the exclusive lock. Preserves uncertain/accepted sends and
+/// prunes only positively matching closed identities not also observed open.
+/// Writes intent before any transport call and outcomes before returning.
+/// Returns one honest notification status per open incident; save failures
+/// stop processing and never justify a resend of a possibly sent report.
+fn report_page(
+    notify: &NotifyConfig,
+    telegram: Option<&TelegramConfig>,
+    transport: &dyn Transport,
+    incidents: &[IncidentView],
+    closed: &[IncidentView],
+    now_ms: u64,
+    ledger: &mut Ledger,
+) -> Result<Vec<Value>, String> {
     for entry in ledger.entries.values_mut() {
         if entry.state == NoteState::Sending {
             entry.state = NoteState::PossibleSend;
@@ -425,6 +516,133 @@ mod tests {
         let second = setup.pass(&transport, &[incident(1)], 20);
         assert_eq!(second[0]["requested_now"], false);
         assert_eq!(*transport.1.borrow(), 1, "exactly one request ever");
+    }
+
+    /// Faithful predeclared provider pages prove the M6 lock/cursor/outcome
+    /// contract across restarts, a new high-water scan and positive closure.
+    /// No Core state machine, network or native session is reimplemented.
+    #[test]
+    fn paged_passes_reach_new_rows_without_repeating_terminal_reports() {
+        let setup = setup("pages");
+        let mut ledger = Ledger {
+            backend: "core-a".into(),
+            ..Ledger::default()
+        };
+        for seq in 1..=200 {
+            ledger.entries.insert(
+                seq,
+                Entry {
+                    identity: incident_identity(&incident(seq)),
+                    state: match seq % 3 {
+                        0 => NoteState::Sending,
+                        1 => NoteState::ProviderAccepted,
+                        _ => NoteState::PossibleSend,
+                    },
+                    attempts: 1,
+                    updated_ms: 1,
+                    detail: "prior report".into(),
+                    not_before_ms: None,
+                },
+            );
+        }
+        ledger.save(&setup.notify.ledger).unwrap();
+        let accepted = || TransportReply::Responded {
+            status: 200,
+            body: r#"{"ok":true,"result":{"message_id":1}}"#.into(),
+        };
+        let transport = script(vec![accepted(), accepted()]);
+        let first = run_paged(
+            &setup.notify,
+            "core-a",
+            Some(&setup.telegram),
+            &transport,
+            |after, through| {
+                assert_eq!((after, through), (0, None));
+                Ok(((1..=200).map(incident).collect(), 201, Some(200)))
+            },
+            10,
+        )
+        .unwrap();
+        assert_eq!(first["coverage"]["scan_complete"], false);
+        assert_eq!(*transport.1.borrow(), 0);
+        let saved = Ledger::load(&setup.notify.ledger).unwrap();
+        assert_eq!((saved.after_seq, saved.through_seq), (200, Some(201)));
+        let second = run_paged(
+            &setup.notify,
+            "core-a",
+            Some(&setup.telegram),
+            &transport,
+            |after, through| {
+                assert_eq!((after, through), (200, Some(201)));
+                Ok((vec![incident(201)], 201, None))
+            },
+            20,
+        )
+        .unwrap();
+        assert_eq!(second["incidents"][0]["incident_seq"], 201);
+        assert_eq!(second["incidents"][0]["notification"], "provider_accepted");
+        assert_eq!(*transport.1.borrow(), 1);
+        let mut next_rows: Vec<_> = (1..=200).map(incident).collect();
+        next_rows[0].state = IncidentState::Disposed;
+        run_paged(
+            &setup.notify,
+            "core-a",
+            Some(&setup.telegram),
+            &transport,
+            |after, through| {
+                assert_eq!((after, through), (0, None));
+                Ok((next_rows, 202, Some(200)))
+            },
+            30,
+        )
+        .unwrap();
+        let saved = Ledger::load(&setup.notify.ledger).unwrap();
+        assert!(!saved.entries.contains_key(&1));
+        assert!(
+            saved.entries.contains_key(&201),
+            "absence from this page cannot forget an accepted report"
+        );
+        let fourth = run_paged(
+            &setup.notify,
+            "core-a",
+            Some(&setup.telegram),
+            &transport,
+            |after, through| {
+                assert_eq!((after, through), (200, Some(202)));
+                Ok((vec![incident(201), incident(202)], 202, None))
+            },
+            40,
+        )
+        .unwrap();
+        assert_eq!(fourth["incidents"][0]["requested_now"], false);
+        assert_eq!(
+            *transport.1.borrow(),
+            2,
+            "only new identities 201 and 202 were reported"
+        );
+        let saved = Ledger::load(&setup.notify.ledger).unwrap();
+        assert_eq!((saved.after_seq, saved.through_seq), (0, None));
+        assert_eq!(
+            saved.entries[&3].state,
+            NoteState::PossibleSend,
+            "crash intent is never resent"
+        );
+        let before = std::fs::read(&setup.notify.ledger).unwrap();
+        let failed = run_paged(
+            &setup.notify,
+            "core-a",
+            Some(&setup.telegram),
+            &transport,
+            |_, _| Err("operator auth/cursor/read refused".into()),
+            50,
+        );
+        assert!(failed.is_err());
+        assert_eq!(
+            std::fs::read(&setup.notify.ledger).unwrap(),
+            before,
+            "failed reads neither advance nor prune"
+        );
+        assert_eq!(*transport.1.borrow(), 2);
     }
 
     /// A ledger entry left in `Sending` by a crash is reported as `possible_send`

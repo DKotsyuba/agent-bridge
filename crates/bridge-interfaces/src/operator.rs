@@ -77,7 +77,7 @@ pub fn classify(kind: &str) -> (&'static str, &'static str) {
         ),
         "permanent_refusal" | "retries_exhausted" => (
             "refused",
-            "known non-acceptance: fix the recipient or carrier, then dispose or authorize a retry.",
+            "this attempt was refused; an earlier hand-off may remain unknown. Inspect the retained evidence, then dispose this event with an audited note. Refused events cannot be retried; retry --accept-duplicate-risk applies only to review or held events. A new notification requires a separate explicit decision and does not resolve an earlier possible effect.",
         ),
         "storage_integrity" => (
             "integrity",
@@ -348,6 +348,11 @@ mod tests {
         assert_eq!(classify("held_overdue").0, "overdue");
         assert_eq!(classify("recipient_held").0, "held");
         assert_eq!(classify("retries_exhausted").0, "refused");
+        assert!(
+            classify("retries_exhausted")
+                .1
+                .contains("Refused events cannot be retried")
+        );
         assert!(classify("unknown_handoff").1.contains("Never resent"));
     }
 

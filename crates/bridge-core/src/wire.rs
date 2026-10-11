@@ -129,6 +129,8 @@ mod tests {
         (BufReader::new(left), right)
     }
 
+    /// The bounded reader returns complete lines and a clean EOF before any
+    /// bytes.
     #[test]
     fn reads_lines_and_clean_eof() {
         let (mut reader, mut peer) = pair();
@@ -155,6 +157,8 @@ mod tests {
     }
 
     #[test]
+    /// An oversized unterminated line is refused without buffering it
+    /// whole: memory stays bounded by the cap.
     fn oversize_unterminated_line_is_refused_without_buffering_it() {
         let (mut reader, mut peer) = pair();
         peer.write_all(&[b'a'; 64]).unwrap();
@@ -168,6 +172,8 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
+    /// Idle and stalled peers hit their read timeout instead of blocking
+    /// the connection forever.
     #[test]
     fn idle_and_stalled_peers_time_out() {
         let (mut reader, mut peer) = pair();

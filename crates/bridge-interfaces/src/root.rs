@@ -83,7 +83,10 @@ pub const ATTEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// repeatable attempts of a 10 s request write plus a 30 s first-byte wait
 /// (`bridge-client`). It is a budget, not a hard bound: a peer that trickles
 /// bytes into the attestation read and waiting for the shared core
-/// connection behind other requests are not counted.
+/// connection behind other requests are not counted. An expired replay also
+/// performs a custody lookup before publication; that additional exchange is
+/// outside this ordinary one-operation budget and can outlast the finite
+/// frontend wait without justifying a new request identity.
 const RELAY_BUDGET_SECS: u64 =
     2 * IO_TIMEOUT.as_secs() + 2 * ATTEST_TIMEOUT.as_secs() + 2 * (10 + 30);
 
@@ -128,8 +131,11 @@ pub enum RelayResponse {
         /// Tool result.
         value: Value,
     },
-    /// The tool refused; nothing was published or disclosed beyond the
-    /// refusal itself.
+    /// A refusal or an uncertain outcome, classified by `class`.
+    /// Pre-effect validation/authorization and unavailable-connection refusals
+    /// publish nothing. `custody_unknown` and `relay_outcome_unknown` may follow
+    /// publication: reconcile or repeat the same `request_id`, never invent a
+    /// new identity for that message. Detail discloses no token or proof.
     Error {
         /// Machine-readable class (see [`RootRelay::handle`]).
         class: String,
@@ -319,7 +325,13 @@ impl RootRelay {
         }
     }
 
-    /// `bridge_send`: validates and publishes one keep_all event.
+    /// Validates and publishes one exact-grant keep_all event at Unix epoch
+    /// milliseconds `now_ms`, for the already verified root `caller` and its
+    /// configured `policy`. Consumes the closed arguments; returns custody
+    /// identity or the explicit validation/core/uncertainty refusal.
+    /// New expired events refuse; an expired identity already in custody is
+    /// submitted to the core's immutable-hash replay check, returning the
+    /// original receipt or a conflict. No retry extends the original expiry.
     fn send(
         &self,
         caller: &VerifiedCaller,
@@ -375,17 +387,21 @@ impl RootRelay {
         .with_metadata("sender_harness", caller.address().harness.as_str())
         .with_metadata("sender_session", caller.address().native_session_id.clone());
         if let Some(expires) = args.expires_at_ms {
-            if expires <= now_ms {
-                return Err(RelayResponse::error(
-                    "expired",
-                    "expires_at_ms is not in the future; nothing was sent",
-                ));
-            }
             request =
                 request.with_expires_at(ExpiresAt::from_unix_millis(expires).map_err(invalid)?);
         }
         let body = request.into_body().map_err(invalid)?;
-        let receipt = self.with_client(|client, token| client.publish(token, &body))?;
+        let receipt = self.with_client(|client, token| {
+            if args.expires_at_ms.is_some_and(|expires| expires <= now_ms)
+                && client.status(token, &body.event_id)?.0.is_none()
+            {
+                return Err(ProtocolError {
+                    class: "expired".into(),
+                    detail: "expires_at_ms is not in the future; nothing was sent".into(),
+                });
+            }
+            client.publish(token, &body)
+        })?;
         Ok(RelayResponse::Ok {
             value: json!({
                 "request_id": args.request_id,

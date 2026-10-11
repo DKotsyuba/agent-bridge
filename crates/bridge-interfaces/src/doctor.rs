@@ -159,7 +159,11 @@ pub fn run(input: &DoctorInput) -> Vec<Check> {
     checks
 }
 
-/// Checks of the interfaces configuration.
+/// Reports the validated `config` through `push`: protected-secret presence,
+/// read-only socket/recovery observations, configured closed tools and caller
+/// scopes, and owner-channel configuration. Never sends, repairs or exposes
+/// credentials; configured capabilities remain `not_verified` independently
+/// of reachability. An absent root is `not_configured`.
 fn interfaces(config: &InterfacesConfig, push: &mut dyn FnMut(&str, &'static str, Value)) {
     push("config.interfaces", "ok", json!("valid"));
     push(
@@ -220,6 +224,25 @@ fn interfaces(config: &InterfacesConfig, push: &mut dyn FnMut(&str, &'static str
     }
     match &config.root {
         Some(root) => {
+            push(
+                "relay.tools",
+                "not_verified",
+                json!({
+                    "tools": crate::root::TOOLS,
+                    "policy": "keep_all",
+                    "max_body_bytes": root.max_body_bytes,
+                    "callers": root.callers.iter().map(|caller| json!({
+                        "host_id": caller.host_id,
+                        "harness": caller.harness,
+                        "native_store_namespace": caller.native_store_namespace,
+                        "native_session_id": caller.native_session_id,
+                        "recipients": caller.recipients,
+                        "modes": caller.modes,
+                        "kinds": caller.kinds,
+                    })).collect::<Vec<_>>(),
+                    "note": "configured root scopes only; exact-session entries take precedence over store scopes. Loaded tool/caller capabilities require separate qualification",
+                }),
+            );
             push(
                 "relay.reachable",
                 if std::os::unix::net::UnixStream::connect(&root.socket).is_ok() {
@@ -486,5 +509,51 @@ mod tests {
         assert_eq!(pending.status, "not_configured");
         assert_eq!(pending.detail["state"], "unknown");
         assert_eq!(exit_code(&checks), 2, "the unreachable core still fails");
+    }
+
+    /// Configured caller grants and the closed tool set are visible without
+    /// asserting loaded capability or exposing the grant's token path/value.
+    #[test]
+    fn configured_root_tools_and_scopes_are_unqualified() {
+        let config: InterfacesConfig = toml::from_str(
+            r#"
+core_socket = "/absent/core.sock"
+[root]
+socket = "/absent/relay.sock"
+token_file = "/absent/root.token"
+max_body_bytes = 123
+[[root.callers]]
+host_id = "host"
+harness = "codex"
+native_store_namespace = "store"
+native_session_id = "session"
+recipients = ["host/codex/store/other"]
+modes = ["inject"]
+kinds = ["note"]
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let mut found = None;
+        interfaces(&config, &mut |name, status, detail| {
+            if name == "relay.tools" {
+                found = Some((status, detail));
+            }
+        });
+        let (status, tools) = found.expect("configured tools are reported");
+        assert_eq!(status, "not_verified");
+        assert_eq!(
+            tools["tools"],
+            json!(["bridge_me", "bridge_send", "bridge_status"])
+        );
+        assert_eq!(tools["max_body_bytes"], 123);
+        assert_eq!(tools["callers"][0]["native_session_id"], "session");
+        assert_eq!(
+            tools["callers"][0]["recipients"],
+            json!(["host/codex/store/other"])
+        );
+        assert_eq!(tools["callers"][0]["modes"], json!(["inject"]));
+        assert_eq!(tools["callers"][0]["kinds"], json!(["note"]));
+        assert!(!tools.to_string().contains("root.token"));
     }
 }

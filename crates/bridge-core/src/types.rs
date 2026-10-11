@@ -880,6 +880,7 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 ///
 /// Used only for hash digests; not a general formatting utility.
 fn hex_encode(bytes: &[u8]) -> String {
+    /// Lowercase hexadecimal digit alphabet indexed by nibble value.
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -1026,6 +1027,8 @@ mod tests {
         .unwrap()
     }
 
+    /// The envelope hash is stable regardless of construction order of the
+    /// sorted metadata.
     #[test]
     fn hash_is_stable_across_construction_order() {
         // Same logical content, metadata inserted in opposite order.
@@ -1045,6 +1048,7 @@ mod tests {
         assert_eq!(left.canonical_bytes(), right.canonical_bytes());
     }
 
+    /// Any identity-content change produces a different envelope hash.
     #[test]
     fn hash_changes_with_identity_content() {
         let left = envelope("body");
@@ -1053,6 +1057,8 @@ mod tests {
         assert_ne!(left.envelope_hash(), right.envelope_hash());
     }
 
+    /// An envelope round-trips exactly through its canonical bytes with the
+    /// same hash.
     #[test]
     fn envelope_roundtrips_through_canonical_bytes() {
         let original = envelope("round trip");
@@ -1062,6 +1068,7 @@ mod tests {
         assert_eq!(parsed.envelope_hash(), original.envelope_hash());
     }
 
+    /// Policy validation refuses invalid stream and group shapes.
     #[test]
     fn policy_validation_refuses_invalid_input() {
         assert!(
@@ -1075,6 +1082,8 @@ mod tests {
         assert!(StreamId::new("ok").is_ok());
     }
 
+    /// Field validation refuses empty, oversized and control-bearing
+    /// identifiers, addresses and payloads.
     #[test]
     fn field_validation_refuses_control_chars_and_oversize() {
         assert!(EventId::new("bad\u{1}id").is_err());
@@ -1084,6 +1093,8 @@ mod tests {
         assert!(NativeAddress::new("h", Harness::Codex, "ns", "").is_err());
     }
 
+    /// A relative TTL is normalized to an absolute expiry exactly once; the
+    /// envelope never stores a relative value.
     #[test]
     fn relative_ttl_is_normalized_exactly_once() {
         let baked = ExpiresAt::relative(5_000, 1_000_000).unwrap();
@@ -1102,6 +1113,8 @@ mod tests {
         assert!(ExpiresAt::from_unix_millis(0).is_err());
     }
 
+    /// Harness names and percent-encoded addresses round-trip through the
+    /// canonical text form and refuse malformed input.
     #[test]
     fn harness_and_address_roundtrip_canonically() {
         let address = address();
@@ -1112,6 +1125,8 @@ mod tests {
     }
 
     #[test]
+    /// Busy, locked and full storage conditions map to the single retryable
+    /// busy class; integrity failures never do.
     fn busy_locked_and_full_storage_map_to_retryable_busy_only() {
         for code in [
             rusqlite::ffi::SQLITE_BUSY,
@@ -1135,6 +1150,8 @@ mod tests {
     }
 
     #[test]
+    /// Deserialized newtype values pass the same validation as constructed
+    /// ones.
     fn deserialized_values_are_validated() {
         assert!(serde_json::from_str::<EventId>("\"\"").is_err());
         assert!(serde_json::from_str::<Payload>(&format!("\"{}\"", "x".repeat(70_000))).is_err());

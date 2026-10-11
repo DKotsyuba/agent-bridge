@@ -1082,3 +1082,87 @@ kinds = []
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// An accepted immutable send replays after its original expiry; a changed
+/// envelope still conflicts, a new expired identity refuses without custody,
+/// and current recipient authorization is checked before either lookup.
+#[test]
+fn expired_replays_preserve_custody_without_admitting_new_expired_events() {
+    let lab = lab("exp");
+    let mut harness = Harnessed::start(&lab.store);
+    lab.hook(
+        &mut harness,
+        json!({"hook_event_name": "SessionStart", "session_id": "s1", "cwd": "/ignored"}),
+    );
+    let expiry = bridge_core::service::current_unix_millis() + 5000;
+    let args = json!({"request_id":"expiry", "recipient":recipient("s2"), "kind":"root.note", "mode":"inject", "body":"same", "expires_at_ms":expiry});
+    let sent = lab.call(
+        &mut harness,
+        "s1",
+        "exp-send",
+        None,
+        "bridge_send",
+        args.clone(),
+    );
+    assert_eq!(class(&sent), "ok", "{sent}");
+    std::thread::sleep(Duration::from_millis(
+        expiry.saturating_sub(bridge_core::service::current_unix_millis()) + 20,
+    ));
+    let replay = lab.call(
+        &mut harness,
+        "s1",
+        "exp-replay",
+        None,
+        "bridge_send",
+        args.clone(),
+    );
+    assert_eq!(class(&replay), "ok", "{replay}");
+    assert_eq!(replay["structuredContent"]["custody"]["replayed"], true);
+    for field in ["envelope_hash", "accepted_at_ms"] {
+        assert_eq!(
+            replay["structuredContent"]["custody"][field],
+            sent["structuredContent"]["custody"][field]
+        );
+    }
+    let mut changed = args.clone();
+    changed["body"] = json!("changed");
+    assert_eq!(
+        class(&lab.call(
+            &mut harness,
+            "s1",
+            "exp-conflict",
+            None,
+            "bridge_send",
+            changed
+        )),
+        "conflict"
+    );
+    let mut foreign = args.clone();
+    foreign["recipient"] = recipient("s9");
+    assert_eq!(
+        class(&lab.call(
+            &mut harness,
+            "s1",
+            "exp-foreign",
+            None,
+            "bridge_send",
+            foreign
+        )),
+        "forbidden"
+    );
+    let mut new = args;
+    new["request_id"] = json!("new-expired");
+    assert_eq!(
+        class(&lab.call(&mut harness, "s1", "exp-new", None, "bridge_send", new)),
+        "expired"
+    );
+    let status = lab.call(
+        &mut harness,
+        "s1",
+        "exp-status",
+        None,
+        "bridge_status",
+        json!({"request_id":"new-expired"}),
+    );
+    assert_eq!(status["structuredContent"]["custody"]["state"], "not_found");
+}

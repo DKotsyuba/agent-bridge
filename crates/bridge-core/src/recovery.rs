@@ -85,7 +85,8 @@ pub enum DeliveryState {
     HookSubmitted,
     /// Permanently refused before acceptance (incident retained).
     Refused,
-    /// Closed by an audited operator disposition; never delivered.
+    /// Closed by an audited operator disposition; no further automatic Core dispatch.
+    /// A prior possible hand-off is not undone or disproved, and processing is not proved.
     Disposed,
 }
 
@@ -229,7 +230,13 @@ pub struct IncidentView {
     pub attempt_seq: Option<u64>,
     /// Incident class: `unknown_handoff`, `held_overdue`, `receipt_overdue`,
     /// `permanent_refusal`, `retries_exhausted`, `recipient_held`,
-    /// `storage_integrity` or `migrated_unverified`.
+    /// `predecessor_missing` (a dependent waits for a predecessor that was
+    /// never accepted), `predecessor_expired` (the awaited predecessor
+    /// expired before delivery; only an audited waiver or disposition
+    /// releases the dependent), `storage_integrity`, `migrated_unverified` or
+    /// `lineage_authority_lost` (an unhanded event whose producer lost the
+    /// stream lineage through an audited transfer or an ambiguous
+    /// migration).
     pub kind: String,
     /// Current state.
     pub state: IncidentState,
@@ -253,6 +260,110 @@ pub struct IncidentView {
     pub duplicate_risk: bool,
     /// How it was settled, once it is no longer open.
     pub resolution: Option<String>,
+}
+
+/// One finite incident-scan page, ordered by immutable incident number.
+///
+/// Row state, age and dependents are live facts, not a snapshot. New numbers
+/// above `through_seq` belong to a subsequent scan; reads have no effects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IncidentPage {
+    /// At most 200 incident views in strictly increasing sequence order.
+    pub incidents: Vec<IncidentView>,
+    /// Highest retained number captured at the start of this finite scan.
+    pub through_seq: u64,
+    /// Last returned number when more matching rows remain; otherwise absent.
+    pub next_after_seq: Option<u64>,
+}
+
+impl IncidentPage {
+    /// Rejects out-of-range, unordered, over-cap or inconsistent decoded pages.
+    ///
+    /// Request-specific lower bounds, filter and limit are checked by the client.
+    pub fn validate(&self) -> Result<(), CoreError> {
+        check_ranges(&[self.through_seq])?;
+        if self.incidents.len() > 200 {
+            return Err(CoreError::InvalidEnvelope(
+                "incident page exceeds 200 rows".into(),
+            ));
+        }
+        let mut previous = 0;
+        for incident in &self.incidents {
+            incident.validate()?;
+            if incident.incident_seq <= previous || incident.incident_seq > self.through_seq {
+                return Err(CoreError::InvalidEnvelope(
+                    "incident page is out of sequence bounds".into(),
+                ));
+            }
+            previous = incident.incident_seq;
+        }
+        if self.next_after_seq.is_some_and(|next| {
+            self.incidents.is_empty() || next != previous || next >= self.through_seq
+        }) {
+            return Err(CoreError::InvalidEnvelope(
+                "incident page continuation is inconsistent".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Exact retained event facts for protected operator inspection.
+///
+/// This owns no payload bytes and cannot expire, collect or recall anything.
+/// Custody dispositions and storage eligibility never establish native recall.
+/// Deserialized receipts/evidence retain their existing validation and bounds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionView {
+    /// Original durable identity/hash/acceptance and current custody disposition.
+    pub receipt: crate::storage::CustodyReceipt,
+    /// Existing bounded delivery evidence; absent for ordinary unhanded work.
+    pub delivery: Option<DeliveryEvidence>,
+    /// Original absolute expiry in Unix milliseconds, absent when never set.
+    pub expires_at_ms: Option<u64>,
+    /// Current serialized-envelope storage bytes, without disclosing them.
+    pub envelope_bytes: u64,
+    /// Zero envelope bytes with the immutable dedup row/hash still retained.
+    pub payload_compacted: bool,
+    /// Nonempty terminal unhanded payload passes the logical GC state guard.
+    ///
+    /// The keep-newest retention policy may still retain an eligible payload.
+    pub gc_eligible: bool,
+    /// Stored revision of this latest event's full scope, even after compaction.
+    ///
+    /// Absent for non-latest events or when no watermark was recorded.
+    pub latest_watermark: Option<u64>,
+}
+
+impl RetentionView {
+    /// Rejects invalid ranges and contradictory decoded compaction/GC flags.
+    ///
+    /// No flag can describe handed or pending work as compacted or GC-eligible.
+    pub fn validate(&self) -> Result<(), CoreError> {
+        let mut numbers = vec![self.envelope_bytes];
+        numbers.extend(self.expires_at_ms);
+        numbers.extend(self.latest_watermark);
+        check_ranges(&numbers)?;
+        let terminal = matches!(
+            self.receipt.state,
+            crate::storage::EventState::Superseded | crate::storage::EventState::Expired
+        );
+        let unhanded = self
+            .delivery
+            .as_ref()
+            .is_none_or(|view| view.delivery == DeliveryState::Unhanded);
+        if self.expires_at_ms == Some(0)
+            || self.latest_watermark == Some(0)
+            || self.payload_compacted != (self.envelope_bytes == 0)
+            || (self.payload_compacted && !(terminal && unhanded))
+            || self.gc_eligible != (terminal && unhanded && self.envelope_bytes > 0)
+        {
+            return Err(CoreError::InvalidEnvelope(
+                "retention facts are inconsistent".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// One entry of an event's evidence log.
@@ -507,7 +618,8 @@ pub struct MaintenanceReport {
     pub unknown_handoffs: usize,
     /// Held or unreceipted attempts that became overdue incidents.
     pub overdue_rechecks: usize,
-    /// Long recipient holds escalated to incidents.
+    /// New incidents raised for long recipient holds, predecessors that
+    /// never arrived and dependents blocked behind an expired predecessor.
     pub escalated_holds: usize,
 }
 
@@ -737,6 +849,78 @@ impl Storage {
             .collect()
     }
 
+    /// Reads exact custody, expiry, payload and scoped-watermark storage facts.
+    ///
+    /// `publisher` and `event_id` use their existing validated identifier
+    /// domains; an unaccepted key returns `None`. A local read transaction
+    /// joins the existing receipt/evidence with envelope length and retained
+    /// latest scope, including compacted rows. No payload bytes are loaded or
+    /// returned, and no expiry, GC, delivery or incident mutation occurs.
+    /// Eligibility is only the existing terminal-unhanded nonempty guard;
+    /// keep-newest may retain it and nothing here establishes native recall.
+    /// Invalid identifiers, malformed retained scope or corrupt rows fail.
+    pub fn retention(
+        &self,
+        publisher: &str,
+        event_id: &str,
+    ) -> Result<Option<RetentionView>, CoreError> {
+        let publisher_id = PublisherId::new(publisher)?;
+        let event = crate::types::EventId::new(event_id)?;
+        let publisher = publisher_id.as_str();
+        let event_id = event.as_str();
+        let tx = self.connection.unchecked_transaction()?;
+        let Some(receipt) = self.lookup(&publisher_id, &event)? else {
+            return Ok(None);
+        };
+        let delivery = self.delivery_evidence(publisher, event_id)?;
+        let (expiry, bytes, policy, scope): (Option<i64>, i64, String, String) = tx.query_row(
+            "SELECT expires_at_ms, length(envelope_json), policy_class, scope_key
+             FROM events WHERE publisher_id = ?1 AND event_id = ?2",
+            params![publisher, event_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        let latest_watermark = if policy == "latest" {
+            let fields: Vec<_> = scope.split('\u{1f}').collect();
+            if fields.len() != 8 || fields[0] != publisher || fields[6] != "latest" {
+                return Err(corrupt("invalid retained latest scope".into()));
+            }
+            tx.query_row(
+                "SELECT revision FROM watermarks
+                 WHERE publisher_id = ?1 AND recipient = ?2 AND kind = ?3
+                   AND mode = ?4 AND project = ?5 AND task = ?6 AND stream_id = ?7",
+                params![
+                    fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[7]
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(from_sql)
+            .transpose()?
+        } else {
+            None
+        };
+        let envelope_bytes = from_sql(bytes)?;
+        let terminal = matches!(
+            receipt.state,
+            crate::storage::EventState::Superseded | crate::storage::EventState::Expired
+        );
+        let unhanded = delivery
+            .as_ref()
+            .is_none_or(|view| view.delivery == DeliveryState::Unhanded);
+        let view = RetentionView {
+            receipt,
+            delivery,
+            expires_at_ms: expiry.map(from_sql).transpose()?,
+            envelope_bytes,
+            payload_compacted: envelope_bytes == 0,
+            gc_eligible: terminal && unhanded && envelope_bytes > 0,
+            latest_watermark,
+        };
+        view.validate()?;
+        tx.commit()?;
+        Ok(Some(view))
+    }
+
     /// Lists incidents, newest-deadline-first for open ones.
     ///
     /// With `include_closed` false only open incidents are returned, in
@@ -748,6 +932,88 @@ impl Storage {
         now_ms: u64,
         limit: usize,
     ) -> Result<Vec<IncidentView>, CoreError> {
+        self.incident_listing(include_closed, now_ms, limit, None)
+    }
+
+    /// Reads a bounded stable-number page without changing incident state.
+    ///
+    /// `after_seq` is exclusive and defaults to zero at the caller. An absent
+    /// `through_seq` requires zero `after_seq` and captures the current highest
+    /// retained number. Supplied bounds must be nonnegative SQLite integers,
+    /// ordered and no higher than retained history. `limit` clamps to 1..200.
+    /// Rows/filter/age/dependents are live within one read transaction; new
+    /// numbers above the high-water bound wait for a subsequent scan. Errors
+    /// reject invalid cursors, time or corrupt storage without mutation.
+    pub fn incidents_page(
+        &self,
+        include_closed: bool,
+        now_ms: u64,
+        limit: usize,
+        after_seq: u64,
+        through_seq: Option<u64>,
+    ) -> Result<IncidentPage, CoreError> {
+        to_sql(now_ms)?;
+        to_sql(after_seq)?;
+        if let Some(through) = through_seq {
+            to_sql(through)?;
+        } else if after_seq != 0 {
+            return Err(CoreError::InvalidEnvelope(
+                "continuation requires through_seq".into(),
+            ));
+        }
+        let tx = self.connection.unchecked_transaction()?;
+        let high = from_sql(tx.query_row(
+            "SELECT COALESCE(MAX(incident_seq), 0) FROM incidents",
+            [],
+            |row| row.get(0),
+        )?)?;
+        let through_seq = through_seq.unwrap_or(high);
+        if after_seq > through_seq || through_seq > high {
+            return Err(CoreError::InvalidEnvelope(
+                "incident cursor exceeds scan bounds".into(),
+            ));
+        }
+        let limit = limit.clamp(1, 200);
+        let mut incidents = self.incident_listing(
+            include_closed,
+            now_ms,
+            limit + 1,
+            Some((after_seq, through_seq)),
+        )?;
+        let more = incidents.len() > limit;
+        incidents.truncate(limit);
+        let next_after_seq = more.then(|| incidents.last().expect("nonempty page").incident_seq);
+        let page = IncidentPage {
+            incidents,
+            through_seq,
+            next_after_seq,
+        };
+        page.validate()?;
+        tx.commit()?;
+        Ok(page)
+    }
+
+    /// Loads incident rows for legacy check order or a finite sequence window.
+    ///
+    /// `bounds` absent preserves legacy ordering; present selects strictly
+    /// ascending numbers in its exclusive-lower/inclusive-upper range.
+    /// `limit` bounds decoded rows; age uses `now_ms` and dependents remain
+    /// bounded to 50. Invalid stored identifiers/ranges propagate as errors.
+    fn incident_listing(
+        &self,
+        include_closed: bool,
+        now_ms: u64,
+        limit: usize,
+        bounds: Option<(u64, u64)>,
+    ) -> Result<Vec<IncidentView>, CoreError> {
+        let order = if bounds.is_some() {
+            "incident_seq"
+        } else {
+            "(state = 'open') DESC, next_check_ms, incident_seq"
+        };
+        let (after_seq, through_seq) = bounds.map_or((None, None), |(after, through)| {
+            (Some(after), Some(through))
+        });
         let filter = if include_closed {
             "1 = 1"
         } else {
@@ -758,8 +1024,13 @@ impl Storage {
                     created_ms, updated_ms, next_check_ms, review_deadline_ms, responsible,
                     duplicate_risk, resolution
              FROM incidents WHERE {filter}
-             ORDER BY (state = 'open') DESC, next_check_ms, incident_seq LIMIT ?1"
+               AND (?2 IS NULL OR incident_seq > ?2) AND (?3 IS NULL OR incident_seq <= ?3)
+             ORDER BY {order} LIMIT ?1"
         ))?;
+        /// One `incidents` row in `SELECT` order: incident number, publisher,
+        /// event, attempt, kind, state, reason, created, updated, next check,
+        /// review deadline, responsible parties, duplicate-risk flag and
+        /// resolution. States are parsed into [`IncidentState`] afterwards.
         type Row = (
             i64,
             String,
@@ -777,24 +1048,31 @@ impl Storage {
             Option<String>,
         );
         let rows: Vec<Row> = statement
-            .query_map(params![to_sql(limit as u64)?], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                    row.get(9)?,
-                    row.get(10)?,
-                    row.get(11)?,
-                    row.get(12)?,
-                    row.get(13)?,
-                ))
-            })?
+            .query_map(
+                params![
+                    to_sql(limit as u64)?,
+                    after_seq.map(to_sql).transpose()?,
+                    through_seq.map(to_sql).transpose()?
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
+                        row.get(13)?,
+                    ))
+                },
+            )?
             .collect::<Result<_, _>>()?;
         let mut views = Vec::with_capacity(rows.len());
         for (
@@ -1250,7 +1528,8 @@ impl Storage {
         tx.execute(
             "UPDATE incidents SET state = 'disposed', resolved_ms = ?1, updated_ms = ?1,
                  resolution = ?2
-             WHERE publisher_id = ?3 AND event_id = ?4 AND kind = 'predecessor_missing'
+             WHERE publisher_id = ?3 AND event_id = ?4
+               AND kind IN ('predecessor_missing', 'predecessor_expired')
                AND state = 'open'",
             params![
                 to_sql(now_ms)?,
@@ -1598,8 +1877,8 @@ impl Storage {
     }
 
     /// Runs one bounded reconciliation pass: expiry of unhanded events,
-    /// lease and recheck handling, and escalation of long recipient holds
-    /// to incidents.
+    /// lease and recheck handling, and escalation of long recipient holds,
+    /// missing predecessors and expired predecessors to incidents.
     pub fn run_maintenance(&mut self, now_ms: u64) -> Result<MaintenanceReport, CoreError> {
         let expired_events = self.expire_due(now_ms)?;
         let (reclaimed_reservations, unknown_handoffs, overdue_rechecks) =
@@ -1616,13 +1895,40 @@ impl Storage {
 
     /// Escalates holds older than the hold threshold to incidents on the
     /// recipient's oldest waiting event and resolves stale ones.
+    ///
+    /// Also raises `predecessor_missing` for a dependent whose predecessor
+    /// was never accepted (after the hold threshold) and
+    /// `predecessor_expired` for one whose predecessor expired before
+    /// delivery (at once; expiry is final). Neither releases the dependent;
+    /// both close when the dependent is waived, disposed or no longer
+    /// waiting, and `predecessor_expired` also closes (and is not raised
+    /// again) once the predecessor reaches a state that satisfies the dispatch
+    /// dependency rule (accepted, hook-submitted or disposed),
+    /// with a neutral resolution text that claims no particular decision.
+    /// Returns how many incidents were newly opened.
+    ///
+    /// Each candidate query is bounded by `MAINTENANCE_BATCH` and skips
+    /// items that already have an open incident of its kind, so a backlog
+    /// larger than one batch is exposed over successive passes instead of
+    /// re-selecting the same oldest items forever; an incident that was
+    /// closed (resolved, disposed or authorized) no longer suppresses its
+    /// item, and nothing here ever releases a dependent.
     fn escalate_holds(&mut self, now_ms: u64) -> Result<usize, CoreError> {
         let threshold = to_sql(now_ms.saturating_sub(HOLD_INCIDENT_AFTER_MS))?;
         let tx = self.begin()?;
         let holds: Vec<(String, String)> = tx
             .prepare(
-                "SELECT recipient, reason FROM recipient_holds
-                 WHERE since_ms <= ?1 ORDER BY since_ms LIMIT ?2",
+                "SELECT h.recipient, h.reason FROM recipient_holds h
+                 WHERE h.since_ms <= ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM incidents i
+                       WHERE i.kind = 'recipient_held' AND i.state = 'open'
+                         AND (i.publisher_id, i.event_id) = (
+                             SELECT o.publisher_id, o.event_id FROM events o
+                             WHERE o.state = 'pending' AND o.delivery = 'unhanded'
+                               AND o.recipient = h.recipient
+                             ORDER BY o.acceptance_seq LIMIT 1))
+                 ORDER BY h.since_ms LIMIT ?2",
             )?
             .query_map(params![threshold, MAINTENANCE_BATCH], |row| {
                 Ok((row.get(0)?, row.get(1)?))
@@ -1638,6 +1944,10 @@ impl Storage {
                    AND NOT EXISTS (SELECT 1 FROM events p
                                    WHERE p.publisher_id = e.publisher_id
                                      AND p.event_id = e.predecessor)
+                   AND NOT EXISTS (SELECT 1 FROM incidents i
+                                   WHERE i.publisher_id = e.publisher_id
+                                     AND i.event_id = e.event_id
+                                     AND i.kind = 'predecessor_missing' AND i.state = 'open')
                  ORDER BY e.acceptance_seq LIMIT ?2",
             )?
             .query_map(params![threshold, MAINTENANCE_BATCH], |row| {
@@ -1657,6 +1967,42 @@ impl Storage {
                 escalated += 1;
             }
         }
+        // A predecessor that expired before delivery can never produce the
+        // evidence its dependent waits for; the dependent keeps its order
+        // and becomes an explicit incident until an audited waiver or
+        // disposition.
+        let expired: Vec<(String, String, String)> = tx
+            .prepare(
+                "SELECT e.publisher_id, e.event_id, e.predecessor FROM events e
+                 JOIN events p ON p.publisher_id = e.publisher_id AND p.event_id = e.predecessor
+                 WHERE e.state = 'pending' AND e.delivery = 'unhanded'
+                   AND e.predecessor_waived = 0 AND p.state = 'expired'
+                   AND p.delivery NOT IN ('accepted', 'hook_submitted', 'disposed')
+                   AND NOT EXISTS (SELECT 1 FROM incidents i
+                                   WHERE i.publisher_id = e.publisher_id
+                                     AND i.event_id = e.event_id
+                                     AND i.kind = 'predecessor_expired' AND i.state = 'open')
+                 ORDER BY e.acceptance_seq LIMIT ?1",
+            )?
+            .query_map(params![MAINTENANCE_BATCH], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<_, _>>()?;
+        for (publisher, event_id, predecessor) in expired {
+            if open_incident_in(
+                &tx,
+                &publisher,
+                &event_id,
+                None,
+                "predecessor_expired",
+                &format!(
+                    "predecessor {predecessor} expired before delivery; an audited waiver or disposition is required"
+                ),
+                now_ms,
+            )? {
+                escalated += 1;
+            }
+        }
         tx.execute(
             "UPDATE incidents SET state = 'resolved', resolved_ms = ?1, updated_ms = ?1,
                  resolution = 'the predecessor was accepted'
@@ -1665,6 +2011,32 @@ impl Storage {
                              ON p.publisher_id = e.publisher_id AND p.event_id = e.predecessor
                            WHERE e.publisher_id = incidents.publisher_id
                              AND e.event_id = incidents.event_id)",
+            params![to_sql(now_ms)?],
+        )?;
+        // Once the predecessor reaches a releasing delivery state, the
+        // dispatch eligibility rule releases its dependent on its own; the
+        // incident closes without asserting which outcome satisfied the rule.
+        tx.execute(
+            "UPDATE incidents SET state = 'resolved', resolved_ms = ?1, updated_ms = ?1,
+                 resolution = 'the predecessor now satisfies the dispatch dependency rule (accepted, hook-submitted or disposed)'
+             WHERE kind = 'predecessor_expired' AND state = 'open'
+               AND EXISTS (SELECT 1 FROM events e JOIN events p
+                             ON p.publisher_id = e.publisher_id AND p.event_id = e.predecessor
+                           WHERE e.publisher_id = incidents.publisher_id
+                             AND e.event_id = incidents.event_id
+                             AND p.delivery IN ('accepted', 'hook_submitted', 'disposed'))",
+            params![to_sql(now_ms)?],
+        )?;
+        // A dependent that expired, was disposed or was waived no longer waits.
+        tx.execute(
+            "UPDATE incidents SET state = 'resolved', resolved_ms = ?1, updated_ms = ?1,
+                 resolution = 'the dependent is no longer waiting'
+             WHERE kind IN ('predecessor_missing', 'predecessor_expired') AND state = 'open'
+               AND NOT EXISTS (SELECT 1 FROM events e
+                               WHERE e.publisher_id = incidents.publisher_id
+                                 AND e.event_id = incidents.event_id
+                                 AND e.state = 'pending' AND e.delivery = 'unhanded'
+                                 AND e.predecessor_waived = 0)",
             params![to_sql(now_ms)?],
         )?;
         for (recipient, reason) in holds {
