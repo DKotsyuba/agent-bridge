@@ -498,8 +498,9 @@ impl Hub {
     /// background pass ([`Hub::close_pass`]), which reads the transcript
     /// before releasing one past its deadline, so evidence appended after
     /// the previous pass, even across the deadline, is still recorded. Their
-    /// slots therefore free at most one [`ClaudeTiming::close_interval`]
-    /// (2 s by default) after the deadline; meanwhile the recipient stays
+    /// slots free on a following transcript-first pass: the delay between
+    /// passes is [`ClaudeTiming::close_interval`] (2 s by default), plus
+    /// the time spent scanning transcripts. Meanwhile the recipient stays
     /// held at attestation with no attempt reserved.
     fn expire(&self, now: u64) {
         let expired: Vec<String> = self

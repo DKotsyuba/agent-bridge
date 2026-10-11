@@ -1045,23 +1045,46 @@ fn reserve_in(
     }
 
     let modes = path_modes(mode, attestation.lifecycle);
-    let head: Option<(String, String, String, String)> = tx
-        .query_row(
-            &format!(
-                "SELECT e.publisher_id, e.event_id, e.policy_class, e.scope_key FROM events e
-                 WHERE {ELIGIBLE} AND e.mode IN {modes}
-                 ORDER BY e.accepted_at_ms
-                          - CASE e.policy_class WHEN 'keep_all' THEN {KEEP_ALL_BOOST_MS} ELSE 0 END,
-                          e.acceptance_seq
-                 LIMIT 1"
-            ),
-            params![recipient, now],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .optional()?;
-    let Some((head_publisher, head_event, policy_class, scope)) = head else {
-        set_hold(tx, &recipient, None, now_ms)?;
-        return Ok(Selection::Idle);
+    // Head selection loop: a `latest` head whose producer lost lineage
+    // authority is held visibly (delivery + retained incident) and skipped,
+    // so stale old-producer snapshots can never be selected after an
+    // audited transfer or an ambiguous migration. The loop is bounded by
+    // the eligible set size.
+    let (head_publisher, head_event, policy_class, scope) = loop {
+        let head: Option<(String, String, String, String, String)> = tx
+            .query_row(
+                &format!(
+                    "SELECT e.publisher_id, e.event_id, e.policy_class, e.scope_key, e.lineage_key
+                     FROM events e
+                     WHERE {ELIGIBLE} AND e.mode IN {modes}
+                     ORDER BY e.accepted_at_ms
+                              - CASE e.policy_class WHEN 'keep_all' THEN {KEEP_ALL_BOOST_MS} ELSE 0 END,
+                              e.acceptance_seq
+                     LIMIT 1"
+                ),
+                params![recipient, now],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((publisher, event, policy_class, scope, lineage_key)) = head else {
+            set_hold(tx, &recipient, None, now_ms)?;
+            return Ok(Selection::Idle);
+        };
+        if policy_class == "latest"
+            && let Some(reason) = crate::storage::lineage_block(tx, &publisher, &lineage_key)?
+        {
+            crate::storage::hold_for_lineage(tx, &publisher, &event, &reason, now_ms)?;
+            continue;
+        }
+        break (publisher, event, policy_class, scope);
     };
 
     let mut candidates = vec![(head_publisher.clone(), head_event.clone())];
@@ -1344,6 +1367,31 @@ impl Storage {
                 tx,
                 "the recipient is no longer inactive; auto waits for its hook".into(),
             );
+        }
+        // Cheap pre-invocation lineage authority fence: a `latest` member
+        // whose producer lost the lineage between reservation and now is
+        // held visibly (bytes and any evidence untouched) and the
+        // reservation — still uninvoked — is released untouched.
+        {
+            let mut statement = tx.prepare(
+                "SELECT m.publisher_id, m.event_id, e.lineage_key FROM attempt_members m
+                 JOIN events e ON e.publisher_id = m.publisher_id AND e.event_id = m.event_id
+                 WHERE m.attempt_seq = ?1 AND e.policy_class = 'latest'
+                   AND e.lineage_key != ''",
+            )?;
+            let members: Vec<(String, String, String)> = statement
+                .query_map(params![to_sql(fence.attempt_seq)?], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .collect::<Result<_, _>>()?;
+            drop(statement);
+            for (publisher, event_id, lineage_key) in members {
+                if let Some(reason) = crate::storage::lineage_block(&tx, &publisher, &lineage_key)?
+                {
+                    crate::storage::hold_for_lineage(&tx, &publisher, &event_id, &reason, now_ms)?;
+                    return release(tx, reason);
+                }
+            }
         }
         let live: i64 = tx.query_row(
             "SELECT COUNT(*) FROM attempt_members m JOIN events e

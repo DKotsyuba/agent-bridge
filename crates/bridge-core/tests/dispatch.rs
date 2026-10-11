@@ -81,7 +81,9 @@ fn reserved_attempt_freezes_recipient_actor_epoch_path_manifest_and_deadline() {
     assert!(
         record
             .manifest
-            .contains("<agent-run event=\"evt-1\" kind=\"worker.completed\">")
+            .contains("<agent-run event=\"evt-1\" kind=\"worker.completed\" source=\"agent-run\">"),
+        "the frozen manifest includes the stamped issuer provenance: {}",
+        record.manifest
     );
     assert!(record.manifest.contains(PROVENANCE_STATEMENT));
     assert_eq!(

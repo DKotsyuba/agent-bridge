@@ -33,11 +33,31 @@ automatically repeated after a possible handoff.
     (non-terminal cap, per-publisher, per-recipient snapshot reserve with
     keep_all exempt, and a hard cap on retained dedup history that is never
     evicted), pending-only expiry, payload compaction that keeps dedup
-    identity. The schema is versioned (current: 4); versions 2 and 3 migrate
-    forward in one transaction without touching accepted bytes, hashes or
-    identifiers, a version-3 attempt that may have reached a carrier becomes
-    a `review` event with an incident, and unknown/newer/foreign databases
-    are refused untouched.
+    identity, and producer-lineage authority: one authenticated producer
+    owns each `latest` lineage (the coalescing scope without the
+    publisher); any other producer is declined before acceptance, and
+    authority passes only through an audited operator transfer that never
+    rewrites event ids, watermarks, attempts or evidence. A transfer
+    validates every scope field with the publication domain rules and the
+    canonical recipient, holds the previous owner's unhanded or reserved
+    `latest` events visibly (retained `lineage_authority_lost` incident) so
+    they are never selected or invoked afterwards, and is *refused* while
+    another producer's event in the lineage is invoking, in review or held
+    by the native side: a possible native effect cannot be recalled, so the
+    operator must first resolve it with the audited disposition. Identity
+    is the Bridge-stamped publisher only. Two processes sharing one grant
+    are one producer, so a same-publisher restart that reuses lower
+    revisions is indistinguishable from stale input and stays superseded;
+    the supported declared signals are a new stream id or an audited
+    transfer to a different publisher identity — cross-publisher isolation
+    does not cover this case. The schema is versioned (current: 5); versions
+    2, 3 and 4 migrate forward in one transaction without touching accepted
+    bytes, hashes or identifiers (lineage owners are backfilled from the
+    retained events and watermarks; a lineage with several historical
+    producers migrates as *ambiguous* and fences publication and dispatch
+    until an operator resolves it), a version-3 attempt that may have
+    reached a carrier becomes a `review` event with an incident, and
+    unknown/newer/foreign databases are refused untouched.
   - `framing`: allowlisted source-tag wrappers with escaped, bounded
     manifests, a separate source block per member, forbidden-control
     rejection and the fixed external-data/no-authority statement. An event
@@ -134,9 +154,9 @@ status disclosure. Two disjoint realms:
   forcing `keep_all` and its exact recipients; an external root token is never
   a core credential.
 - **operator grants** (`admin = true`, empty allowlists, cannot publish):
-  `incidents`, `holds`, `authorize_retry`, `dispose`, `waive_predecessor`,
-  `evidence`, `pause`, `resume`, `shutdown`; every decision is audited with the
-  grant's identity.
+  `incidents`, `holds`, `counts`, `authorize_retry`, `dispose`,
+  `waive_predecessor`, `evidence`, `pause`, `resume`, `transfer_lineage`,
+  `shutdown`; every decision is audited with the grant's identity.
 
 Lifecycle: socket ownership refuses a live endpoint, preserves every foreign
 path (regular file, symlink, directory, unprovable socket) and removes a stale

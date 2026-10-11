@@ -96,8 +96,8 @@ Codex / Claude qualification is **not** established (see the end).
   payload stays pending until a slot frees; that check releases only held
   hand-offs past their recheck horizon, in memory, and reads no transcript;
   written-without-receipt slots are freed by the background pass, which
-  checks the transcript first, at most one pass interval (2 s by default)
-  after their deadline); earlier candidates shared one callback per daemon and inbox
+  checks the transcript first; passes are 2 s apart by default, plus
+  transcript scan time); earlier candidates shared one callback per daemon and inbox
   directory, which let a historical peer entry settle a later same-manifest
   attempt after a manual retry. A receipt counts only on the attempt's own
   callback, when it names that attempt's unguessable message id *and* its sender's kernel

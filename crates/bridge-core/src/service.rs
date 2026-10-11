@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use crate::dispatch::{
     DispatchCarrier, DispatchReport, DispatchTiming, dispatch_message, lock_storage,
 };
-use crate::recovery::{EvidenceTier, HoldView, IncidentView};
+use crate::recovery::{DeliveryState, EvidenceTier, HoldView, IncidentView, LineageScope};
 use crate::storage::{CustodyReceipt, Limits, Storage};
 use crate::types::{
     CoreError, Envelope, EventId, ExpiresAt, Kind, Metadata, Mode, NativeAddress, Payload, Policy,
@@ -201,6 +201,36 @@ pub struct PublishBody {
     pub expires_at: Option<ExpiresAt>,
 }
 
+/// Bounded delivery counts for the operator surface.
+///
+/// Counts only: no event payloads, recipients or foreign detail are
+/// enumerated. Routine losses stay countable (`held` covers native holds
+/// and written-no-receipt; `review` covers possible hand-offs) so they
+/// cannot be buried under routine unknowns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryCounts {
+    /// Events never handed to any path.
+    pub unhanded: u64,
+    /// Events frozen into a reserved attempt that has not invoked.
+    pub reserved: u64,
+    /// Events with an invoking attempt (a hand-off may exist).
+    pub invoking: u64,
+    /// Events held by the native side or written without a receipt.
+    pub held: u64,
+    /// Events with a possible hand-off awaiting manual resolution.
+    pub review: u64,
+    /// Events accepted by a native queue or inbox.
+    pub accepted: u64,
+    /// Events whose hook payload was handed out.
+    pub hook_submitted: u64,
+    /// Events permanently refused before acceptance.
+    pub refused: u64,
+    /// Events closed by an audited disposition.
+    pub disposed: u64,
+    /// Currently open incidents.
+    pub open_incidents: u64,
+}
+
 /// A bearer token that never appears in `Debug` output.
 ///
 /// On the wire it is a plain JSON string (the early wire format is
@@ -274,6 +304,13 @@ pub enum Request {
         /// Maximum rows (default 100, at most 200).
         limit: Option<usize>,
     },
+    /// Bounded delivery counts: how many events/attempt states sit in each
+    /// tier, so routine losses (held, written-no-receipt, unknown) are
+    /// countable without enumerating any event payload or foreign detail.
+    Counts {
+        /// Operator-grant bearer token.
+        token: Token,
+    },
     /// Authorize one more attempt of the same event after an unresolved
     /// possible hand-off; the duplicate risk is recorded permanently.
     AuthorizeRetry {
@@ -323,6 +360,36 @@ pub enum Request {
         /// The observed fact.
         detail: String,
     },
+    /// Transfer a stream lineage's authoritative producer (audited).
+    ///
+    /// Operator grants only. The lineage is the coalescing scope without
+    /// the publisher (exact recipient, kind, mode, declared project/task,
+    /// stream); the previous owner is fenced from further `latest`
+    /// publications into it, and neither producer's watermarks, event ids,
+    /// attempts nor evidence are rewritten. Refused while another
+    /// producer's event in the lineage has a possible or unknown native
+    /// effect (invoking, review or natively held): resolve it first.
+    TransferLineage {
+        /// Operator-grant bearer token.
+        token: Token,
+        /// Exact recipient address of the lineage.
+        recipient: NativeAddress,
+        /// Event kind of the lineage.
+        kind: String,
+        /// Requested delivery mode of the lineage.
+        mode: String,
+        /// Declared project scope (empty string when none).
+        project: String,
+        /// Declared task scope (empty string when none).
+        task: String,
+        /// The authoritative stream.
+        stream: String,
+        /// The publisher taking authority (validated, Bridge-stamped
+        /// thereafter; never taken from event metadata).
+        new_publisher: String,
+        /// Audit note: why the handover is acceptable.
+        note: String,
+    },
     /// Set the durable no-wake policy for a recipient.
     Pause {
         /// Operator-grant bearer token.
@@ -367,6 +434,11 @@ pub enum Response {
     Holds {
         /// The holds, bounded by the request limit.
         holds: Vec<HoldView>,
+    },
+    /// Bounded delivery counts (no payloads, no enumeration).
+    Counts {
+        /// Count of events per delivery tier.
+        counts: DeliveryCounts,
     },
     /// An operator action was applied (and audited).
     Done,
@@ -1043,6 +1115,25 @@ fn serve(state: &ServiceState, request: Request) -> Result<Response, Refusal> {
                 holds: storage.holds(listing(limit))?,
             })
         }
+        Request::Counts { token } => {
+            operator(state, &token)?;
+            let storage = lock_storage(&state.storage);
+            let count = |state: DeliveryState| storage.count_delivery(state);
+            Ok(Response::Counts {
+                counts: DeliveryCounts {
+                    unhanded: count(DeliveryState::Unhanded)?,
+                    reserved: count(DeliveryState::Reserved)?,
+                    invoking: count(DeliveryState::Invoking)?,
+                    held: count(DeliveryState::Held)?,
+                    review: count(DeliveryState::Review)?,
+                    accepted: count(DeliveryState::Accepted)?,
+                    hook_submitted: count(DeliveryState::HookSubmitted)?,
+                    refused: count(DeliveryState::Refused)?,
+                    disposed: count(DeliveryState::Disposed)?,
+                    open_incidents: storage.open_incident_count()?,
+                },
+            })
+        }
         Request::AuthorizeRetry {
             token,
             publisher,
@@ -1114,6 +1205,36 @@ fn serve(state: &ServiceState, request: Request) -> Result<Response, Refusal> {
                         current_unix_millis(),
                     )
                     .map(|_| ())
+            })
+        }
+        Request::TransferLineage {
+            token,
+            recipient,
+            kind,
+            mode,
+            project,
+            task,
+            stream,
+            new_publisher,
+            note,
+        } => {
+            let grant = operator(state, &token)?;
+            mutate(state, |storage| {
+                storage.transfer_lineage(
+                    &LineageScope {
+                        recipient: recipient.to_canonical_string(),
+                        kind,
+                        mode,
+                        project,
+                        task,
+                        stream,
+                    },
+                    &new_publisher,
+                    &note,
+                    &grant.publisher,
+                    current_unix_millis(),
+                )?;
+                Ok(())
             })
         }
         Request::Pause {

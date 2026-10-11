@@ -14,8 +14,8 @@
 //! The client reconnects once on its own when an idle connection was closed
 //! by the service, but only for requests that are safe to repeat.
 
-pub use bridge_core::recovery::{EvidenceTier, HoldView, IncidentView};
-pub use bridge_core::service::DeliveryEvidence;
+pub use bridge_core::recovery::{EvidenceTier, HoldView, IncidentView, LineageScope};
+pub use bridge_core::service::{DeliveryCounts, DeliveryEvidence};
 pub use bridge_core::{
     CoreError, CustodyReceipt, Envelope, EnvelopeHash, EventId, ExpiresAt, Harness, Kind, Metadata,
     Mode, NativeAddress, Payload, Policy, PublisherId, SCHEMA_VERSION, StreamId,
@@ -270,7 +270,62 @@ impl BridgeClient {
         })
     }
 
+    /// Reads bounded delivery counts (events per tier plus open
+    /// incidents); operator grants only.
+    pub fn counts(&mut self, token: &str) -> Result<DeliveryCounts, ProtocolError> {
+        match self.round_trip(
+            &Request::Counts {
+                token: Token::new(token),
+            },
+            false,
+        )? {
+            Response::Counts { counts } => Ok(counts),
+            Response::Error { class, detail } => Err(ProtocolError { class, detail }),
+            other => Err(ProtocolError {
+                class: "internal".into(),
+                detail: format!("unexpected response to counts: {other:?}"),
+            }),
+        }
+    }
+
+    /// Transfers a stream lineage's authoritative producer (audited,
+    /// operator grants only).
+    ///
+    /// The lineage is the coalescing scope without the publisher (exact
+    /// recipient, kind, mode, declared project/task, stream). After the
+    /// transfer the previous owner's further `latest` publications into
+    /// the lineage are declined before acceptance; event ids, watermarks,
+    /// attempts and evidence are never rewritten. The core refuses the handover
+    /// while another producer's event in the lineage has a possible or
+    /// unknown native effect (invoking, in review or natively held): resolve
+    /// it with an audited disposition first. Never resent after a
+    /// lost response: re-read the incident/audit surface instead.
+    pub fn transfer_lineage(
+        &mut self,
+        token: &str,
+        scope: &LineageScope,
+        new_publisher: &str,
+        note: &str,
+    ) -> Result<(), ProtocolError> {
+        let recipient = NativeAddress::parse(&scope.recipient).map_err(|error| ProtocolError {
+            class: "invalid".into(),
+            detail: error.to_string(),
+        })?;
+        self.operator_action(Request::TransferLineage {
+            token: Token::new(token),
+            recipient,
+            kind: scope.kind.clone(),
+            mode: scope.mode.clone(),
+            project: scope.project.clone(),
+            task: scope.task.clone(),
+            stream: scope.stream.clone(),
+            new_publisher: new_publisher.to_string(),
+            note: note.to_string(),
+        })
+    }
+
     /// Sets the durable no-wake policy for a recipient.
+    ///
     pub fn pause(
         &mut self,
         token: &str,
