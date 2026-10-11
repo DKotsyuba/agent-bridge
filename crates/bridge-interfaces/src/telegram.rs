@@ -15,9 +15,9 @@
 //! standard input as a config file, never in argv (visible to other
 //! processes). Every transport observation is redacted against the token
 //! (verbatim, with `:` percent-encoded, and its secret part after `:`)
-//! *before* any classification, truncation or detail is built, so a
-//! provider or transport that echoes the token cannot put it into an
-//! outcome, ledger or log.
+//! *before* any classification, truncation or detail is built — and, for a
+//! JSON answer, again on every decoded string, so a token hidden behind JSON
+//! escapes still cannot reach an outcome, ledger or log.
 //!
 //! Outcome classes are kept strictly apart ([`SendOutcome`]): provider
 //! acceptance (not proof that anyone read it), known refusal (an HTTP 4xx
@@ -303,13 +303,42 @@ pub fn redact(text: &str, token: &str) -> String {
         .fold(text.to_string(), |text, form| text.replace(form, REDACTED))
 }
 
+/// Redacts every string (and object key) of a decoded JSON value in place.
+fn redact_json(value: &mut Value, token: &str) {
+    match value {
+        Value::String(text) => *text = redact(text, token),
+        Value::Array(items) => items.iter_mut().for_each(|item| redact_json(item, token)),
+        Value::Object(map) => {
+            *map = std::mem::take(map)
+                .into_iter()
+                .map(|(key, mut item)| {
+                    redact_json(&mut item, token);
+                    (redact(&key, token), item)
+                })
+                .collect();
+        }
+        _ => {}
+    }
+}
+
 /// Redacts every untrusted text of a transport reply.
+///
+/// An answer body is redacted as raw text and, when it is JSON, again after
+/// decoding: a JSON string escape (`:`, `T`, …) can hide a token
+/// from the raw text yet decode to it in a provider description.
 fn redact_reply(reply: TransportReply, token: &str) -> TransportReply {
     match reply {
-        TransportReply::Responded { status, body } => TransportReply::Responded {
-            status,
-            body: redact(&body, token),
-        },
+        TransportReply::Responded { status, body } => {
+            let body = redact(&body, token);
+            let body = match serde_json::from_str::<Value>(&body) {
+                Ok(mut parsed) => {
+                    redact_json(&mut parsed, token);
+                    parsed.to_string()
+                }
+                Err(_) => body,
+            };
+            TransportReply::Responded { status, body }
+        }
         TransportReply::NotSent(detail) => TransportReply::NotSent(redact(&detail, token)),
         TransportReply::Uncertain(detail) => TransportReply::Uncertain(redact(&detail, token)),
     }
@@ -721,5 +750,48 @@ mod tests {
         );
         assert!(args.contains(&"=https".to_string()));
         assert_eq!(args.first().map(String::as_str), Some("--disable"));
+    }
+
+    /// A transport answering one fixed raw HTTP body.
+    struct Fixed(u16, String);
+
+    impl Transport for Fixed {
+        /// Answers the fixed status and body.
+        fn post(&self, _url: &str, _body: &str, _timeout: Duration) -> TransportReply {
+            TransportReply::Responded {
+                status: self.0,
+                body: self.1.clone(),
+            }
+        }
+    }
+
+    /// `text` with every character written as a JSON `\uXXXX` escape, so the
+    /// raw body never holds any run of it verbatim.
+    fn escape_all(text: &str) -> String {
+        text.chars()
+            .map(|character| format!("\\u{:04x}", character as u32))
+            .collect()
+    }
+
+    /// A token echoed through JSON string escapes (so the raw body never holds
+    /// it verbatim) is redacted from the decoded outcome detail too.
+    #[test]
+    fn json_escaped_token_echoes_are_redacted_after_decoding() {
+        let dir = TestDir::new("tgjson");
+        let secret = TOKEN.split_once(':').unwrap().1;
+        for (status, echoed) in [
+            (400, escape_all(TOKEN)),
+            (
+                401,
+                format!("{} and {}", escape_all(secret), escape_all(TOKEN)),
+            ),
+            (200, escape_all(&TOKEN.replace(":", "%3A"))),
+        ] {
+            let body = format!(r#"{{"ok":false,"description":"bad {echoed} here"}}"#);
+            let outcome = send(Some(&config(&dir)), &Fixed(status, body), "x");
+            let rendered = serde_json::to_string(&outcome).unwrap();
+            assert!(!rendered.contains(secret), "{status}: {rendered}");
+            assert!(!rendered.contains("123456:"), "{status}: {rendered}");
+        }
     }
 }

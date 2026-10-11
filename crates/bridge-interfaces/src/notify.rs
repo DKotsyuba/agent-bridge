@@ -18,7 +18,20 @@
 //! another; each entry records the incident's publisher, event, kind and
 //! creation time, so an incident number reused by a different incident is
 //! never mistaken for the one already reported (its stale entry is
-//! replaced, and the run says so).
+//! replaced, and the run says so). An entry is pruned only on the core's own
+//! closed row of the same incident, never because an incident is merely absent
+//! from a (possibly capped or racing) listing.
+//!
+//! Operating ceiling: incidents are never deleted, and the closed listing is
+//! capped at 200 rows ordered open first, then next check, then number, so
+//! after about 200 closed incidents newer closed rows can stay outside the
+//! window indefinitely and their entries are then never pruned. Entries are
+//! kept forever: there is no maximum entry count or byte bound, [`Ledger::load`]
+//! reads the whole file, and the ledger is rewritten as pretty JSON with a
+//! file and directory sync before every send and once at the end of every
+//! pass. The upgrade path, when ledger size or run time matters, is a core
+//! lookup of closed incidents by number for the entries held (not built here:
+//! no unsafe absence pruning, bound or core API was added).
 //!
 //! Reporting an incident never touches the original event: no resend, no
 //! retry, no permission answer. Runs are serialized by an exclusive lock
@@ -34,6 +47,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use bridge_client::IncidentView;
+use bridge_core::recovery::IncidentState;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -164,10 +178,15 @@ pub fn report_text(incident: &IncidentView) -> String {
 /// Runs one notification pass over `incidents` (the open incidents of
 /// the core identified by `backend`).
 ///
-/// Refuses before any send when `notify` fails [`NotifyConfig::check`],
-/// the lock or ledger cannot be used, or the ledger belongs to another
-/// core. `complete` says the list holds every open incident, so ledger entries
-/// of incidents no longer open are pruned. Returns one line per incident:
+/// Refuses before any send when `notify` fails [`NotifyConfig::check`], the
+/// lock or ledger cannot be used, or the ledger belongs to another core.
+/// `incidents` may be a capped or racing listing, so absence from it never
+/// forgets a ledger entry: a possible or accepted send is pruned only on
+/// positive proof that its incident is closed — a row of `closed` (incidents
+/// the core reports in a state other than open) with the same incident
+/// number *and* identity ([`incident_identity`]) as the entry, which is not
+/// also in `incidents`. Entries without such proof are kept, so a displaced
+/// open incident is never reported again. Returns one line per incident:
 /// its notification state, whether a request was made in this run,
 /// whether a stale entry for a reused number was replaced, and
 /// `owner_read: "unknown"` (never claimed).
@@ -177,7 +196,7 @@ pub fn run(
     telegram: Option<&TelegramConfig>,
     transport: &dyn Transport,
     incidents: &[IncidentView],
-    complete: bool,
+    closed: &[IncidentView],
     now_ms: u64,
 ) -> Result<Vec<Value>, String> {
     notify.check()?;
@@ -199,13 +218,16 @@ pub fn run(
             entry.detail = "a previous run stopped during the send".into();
         }
     }
-    if complete {
-        ledger.entries.retain(|seq, _| {
-            incidents
-                .iter()
-                .any(|incident| incident.incident_seq == *seq)
-        });
-    }
+    ledger.entries.retain(|seq, entry| {
+        incidents
+            .iter()
+            .any(|incident| incident.incident_seq == *seq)
+            || !closed.iter().any(|incident| {
+                incident.incident_seq == *seq
+                    && incident.state != IncidentState::Open
+                    && incident_identity(incident) == entry.identity
+            })
+    });
     let mut lines = Vec::new();
     for incident in incidents {
         let seq = incident.incident_seq;
@@ -385,7 +407,7 @@ mod tests {
                 Some(&self.telegram),
                 transport,
                 incidents,
-                true,
+                &[],
                 now,
             )
             .unwrap()
@@ -443,7 +465,7 @@ mod tests {
             None,
             &script(vec![]),
             &[incident(3)],
-            true,
+            &[],
             1,
         )
         .unwrap();
@@ -489,6 +511,90 @@ mod tests {
         assert_eq!(later[0]["owner_read"], "unknown");
     }
 
+    /// A capped or racing listing that no longer shows an open incident never
+    /// prunes its possible send (the incident is not resent when it shows
+    /// again); only a positive closed row of the same incident does.
+    #[test]
+    fn absence_from_a_listing_never_prunes_a_send_but_a_closed_row_does() {
+        let setup = setup("absent");
+        let transport = script(vec![
+            TransportReply::Uncertain("timeout".into()),
+            TransportReply::Responded {
+                status: 200,
+                body: r#"{"ok":true,"result":{"message_id":1}}"#.into(),
+            },
+        ]);
+        setup.pass(&transport, &[incident(7)], 100);
+        let closed = |seq: u64, event: &str, state: IncidentState| {
+            let mut view = incident(seq);
+            view.event_id = event.into();
+            view.state = state;
+            view
+        };
+        let keeps = |closed: &[IncidentView], now: u64| {
+            run(
+                &setup.notify,
+                "core-a",
+                Some(&setup.telegram),
+                &transport,
+                &[],
+                closed,
+                now,
+            )
+            .unwrap();
+            Ledger::load(&setup.notify.ledger)
+                .unwrap()
+                .entries
+                .contains_key(&7)
+        };
+        // Incident 7 is open but displaced from a capped, racing list.
+        assert!(keeps(&[], 150), "absence pruned a possible send");
+        // A closed row of another incident, or of a reused number with a
+        // different identity, or one that is still open, proves nothing.
+        assert!(keeps(&[closed(8, "e", IncidentState::Disposed)], 160));
+        assert!(keeps(&[closed(7, "other", IncidentState::Disposed)], 170));
+        assert!(keeps(&[closed(7, "e", IncidentState::Open)], 180));
+        let again = setup.pass(&transport, &[incident(7)], 200);
+        assert_eq!(again[0]["requested_now"], false);
+        assert_eq!(*transport.1.borrow(), 1, "a possible send is never resent");
+        // A closed row of the very incident that is also in the open list is
+        // a race, not proof.
+        run(
+            &setup.notify,
+            "core-a",
+            Some(&setup.telegram),
+            &transport,
+            &[incident(7)],
+            &[closed(7, "e", IncidentState::Resolved)],
+            210,
+        )
+        .unwrap();
+        assert_eq!(
+            *transport.1.borrow(),
+            1,
+            "a raced closed row caused a resend"
+        );
+        assert!(keeps(&[], 220));
+        // Positive proof: the same incident, closed.
+        for state in [
+            IncidentState::Resolved,
+            IncidentState::Authorized,
+            IncidentState::Disposed,
+        ] {
+            let mut ledger = Ledger::load(&setup.notify.ledger).unwrap();
+            ledger.entries.entry(7).or_insert_with(|| Entry {
+                identity: incident_identity(&incident(7)),
+                state: NoteState::PossibleSend,
+                attempts: 1,
+                updated_ms: 1,
+                detail: String::new(),
+                not_before_ms: None,
+            });
+            ledger.save(&setup.notify.ledger).unwrap();
+            assert!(!keeps(&[closed(7, "e", state)], 300), "{state:?} kept");
+        }
+    }
+
     /// A reused incident number with a different identity replaces the stale
     /// entry and is reported again, and a ledger bound to one core refuses
     /// another.
@@ -512,7 +618,7 @@ mod tests {
             Some(&setup.telegram),
             &script(vec![]),
             &[incident(5)],
-            true,
+            &[],
             3,
         );
         assert!(foreign.is_err(), "a ledger is never shared between cores");
@@ -546,7 +652,7 @@ mod tests {
             Some(&setup.telegram),
             &transport,
             &[incident(1)],
-            true,
+            &[],
             1,
         );
         assert!(linked.is_err());
@@ -559,12 +665,12 @@ mod tests {
         std::fs::write(&setup.notify.ledger, EMPTY_LEDGER).unwrap();
         std::fs::set_permissions(&setup.notify.ledger, std::fs::Permissions::from_mode(0o644))
             .unwrap();
-        assert!(run(&setup.notify, "core-a", None, &transport, &[], true, 1).is_err());
+        assert!(run(&setup.notify, "core-a", None, &transport, &[], &[], 1).is_err());
         let unbounded = NotifyConfig {
             max_attempts: 0,
             ..setup.notify.clone()
         };
-        assert!(run(&unbounded, "core-a", None, &transport, &[], true, 1).is_err());
+        assert!(run(&unbounded, "core-a", None, &transport, &[], &[], 1).is_err());
         assert_eq!(*transport.1.borrow(), 0);
     }
 }

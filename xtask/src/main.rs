@@ -505,16 +505,18 @@ kinds = ["root.note"]
         home: home.clone(),
         state: state.clone(),
     };
+    // `service stop` accepts no `--config` (the CLI refuses unknown options).
     let service = |verb: &str, component: &str, config: &Path| {
-        product(
-            Command::new(bin.join("bridge"))
-                .args(["service", verb, component, "--home"])
-                .arg(&home)
-                .arg("--state")
-                .arg(&state)
-                .arg("--config")
-                .arg(config),
-        )
+        let mut command = Command::new(bin.join("bridge"));
+        command
+            .args(["service", verb, component, "--home"])
+            .arg(&home)
+            .arg("--state")
+            .arg(&state);
+        if verb == "start" {
+            command.arg("--config").arg(config);
+        }
+        product(&mut command)
     };
     let start_all = |recorder: &mut Recorder, daemon: &Path, tag: &str| -> Result<(), String> {
         let (core, observed) = service("start", "core", daemon)?;

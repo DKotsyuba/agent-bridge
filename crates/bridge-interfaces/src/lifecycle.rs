@@ -118,7 +118,7 @@ fn pid_path(state: &Path, component: Component) -> PathBuf {
 /// until the file is dropped), creating the state directory when absent.
 /// Serializes every start and stop of one component.
 fn lock_component(state: &Path, component: Component) -> Result<std::fs::File, String> {
-    private_state_dir(state)?;
+    private_dir(state, true)?;
     let lock = crate::config::open_private(&state.join(format!("{}.lock", component.name())))?;
     lock.lock()
         .map_err(|error| format!("cannot lock {} state: {error}", component.name()))?;
@@ -225,7 +225,11 @@ fn remove_record_if(state: &Path, component: Component, record: &PidRecord) {
 /// record is preserved byte for byte); replaces only a valid record of ours
 /// whose process has ended; requires `home/current` to be the recorded active
 /// release ([`crate::install::check_current`]: an interrupted activation is
-/// reported, never started) and the active executable to be a sealed
+/// reported, never started), the whole active release to verify against its
+/// manifest (`install::verify_release`: every binary's size and
+/// digest, and the home, `releases` and release directories owned by this user
+/// with no group/other write — a planted or modified executable is never run)
+/// and the active executable to be a sealed
 /// release executable of `home`; spawns it in its own process group, records it
 /// atomically and waits until the configured socket is served by *that*
 /// process (kernel peer pid). On every failure after the spawn the child
@@ -257,7 +261,8 @@ pub fn start(
             ));
         }
     }
-    crate::install::check_current(home)?;
+    let active = crate::install::check_current(home)?;
+    crate::install::verify_release(home, &active)?;
     let exe = home
         .join("current")
         .join("bin")
@@ -324,20 +329,19 @@ pub fn start(
     }
 }
 
-/// Creates the state directory (`0700`) when absent, or requires an
-/// existing one to be a real directory owned by this user that no group or
-/// other user can write (otherwise another user could replace pid or lock
-/// files). Never changes permissions of, clears or replaces anything in an
-/// existing directory.
-fn private_state_dir(state: &Path) -> Result<(), String> {
+/// Requires `path` to be a real directory owned by this user that no group
+/// or other user can write (otherwise another user could replace the files
+/// inside it); with `create`, an absent directory is created (`0700`). Never
+/// changes permissions of, clears or replaces anything that already exists.
+pub(crate) fn private_dir(path: &Path, create: bool) -> Result<(), String> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    match std::fs::symlink_metadata(state) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(state).map_err(|error| error.to_string())?;
-            std::fs::set_permissions(state, std::fs::Permissions::from_mode(0o700))
+    match std::fs::symlink_metadata(path) {
+        Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(path).map_err(|error| error.to_string())?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
                 .map_err(|error| error.to_string())
         }
-        Err(error) => Err(error.to_string()),
+        Err(error) => Err(format!("{}: {error}", path.display())),
         Ok(metadata)
             if metadata.is_dir()
                 && metadata.uid() == crate::config::own_uid()?
@@ -347,7 +351,7 @@ fn private_state_dir(state: &Path) -> Result<(), String> {
         }
         Ok(_) => Err(format!(
             "{} is not a directory owned by this user without group/other write; it was left unchanged",
-            state.display()
+            path.display()
         )),
     }
 }

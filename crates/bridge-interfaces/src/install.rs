@@ -8,7 +8,9 @@
 //! digest of `SHA256SUMS`, printed by [`package`], is the out-of-band
 //! attestation value: `install.sh` and [`self_install`] refuse a bundle
 //! whose `SHA256SUMS` differs from it *before* any bundle executable runs
-//! (`install.sh` checks with `shasum`, then runs the verified `bridge`).
+//! (`install.sh` copies the bundle to a private directory, checks the copy with
+//! `shasum` and runs the verified copy of `bridge`; the sealed bytes must hash
+//! to the same attested digest).
 //! A hash is not a signature: trust is the operator's own local build.
 //!
 //! Layout under the installation home (nothing outside it and the launcher
@@ -352,40 +354,29 @@ pub struct RelayBinding {
 /// Takes the home's installer lock (held until the file is dropped).
 ///
 /// The home must be absolute. An absent home is created with mode `0700`.
-/// An existing one must be a real directory owned by this user that is
-/// either empty or already an Agent Bridge home (holds `.lock` or the
-/// state file); anything else is refused untouched, so user files are
-/// never mixed with or replaced by releases.
+/// An existing one must be a real directory owned by this user that no
+/// group or other user can write ([`crate::lifecycle::private_dir`]; its
+/// mode is never changed) and that is either empty or already an Agent
+/// Bridge home (holds `.lock` or the state file); anything else is refused
+/// untouched, so user files are never mixed with or replaced by releases
+/// and nobody else can swap a release the daemons will run.
 fn lock_home(home: &Path) -> Result<File, String> {
-    use std::os::unix::fs::MetadataExt;
     if !home.is_absolute() {
         return Err("the installation home must be an absolute path".into());
     }
-    match std::fs::symlink_metadata(home) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(home).map_err(|error| error.to_string())?;
-            std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700))
-                .map_err(|error| error.to_string())?;
-        }
-        Err(error) => return Err(error.to_string()),
-        Ok(metadata) => {
-            if !metadata.is_dir() || metadata.uid() != crate::config::own_uid()? {
-                return Err(format!(
-                    "{} is not a directory owned by this user",
-                    home.display()
-                ));
-            }
-            let ours = home.join(".lock").exists() || home.join(STATE).exists();
-            let empty = std::fs::read_dir(home)
-                .map_err(|error| error.to_string())?
-                .next()
-                .is_none();
-            if !ours && !empty {
-                return Err(format!(
-                    "{} is not empty and not an Agent Bridge home; refusing",
-                    home.display()
-                ));
-            }
+    let existed = std::fs::symlink_metadata(home).is_ok();
+    crate::lifecycle::private_dir(home, true)?;
+    if existed {
+        let ours = home.join(".lock").exists() || home.join(STATE).exists();
+        let empty = std::fs::read_dir(home)
+            .map_err(|error| error.to_string())?
+            .next()
+            .is_none();
+        if !ours && !empty {
+            return Err(format!(
+                "{} is not empty and not an Agent Bridge home; refusing",
+                home.display()
+            ));
         }
     }
     let lock = crate::config::open_private(&home.join(".lock"))?;
@@ -408,12 +399,18 @@ fn valid_release_id(id: &str) -> bool {
 }
 
 /// Verifies the sealed release `id` of `home`: a valid id naming a real
-/// directory (not a link) whose verified manifest has exactly that id.
-fn verify_release(home: &Path, id: &str) -> Result<ReleaseManifest, String> {
+/// directory (not a link) whose verified manifest has exactly that id. The
+/// home, its `releases` directory and the release directory must be owned by
+/// this user with no group/other write ([`crate::lifecycle::private_dir`]),
+/// so nobody else could have swapped what is about to be executed.
+pub(crate) fn verify_release(home: &Path, id: &str) -> Result<ReleaseManifest, String> {
     if !valid_release_id(id) {
         return Err("installation state names an invalid release id".into());
     }
     let dir = home.join("releases").join(id);
+    for owned in [home, &home.join("releases"), &dir] {
+        crate::lifecycle::private_dir(owned, false)?;
+    }
     let metadata =
         std::fs::symlink_metadata(&dir).map_err(|error| format!("release {id}: {error}"))?;
     if !metadata.is_dir() {
@@ -471,6 +468,15 @@ thread_local! {
     /// Test-only fault point: the next `current` switch fails before it
     /// changes anything (an interruption after the state was recorded).
     static FAIL_NEXT_SWITCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only race point: runs once right after the bundle was verified,
+    /// standing in for a writer that changes a writable bundle before it is
+    /// copied.
+    static AFTER_BUNDLE_VERIFIED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Points `home/current` at `releases/<id>` atomically through an
@@ -562,8 +568,11 @@ fn activate(home: &Path, next: &InstallState) -> Result<(), String> {
 ///
 /// `expected_sums` is the out-of-band `SHA256SUMS` digest and is
 /// mandatory: a bundle is installed only when it matches. Order: verify
-/// the bundle, lock and reconcile the home, check launcher paths, seal the
-/// release (or reuse an identical one; same id with other bytes refuses),
+/// the bundle, lock and reconcile the home (an existing home or `releases`
+/// directory writable by group or others refuses untouched), check launcher
+/// paths, seal the release (its staged bytes must hash to `expected_sums`,
+/// so a bundle changed after verification refuses; or reuse an identical
+/// one; same id with other bytes refuses),
 /// refuse a schema downgrade, record the new state and floor, switch
 /// `current`, create missing launchers.
 pub fn self_install(
@@ -573,6 +582,10 @@ pub fn self_install(
     expected_sums: &str,
 ) -> Result<Activation, String> {
     let manifest = verify_bundle(bundle, Some(expected_sums))?;
+    #[cfg(test)]
+    if let Some(race) = AFTER_BUNDLE_VERIFIED.with(|slot| slot.borrow_mut().take()) {
+        race();
+    }
     if !bin_dir.is_absolute() {
         return Err("the launcher directory must be an absolute path".into());
     }
@@ -581,14 +594,14 @@ pub fn self_install(
     let launchers = launcher_plan(home, bin_dir)?;
     let id = manifest.release_id();
     let releases = home.join("releases");
-    std::fs::create_dir_all(&releases).map_err(|error| error.to_string())?;
+    crate::lifecycle::private_dir(&releases, true)?;
     let reused = if std::fs::symlink_metadata(releases.join(&id)).is_ok() {
         if verify_release(home, &id)? != manifest {
             return Err(format!("release {id} exists with different bytes"));
         }
         true
     } else {
-        seal(bundle, &releases, &id)?;
+        seal(bundle, &releases, &id, expected_sums)?;
         false
     };
     if manifest.core_schema < state.max_core_schema {
@@ -634,9 +647,13 @@ fn launcher_plan(home: &Path, bin_dir: &Path) -> Result<Vec<(PathBuf, PathBuf)>,
 
 /// Copies a verified bundle into an exclusively created, unpredictable
 /// staging directory, re-verifies it, seals permissions and renames it to
-/// `releases/<id>`. On failure only that staging directory is removed;
-/// leftovers of other runs are never touched.
-fn seal(bundle: &Path, releases: &Path, id: &str) -> Result<(), String> {
+/// `releases/<id>`. The copy is read again from the bundle, so the staged
+/// files must hash — manifest and every binary — to the original attested
+/// `expected_sums` digest (the digest of the `SHA256SUMS` those hashes imply);
+/// a bundle changed after [`verify_bundle`], even consistently, is refused.
+/// On failure only that staging directory is removed; leftovers of other runs
+/// are never touched.
+fn seal(bundle: &Path, releases: &Path, id: &str, expected_sums: &str) -> Result<(), String> {
     let staging = releases.join(format!(".staging-{id}-{}", crate::config::random_hex(12)?));
     std::fs::create_dir(&staging).map_err(|error| format!("cannot create staging: {error}"))?;
     let result = (|| {
@@ -655,7 +672,11 @@ fn seal(bundle: &Path, releases: &Path, id: &str) -> Result<(), String> {
             let bytes = std::fs::read(&from).map_err(|error| error.to_string())?;
             write_file(&to, &bytes, mode)?;
         }
-        verify_tree(&staging)?;
+        let staged = verify_tree(&staging)?;
+        let implied = staged.sums(&file_sha256(&staging.join(MANIFEST))?);
+        if hex(&Sha256::digest(implied.as_bytes())) != expected_sums {
+            return Err("the sealed bytes do not match the attested digest".into());
+        }
         for dir in [staging.join("bin"), staging.clone()] {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))
                 .map_err(|error| error.to_string())?;
@@ -868,6 +889,90 @@ mod tests {
             entries,
             vec![std::ffi::OsString::from("notes.txt")],
             "nothing added"
+        );
+    }
+
+    /// A bundle rewritten consistently (manifest, sums and binaries) after it
+    /// was verified is refused at seal time: the sealed bytes must hash to the
+    /// attested digest, not merely agree with their own manifest.
+    #[test]
+    fn a_bundle_swapped_after_verification_is_not_sealed() {
+        let scratch = TestDir::new("iswap");
+        let dir = scratch.path();
+        let (home, bin) = (dir.join("home"), dir.join("bin"));
+        let (good, sums) = bundle(dir, "a", "good", 4);
+        let (evil, _) = bundle(&dir.join("evil"), "a", "evil", 4);
+        let target = good.clone();
+        AFTER_BUNDLE_VERIFIED.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                std::fs::copy(evil.join(MANIFEST), target.join(MANIFEST)).unwrap();
+                std::fs::copy(evil.join(SUMS), target.join(SUMS)).unwrap();
+                for name in BINARIES {
+                    std::fs::copy(evil.join("bin").join(name), target.join("bin").join(name))
+                        .unwrap();
+                }
+            }));
+        });
+        let error = self_install(&good, &home, &bin, &sums).unwrap_err();
+        assert!(error.contains("attested digest"), "{error}");
+        assert!(std::fs::symlink_metadata(home.join("current")).is_err());
+        assert!(
+            std::fs::read_dir(home.join("releases"))
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(true),
+            "nothing sealed or left behind"
+        );
+    }
+
+    /// An existing home or `releases` directory that group/other users can
+    /// write is refused untouched (no silent mode change, nothing added).
+    #[test]
+    fn unsafe_owned_homes_and_release_directories_are_refused_untouched() {
+        let scratch = TestDir::new("iprivacy");
+        let dir = scratch.path();
+        let (one, sums) = bundle(dir, "a", "one", 4);
+        let home = dir.join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let error = self_install(&one, &home, &dir.join("bin"), &sums).unwrap_err();
+        assert!(error.contains("without group/other write"), "{error}");
+        assert_eq!(
+            std::fs::metadata(&home).unwrap().permissions().mode() & 0o777,
+            0o775,
+            "mode left unchanged"
+        );
+        assert!(rollback(&home).is_err());
+        assert_eq!(
+            std::fs::read_dir(&home).unwrap().count(),
+            0,
+            "nothing added"
+        );
+
+        let other = dir.join("home2");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(other.join(".lock"), "").unwrap();
+        std::fs::set_permissions(other.join(".lock"), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        std::fs::create_dir(other.join("releases")).unwrap();
+        std::fs::set_permissions(
+            other.join("releases"),
+            std::fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+        let error = self_install(&one, &other, &dir.join("bin"), &sums).unwrap_err();
+        assert!(error.contains("without group/other write"), "{error}");
+        assert_eq!(
+            std::fs::metadata(other.join("releases"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o777,
+            "mode left unchanged"
+        );
+        assert_eq!(
+            std::fs::read_dir(other.join("releases")).unwrap().count(),
+            0
         );
     }
 

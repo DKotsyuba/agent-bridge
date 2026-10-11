@@ -24,7 +24,9 @@
 //! ```
 //!
 //! Results are JSON on stdout. Exit codes: 0 success, 2 the operation or
-//! a required check failed (detail on stderr), 3 invalid invocation.
+//! a required check failed (detail on stderr), 3 invalid invocation (including
+//! an option the command does not accept or a wrong number of positional
+//! arguments, refused before any connection).
 //! Secrets are read only from protected files named by the configuration;
 //! none is accepted as an argument or printed.
 
@@ -33,6 +35,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use bridge_client::{BridgeClient, LineageScope, NativeAddress};
+use bridge_core::recovery::IncidentState;
 use bridge_interfaces::config::{InterfacesConfig, read_secret};
 use bridge_interfaces::operator::{
     Decision, apply, check, check_scope, failure_text, parse_tier, read_failure_text, report,
@@ -95,6 +98,29 @@ impl Args {
         self.flags.contains_key(name)
     }
 
+    /// Requires exactly `positionals` positional arguments (command words
+    /// included) and no flag outside `allowed`; a usage failure otherwise.
+    /// Runs before anything is read, written or connected.
+    fn closed(&self, positionals: usize, allowed: &[&str]) -> Result<(), Failure> {
+        if self.positional.len() != positionals {
+            return Err(Failure::Usage(format!(
+                "expected {positionals} positional arguments, got {}",
+                self.positional.len()
+            )));
+        }
+        let mut unknown: Vec<&str> = self
+            .flags
+            .keys()
+            .map(String::as_str)
+            .filter(|flag| !allowed.contains(flag))
+            .collect();
+        unknown.sort_unstable();
+        match unknown.first() {
+            Some(flag) => Err(Failure::Usage(format!("unknown option {flag}"))),
+            None => Ok(()),
+        }
+    }
+
     /// Positional `index`, required.
     fn at(&self, index: usize, what: &str) -> Result<String, String> {
         self.positional
@@ -148,15 +174,19 @@ fn main() -> ExitCode {
 fn dispatch(args: &Args) -> Result<(Value, u8), Failure> {
     let command = args.at(0, "command").map_err(Failure::Usage)?;
     match command.as_str() {
-        "version" => Ok((
-            json!({"product": install::PRODUCT, "version": env!("CARGO_PKG_VERSION"),
-                   "build_label": install::BUILD_LABEL, "target": install::target(),
-                   "core_schema": bridge_core::schema::SCHEMA_VERSION}),
-            0,
-        )),
+        "version" => {
+            args.closed(1, &[])?;
+            Ok((
+                json!({"product": install::PRODUCT, "version": env!("CARGO_PKG_VERSION"),
+                       "build_label": install::BUILD_LABEL, "target": install::target(),
+                       "core_schema": bridge_core::schema::SCHEMA_VERSION}),
+                0,
+            ))
+        }
         "operator" => operator(args).map(|value| (value, 0)),
         "notify" => notify_command(args).map(|value| (value, 0)),
         "package" => {
+            args.closed(1, &["--from", "--out"])?;
             let (manifest, sums) = install::package(
                 &args
                     .path("--from")
@@ -168,6 +198,7 @@ fn dispatch(args: &Args) -> Result<(Value, u8), Failure> {
             Ok((json!({"manifest": manifest, "sums_sha256": sums}), 0))
         }
         "verify" => {
+            args.closed(2, &["--sums-sha256"])?;
             let bundle = PathBuf::from(args.at(1, "bundle").map_err(Failure::Usage)?);
             let manifest =
                 install::verify_bundle(&bundle, args.optional("--sums-sha256").as_deref())?;
@@ -178,6 +209,7 @@ fn dispatch(args: &Args) -> Result<(Value, u8), Failure> {
             ))
         }
         "self-install" => {
+            args.closed(1, &["--bundle", "--home", "--bin-dir", "--sums-sha256"])?;
             let activation = install::self_install(
                 &args
                     .path("--bundle")
@@ -193,6 +225,7 @@ fn dispatch(args: &Args) -> Result<(Value, u8), Failure> {
             Ok((json!(activation), 0))
         }
         "rollback" => {
+            args.closed(1, &["--home"])?;
             let home = args
                 .path("--home")
                 .ok_or(Failure::Usage("--home is required".into()))?;
@@ -200,6 +233,16 @@ fn dispatch(args: &Args) -> Result<(Value, u8), Failure> {
         }
         "service" => service(args),
         "doctor" => {
+            args.closed(
+                1,
+                &[
+                    "--home",
+                    "--bin-dir",
+                    "--state",
+                    "--config",
+                    "--daemon-config",
+                ],
+            )?;
             let checks = doctor::run(&doctor::DoctorInput {
                 home: args.path("--home"),
                 bin_dir: args.path("--bin-dir"),
@@ -232,8 +275,40 @@ enum Action {
     Decision(Decision),
 }
 
+/// The exact positional count (`operator`, the configuration, the action and
+/// its operands) and the only flags `bridge operator` accepts for `action`;
+/// `None` for an unknown action.
+fn operator_shape(action: &str) -> Option<(usize, &'static [&'static str])> {
+    Some(match action {
+        "incidents" => (3, &["--all", "--limit"]),
+        "holds" => (3, &["--limit"]),
+        "counts" | "shutdown" => (3, &[]),
+        "retry" => (5, &["--note", "--accept-duplicate-risk"]),
+        "dispose" | "waive" => (5, &["--note"]),
+        "evidence" => (7, &["--detail"]),
+        "pause" => (4, &["--reason"]),
+        "resume" => (4, &[]),
+        "transfer-lineage" => (
+            3,
+            &[
+                "--recipient",
+                "--kind",
+                "--mode",
+                "--project",
+                "--task",
+                "--stream",
+                "--new-publisher",
+                "--note",
+            ],
+        ),
+        _ => return None,
+    })
+}
+
 /// `bridge operator <config> <action> …`.
 ///
+/// The action must be known and its positional count and flags exact
+/// ([`operator_shape`]), else exit 3 before anything else happens.
 /// Arguments are parsed first; a decision then passes [`check`] (blank
 /// notes and reasons, retry risk acceptance, lineage scope validators)
 /// *before* the connection is opened, and [`apply`] repeats that check
@@ -245,6 +320,9 @@ enum Action {
 fn operator(args: &Args) -> Result<Value, Failure> {
     let config_path = PathBuf::from(args.at(1, "configuration").map_err(Failure::Usage)?);
     let action = args.at(2, "operator action").map_err(Failure::Usage)?;
+    let (positionals, flags) = operator_shape(&action)
+        .ok_or_else(|| Failure::Usage(format!("unknown operator action {action:?}")))?;
+    args.closed(positionals, flags)?;
     let limit = args
         .optional("--limit")
         .map(|limit| limit.parse::<usize>())
@@ -370,7 +448,15 @@ fn operator(args: &Args) -> Result<Value, Failure> {
 }
 
 /// `bridge notify <config>`: one owner-notification pass.
+///
+/// Lists the open incidents (at most 200) to report. Ledger entries are
+/// pruned only on positive proof: the core's own rows for incidents that are
+/// no longer open (same listing request with closed incidents included, also
+/// capped). Absence from either listing, or a failed second listing, prunes
+/// nothing, so a capped or racing listing can never
+/// make a possible or accepted send be reported again.
 fn notify_command(args: &Args) -> Result<Value, Failure> {
+    args.closed(2, &[])?;
     let config = InterfacesConfig::load(&PathBuf::from(
         args.at(1, "configuration").map_err(Failure::Usage)?,
     ))?;
@@ -383,20 +469,28 @@ fn notify_command(args: &Args) -> Result<Value, Failure> {
         .as_ref()
         .ok_or_else(|| "the configuration has no [operator] section".to_string())?;
     let token = read_secret(&operator.token_file)?;
-    let limit = 200;
-    let incidents = BridgeClient::connect(&config.core_socket)
-        .map_err(|error| format!("core unreachable: {error}"))?
-        .incidents(&token, false, Some(limit))
+    let now_ms = bridge_core::service::current_unix_millis();
+    let mut client = BridgeClient::connect(&config.core_socket)
+        .map_err(|error| format!("core unreachable: {error}"))?;
+    let incidents = client
+        .incidents(&token, false, Some(200))
         .map_err(|error| error.to_string())?;
-    let complete = incidents.len() < limit;
+    let closed: Vec<_> = client
+        .incidents(&token, true, Some(200))
+        .map(|all| {
+            all.into_iter()
+                .filter(|incident| incident.state != IncidentState::Open)
+                .collect()
+        })
+        .unwrap_or_default();
     let lines = notify::run(
         notify_config,
         &config.core_socket.display().to_string(),
         config.telegram.as_ref(),
         &telegram::CurlTransport::default(),
         &incidents,
-        complete,
-        bridge_core::service::current_unix_millis(),
+        &closed,
+        now_ms,
     )?;
     Ok(json!({
         "channel": if config.telegram.is_some() { "telegram" } else { "unconfigured" },
@@ -407,6 +501,12 @@ fn notify_command(args: &Args) -> Result<Value, Failure> {
 /// `bridge service start|stop <component> …`.
 fn service(args: &Args) -> Result<(Value, u8), Failure> {
     let verb = args.at(1, "start or stop").map_err(Failure::Usage)?;
+    let allowed: &[&str] = match verb.as_str() {
+        "start" => &["--home", "--state", "--config"],
+        "stop" => &["--home", "--state"],
+        other => return Err(Failure::Usage(format!("unknown service verb {other:?}"))),
+    };
+    args.closed(3, allowed)?;
     let component = lifecycle::Component::parse(&args.at(2, "component").map_err(Failure::Usage)?)
         .ok_or_else(|| Failure::Usage("component must be core or relay".into()))?;
     let state = args

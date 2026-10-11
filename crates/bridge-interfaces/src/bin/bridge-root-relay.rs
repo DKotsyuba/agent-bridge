@@ -18,7 +18,7 @@ use bridge_adapters::RegistryAttestor;
 use bridge_adapters::registry::{CallerAttestor, Unattested};
 use bridge_core::service::log_event;
 use bridge_interfaces::config::{InterfacesConfig, read_secret};
-use bridge_interfaces::root::{RelayServer, RootRelay};
+use bridge_interfaces::root::{ATTEST_TIMEOUT, RelayServer, RootRelay};
 use signal_hook::consts::{SIGINT, SIGTERM};
 
 /// Logs a startup failure.
@@ -47,7 +47,7 @@ fn main() -> ExitCode {
     let attestor: Box<dyn CallerAttestor> = match &root.channel {
         Some(channel) => Box::new(RegistryAttestor::new(
             channel,
-            Duration::from_secs(5),
+            ATTEST_TIMEOUT,
             root.max_caller_age_ms,
         )),
         None => {

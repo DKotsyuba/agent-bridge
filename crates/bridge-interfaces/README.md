@@ -47,6 +47,14 @@ without `[root].channel`), `caller_missing`, `caller_duplicate`,
 `caller_unavailable`, `forbidden`, `invalid`, `oversize`, `expired`,
 `unknown_tool`, `core_unavailable` (nothing sent), `custody_unknown`
 (repeat the same `request_id`; idempotent) and the core's own classes.
+The frontend adds two of its own: `relay_unavailable` (the relay could not
+be reached before the request was written: nothing was sent, call the tool
+again) and `relay_outcome_unknown` (the request was written but no answer
+arrived within the frontend's finite wait of about 115 s (the relay's expected
+budget, not a hard bound: queueing behind other requests is not counted): a `bridge_send` may
+have been published, so repeat the **same** `request_id` or ask
+`bridge_status` with it; never use a new `request_id` for the same
+message).
 
 - `bridge_me` → the attested address, endpoint epoch, channel and the
   permitted recipients, modes, kinds, `keep_all` and body bound.
@@ -60,10 +68,21 @@ without `[root].channel`), `caller_missing`, `caller_duplicate`,
   refused explicitly; nothing is truncated.
 - `bridge_status(request_id)` → only the caller's own events: `custody`,
   `native` (`not_handed`, `in_flight`, `native_accepted`, `native_held`,
-  `written_no_receipt`, `hook_emitted`, `unknown`, `refused`,
-  `disposed_not_delivered`), `context` and `processed` (`observed` only for
+  `written_no_receipt`, `hook_emitted`, `unknown`, `refused`),
+  `context` and `processed` (`observed` only for
   that exact recorded tier) and `uncertainty` (manual resolution, never an
-  automatic resend). Tier details are withheld.
+  automatic resend). A disposition closes the workflow and future dispatch
+  but never claims non-delivery: `delivery.state` is `disposed`, `native`
+  keeps what the surviving evidence shows and `uncertainty` stays set with
+  `disposed: true`. An earlier unknown attempt is never erased by a later
+  known-unsent one (nor by a duplicate-risk retry: an `unhanded` event whose
+  earlier attempt may have reached the recipient is `unknown`, not
+  `not_handed`, and a `refused` one — retries exhausted or a permanent
+  refusal after such a retry — is `unknown` too, its open incident's reason
+  also naming the earlier hand-off); when the record cannot rule the earlier
+  hand-off out (a full evidence window, a duplicate-risk mark, or a disposed
+  event with no record at all, which cannot be told from a closed legacy
+  hand-off), `native` is `unknown`. Tier details are withheld.
 
 There is no enumeration, retry, reset, drain, admin, raw passthrough or
 acknowledgement tool, and no counts, incident or lineage tool (those are
@@ -121,7 +140,9 @@ unchanged. Before the connection is opened the CLI refuses blank notes
 and reasons, a retry without `--accept-duplicate-risk`, and a lineage
 scope or new producer that fails the core's public validators (address,
 kind, mode, stream, publisher id, project/task metadata) — such a decision
-never contacts the core. The core itself validates the final operator
+never contacts the core. Unknown flags, a misspelled option and surplus or
+missing positional arguments exit 3 the same way, before any connection
+(each action accepts only its own flags). The core itself validates the final operator
 text (for example its length and control characters) before any
 mutation and its refusal is printed unchanged. Each decision is sent once;
 a lost answer prints `outcome unknown … it was not resent`: re-read
@@ -199,7 +220,9 @@ read. The token is read from the protected file and given to
 ignored, the environment is cleared, `--noproxy *`, only https, no
 redirects, bounded total time and reply. Every provider answer and
 transport diagnostic is redacted against the token (verbatim, `%3A`-encoded
-and its secret part) before anything is classified, cut or stored.
+and its secret part) before anything is classified, cut or stored, and
+again on every decoded string of a JSON answer (a JSON escape cannot hide
+the token).
 Configuration parse errors report only a line number, never parser text.
 
 Classification: HTTP 2xx with `ok: true` → `provider_accepted` (not proof
@@ -214,7 +237,20 @@ ambiguous answers, 5xx.
 
 The ledger is bound to one core (its socket path) and records each
 incident's identity (publisher, event, kind, creation time), so a reused
-incident number is reported again instead of being suppressed. It records
+incident number is reported again instead of being suppressed. The
+ledger drops an entry only on the core's own closed row of the same
+incident (same number and identity, state other than open); absence from a
+capped or racing listing, or a failed second listing, prunes nothing, so a
+`possible_send` or `provider_accepted` entry is never forgotten while its
+incident may still be open. Operating
+ceiling: incidents are never deleted and the closed listing is capped at 200
+rows (open first, then next check, then number), so after about 200 closed
+incidents newer closed rows can stay outside the window and their entries
+are never pruned; entries are kept forever with no entry-count or byte
+bound, the whole file is read on load, and it is rewritten (pretty JSON,
+file and directory sync) before every send and once per pass. When this
+matters, upgrade by looking closed incidents up by number in the core; no
+unsafe pruning, bound or core API is added here. It records
 a `sending` intent before each request; a crash during a send becomes
 `possible_send`, which is never resent automatically. Only known-unsent
 reports are retried, at most `max_attempts`, then `gave_up`. Ledger and lock
@@ -237,14 +273,23 @@ bridge rollback --home H
 bridge service stop relay|core --home H --state S
 ```
 
-- `install.sh` checks `SHA256SUMS` against the digest you pass and every
-  expected file against `SHA256SUMS` before running anything from the
-  bundle; then the verified `bridge self-install` re-verifies, seals the
-  release under `releases/<version>+<label>` (read-only), switches
-  `current` atomically and links launchers. Same release id with other
+- `install.sh` copies the bundle into a private temporary
+  directory, checks `SHA256SUMS` against the digest you pass and every
+  expected file against `SHA256SUMS` on that copy before running anything
+  from it (a bundle changed afterwards cannot change what runs; a linked
+  bundle root, `bin` or `SHA256SUMS` is refused before anything runs); then the
+  verified `bridge self-install` re-verifies and seals the release under
+  `releases/<version>+<label>` (read-only; the sealed bytes must hash to the
+  attested digest, so a bundle rewritten even consistently after
+  verification is refused), switches `current` atomically and links
+  launchers. Same release id with other
   bytes, foreign launcher files and core-schema downgrades are refused.
 - The home must be new, empty or an existing Agent Bridge home (owned by
-  you); a non-empty foreign directory is refused untouched. Staging,
+  you, writable by no group or other user, never chmod-ed by the installer);
+  a non-empty foreign directory, or a home or `releases` directory others
+  can write, is refused untouched. `service start` verifies the whole
+  active release against its manifest first, so a planted or modified
+  executable is never run. Staging,
   state and `current` updates use exclusively created, unpredictable
   temporary names; an interrupted install may leave a `.staging-*`
   directory, which is never reused or deleted automatically. The service
@@ -273,7 +318,9 @@ bridge service stop relay|core --home H --state S
 - `doctor` exit codes: 0 no failed check, 2 a check failed, 3 invalid
   invocation. Declared adapter capabilities and Telegram are always
   `not_verified`; the overall qualification is `not_verified`.
-- `doctor` `recovery.pending` reads the core's complete `counts` and then,
+- `doctor` `recovery.pending` is `not_configured` with `state: unknown`
+  when the configuration has no `[operator]` section (pending work cannot
+  be read), and otherwise reads the core's complete `counts` and then,
   separately, a bounded sample of at most 200 open incidents; the two
   reads are not one snapshot. `ok`/`empty` only when the counts show
   nothing waiting, nothing in review and no open incident *and* the
@@ -284,7 +331,7 @@ bridge service stop relay|core --home H --state S
   category breakdown covers only the sample. `observations_consistent`
   is false when the sample holds more incidents than the counted total,
   and `sample_complete` is true only for a consistent sample of exactly
-  the counted number. A refused counts call, authentication error or unreadable
+  the counted number that is smaller than the 200-incident cap. A refused counts call, authentication error or unreadable
   token is `fail` with `state: unknown`, never zero. No native delivery
   is asserted.
 

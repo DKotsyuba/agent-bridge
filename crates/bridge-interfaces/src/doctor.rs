@@ -184,6 +184,15 @@ fn interfaces(config: &InterfacesConfig, push: &mut dyn FnMut(&str, &'static str
     if let Some(telegram) = &config.telegram {
         secret("secret.telegram", &telegram.token_file);
     }
+    if config.operator.is_none() {
+        // Without an operator credential pending recovery work cannot be
+        // read; say so instead of omitting the check.
+        push(
+            "recovery.pending",
+            "not_configured",
+            json!({"state": "unknown", "detail": "no [operator] section: pending recovery work cannot be read"}),
+        );
+    }
     if let Some(operator) = &config.operator {
         let read = read_secret(&operator.token_file).and_then(|token| {
             let mut client = bridge_client::BridgeClient::connect(&config.core_socket)
@@ -316,7 +325,9 @@ const INCIDENT_SAMPLE: usize = 200;
 /// come from `counts`; the category breakdown covers only the sample.
 /// `observations_consistent` is false when the sample holds more incidents
 /// than the counted total, and `sample_complete` is true only when the
-/// sample is consistent and holds exactly the counted number. Nothing here
+/// sample is consistent, holds exactly the counted number and is smaller than
+/// the listing cap (a full sample may have been truncated, or the incidents
+/// may have grown between the two reads). Nothing here
 /// asserts native delivery.
 pub fn recovery(counts: &DeliveryCounts, sample: &[IncidentView]) -> (&'static str, Value) {
     let waiting = counts.unhanded + counts.reserved + counts.invoking + counts.held;
@@ -346,7 +357,7 @@ pub fn recovery(counts: &DeliveryCounts, sample: &[IncidentView]) -> (&'static s
                 "sampled": sampled,
                 "limit": INCIDENT_SAMPLE,
                 "observations_consistent": consistent,
-                "sample_complete": consistent && sampled == counts.open_incidents,
+                "sample_complete": consistent && sampled == counts.open_incidents && sampled < INCIDENT_SAMPLE as u64,
                 "by_category": categories,
             },
             "note": "counts and the incident sample are separate reads, not one snapshot; totals are the core's counts; categories cover only the sample; no native delivery is asserted",
@@ -438,5 +449,42 @@ mod tests {
         // More sampled than counted is inconsistent, never complete.
         let (_, detail) = recovery(&counts(0, 0, 1), &incidents(2, "unknown_handoff"));
         assert_eq!(detail["incident_sample"]["sample_complete"], false);
+    }
+
+    /// A sample that hit the listing cap is never certified complete, even when
+    /// the counts equal it (incidents may have grown between the two reads).
+    #[test]
+    fn a_sample_at_the_listing_cap_is_never_complete() {
+        let (_, detail) = recovery(&counts(0, 0, 200), &incidents(200, "unknown_handoff"));
+        assert_eq!(detail["incident_sample"]["sample_complete"], false);
+        let (_, detail) = recovery(&counts(0, 0, 199), &incidents(199, "unknown_handoff"));
+        assert_eq!(detail["incident_sample"]["sample_complete"], true);
+    }
+
+    /// Without an `[operator]` section recovery work is explicitly unknown
+    /// (`not_configured`), not silently omitted.
+    #[test]
+    fn missing_operator_configuration_reports_recovery_unknown() {
+        let dir = crate::testdir::TestDir::new("docnoop");
+        let config = dir.path().join("interfaces.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "core_socket = \"{}\"\n",
+                dir.path().join("absent.sock").display()
+            ),
+        )
+        .unwrap();
+        let checks = run(&DoctorInput {
+            config: Some(config),
+            ..DoctorInput::default()
+        });
+        let pending = checks
+            .iter()
+            .find(|check| check.name == "recovery.pending")
+            .expect("recovery.pending is always reported");
+        assert_eq!(pending.status, "not_configured");
+        assert_eq!(pending.detail["state"], "unknown");
+        assert_eq!(exit_code(&checks), 2, "the unreachable core still fails");
     }
 }

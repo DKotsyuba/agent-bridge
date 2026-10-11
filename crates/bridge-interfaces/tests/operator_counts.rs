@@ -633,3 +633,516 @@ fn non_admin_and_fenced_transfers_are_refused_by_the_core() {
         "a refused transfer holds nothing: {listed}"
     );
 }
+
+/// One synthetic open incident (`seq`) as the wire shape of a core listing.
+fn incident_in(seq: u64, state: &str) -> bridge_client::IncidentView {
+    serde_json::from_value(json!({
+        "incident_seq": seq, "publisher": "p", "event_id": format!("e{seq}"),
+        "attempt_seq": 1, "kind": "unknown_handoff", "state": state, "reason": "lost reply",
+        "created_ms": 1, "updated_ms": 1, "age_ms": 5000, "next_check_ms": null,
+        "review_deadline_ms": null, "responsible": "p/operator",
+        "blocked_dependents": [], "duplicate_risk": false, "resolution": null
+    }))
+    .unwrap()
+}
+
+/// One synthetic open incident (`seq`).
+fn open_incident(seq: u64) -> bridge_client::IncidentView {
+    incident_in(seq, "open")
+}
+
+/// Checks `bridge notify` prunes a ledger tombstone only on the core's closed row of the same incident, never because a capped listing (whose count matches it) does not show it.
+#[test]
+fn notify_prunes_only_on_a_closed_row_of_the_same_incident() {
+    use bridge_core::service::Response;
+    use bridge_interfaces::notify::{Entry, Ledger, NoteState};
+    let scratch = Scratch::new();
+    let socket = scratch.0.join("capped.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    // A fake core whose capped listing shows one open incident (and a count
+    // that matches it) while another open incident, 99, is displaced from it;
+    // with closed incidents included it also reports incident 98 as disposed.
+    let server = std::thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            let Ok((stream, _)) = listener.accept() else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            };
+            stream.set_nonblocking(false).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut stream = stream;
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                let op: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+                let answer = match op["op"].as_str() {
+                    Some("incidents") if op["include_closed"] == true => Response::Incidents {
+                        incidents: vec![open_incident(1), incident_in(98, "disposed")],
+                    },
+                    Some("incidents") => Response::Incidents {
+                        incidents: vec![open_incident(1)],
+                    },
+                    _ => Response::Counts {
+                        counts: serde_json::from_value(json!({
+                            "unhanded": 0, "reserved": 0, "invoking": 0, "held": 0,
+                            "review": 1, "accepted": 0, "hook_submitted": 0, "refused": 0,
+                            "disposed": 0, "open_incidents": 1
+                        }))
+                        .unwrap(),
+                    },
+                };
+                use std::io::Write;
+                let _ = writeln!(stream, "{}", serde_json::to_string(&answer).unwrap());
+                line.clear();
+            }
+        }
+    });
+    let ledger_path = scratch.0.join("ledger.json");
+    let mut ledger = Ledger {
+        backend: socket.display().to_string(),
+        ..Ledger::default()
+    };
+    for (seq, event) in [(99, "e99"), (98, "e98")] {
+        ledger.entries.insert(
+            seq,
+            Entry {
+                identity: format!("p/{event}/unknown_handoff/1"),
+                state: NoteState::PossibleSend,
+                attempts: 1,
+                updated_ms: 1,
+                detail: "an earlier run may have sent this".into(),
+                not_before_ms: None,
+            },
+        );
+    }
+    ledger.save(&ledger_path).unwrap();
+    let token_file = scratch.0.join("n.token");
+    private(&token_file, OPERATOR);
+    let config = scratch.0.join("n.toml");
+    private(
+        &config,
+        &format!(
+            "core_socket = \"{}\"\n[operator]\ntoken_file = \"{}\"\n[notify]\nledger = \"{}\"\n",
+            socket.display(),
+            token_file.display(),
+            ledger_path.display()
+        ),
+    );
+    let (code, _, stderr) = cli(&["notify", config.to_str().unwrap()]);
+    assert_eq!(code, 0, "{stderr}");
+    let ledger = Ledger::load(&ledger_path).unwrap();
+    assert!(
+        ledger.entries.contains_key(&99),
+        "a displaced open incident's tombstone was pruned by absence: {ledger:?}"
+    );
+    assert!(
+        !ledger.entries.contains_key(&98),
+        "the core's closed row of the same incident did not prune it: {ledger:?}"
+    );
+    drop(server);
+}
+
+/// Checks unknown flags and surplus or missing positionals exit 3 before any connection while valid forms still connect.
+#[test]
+fn unknown_flags_and_wrong_positions_exit_3_before_connecting() {
+    let scratch = Scratch::new();
+    let socket = scratch.0.join("recording.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let config = interfaces(&scratch.0, "recording", &socket, OPERATOR);
+    let config = config.to_str().unwrap();
+    let address = recipient().to_canonical_string();
+    let zeros = "0".repeat(64);
+    let invalid: Vec<Vec<&str>> = vec![
+        vec!["operator", config, "incidents", "--limt", "5"],
+        vec!["operator", config, "incidents", "extra"],
+        vec!["operator", config, "counts", "--limit", "5"],
+        vec!["operator", config, "holds", "--all"],
+        vec!["operator", config, "shutdown", "extra"],
+        vec![
+            "operator", config, "pause", &address, "junk", "--reason", "r",
+        ],
+        vec![
+            "operator", config, "pause", &address, "--reason", "r", "--note", "n",
+        ],
+        vec!["operator", config, "resume", &address, "--reason", "r"],
+        vec!["operator", config, "dispose", "p", "e", "x", "--note", "n"],
+        vec![
+            "operator",
+            config,
+            "dispose",
+            "p",
+            "e",
+            "--note",
+            "n",
+            "--accept-duplicate-risk",
+        ],
+        vec![
+            "operator", config, "retry", "p", "e", "--note", "n", "--detail", "d",
+        ],
+        vec![
+            "operator",
+            config,
+            "evidence",
+            "p",
+            "e",
+            "1",
+            "native_accepted",
+            "x",
+            "--detail",
+            "d",
+        ],
+        vec!["notify", config, "extra"],
+        vec!["notify", config, "--all"],
+        vec!["version", "extra"],
+        vec!["doctor", "extra"],
+        vec!["doctor", "--hom", "/x"],
+        vec!["rollback", "--home", "/x", "extra"],
+        vec![
+            "service", "stop", "core", "--home", "/x", "--state", "/y", "--config", "/z",
+        ],
+        vec!["verify", "/x", "--bundle", "/y"],
+        vec!["package", "--from", "/x", "--out", "/y", "--bogus", "1"],
+        vec![
+            "self-install",
+            "--bundle",
+            "/x",
+            "--home",
+            "/h",
+            "--bin-dir",
+            "/b",
+            "--sums-sha256",
+            zeros.as_str(),
+            "--bogus",
+            "1",
+        ],
+    ];
+    for args in &invalid {
+        let (code, _, stderr) = cli(args);
+        assert_eq!(code, 3, "{args:?}: {stderr}");
+    }
+    let mut accepted = 0;
+    while listener.accept().is_ok() {
+        accepted += 1;
+    }
+    assert_eq!(accepted, 0, "an invalid invocation opened a connection");
+    // Valid forms keep their flags: they pass argument validation and reach
+    // the (unreachable) core, failing as an operation (2), not as usage (3).
+    let missing = scratch.0.join("absent.sock");
+    let absent = interfaces(&scratch.0, "absent", &missing, OPERATOR);
+    let absent = absent.to_str().unwrap();
+    for args in [
+        vec!["operator", absent, "incidents", "--all", "--limit", "5"],
+        vec!["operator", absent, "holds", "--limit", "5"],
+        vec!["operator", absent, "counts"],
+        vec!["operator", absent, "pause", &address, "--reason", "r"],
+        vec!["operator", absent, "resume", &address],
+        vec!["operator", absent, "shutdown"],
+        vec![
+            "operator",
+            absent,
+            "retry",
+            "p",
+            "e",
+            "--note",
+            "n",
+            "--accept-duplicate-risk",
+        ],
+        vec!["operator", absent, "dispose", "p", "e", "--note", "n"],
+        vec!["operator", absent, "waive", "p", "e", "--note", "n"],
+        vec![
+            "operator",
+            absent,
+            "evidence",
+            "p",
+            "e",
+            "1",
+            "native_accepted",
+            "--detail",
+            "d",
+        ],
+    ] {
+        let (code, _, stderr) = cli(&args);
+        assert_eq!(code, 2, "{args:?}: {stderr}");
+    }
+}
+
+/// Checks the status of a real core event keeps its earlier possible hand-off through a duplicate-risk manual retry whose later attempt was known-unsent, before and after the audited disposition.
+#[test]
+fn a_later_known_unsent_attempt_never_erases_an_earlier_unknown_hand_off() {
+    use bridge_core::dispatch::{
+        Attestation, Capabilities, DispatchTiming, EffectiveMode, Lifecycle, Outcome, Selection,
+    };
+    use bridge_interfaces::root::status_view;
+    let lab = lab();
+    let operator = lab.operator_config.to_str().unwrap();
+    let mut client = BridgeClient::connect(&lab.socket).unwrap();
+    let publish = |client: &mut BridgeClient, id: &str| {
+        let body = PublishRequest::new(
+            EventId::new(id).unwrap(),
+            recipient(),
+            Kind::new("note").unwrap(),
+            Mode::Message,
+            Policy::KeepAll,
+            Payload::new("body").unwrap(),
+        )
+        .into_body()
+        .unwrap();
+        client.publish(PRODUCER_A, &body).unwrap();
+    };
+    let view = |client: &mut BridgeClient, id: &str| -> Value {
+        let (_, delivery) = client.status(PRODUCER_A, id).unwrap();
+        status_view(delivery.as_ref())
+    };
+    publish(&mut client, "retried");
+    publish(&mut client, "never-handed");
+    // A real event nothing has touched is truthfully not handed.
+    let untouched = view(&mut client, "never-handed");
+    assert_eq!(untouched["native"], "not_handed", "{untouched}");
+    assert!(untouched["uncertainty"].is_null(), "{untouched}");
+
+    let core = lab.core.as_ref().unwrap();
+    // One dispatch of the event "retried": hand it off and record `outcome`.
+    let attempt = |outcome: Outcome, offset: u64| {
+        core.with_storage(|storage| {
+            let now = bridge_core::service::current_unix_millis() + offset;
+            let attestation = Attestation::verified(
+                recipient(),
+                recipient().native_session_id,
+                1,
+                Lifecycle::Inactive,
+                Capabilities {
+                    inject: false,
+                    message: true,
+                },
+                "synthetic-fixture-proof",
+            )
+            .unwrap();
+            let Selection::Attempt(attempt) = storage
+                .reserve_next(
+                    &attestation,
+                    EffectiveMode::Message,
+                    now,
+                    &DispatchTiming::default(),
+                )
+                .unwrap()
+            else {
+                panic!("nothing reserved");
+            };
+            storage
+                .mark_invoking(&attempt.fence, &attestation, now + 1)
+                .unwrap();
+            storage
+                .record_outcome(&attempt.fence, outcome, now + 2)
+                .unwrap();
+        });
+    };
+    // Attempt A: a possible hand-off with an unknown effect (Review).
+    attempt(
+        Outcome::OutcomeUnknown {
+            reason: "lost reply".into(),
+        },
+        0,
+    );
+    let review = view(&mut client, "retried");
+    assert_eq!(review["native"], "unknown", "{review}");
+    assert_eq!(review["uncertainty"]["manual_resolution_required"], true);
+    // The operator explicitly accepts the duplicate risk and retries.
+    let (code, _, stderr) = cli(&[
+        "operator",
+        operator,
+        "retry",
+        "producer-a",
+        "retried",
+        "--note",
+        "owner accepts a duplicate",
+        "--accept-duplicate-risk",
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    let authorized = view(&mut client, "retried");
+    assert_eq!(authorized["delivery"]["state"], "unhanded", "{authorized}");
+    assert_eq!(
+        authorized["native"], "unknown",
+        "A's effect survives the retry: {authorized}"
+    );
+    assert_eq!(authorized["uncertainty"]["automatic_resend"], false);
+    // Attempt B is positively known-unsent; A's possible effect still stands.
+    attempt(
+        Outcome::KnownUnsent {
+            evidence: "carrier proved nothing was written".into(),
+        },
+        60_000,
+    );
+    let after_b = view(&mut client, "retried");
+    assert_eq!(after_b["native"], "unknown", "{after_b}");
+    assert!(!after_b["uncertainty"].is_null(), "{after_b}");
+    // The audited disposition closes the workflow without erasing it.
+    let (code, _, stderr) = cli(&[
+        "operator",
+        operator,
+        "dispose",
+        "producer-a",
+        "retried",
+        "--note",
+        "closing",
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    let disposed = view(&mut client, "retried");
+    assert_eq!(disposed["delivery"]["state"], "disposed", "{disposed}");
+    assert_eq!(disposed["native"], "unknown", "{disposed}");
+    assert_eq!(disposed["uncertainty"]["disposed"], true, "{disposed}");
+    assert_eq!(disposed["uncertainty"]["automatic_resend"], false);
+    // Disposing the untouched event leaves no hand-off record to read, which
+    // cannot be told apart from a closed legacy possible hand-off: unknown.
+    let (code, _, stderr) = cli(&[
+        "operator",
+        operator,
+        "dispose",
+        "producer-a",
+        "never-handed",
+        "--note",
+        "cancel",
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    let cancelled = view(&mut client, "never-handed");
+    assert_eq!(cancelled["delivery"]["state"], "disposed", "{cancelled}");
+    assert_eq!(cancelled["native"], "unknown", "{cancelled}");
+}
+
+/// Hands the oldest pending event of the synthetic recipient to a stand-in
+/// carrier on the lab's real core at `now + offset_ms` and records `outcome`.
+fn dispatch_once(lab: &Lab, outcome: bridge_core::dispatch::Outcome, offset_ms: u64) {
+    use bridge_core::dispatch::{
+        Attestation, Capabilities, DispatchTiming, EffectiveMode, Lifecycle, Selection,
+    };
+    lab.core.as_ref().unwrap().with_storage(|storage| {
+        let now = bridge_core::service::current_unix_millis() + offset_ms;
+        let attestation = Attestation::verified(
+            recipient(),
+            recipient().native_session_id,
+            1,
+            Lifecycle::Inactive,
+            Capabilities {
+                inject: false,
+                message: true,
+            },
+            "synthetic-fixture-proof",
+        )
+        .unwrap();
+        let Selection::Attempt(attempt) = storage
+            .reserve_next(
+                &attestation,
+                EffectiveMode::Message,
+                now,
+                &DispatchTiming::default(),
+            )
+            .unwrap()
+        else {
+            panic!("nothing reserved at +{offset_ms} ms");
+        };
+        storage
+            .mark_invoking(&attempt.fence, &attestation, now + 1)
+            .unwrap();
+        storage
+            .record_outcome(&attempt.fence, outcome, now + 2)
+            .unwrap();
+    });
+}
+
+/// Checks a real core event refused after an unknown attempt and an audited duplicate-risk retry (permanent refusal, or retries exhausted) never reports `refused` alone, while a plain refusal still does.
+#[test]
+fn a_refusal_after_a_duplicate_risk_retry_never_hides_the_earlier_unknown_hand_off() {
+    use bridge_core::dispatch::Outcome;
+    use bridge_interfaces::root::status_view;
+    let status = |lab: &Lab| -> Value {
+        let mut client = BridgeClient::connect(&lab.socket).unwrap();
+        let (_, delivery) = client.status(PRODUCER_A, "chain").unwrap();
+        status_view(delivery.as_ref())
+    };
+    let publish = |lab: &Lab| {
+        let body = PublishRequest::new(
+            EventId::new("chain").unwrap(),
+            recipient(),
+            Kind::new("note").unwrap(),
+            Mode::Message,
+            Policy::KeepAll,
+            Payload::new("body").unwrap(),
+        )
+        .into_body()
+        .unwrap();
+        BridgeClient::connect(&lab.socket)
+            .unwrap()
+            .publish(PRODUCER_A, &body)
+            .unwrap();
+    };
+    // Control: a plain permanent refusal is `refused`.
+    let plain = lab();
+    publish(&plain);
+    dispatch_once(
+        &plain,
+        Outcome::PermanentRefusal {
+            reason: "carrier refused".into(),
+        },
+        0,
+    );
+    let view = status(&plain);
+    assert_eq!(view["delivery"]["state"], "refused", "{view}");
+    assert_eq!(view["native"], "refused", "{view}");
+    assert!(
+        !view["uncertainty"]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("earlier attempt may also"),
+        "{view}"
+    );
+    for scenario in ["permanent_refusal", "retries_exhausted"] {
+        let lab = lab();
+        let operator = lab.operator_config.to_str().unwrap().to_string();
+        publish(&lab);
+        dispatch_once(
+            &lab,
+            Outcome::OutcomeUnknown {
+                reason: "lost reply".into(),
+            },
+            0,
+        );
+        let (code, _, stderr) = cli(&[
+            "operator",
+            &operator,
+            "retry",
+            "producer-a",
+            "chain",
+            "--note",
+            "owner accepts a duplicate",
+            "--accept-duplicate-risk",
+        ]);
+        assert_eq!(code, 0, "{scenario}: {stderr}");
+        if scenario == "permanent_refusal" {
+            dispatch_once(
+                &lab,
+                Outcome::PermanentRefusal {
+                    reason: "carrier refused".into(),
+                },
+                10_000_000_000,
+            );
+        } else {
+            for round in 1..=5u64 {
+                dispatch_once(
+                    &lab,
+                    Outcome::KnownUnsent {
+                        evidence: "carrier proved nothing was written".into(),
+                    },
+                    round * 10_000_000_000,
+                );
+            }
+        }
+        let view = status(&lab);
+        assert_eq!(view["delivery"]["state"], "refused", "{scenario}: {view}");
+        assert_eq!(view["uncertainty"]["incident_kind"], scenario, "{view}");
+        assert_eq!(view["native"], "unknown", "{scenario}: {view}");
+        let reason = view["uncertainty"]["reason"].as_str().unwrap();
+        assert!(reason.contains("earlier attempt may also"), "{view}");
+        assert_eq!(view["uncertainty"]["automatic_resend"], false, "{view}");
+    }
+}

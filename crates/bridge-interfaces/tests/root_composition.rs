@@ -931,8 +931,19 @@ fn lost_hook_reply_stays_a_manual_incident_without_resend() {
         "bridge_status",
         json!({"request_id": "u1"}),
     );
+    // The disposition closes the workflow but never claims non-delivery: the
+    // earlier possible hand-off stays unknown, with its uncertainty kept.
+    assert_eq!(after["structuredContent"]["native"], "unknown", "{after}");
     assert_eq!(
-        after["structuredContent"]["native"], "disposed_not_delivered",
+        after["structuredContent"]["delivery"]["state"], "disposed",
+        "{after}"
+    );
+    assert_eq!(
+        after["structuredContent"]["uncertainty"]["disposed"], true,
+        "{after}"
+    );
+    assert_eq!(
+        after["structuredContent"]["uncertainty"]["automatic_resend"], false,
         "{after}"
     );
     let (_, closed) = lab.cli(&["operator", "@config", "incidents", "--all"]);

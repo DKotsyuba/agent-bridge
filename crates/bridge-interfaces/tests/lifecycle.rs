@@ -10,6 +10,9 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use bridge_interfaces::install::{
+    BINARIES, MANIFEST, MANIFEST_SCHEMA, PRODUCT, ReleaseFile, ReleaseManifest, file_sha256, target,
+};
 use bridge_interfaces::lifecycle::{Component, PidRecord, read_record, start, stop};
 
 /// An exclusively created scratch tree, removed (only it) on drop.
@@ -39,8 +42,9 @@ impl Drop for Scratch {
     }
 }
 
-/// A home with one sealed-layout release holding a copy of the relay, its
-/// interfaces configuration and state directory.
+/// A home with one sealed-layout release holding a copy of the relay (and
+/// inert stand-ins for the other packaged binaries, all bound by a manifest),
+/// its interfaces configuration and state directory.
 struct Fixture {
     /// Scratch owner.
     scratch: Scratch,
@@ -66,6 +70,34 @@ fn fixture() -> Fixture {
     let exe = bin.join("bridge-root-relay");
     std::fs::copy(env!("CARGO_BIN_EXE_bridge-root-relay"), &exe).unwrap();
     std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The other packaged binaries are inert stand-ins; the manifest binds
+    // every file, as in a sealed release.
+    let mut files = Vec::new();
+    for name in BINARIES {
+        let path = bin.join(name);
+        if name != "bridge-root-relay" {
+            std::fs::write(&path, format!("#!/bin/sh\necho {name}\n")).unwrap();
+        }
+        files.push(ReleaseFile {
+            name: name.into(),
+            sha256: file_sha256(&path).unwrap(),
+            bytes: std::fs::metadata(&path).unwrap().len(),
+        });
+    }
+    let manifest = ReleaseManifest {
+        schema: MANIFEST_SCHEMA,
+        product: PRODUCT.into(),
+        version: "0.1.0".into(),
+        build_label: "t".into(),
+        target: target(),
+        core_schema: 4,
+        files,
+    };
+    std::fs::write(
+        home.join("releases").join("0.1.0+t").join(MANIFEST),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
     std::os::unix::fs::symlink("releases/0.1.0+t", home.join("current")).unwrap();
     let state_file = home.join("install-state.json");
     std::fs::write(
@@ -254,6 +286,42 @@ fn an_interrupted_activation_is_never_started() {
     let error = started.unwrap_err();
     assert!(error.contains("interrupted activation"), "{error}");
     assert!(!running(&fixture.exe));
+}
+
+/// A release executable that no longer matches its manifest, or a release
+/// directory other users can write, is never executed by `start`.
+#[test]
+fn a_planted_or_unsafe_release_is_never_executed() {
+    let (fixture, intact) = (fixture(), self::fixture());
+    let marker = fixture.scratch.0.join("planted-ran");
+    std::fs::write(
+        &fixture.exe,
+        format!("#!/bin/sh\ntouch {}\nsleep 5\n", marker.display()),
+    )
+    .unwrap();
+    let error = start(
+        &fixture.home,
+        &fixture.state,
+        Component::Relay,
+        &fixture.config,
+    )
+    .unwrap_err();
+    assert!(error.contains("does not match the manifest"), "{error}");
+    assert!(!marker.exists(), "the planted executable ran");
+    assert!(!fixture.state.join("relay.pid").exists());
+
+    // An unmodified release in a group-writable directory is refused too.
+    let sealed = intact.exe.parent().unwrap().parent().unwrap().to_path_buf();
+    std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o775)).unwrap();
+    let error = start(
+        &intact.home,
+        &intact.state,
+        Component::Relay,
+        &intact.config,
+    )
+    .unwrap_err();
+    assert!(error.contains("group/other write"), "{error}");
+    assert!(!running(&intact.exe));
 }
 
 /// Creates the fixture's state directory with `mode` (not via lifecycle).
