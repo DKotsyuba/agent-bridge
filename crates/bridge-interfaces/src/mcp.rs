@@ -1,290 +1,406 @@
-//! stdio MCP server wrapper for the restricted root tool set.
+//! Root MCP frontend: a stdio MCP server the harness launches, exposing
+//! exactly `bridge_me`, `bridge_send` and `bridge_status`.
 //!
-//! Exposes `bridge.me`, `bridge.send` and `bridge.status` as MCP tools over
-//! JSON-RPC 2.0 on stdin/stdout, reusing the root ingress request logic
-//! in-process. The MCP server never serves more tools and never accepts an
-//! identity from tool arguments: the root token comes from the server
-//! process's protected environment (`BRIDGE_ROOT_TOKEN`), and tool
-//! arguments go through the same closed-key validation as the socket
-//! surface.
+//! The frontend holds no Bridge credential. For each `tools/call` it reads
+//! only the harness-owned request `_meta` (Claude `claudecode/toolUseId`,
+//! Codex `threadId` + `callId` + `x-codex-turn-metadata`), asks the adapter
+//! registry to attest *this process's* caller and seal a single-use proof
+//! ([`bridge_adapters::RegistryAttestor::attest_sealed`]: the registry
+//! identifies the frontend by kernel peer credentials and requires it to
+//! descend from a qualified harness), and forwards `{proof, tool,
+//! arguments}` to the root relay ([`crate::root`]), which redeems the proof
+//! and enforces policy. Missing `_meta`, a model-supplied identity, or any
+//! attestation failure refuses the call before the relay is contacted.
 //!
-//! Protocol surface: `initialize`, `tools/list`, `tools/call`; requests
-//! with any other method are refused with `-32601`, and notifications
-//! (messages without an `id`) are ignored. One JSON message per line.
+//! Protocol subset: `initialize`, `notifications/*` (ignored), `ping`,
+//! `tools/list` and `tools/call`; anything else is JSON-RPC
+//! `-32601`. Lines are bounded before allocation. Tool results carry the
+//! relay answer as text and `structuredContent`, with `isError` set on
+//! refusal; the sealed proof is never echoed.
 
 use std::io::{BufRead, Write};
+use std::path::Path;
 
-use crate::root::{
-    self, RootConfig, RootResponse, SendArgs, serve_in_process,
-};
+use bridge_adapters::registry::{CorrelationError, PresentedMeta, SealedProof};
+use serde_json::{Value, json};
 
-/// Environment variable holding the root grant token for this MCP server.
-pub const ROOT_TOKEN_ENV: &str = "BRIDGE_ROOT_TOKEN";
+use crate::root::{RelayRequest, RelayResponse, TOOLS, call_relay};
 
-/// MCP protocol version advertised by this server.
-pub const PROTOCOL_VERSION: &str = "2024-11-05";
+/// Largest accepted JSON-RPC line, in bytes.
+pub const MAX_LINE_BYTES: usize = 512 * 1024;
 
-/// Server name advertised in `initialize` results.
+/// MCP protocol revisions this frontend answers with; the newest is the
+/// default when the client asks for an unknown one.
+pub const PROTOCOL_VERSIONS: [&str; 4] = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
+
+/// Server name reported in `initialize`.
 pub const SERVER_NAME: &str = "agent-bridge-root";
 
-/// Runs the stdio MCP server loop over the given reader/writer pair.
+/// The sealing step: attest the caller of one request's `_meta` and return
+/// a single-use proof for the relay (production:
+/// `RegistryAttestor::attest_sealed`, ignoring the frontend-side caller).
+pub type Sealer<'a> = &'a dyn Fn(&PresentedMeta, u64) -> Result<SealedProof, CorrelationError>;
+
+/// Serves JSON-RPC lines from `input` until EOF, answering on `output`.
 ///
-/// Reads one JSON message per line until EOF. Every response is written as
-/// a single line and flushed. Returns the number of requests answered;
-/// write failures end the loop. The token is resolved once from the
-/// environment; a missing token makes every tool call answer with an
-/// `auth` refusal instead of guessing an identity.
-pub fn run_stdio(
-    config: &RootConfig,
-    token: Option<&str>,
+/// A line over [`MAX_LINE_BYTES`] or unparseable JSON answers a JSON-RPC
+/// error with a null id and the loop continues; an output write failure
+/// ends the loop (the harness went away).
+pub fn serve(
     input: &mut dyn BufRead,
     output: &mut dyn Write,
-) -> u64 {
-    let mut answered = 0u64;
-    let mut line = String::new();
+    seal: Sealer<'_>,
+    relay_socket: &Path,
+) -> std::io::Result<()> {
     loop {
-        line.clear();
-        match input.read_line(&mut line) {
-            Ok(0) | Err(_) => return answered,
-            Ok(_) => {}
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let message: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(message) => message,
-            Err(error) => {
-                let _ = write_line(
-                    output,
-                    &jsonrpc_error(
-                        serde_json::Value::Null,
-                        -32700,
-                        &format!("parse error: {error}"),
-                    ),
-                );
-                answered += 1;
+        let line = match read_line(input)? {
+            None => return Ok(()),
+            Some(Ok(line)) => line,
+            Some(Err(message)) => {
+                write_message(output, &error(Value::Null, -32700, message))?;
                 continue;
             }
         };
-        // Notifications carry no id and never get a response.
-        let id = message.get("id").cloned();
-        let Some(id) = id else {
+        if line.trim().is_empty() {
             continue;
-        };
-        let method = message
-            .get("method")
-            .and_then(|method| method.as_str())
-            .unwrap_or("");
-        let result = match method {
-            "initialize" => Ok(serde_json::json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION")},
-            })),
-            "tools/list" => Ok(serde_json::json!({"tools": tools()})),
-            "tools/call" => {
-                let name = message
-                    .pointer("/params/name")
-                    .and_then(|name| name.as_str())
-                    .unwrap_or("");
-                let arguments = message
-                    .pointer("/params/arguments")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Object(Default::default()));
-                match call_tool(config, token, name, &arguments) {
-                    Ok(text) => Ok(serde_json::json!({
-                        "content": [{"type": "text", "text": text}]
-                    })),
-                    Err(detail) => Ok(serde_json::json!({
-                        "content": [{"type": "text", "text": detail}],
-                        "isError": true,
-                    })),
-                }
-            }
-            other => Err(jsonrpc_error(
-                id.clone(),
-                -32601,
-                &format!("method not found: {other}"),
-            )),
-        };
-        let response = match result {
-            Ok(value) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": value}),
-            Err(error) => error,
-        };
-        if write_line(output, &response).is_err() {
-            return answered;
         }
-        answered += 1;
+        if let Some(answer) = handle_line(&line, seal, relay_socket) {
+            write_message(output, &answer)?;
+        }
     }
 }
 
-/// The closed tool list served by this MCP server.
-fn tools() -> serde_json::Value {
-    serde_json::json!([
+/// Reads one line bounded by [`MAX_LINE_BYTES`].
+///
+/// `None` at EOF; `Some(Err)` for an oversize (the rest of that line is
+/// discarded) or non-UTF-8 line. A final line without a newline is
+/// accepted.
+fn read_line(input: &mut dyn BufRead) -> std::io::Result<Option<Result<String, &'static str>>> {
+    let mut line = Vec::new();
+    let mut oversize = false;
+    loop {
+        let available = input.fill_buf()?;
+        if available.is_empty() {
+            if line.is_empty() && !oversize {
+                return Ok(None);
+            }
+            break;
+        }
+        let end = available.iter().position(|byte| *byte == b'\n');
+        let take = end.unwrap_or(available.len());
+        if line.len() + take > MAX_LINE_BYTES {
+            oversize = true;
+            line.clear();
+        } else if !oversize {
+            line.extend_from_slice(&available[..take]);
+        }
+        input.consume(take + usize::from(end.is_some()));
+        if end.is_some() {
+            break;
+        }
+    }
+    if oversize {
+        return Ok(Some(Err("request line too large")));
+    }
+    Ok(Some(
+        String::from_utf8(line).map_err(|_| "request is not UTF-8"),
+    ))
+}
+
+/// Handles one JSON-RPC message; `None` for notifications.
+pub fn handle_line(line: &str, seal: Sealer<'_>, relay_socket: &Path) -> Option<Value> {
+    let Ok(Value::Object(message)) = serde_json::from_str::<Value>(line) else {
+        return Some(error(Value::Null, -32700, "invalid JSON-RPC message"));
+    };
+    let id = message.get("id").cloned();
+    let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+    let params = message.get("params").cloned().unwrap_or(Value::Null);
+    let id = id?;
+    let result = match method {
+        "initialize" => Ok(initialize(&params)),
+        "ping" => Ok(json!({})),
+        "tools/list" => Ok(json!({"tools": tool_list()})),
+        "tools/call" => call_tool(&params, seal, relay_socket),
+        _ => Err((-32601, "method not found")),
+    };
+    Some(match result {
+        Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+        Err((code, message)) => error(id, code, message),
+    })
+}
+
+/// The `initialize` result: the requested revision when supported.
+fn initialize(params: &Value) -> Value {
+    let requested = params
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let version = PROTOCOL_VERSIONS
+        .iter()
+        .find(|version| **version == requested)
+        .unwrap_or(&PROTOCOL_VERSIONS[PROTOCOL_VERSIONS.len() - 1]);
+    json!({
+        "protocolVersion": version,
+        "capabilities": {"tools": {"listChanged": false}},
+        "serverInfo": {"name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION")},
+        "instructions": "Agent Bridge root tools. Your identity comes from the harness, never from arguments. Sends are keep_all to exact allowlisted recipients; status shows only your own requests. Uncertain delivery is never resent automatically.",
+    })
+}
+
+/// The closed tool definitions.
+pub fn tool_list() -> Value {
+    let address = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["host_id", "harness", "native_store_namespace", "native_session_id"],
+        "properties": {
+            "host_id": {"type": "string"},
+            "harness": {"type": "string", "enum": ["codex", "claude-code"]},
+            "native_store_namespace": {"type": "string"},
+            "native_session_id": {"type": "string"},
+        },
+    });
+    json!([
         {
-            "name": "bridge.me",
-            "description": "The caller's attested native address and its permitted delivery capabilities.",
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+            "name": TOOLS[0],
+            "description": "Your attested native address and what you may send.",
+            "inputSchema": {"type": "object", "additionalProperties": false, "properties": {}},
+            "annotations": {"readOnlyHint": true, "openWorldHint": false},
         },
         {
-            "name": "bridge.send",
-            "description": "Publish one bounded keep_all notification to an explicitly authorized exact recipient.",
+            "name": TOOLS[1],
+            "description": "Send one keep_all notification to an exact allowlisted recipient. Repeating a request_id is an idempotent replay.",
             "inputSchema": {
                 "type": "object",
+                "additionalProperties": false,
+                "required": ["request_id", "recipient", "kind", "mode", "body"],
                 "properties": {
-                    "request_id": {"type": "string"},
-                    "recipient": {"type": "string"},
+                    "request_id": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$"},
+                    "recipient": address,
                     "kind": {"type": "string"},
                     "mode": {"type": "string", "enum": ["inject", "message", "auto"]},
-                    "body": {"type": "string"}
+                    "body": {"type": "string"},
+                    "expires_at_ms": {"type": "integer", "minimum": 1},
                 },
-                "required": ["request_id", "recipient", "kind", "mode", "body"],
-                "additionalProperties": false,
             },
+            "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
         },
         {
-            "name": "bridge.status",
-            "description": "Only this caller's own publication and delivery evidence.",
+            "name": TOOLS[2],
+            "description": "Custody, native, context and uncertainty status of one of your own requests.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"request_id": {"type": "string"}},
-                "required": ["request_id"],
                 "additionalProperties": false,
+                "required": ["request_id"],
+                "properties": {"request_id": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$"}},
             },
+            "annotations": {"readOnlyHint": true, "openWorldHint": false},
         },
     ])
 }
 
-/// Calls one tool with closed-key-validated arguments.
-///
-/// `Ok` carries the JSON text of the root response for the tool result;
-/// `Err` carries a tool-level error string (unknown tool, malformed
-/// arguments, missing token environment). Tool arguments never include a
-/// token or any identity field.
+/// `tools/call`: closed params, attestation, relay.
 fn call_tool(
-    config: &RootConfig,
-    token: Option<&str>,
-    name: &str,
-    arguments: &serde_json::Value,
-) -> Result<String, String> {
-    let Some(token) = token else {
-        return Err(format!("{ROOT_TOKEN_ENV} is not set; refusing to guess a caller"));
+    params: &Value,
+    seal: Sealer<'_>,
+    relay_socket: &Path,
+) -> Result<Value, (i64, &'static str)> {
+    let Some(params) = params.as_object() else {
+        return Err((-32602, "params must be an object"));
     };
-    let response = match name {
-        "bridge.me" => {
-            closed_keys(arguments, &[])?;
-            serve_in_process(config, root_request_me(token))
-        }
-        "bridge.send" => {
-            closed_keys(
-                arguments,
-                &["request_id", "recipient", "kind", "mode", "body"],
-            )?;
-            let args = SendArgs {
-                request_id: string_argument(arguments, "request_id")?,
-                recipient: string_argument(arguments, "recipient")?,
-                kind: string_argument(arguments, "kind")?,
-                mode: string_argument(arguments, "mode")?,
-                body: string_argument(arguments, "body")?,
-            };
-            serve_in_process(config, root_request_send(token, args))
-        }
-        "bridge.status" => {
-            closed_keys(arguments, &["request_id"])?;
-            let request_id = string_argument(arguments, "request_id")?;
-            serve_in_process(config, root_request_status(token, request_id))
-        }
-        other => return Err(format!("unknown tool {other:?}")),
-    };
-    let response = response.unwrap_or_else(|response| response);
-    Ok(serde_json::to_string(&response).unwrap_or_else(|error| {
-        serde_json::to_string(&RootResponse::Error {
-            class: "internal".into(),
-            detail: format!("serialize response: {error}"),
-        })
-        .unwrap_or_default()
-    }))
-}
-
-/// Builds the in-process `me` request.
-fn root_request_me(token: &str) -> crate::root::RootRequest {
-    crate::root::RootRequest::Me {
-        token: token.to_string(),
-    }
-}
-
-/// Builds the in-process `send` request.
-fn root_request_send(token: &str, args: SendArgs) -> crate::root::RootRequest {
-    crate::root::RootRequest::Send {
-        token: token.to_string(),
-        args,
-    }
-}
-
-/// Builds the in-process `status` request.
-fn root_request_status(token: &str, request_id: String) -> crate::root::RootRequest {
-    crate::root::RootRequest::Status {
-        token: token.to_string(),
-        request_id,
-    }
-}
-
-/// Enforces the closed argument key set for one tool call.
-///
-/// Exactly the given fields may appear; anything else (including token or
-/// identity fields) is a tool error before any request is built.
-fn closed_keys(
-    arguments: &serde_json::Value,
-    fields: &[&str],
-) -> Result<(), String> {
-    let object = arguments
-        .as_object()
-        .ok_or_else(|| "tool arguments must be a JSON object".to_string())?;
-    let unexpected: Vec<&str> = object
+    if params
         .keys()
-        .map(String::as_str)
-        .filter(|key| !fields.contains(key))
-        .collect();
-    if !unexpected.is_empty() {
-        return Err(format!("closed schema: unknown argument keys {unexpected:?}"));
+        .any(|key| !matches!(key.as_str(), "name" | "arguments" | "_meta"))
+    {
+        return Err((-32602, "unknown tools/call parameter"));
     }
-    let missing: Vec<&str> = fields
-        .iter()
-        .copied()
-        .filter(|field| !object.contains_key(*field))
-        .collect();
-    if !missing.is_empty() {
-        return Err(format!("closed schema: missing argument keys {missing:?}"));
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !TOOLS.contains(&name) {
+        return Err((-32602, "unknown tool"));
     }
-    Ok(())
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if !arguments.is_object() {
+        return Err((-32602, "arguments must be an object"));
+    }
+    let answer = match params.get("_meta").and_then(Value::as_object) {
+        None => RelayResponse::error(
+            "caller_not_evidence",
+            "the request carries no harness _meta; arguments never identify a caller",
+        ),
+        Some(meta) => match PresentedMeta::from_mcp_meta(meta)
+            .and_then(|meta| seal(&meta, bridge_core::service::current_unix_millis()))
+        {
+            Err(refusal) => RelayResponse::error(
+                format!("caller_{}", refusal.class().trim_start_matches("caller_")),
+                refusal.detail().to_string(),
+            ),
+            Ok(proof) => call_relay(
+                relay_socket,
+                &RelayRequest {
+                    proof,
+                    tool: name.to_string(),
+                    arguments,
+                },
+            ),
+        },
+    };
+    Ok(tool_result(&answer))
 }
 
-/// Reads one required string tool argument.
-fn string_argument(
-    arguments: &serde_json::Value,
-    field: &str,
-) -> Result<String, String> {
-    arguments
-        .get(field)
-        .and_then(|value| value.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| format!("argument {field:?} must be a string"))
-}
-
-/// Builds a JSON-RPC error response value.
-fn jsonrpc_error(id: serde_json::Value, code: i64, message: &str) -> serde_json::Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {"code": code, "message": message},
+/// Renders a relay answer as an MCP tool result.
+fn tool_result(answer: &RelayResponse) -> Value {
+    let (structured, is_error) = match answer {
+        RelayResponse::Ok { value } => (value.clone(), false),
+        RelayResponse::Error { class, detail } => (json!({"error": class, "detail": detail}), true),
+    };
+    json!({
+        "content": [{"type": "text", "text": structured.to_string()}],
+        "structuredContent": structured,
+        "isError": is_error,
     })
 }
 
-/// Writes one JSON message followed by a newline and flushes.
-fn write_line(output: &mut dyn Write, value: &serde_json::Value) -> std::io::Result<()> {
-    let mut line = serde_json::to_vec(value).map_err(std::io::Error::other)?;
+/// A JSON-RPC error object.
+fn error(id: Value, code: i64, message: &str) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+}
+
+/// Writes one message line and flushes.
+fn write_message(output: &mut dyn Write, message: &Value) -> std::io::Result<()> {
+    let mut line = serde_json::to_vec(message).map_err(std::io::Error::other)?;
     line.push(b'\n');
     output.write_all(&line)?;
     output.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    //! Protocol framing and refusal before any relay contact.
+
+    use super::*;
+
+    /// A sealer that must never be reached.
+    fn unreachable_sealer(_: &PresentedMeta, _: u64) -> Result<SealedProof, CorrelationError> {
+        panic!("sealing must not run");
+    }
+
+    /// A sealer that refuses as a duplicate.
+    fn duplicate_sealer(_: &PresentedMeta, _: u64) -> Result<SealedProof, CorrelationError> {
+        Err(CorrelationError::Duplicate("call-1".into()))
+    }
+
+    /// Runs one line through the handler with a dead relay path.
+    fn run(line: &str, seal: Sealer<'_>) -> Value {
+        handle_line(line, seal, Path::new("/nonexistent/relay.sock")).unwrap()
+    }
+
+    #[test]
+    fn lists_exactly_three_closed_tools() {
+        let tools = tool_list();
+        let names: Vec<_> = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, TOOLS);
+        for tool in tools.as_array().unwrap() {
+            assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+        }
+    }
+
+    #[test]
+    fn missing_meta_refuses_without_sealing() {
+        let answer = run(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"bridge_me","arguments":{"caller":"root"}}}"#,
+            &unreachable_sealer,
+        );
+        assert_eq!(answer["result"]["isError"], true);
+        assert_eq!(
+            answer["result"]["structuredContent"]["error"],
+            "caller_not_evidence"
+        );
+    }
+
+    #[test]
+    fn attestation_refusal_is_reported_with_its_class() {
+        let answer = run(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"bridge_status","arguments":{"request_id":"a"},"_meta":{"claudecode/toolUseId":"call-1"}}}"#,
+            &duplicate_sealer,
+        );
+        assert_eq!(
+            answer["result"]["structuredContent"]["error"],
+            "caller_duplicate"
+        );
+    }
+
+    #[test]
+    fn unknown_tools_params_and_methods_are_refused() {
+        // No acknowledgement, retry, reset, enumeration or admin tool
+        // exists; asking for one never reaches attestation.
+        for tool in [
+            "bridge_ack",
+            "bridge.ack",
+            "bridge_retry",
+            "bridge_list",
+            "bridge_admin",
+        ] {
+            let unknown_tool = run(
+                &json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                        "params": {"name": tool, "arguments": {"receipt_handle": "x"},
+                                   "_meta": {"claudecode/toolUseId": "call-1"}}})
+                .to_string(),
+                &unreachable_sealer,
+            );
+            assert_eq!(unknown_tool["error"]["code"], -32602, "{tool}");
+        }
+        let listed = tool_list().to_string();
+        assert!(!listed.contains("ack") && !listed.contains("receipt"));
+        let extra = run(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"bridge_me","caller":"x"}}"#,
+            &unreachable_sealer,
+        );
+        assert_eq!(extra["error"]["code"], -32602);
+        let method = run(
+            r#"{"jsonrpc":"2.0","id":5,"method":"resources/list"}"#,
+            &unreachable_sealer,
+        );
+        assert_eq!(method["error"]["code"], -32601);
+        assert!(
+            handle_line(
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+                &unreachable_sealer,
+                Path::new("/x")
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn oversize_lines_are_refused_and_skipped() {
+        let mut input = Vec::new();
+        input.extend(std::iter::repeat_n(b'x', MAX_LINE_BYTES + 10));
+        input.extend_from_slice(b"\n{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"ping\"}");
+        let mut output = Vec::new();
+        serve(
+            &mut std::io::BufReader::new(&input[..]),
+            &mut output,
+            &unreachable_sealer,
+            Path::new("/x"),
+        )
+        .unwrap();
+        let lines: Vec<Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines[0]["error"]["code"], -32700);
+        assert_eq!(lines[1]["id"], 9);
+    }
 }

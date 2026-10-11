@@ -3,6 +3,8 @@ members = [
     "crates/bridge-core",
     "crates/bridge-client",
     "crates/bridge-adapters",
+    "crates/bridge-interfaces",
+    "xtask",
 ]
 resolver = "3"
 

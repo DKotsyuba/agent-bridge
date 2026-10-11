@@ -58,6 +58,17 @@ automatically repeated after a possible handoff.
   OS-confined Codex queue and Claude `later` message carriers, and the
   `bridge-native-daemon`. See `crates/bridge-adapters/README.md` for its
   trust model, configuration and unqualified native gaps.
+- `crates/bridge-interfaces` — the restricted root MCP (`bridge-root-mcp`
+  frontend + `bridge-root-relay`: attested `bridge_me` / `bridge_send` /
+  `bridge_status` only), the operator CLI over core incidents and audited
+  same-event recovery, outbound-only owner notification (Telegram) with a
+  durable send ledger, and packaging, install, rollback, process lifecycle
+  and doctor (`bridge`). See `crates/bridge-interfaces/README.md` for the
+  operator, Telegram and install guides and its evidence levels.
+- `xtask` — `cargo xtask package` (release bundle) and `cargo xtask
+  qualify --prefix ABS` (isolated install/lifecycle qualification);
+  `install.sh` installs a bundle after checking its attested digest;
+  `family.toml` declares the family profile (`not_verified`).
 
 ## Dispatch contract (what an adapter implements and calls)
 
@@ -226,6 +237,10 @@ gap — never a pass:
 - the optional receipt-token tier is recorded as an annotation only (no
   per-producer predeclared release/GC contract);
 - operator notification channels (Telegram) are not part of core: incidents are
-  durable and listed, but nothing tells the owner by itself;
+  durable and listed; `bridge notify` (bridge-interfaces) reports them to a
+  configured owner chat, and without one reports the owner as not notified —
+  no live Telegram send has been qualified;
+- the root MCP has no `bridge.ack`: core issues no recipient receipt token and
+  no producer has predeclared a receipt tier;
 - wall-clock regressions are not modeled (leases and deadlines use the service
   clock as given).

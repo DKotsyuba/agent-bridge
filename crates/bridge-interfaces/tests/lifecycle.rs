@@ -1,0 +1,371 @@
+//! Lifecycle of a real managed daemon (`bridge-root-relay`, copied into an
+//! owned sealed-release layout) under faults: parallel starts, a foreign
+//! endpoint already bound at the socket, a pid record that cannot be
+//! written, and a forged pid record. Everything lives in fresh exclusive
+//! scratch directories under `/tmp`; the only processes started or
+//! signalled are the relay copies these tests spawn.
+
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixListener;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use bridge_interfaces::lifecycle::{Component, PidRecord, read_record, start, stop};
+
+/// An exclusively created scratch tree, removed (only it) on drop.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    /// Creates `/tmp/bil<12 random hex>` with mode `0700`; never reuses
+    /// an existing path.
+    fn new() -> Scratch {
+        for _ in 0..16 {
+            let random = bridge_adapters::os::random_bytes().unwrap();
+            let suffix: String = random[..6].iter().map(|b| format!("{b:02x}")).collect();
+            let dir = PathBuf::from(format!("/tmp/bil{suffix}"));
+            if std::fs::create_dir(&dir).is_ok() {
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+                return Scratch(dir.canonicalize().unwrap());
+            }
+        }
+        panic!("no free scratch name");
+    }
+}
+
+impl Drop for Scratch {
+    /// Removes the scratch tree.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A home with one sealed-layout release holding a copy of the relay, its
+/// interfaces configuration and state directory.
+struct Fixture {
+    /// Scratch owner.
+    scratch: Scratch,
+    /// Installation home.
+    home: PathBuf,
+    /// Lifecycle state directory.
+    state: PathBuf,
+    /// Relay configuration.
+    config: PathBuf,
+    /// Relay socket.
+    socket: PathBuf,
+    /// The copied relay executable (unique per fixture).
+    exe: PathBuf,
+}
+
+/// Builds a fixture.
+fn fixture() -> Fixture {
+    let scratch = Scratch::new();
+    let root = scratch.0.clone();
+    let home = root.join("home");
+    let bin = home.join("releases").join("0.1.0+t").join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let exe = bin.join("bridge-root-relay");
+    std::fs::copy(env!("CARGO_BIN_EXE_bridge-root-relay"), &exe).unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink("releases/0.1.0+t", home.join("current")).unwrap();
+    let state_file = home.join("install-state.json");
+    std::fs::write(
+        &state_file,
+        r#"{"current":"0.1.0+t","previous":null,"max_core_schema":4}"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&state_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let relay_dir = root.join("rl");
+    std::fs::create_dir(&relay_dir).unwrap();
+    std::fs::set_permissions(&relay_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let token = relay_dir.join("token");
+    std::fs::write(&token, "relay-token-for-lifecycle-test").unwrap();
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let socket = relay_dir.join("r.sock");
+    let config = root.join("interfaces.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "core_socket = \"{core}\"\n[root]\nsocket = \"{socket}\"\ntoken_file = \"{token}\"\n[[root.callers]]\nhost_id = \"h\"\nharness = \"claude-code\"\nnative_store_namespace = \"n\"\nrecipients = []\nmodes = []\nkinds = []\n",
+            core = root.join("absent-core.sock").display(),
+            socket = socket.display(),
+            token = token.display(),
+        ),
+    )
+    .unwrap();
+    Fixture {
+        state: root.join("state"),
+        home,
+        config,
+        socket,
+        exe: exe.canonicalize().unwrap(),
+        scratch,
+    }
+}
+
+/// Whether any process runs from `exe` (test-only check of this
+/// fixture's unique executable path).
+fn running(exe: &Path) -> bool {
+    Command::new("/usr/bin/pgrep")
+        .arg("-f")
+        .arg(exe)
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+#[test]
+fn parallel_starts_are_serialized_and_stop_is_exact() {
+    let fixture = fixture();
+    let results: Vec<Result<PidRecord, String>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                scope.spawn(|| {
+                    start(
+                        &fixture.home,
+                        &fixture.state,
+                        Component::Relay,
+                        &fixture.config,
+                    )
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    });
+    let started: Vec<_> = results
+        .iter()
+        .filter_map(|result| result.as_ref().ok())
+        .collect();
+    assert_eq!(started.len(), 1, "{results:?}");
+    assert!(results.iter().any(|result| {
+        result
+            .as_ref()
+            .is_err_and(|error| error.contains("already running"))
+    }));
+    assert_eq!(
+        read_record(&fixture.state, Component::Relay)
+            .unwrap()
+            .as_ref(),
+        Some(started[0])
+    );
+    assert!(stop(&fixture.home, &fixture.state, Component::Relay).unwrap());
+    assert!(!running(&fixture.exe));
+    assert!(!fixture.socket.exists(), "relay removed its own socket");
+    assert!(!stop(&fixture.home, &fixture.state, Component::Relay).unwrap());
+}
+
+#[test]
+fn a_foreign_endpoint_is_never_taken_for_ours() {
+    let fixture = fixture();
+    let foreign = UnixListener::bind(&fixture.socket).unwrap();
+    let error = start(
+        &fixture.home,
+        &fixture.state,
+        Component::Relay,
+        &fixture.config,
+    )
+    .unwrap_err();
+    assert!(!error.is_empty());
+    assert!(fixture.socket.exists(), "foreign socket untouched");
+    assert!(
+        read_record(&fixture.state, Component::Relay)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!running(&fixture.exe), "the spawned child was stopped");
+    drop(foreign);
+}
+
+#[test]
+fn a_record_write_failure_stops_the_spawned_child() {
+    let fixture = fixture();
+    // Lock and log exist; the directory then becomes read-only, so the
+    // daemon starts but its pid record cannot be written.
+    state_dir(&fixture, 0o700);
+    for name in ["relay.lock", "relay.log"] {
+        pid_file_named(&fixture, name);
+    }
+    std::fs::set_permissions(&fixture.state, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let result = start(
+        &fixture.home,
+        &fixture.state,
+        Component::Relay,
+        &fixture.config,
+    );
+    std::fs::set_permissions(&fixture.state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let error = result.unwrap_err();
+    assert!(error.contains("cannot record pid"), "{error}");
+    assert!(!running(&fixture.exe), "no orphan without a record");
+    assert!(!fixture.state.join("relay.pid").exists());
+}
+
+#[test]
+fn a_forged_record_is_preserved_and_nothing_is_signalled() {
+    let fixture = fixture();
+    std::fs::create_dir(&fixture.state).unwrap();
+    std::fs::set_permissions(&fixture.state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let own = bridge_adapters::os::process_facts(std::process::id()).unwrap();
+    let forged = PidRecord {
+        pid: own.pid,
+        start_time: own.start_time,
+        exe: own.exe.unwrap(),
+        socket: fixture.socket.clone(),
+    };
+    let path = fixture.state.join("relay.pid");
+    std::fs::write(&path, serde_json::to_vec(&forged).unwrap()).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let error = stop(&fixture.home, &fixture.state, Component::Relay).unwrap_err();
+    assert!(error.contains("preserved"), "{error}");
+    assert_eq!(
+        read_record(&fixture.state, Component::Relay),
+        Ok(Some(forged))
+    );
+    let _ = &fixture.scratch;
+}
+
+#[test]
+fn an_interrupted_activation_is_never_started() {
+    let fixture = fixture();
+    // The state records another release than `current` points at.
+    let state_file = fixture.home.join("install-state.json");
+    std::fs::write(
+        &state_file,
+        r#"{"current":"0.1.0+other","previous":"0.1.0+t","max_core_schema":4}"#,
+    )
+    .unwrap();
+    let started = start(
+        &fixture.home,
+        &fixture.state,
+        Component::Relay,
+        &fixture.config,
+    );
+    // Clean up first in every outcome, then judge.
+    let _ = stop(&fixture.home, &fixture.state, Component::Relay);
+    let error = started.unwrap_err();
+    assert!(error.contains("interrupted activation"), "{error}");
+    assert!(!running(&fixture.exe));
+}
+
+/// Creates the fixture's state directory with `mode` (not via lifecycle).
+fn state_dir(fixture: &Fixture, mode: u32) {
+    std::fs::create_dir(&fixture.state).unwrap();
+    std::fs::set_permissions(&fixture.state, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// Writes `bytes` as the relay pid record with `mode`.
+fn pid_file(fixture: &Fixture, bytes: &[u8], mode: u32) -> PathBuf {
+    let path = fixture.state.join("relay.pid");
+    std::fs::write(&path, bytes).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    path
+}
+
+#[test]
+fn untrusted_pid_records_are_preserved_and_refuse_start_and_stop() {
+    let fixture = fixture();
+    state_dir(&fixture, 0o700);
+    // A real record of the managed daemon but readable by others, malformed
+    // bytes, and a valid record of a foreign executable: none may be
+    // overwritten, signalled or read as "not running".
+    let dead = PidRecord {
+        pid: 999_999,
+        start_time: 1,
+        exe: fixture.exe.clone(),
+        socket: fixture.socket.clone(),
+    };
+    // A valid private record naming a foreign executable is preserved too.
+    let foreign = PidRecord {
+        exe: PathBuf::from("/usr/bin/true"),
+        ..dead.clone()
+    };
+    let cases: [(Vec<u8>, u32, bool); 3] = [
+        (serde_json::to_vec(&dead).unwrap(), 0o644, true),
+        (b"{ not a pid record".to_vec(), 0o600, true),
+        (serde_json::to_vec(&foreign).unwrap(), 0o600, false),
+    ];
+    for (bytes, mode, untrusted) in cases {
+        let path = pid_file(&fixture, &bytes, mode);
+        let started = start(
+            &fixture.home,
+            &fixture.state,
+            Component::Relay,
+            &fixture.config,
+        );
+        let stopped = stop(&fixture.home, &fixture.state, Component::Relay);
+        let after = std::fs::read(&path).unwrap();
+        assert!(!running(&fixture.exe), "nothing was spawned");
+        assert!(started.unwrap_err().contains("preserved"));
+        assert!(
+            stopped.unwrap_err().contains("preserved"),
+            "never 'not running'"
+        );
+        assert_eq!(
+            read_record(&fixture.state, Component::Relay).is_err(),
+            untrusted
+        );
+        assert_eq!(after, bytes, "record preserved byte for byte");
+        std::fs::remove_file(&path).unwrap();
+    }
+}
+
+#[test]
+fn a_valid_dead_record_of_ours_is_replaced() {
+    let fixture = fixture();
+    state_dir(&fixture, 0o700);
+    let mut gone = Command::new("/usr/bin/true").spawn().unwrap();
+    let pid = gone.id();
+    gone.wait().unwrap();
+    let dead = PidRecord {
+        pid,
+        start_time: 1,
+        exe: fixture.exe.clone(),
+        socket: fixture.socket.clone(),
+    };
+    pid_file(&fixture, &serde_json::to_vec(&dead).unwrap(), 0o600);
+    let started = start(
+        &fixture.home,
+        &fixture.state,
+        Component::Relay,
+        &fixture.config,
+    );
+    let stopped = stop(&fixture.home, &fixture.state, Component::Relay);
+    let record = started.unwrap();
+    assert_ne!(record.pid, pid);
+    assert!(stopped.unwrap());
+    assert!(!running(&fixture.exe));
+}
+
+#[test]
+fn a_group_or_world_writable_state_directory_is_refused_unchanged() {
+    let fixture = fixture();
+    state_dir(&fixture, 0o777);
+    let started = start(
+        &fixture.home,
+        &fixture.state,
+        Component::Relay,
+        &fixture.config,
+    );
+    let stopped = stop(&fixture.home, &fixture.state, Component::Relay);
+    assert!(!running(&fixture.exe));
+    assert!(started.unwrap_err().contains("group/other write"));
+    assert!(stopped.is_err());
+    let mode = std::fs::metadata(&fixture.state)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o777, "permissions never changed");
+    assert_eq!(
+        std::fs::read_dir(&fixture.state).unwrap().count(),
+        0,
+        "nothing written"
+    );
+}
+
+/// Creates an empty private file `name` in the fixture's state directory.
+fn pid_file_named(fixture: &Fixture, name: &str) {
+    let path = fixture.state.join(name);
+    std::fs::write(&path, b"").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}

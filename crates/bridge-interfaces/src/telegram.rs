@@ -1,453 +1,711 @@
-//! Outbound-only owner notification channel (Telegram).
+//! Outbound-only owner channel: one Telegram `sendMessage` call.
 //!
-//! Sends plain-text `sendMessage` requests to the one configured owner
-//! destination and nothing else. There is no incoming path in this module:
-//! no getUpdates, no webhook, no commands, no replies, no approval
-//! handling — none of that code exists.
+//! The only request this module can build is `POST
+//! https://api.telegram.org/bot<token>/sendMessage` with `{"chat_id",
+//! "text"}` for the one configured chat: plain text (no `parse_mode`), no
+//! reply targeting, no harness delivery mode. The origin is the fixed
+//! [`crate::config::TELEGRAM_API`]; [`send`] re-checks the whole
+//! configuration ([`TelegramConfig::check`]) before reading the token, so a
+//! hand-built configuration cannot forward the token elsewhere. There is no
+//! incoming path — no `getUpdates`, webhook, command, reply or approval code
+//! exists.
 //!
-//! Failure classification is the point of this file:
-//! - [`SendOutcome::Sent`] means the provider accepted the message. That is
-//!   provider acceptance, explicitly not proof that the owner read it.
-//! - [`SendOutcome::KnownRefusal`] is a positively established
-//!   non-acceptance (definitive 4xx, including rate limits). Only this
-//!   class may ever feed a bounded automatic retry policy elsewhere.
-//! - [`SendOutcome::PossibleSend`] covers timeouts and connection failures
-//!   after the request may have been written: the message may have been
-//!   delivered. This class never authorizes an automatic retry and never
-//!   hardens into "unsent" without new positive evidence.
-//! - An unconfigured channel reports [`SendOutcome::Unconfigured`] and any
-//!   dependent incident stays open: "no configured channel" must never
-//!   imply the owner was notified.
+//! Credentials: the bot token is read from a protected file
+//! ([`crate::config::read_secret`]) and handed to `curl` only through its
+//! standard input as a config file, never in argv (visible to other
+//! processes). Every transport observation is redacted against the token
+//! (verbatim, with `:` percent-encoded, and its secret part after `:`)
+//! *before* any classification, truncation or detail is built, so a
+//! provider or transport that echoes the token cannot put it into an
+//! outcome, ledger or log.
 //!
-//! Credentials live in a protected file outside this code's control and are
-//! never logged, never copied into incidents and never echoed in errors.
+//! Outcome classes are kept strictly apart ([`SendOutcome`]): provider
+//! acceptance (not proof that anyone read it), known refusal (an HTTP 4xx
+//! answer), known-unsent (provably no request left this host) and possible
+//! send (anything after the request may have started). Only the two known
+//! non-acceptance classes may ever be retried, and only by
+//! [`crate::notify`]'s bounded policy; this module itself never retries.
 
+use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
-use crate::operator::{IncidentInput, IncidentStore};
+use crate::config::{TELEGRAM_API, TelegramConfig, read_secret};
 
-/// Configuration for the outbound owner channel, usually from TOML.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TelegramConfig {
-    /// Whether the channel is configured and may be used at all.
-    ///
-    /// `false` (or a missing/unreadable token file) makes every send
-    /// report [`SendOutcome::Unconfigured`]/[`SendOutcome::Misconfigured`]
-    /// without any network attempt.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Path of the protected file holding the bot token (0600).
-    pub bot_token_file: PathBuf,
-    /// The one fixed destination chat id; never caller-supplied.
-    pub chat_id: String,
-    /// API host base, default `api.telegram.org`.
-    #[serde(default = "default_api_base")]
-    pub api_base: String,
-    /// Per-request timeout in seconds; elapsed time past this is a
-    /// possible-send, not a known refusal.
-    #[serde(default = "default_timeout_secs")]
-    pub timeout_secs: u64,
-}
+/// Largest accepted provider answer, in bytes.
+const MAX_REPLY_BYTES: usize = 64 * 1024;
 
-/// Default Telegram API host.
-fn default_api_base() -> String {
-    "api.telegram.org".to_string()
-}
+/// Largest kept transport diagnostic (curl stderr), in bytes.
+const MAX_DIAGNOSTIC_BYTES: usize = 4 * 1024;
 
-/// Default per-request timeout in seconds.
-const fn default_timeout_secs() -> u64 {
-    15
-}
+/// Largest accepted bot token, in bytes.
+const MAX_TOKEN_BYTES: usize = 128;
 
-/// The classified outcome of one outbound send attempt.
-///
-/// The distinction between `KnownRefusal` and `PossibleSend` is a contract
-/// obligation: collapsing them (treating ambiguity as refusal, or refusal
-/// as ambiguity) is a boundary violation, not a formatting choice.
+/// Largest notification text Telegram accepts, in characters.
+pub const MAX_TEXT_CHARS: usize = 4096;
+
+/// Replacement text for a redacted credential.
+const REDACTED: &str = "<redacted>";
+
+/// The classified result of one send.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum SendOutcome {
-    /// Provider accepted the message (not proof of reading).
-    Sent {
-        /// Provider-assigned message id, when parsed from the response.
+    /// The provider accepted the message. Not proof of reading.
+    ProviderAccepted {
+        /// Provider message id when present.
         message_id: Option<i64>,
     },
-    /// Positively known non-acceptance; the only retry-eligible class.
+    /// The provider answered with a definitive refusal (HTTP 4xx).
     KnownRefusal {
-        /// Safe-for-logging refusal detail (no token, no URL).
+        /// Redacted detail (status and provider description).
         detail: String,
-        /// Rate-limit retry hint from the provider, in milliseconds.
+        /// Provider rate-limit hint, in milliseconds.
         retry_after_ms: Option<u64>,
     },
-    /// The request may have been written; delivery is unknown.
+    /// Provably nothing was sent (pre-effect failure).
+    KnownUnsent {
+        /// Redacted detail.
+        detail: String,
+    },
+    /// The request may have reached the provider; outcome unknown. Never
+    /// retried automatically.
     PossibleSend {
-        /// Safe-for-logging ambiguity detail.
-        detail: String,
-    },
-    /// The channel is not configured; nothing was attempted.
-    Unconfigured,
-    /// Configured but unusable (for example a missing token file).
-    Misconfigured {
-        /// Safe-for-logging configuration problem.
+        /// Redacted detail.
         detail: String,
     },
 }
 
-impl SendOutcome {
-    /// Whether this outcome positively establishes non-acceptance.
-    ///
-    /// Only `KnownRefusal` does; `PossibleSend` and `Sent` never claim it.
-    pub fn is_known_refusal(&self) -> bool {
-        matches!(self, SendOutcome::KnownRefusal { .. })
-    }
-
-    /// Whether this outcome is a failure that must stay visible.
-    ///
-    /// Everything except `Sent` keeps any dependent incident open.
-    pub fn is_failure(&self) -> bool {
-        !matches!(self, SendOutcome::Sent { .. })
-    }
-}
-
-/// One raw transport reply, before classification.
+/// What the transport observed, before redaction and classification.
+///
+/// Untrusted: every text may contain anything the provider or transport
+/// echoed, including the token. [`send`] redacts it before use.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportReply {
-    /// The server answered with this HTTP status and body.
+    /// An HTTP answer arrived.
     Responded {
-        /// HTTP status code.
+        /// HTTP status (0 when unreadable).
         status: u16,
-        /// Response body text, bounded by the transport.
+        /// Bounded answer body.
         body: String,
     },
-    /// The request timed out after the request may have been written.
-    TimedOut,
-    /// The connection failed; treated conservatively as possible-send.
-    ConnectFailed {
-        /// Safe-for-logging connection failure detail.
-        detail: String,
-    },
+    /// The request provably never left this host.
+    NotSent(String),
+    /// The request may have been sent; no usable answer.
+    Uncertain(String),
 }
 
-/// The outbound transport used for `sendMessage`.
-///
-/// Implementations must send exactly the request they are given and report
-/// honestly; tests use scripted fixtures, the real deployment uses
-/// [`CurlTransport`].
+/// One outbound HTTPS POST, at most once per call.
 pub trait Transport {
-    /// Posts one JSON body to an HTTPS URL and reports the raw reply.
+    /// Posts `body` (JSON) to `url` within `timeout`; never retries.
     ///
-    /// Never retries: one call, one honest reply.
-    fn post_json(&self, url: &str, body: &str, timeout: Duration) -> TransportReply;
+    /// `url` contains the token: implementations must not log it. A reply
+    /// may only be `NotSent` when the implementation positively knows that
+    /// no byte of the request could have reached the network.
+    fn post(&self, url: &str, body: &str, timeout: Duration) -> TransportReply;
 }
 
-/// Real transport: one `curl` invocation per send, no retries.
-///
-/// Uses the system `curl` binary so the workspace needs no HTTP client
-/// dependency. The URL contains the bot token, so callers must log the
-/// method and chat id only, never the URL. Live qualification requires
-/// owner-provided configuration and an explicitly authorized test delivery;
-/// none has occurred.
+/// The production transport: the system `curl`, configured through stdin.
 #[derive(Debug, Clone)]
-pub struct CurlTransport;
+pub struct CurlTransport {
+    /// The curl executable.
+    curl: PathBuf,
+    /// Test-only fault and stub hooks; absent from production builds.
+    #[cfg(test)]
+    hooks: TestHooks,
+}
+
+/// Test-only behaviour of [`CurlTransport`].
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+struct TestHooks {
+    /// Rewrites the fixed origin to a local plain-HTTP stub origin.
+    stub_origin: Option<String>,
+    /// Makes the config writer fail after writing all but this many bytes.
+    withhold_tail: Option<usize>,
+}
+
+impl Default for CurlTransport {
+    /// `/usr/bin/curl`.
+    fn default() -> Self {
+        CurlTransport {
+            curl: PathBuf::from("/usr/bin/curl"),
+            #[cfg(test)]
+            hooks: TestHooks::default(),
+        }
+    }
+}
+
+impl CurlTransport {
+    /// The argv (without the executable) for one request: no URL, no token,
+    /// no body — those travel on stdin.
+    ///
+    /// `--disable` ignores `~/.curlrc`; `--noproxy *` (with a cleared
+    /// environment) forbids proxies; only `https`; no redirects; bounded
+    /// total time and reply size.
+    pub fn args(&self, timeout: Duration) -> Vec<String> {
+        #[cfg(test)]
+        let proto = if self.hooks.stub_origin.is_some() {
+            "=https,http"
+        } else {
+            "=https"
+        };
+        #[cfg(not(test))]
+        let proto = "=https";
+        [
+            "--disable",
+            "--silent",
+            "--show-error",
+            "--noproxy",
+            "*",
+            "--proto",
+            proto,
+            "--max-redirs",
+            "0",
+            "--max-time",
+            &format!("{:.3}", timeout.as_secs_f64()),
+            "--max-filesize",
+            &MAX_REPLY_BYTES.to_string(),
+            "--request",
+            "POST",
+            "--write-out",
+            "\n%{http_code}",
+            "--config",
+            "-",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+    }
+
+    /// Writes the request config to curl's stdin (test builds may inject a
+    /// failure after a partial write).
+    fn write_config(&self, stdin: &mut dyn Write, config: &[u8]) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(tail) = self.hooks.withhold_tail {
+            stdin.write_all(&config[..config.len().saturating_sub(tail)])?;
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        }
+        stdin.write_all(config)
+    }
+}
+
+/// Quotes a value for a curl config file (`\` and `"` escaped).
+fn curl_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
 
 impl Transport for CurlTransport {
-    /// Runs `curl -sS --max-time <t> -X POST` with the JSON body on stdin
-    /// and `-w` to append the HTTP status as the final output line.
+    /// Runs curl once with header, body and — last — the URL in a stdin
+    /// config, then waits for it.
     ///
-    /// Exit 0 maps to [`TransportReply::Responded`] with the parsed
-    /// status; a timeout exit (28) maps to [`TransportReply::TimedOut`];
-    /// anything else is a conservative
-    /// [`TransportReply::ConnectFailed`].
-    fn post_json(&self, url: &str, body: &str, timeout: Duration) -> TransportReply {
-        let output = std::process::Command::new("curl")
-            .arg("-sS")
-            .arg("--max-time")
-            .arg(timeout.as_secs().to_string())
-            .arg("-X")
-            .arg("POST")
-            .arg("-H")
-            .arg("content-type: application/json")
-            .arg("--data-binary")
-            .arg("@-")
-            .arg("-w")
-            .arg("\n%{http_code}")
-            .arg(url)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                use std::io::Write;
-                if let Some(stdin) = child.stdin.as_mut() {
-                    stdin.write_all(body.as_bytes())?;
+    /// Classification: failure to start curl → `NotSent`. Once curl runs,
+    /// any failure to deliver the whole config → `Uncertain` (curl may act
+    /// on a partial config). With the whole config delivered: exit 0 parses
+    /// the status trailer; exits 1, 2, 3, 6, 7, 35 and 60 (unsupported
+    /// protocol, init/config, bad URL, DNS, TCP connect, TLS handshake,
+    /// certificate) are failures before any request byte was sent for this
+    /// single request with no proxy and no redirect → `NotSent`; every
+    /// other exit (timeout 28, empty reply 52, send/receive 55/56, …) →
+    /// `Uncertain`. curl's stderr (bounded) is kept as diagnostic text.
+    fn post(&self, url: &str, body: &str, timeout: Duration) -> TransportReply {
+        #[cfg(test)]
+        let rewritten = match &self.hooks.stub_origin {
+            Some(origin) => url.replacen(TELEGRAM_API, origin, 1),
+            None => url.to_string(),
+        };
+        #[cfg(test)]
+        let url = rewritten.as_str();
+        let config = format!(
+            "header = \"content-type: application/json\"\ndata-binary = {}\nurl = {}\n",
+            curl_quote(body),
+            curl_quote(url)
+        );
+        let child = Command::new(&self.curl)
+            .args(self.args(timeout))
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+        let mut child = match child {
+            Ok(child) => child,
+            Err(error) => return TransportReply::NotSent(format!("curl did not start: {error}")),
+        };
+        let delivered = match child.stdin.take() {
+            Some(mut stdin) => self.write_config(&mut stdin, config.as_bytes()),
+            None => Err(std::io::ErrorKind::BrokenPipe.into()),
+        };
+        let mut stdout = Vec::new();
+        if let Some(out) = child.stdout.take() {
+            let _ = out
+                .take(MAX_REPLY_BYTES as u64 + 16)
+                .read_to_end(&mut stdout);
+        }
+        let mut stderr = Vec::new();
+        if let Some(err) = child.stderr.take() {
+            let _ = err
+                .take(MAX_DIAGNOSTIC_BYTES as u64)
+                .read_to_end(&mut stderr);
+        }
+        let status = child.wait();
+        let diagnostic = String::from_utf8_lossy(&stderr).trim().to_string();
+        if let Err(error) = delivered {
+            return TransportReply::Uncertain(format!(
+                "request config delivery failed after curl started ({error}); curl may have acted on part of it: {diagnostic}"
+            ));
+        }
+        let status = match status {
+            Ok(status) => status,
+            Err(error) => return TransportReply::Uncertain(format!("curl wait failed: {error}")),
+        };
+        match status.code() {
+            Some(0) => {
+                let text = String::from_utf8_lossy(&stdout);
+                let (body, code) = text.rsplit_once('\n').unwrap_or(("", &text));
+                TransportReply::Responded {
+                    status: code.trim().parse().unwrap_or(0),
+                    body: body.to_string(),
                 }
-                child.wait_with_output()
-            });
-        match output {
-            Ok(output) if output.status.success() => {
-                let text = String::from_utf8_lossy(&output.stdout).into_owned();
-                let (body, status) = match text.rfind('\n') {
-                    Some(index) => (
-                        text[..index].to_string(),
-                        text[index + 1..].trim().parse::<u16>().unwrap_or(0),
-                    ),
-                    None => (text.clone(), 0),
-                };
-                TransportReply::Responded { status, body }
             }
-            Ok(output) if output.status.code() == Some(28) => TransportReply::TimedOut,
-            Ok(output) => TransportReply::ConnectFailed {
-                detail: format!(
-                    "curl exited {:?}: {}",
-                    output.status.code(),
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ),
-            },
-            Err(error) => TransportReply::ConnectFailed {
-                detail: format!("curl spawn failed: {error}"),
-            },
+            Some(code @ (1 | 2 | 3 | 6 | 7 | 35 | 60)) => TransportReply::NotSent(format!(
+                "curl exit {code} before any request was sent: {diagnostic}"
+            )),
+            other => TransportReply::Uncertain(format!(
+                "curl exit {other:?} after the request may have been sent: {diagnostic}"
+            )),
         }
     }
 }
 
-/// A scripted transport for isolated tests and fixtures.
+/// Replaces every form of `token` in `text`: verbatim, with `:` percent-
+/// encoded (either case), and its secret part after the first `:`.
 ///
-/// Replies are consumed in order; an exhausted script answers
-/// [`TransportReply::TimedOut`] (the conservative class). Recorded requests
-/// are visible for assertions. Not thread-safe by design: test fixtures
-/// drive it strictly sequentially.
-#[derive(Debug)]
-pub struct FixtureTransport {
-    replies: std::cell::RefCell<std::collections::VecDeque<TransportReply>>,
-    /// URLs of every request seen, for assertions (tests use fake tokens).
-    pub seen_urls: std::cell::RefCell<Vec<String>>,
-    /// Bodies of every request seen, for assertions.
-    pub seen_bodies: std::cell::RefCell<Vec<String>>,
-}
-
-impl FixtureTransport {
-    /// Builds a fixture with the given scripted replies.
-    pub fn new(replies: Vec<TransportReply>) -> Self {
-        FixtureTransport {
-            replies: std::cell::RefCell::new(replies.into()),
-            seen_urls: std::cell::RefCell::new(Vec::new()),
-            seen_bodies: std::cell::RefCell::new(Vec::new()),
-        }
+/// Full forms are replaced before the secret part, so no fragment of a
+/// whole token survives; callers must redact before truncating.
+pub fn redact(text: &str, token: &str) -> String {
+    let mut forms = vec![
+        token.to_string(),
+        token.replace(':', "%3A"),
+        token.replace(':', "%3a"),
+    ];
+    if let Some((_, secret)) = token.split_once(':')
+        && !secret.is_empty()
+    {
+        forms.push(secret.to_string());
     }
-
-    /// How many sends this fixture performed.
-    pub fn send_count(&self) -> usize {
-        self.seen_urls.borrow().len()
-    }
+    forms
+        .iter()
+        .fold(text.to_string(), |text, form| text.replace(form, REDACTED))
 }
 
-impl Transport for FixtureTransport {
-    /// Records the request and returns the next scripted reply.
-    fn post_json(&self, url: &str, body: &str, _timeout: Duration) -> TransportReply {
-        self.seen_urls.borrow_mut().push(url.to_string());
-        self.seen_bodies.borrow_mut().push(body.to_string());
-        self.replies
-            .borrow_mut()
-            .pop_front()
-            .unwrap_or(TransportReply::TimedOut)
-    }
-}
-
-/// Reads the bot token from its protected file.
-///
-/// Trims trailing whitespace/newlines. Errors name the file path without
-/// ever including file content.
-fn read_token(config: &TelegramConfig) -> Result<String, SendOutcome> {
-    match std::fs::read_to_string(&config.bot_token_file) {
-        Ok(token) => Ok(token.trim().to_string()),
-        Err(error) => Err(SendOutcome::Misconfigured {
-            detail: format!(
-                "cannot read bot token file {}: {error}",
-                config.bot_token_file.display()
-            ),
-        }),
-    }
-}
-
-/// Builds the exact `sendMessage` request URL for a token.
-///
-/// The only URL this module can produce: the fixed API host, the token
-/// path segment and `sendMessage`. No other Telegram method exists here.
-pub fn send_message_url(config: &TelegramConfig, token: &str) -> String {
-    format!("https://{}/bot{}/sendMessage", config.api_base, token)
-}
-
-/// Builds the exact plain-text `sendMessage` JSON body.
-///
-/// Only `chat_id` and `text`: no `parse_mode`, no reply targeting, no
-/// harness delivery mode — Telegram inputs carry none.
-pub fn send_message_body(config: &TelegramConfig, text: &str) -> String {
-    serde_json::json!({"chat_id": config.chat_id, "text": text}).to_string()
-}
-
-/// Classifies one raw transport reply into a send outcome.
-///
-/// Mapping rules:
-/// - HTTP 200 with `ok: true` and a `result.message_id` → `Sent`.
-/// - HTTP 200 with `ok: true` but no message id → `Sent` with `None`
-///   (acceptance parsed, id absent — still acceptance, still not reading).
-/// - Any response with `ok: false` and a definitive 4xx status →
-///   `KnownRefusal` (429 extracts `parameters.retry_after`).
-/// - HTTP 5xx → `PossibleSend`: the server errored after possibly
-///   processing the request; that is ambiguity, not refusal.
-/// - Timeout/connection failure → `PossibleSend`.
-pub fn classify(reply: TransportReply) -> SendOutcome {
+/// Redacts every untrusted text of a transport reply.
+fn redact_reply(reply: TransportReply, token: &str) -> TransportReply {
     match reply {
-        TransportReply::TimedOut => SendOutcome::PossibleSend {
-            detail: "request timed out after the request may have been written".to_string(),
+        TransportReply::Responded { status, body } => TransportReply::Responded {
+            status,
+            body: redact(&body, token),
         },
-        TransportReply::ConnectFailed { detail } => SendOutcome::PossibleSend {
-            detail: format!("connection failed (possible send): {detail}"),
+        TransportReply::NotSent(detail) => TransportReply::NotSent(redact(&detail, token)),
+        TransportReply::Uncertain(detail) => TransportReply::Uncertain(redact(&detail, token)),
+    }
+}
+
+/// Classifies an (already redacted) transport observation.
+///
+/// HTTP 2xx with `"ok": true` is provider acceptance; any other 2xx, a
+/// 5xx or an unreadable status is a possible send; 4xx is a known refusal
+/// (429 carries `parameters.retry_after`). Descriptions and diagnostics
+/// are cut to 200 characters.
+pub fn classify(reply: TransportReply) -> SendOutcome {
+    let cut = |text: &str| text.chars().take(200).collect::<String>();
+    match reply {
+        TransportReply::NotSent(detail) => SendOutcome::KnownUnsent {
+            detail: cut(&detail),
+        },
+        TransportReply::Uncertain(detail) => SendOutcome::PossibleSend {
+            detail: cut(&detail),
         },
         TransportReply::Responded { status, body } => {
-            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or(
-                serde_json::Value::Object(Default::default()),
-            );
-            let ok = parsed.get("ok").and_then(|ok| ok.as_bool());
-            if ok == Some(true) {
-                let message_id = parsed
-                    .pointer("/result/message_id")
-                    .and_then(|id| id.as_i64());
-                return SendOutcome::Sent { message_id };
-            }
-            let description = parsed
+            let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            let description = cut(parsed
                 .get("description")
-                .and_then(|value| value.as_str())
-                .unwrap_or("provider refused without description")
-                .to_string();
-            if (400..500).contains(&status) {
-                let retry_after_ms = parsed
-                    .pointer("/parameters/retry_after")
-                    .and_then(|value| value.as_u64())
-                    .map(|seconds| seconds * 1000);
-                return SendOutcome::KnownRefusal {
+                .and_then(Value::as_str)
+                .unwrap_or("no description"));
+            match status {
+                200..=299 if parsed.get("ok") == Some(&Value::Bool(true)) => {
+                    SendOutcome::ProviderAccepted {
+                        message_id: parsed.pointer("/result/message_id").and_then(Value::as_i64),
+                    }
+                }
+                400..=499 => SendOutcome::KnownRefusal {
                     detail: format!("http {status}: {description}"),
-                    retry_after_ms,
-                };
-            }
-            SendOutcome::PossibleSend {
-                detail: format!("http {status} after possible processing: {description}"),
+                    retry_after_ms: parsed
+                        .pointer("/parameters/retry_after")
+                        .and_then(Value::as_u64)
+                        .map(|seconds| seconds.saturating_mul(1000)),
+                },
+                _ => SendOutcome::PossibleSend {
+                    detail: format!("http {status} without a definitive answer: {description}"),
+                },
             }
         }
     }
 }
 
-/// Sends one owner notification and classifies the result.
+/// Sends one plain-text message to the configured owner chat.
 ///
-/// Exactly one transport attempt; no retry, no fallback channel. The
-/// caller is responsible for what the outcome means for its incident.
-pub fn send_once(
-    config: &TelegramConfig,
-    transport: &dyn Transport,
-    text: &str,
-) -> SendOutcome {
-    if !config.enabled {
-        return SendOutcome::Unconfigured;
-    }
-    let token = match read_token(config) {
-        Ok(token) => token,
-        Err(outcome) => return outcome,
+/// Known-unsent, with no request, when: `config` is absent
+/// ("unconfigured"); it fails [`TelegramConfig::check`] (checked before
+/// the token is read); the token file is not protected or empty; or the
+/// token is longer than 128 bytes or holds characters outside
+/// `[A-Za-z0-9:_-]`. Otherwise exactly one transport call; its reply is
+/// redacted against the token before classification. `text` is cut to
+/// [`MAX_TEXT_CHARS`] characters.
+pub fn send(config: Option<&TelegramConfig>, transport: &dyn Transport, text: &str) -> SendOutcome {
+    let Some(config) = config else {
+        return SendOutcome::KnownUnsent {
+            detail: "owner channel unconfigured".into(),
+        };
     };
-    if config.chat_id.is_empty() {
-        return SendOutcome::Misconfigured {
-            detail: "configured chat id is empty".to_string(),
+    if let Err(detail) = config.check() {
+        return SendOutcome::KnownUnsent { detail };
+    }
+    let token = match read_secret(&config.token_file) {
+        Ok(token) => token,
+        Err(detail) => return SendOutcome::KnownUnsent { detail },
+    };
+    if token.len() > MAX_TOKEN_BYTES
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b":_-".contains(&byte))
+    {
+        return SendOutcome::KnownUnsent {
+            detail: "bot token file holds an unexpected value".into(),
         };
     }
-    let url = send_message_url(config, &token);
-    let body = send_message_body(config, text);
-    // Log method and destination only; the URL carries the token.
-    bridge_core::service::log_event(
-        "info",
-        "telegram_send",
-        &[("method", "sendMessage"), ("chat_id", &config.chat_id)],
-    );
-    classify(transport.post_json(&url, &body, Duration::from_secs(config.timeout_secs)))
+    let text: String = text.chars().take(MAX_TEXT_CHARS).collect();
+    let url = format!("{TELEGRAM_API}/bot{token}/sendMessage");
+    let body = json!({"chat_id": config.chat_id, "text": text}).to_string();
+    let reply = transport.post(&url, &body, Duration::from_millis(config.timeout_ms));
+    classify(redact_reply(reply, &token))
 }
 
-/// The full owner-notification flow: send once, then keep the truth durable.
-///
-/// On any failure class, an incident is recorded (or idempotently
-/// refreshed) in the operator store so the failure stays visible even
-/// though the owner channel is the thing that failed; an unconfigured
-/// channel records nothing new here but also never claims notification.
-/// This function never resends the original uncertain event and never
-/// retries: one report text, one attempt, one honest record.
-pub fn notify_owner(
-    store: &mut IncidentStore,
-    config: &TelegramConfig,
-    transport: &dyn Transport,
-    report_text: &str,
-    incident_ref: Option<(&str, &str, &str)>,
-) -> (SendOutcome, Option<i64>) {
-    let outcome = send_once(config, transport, report_text);
-    let incident_id = match (&outcome, incident_ref) {
-        // Channel fine: no incident about the channel itself.
-        (SendOutcome::Sent { .. }, _) => None,
-        // Unconfigured: nothing new to record about a channel that is
-        // absent; callers keep their own incident visible regardless.
-        (SendOutcome::Unconfigured, _) => None,
-        // Real channel failure: retain a visible, classified incident.
-        (outcome, Some((publisher, event_id, envelope_hash))) => {
-            let reason = match outcome {
-                SendOutcome::KnownRefusal { .. } => "owner_channel_known_refusal",
-                SendOutcome::PossibleSend { .. } => "owner_channel_possible_send",
-                SendOutcome::Misconfigured { .. } => "owner_channel_misconfigured",
-                SendOutcome::Sent { .. } | SendOutcome::Unconfigured => unreachable!(),
+#[cfg(test)]
+mod tests {
+    //! Classification over a real curl process against a local HTTP stub.
+    //! The stub origin is substituted only inside the test transport; the
+    //! production configuration contract (fixed official origin) is
+    //! unchanged. No network, no real bot, no real token.
+
+    use super::*;
+    use crate::testdir::TestDir;
+    use std::io::BufRead;
+    use std::net::TcpListener;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Fake token used only against the local stub.
+    const TOKEN: &str = "123456:TEST-token_value";
+
+    /// A test transport aimed at the stub on `port`.
+    fn transport(port: u16) -> CurlTransport {
+        CurlTransport {
+            hooks: TestHooks {
+                stub_origin: Some(format!("http://127.0.0.1:{port}")),
+                withhold_tail: None,
+            },
+            ..CurlTransport::default()
+        }
+    }
+
+    /// What the stub does with one request.
+    enum Stub {
+        /// Answer this status and body.
+        Answer(u16, String),
+        /// Read the request, then close without answering.
+        Close,
+        /// Read the request, then stay silent past the client deadline.
+        Silent,
+    }
+
+    /// Serves at most one request on a fresh port for up to 5 s; returns
+    /// the port and a handle yielding the request line and body (`None`
+    /// when no request arrived).
+    fn stub(mode: Stub) -> (u16, std::thread::JoinHandle<Option<(String, String)>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => return None,
+                }
             };
-            let detail = match outcome {
-                SendOutcome::KnownRefusal { detail, .. }
-                | SendOutcome::PossibleSend { detail }
-                | SendOutcome::Misconfigured { detail } => detail.clone(),
-                _ => String::new(),
-            };
-            let input = IncidentInput {
-                publisher: publisher.to_string(),
-                event_id: event_id.to_string(),
-                envelope_hash: envelope_hash.to_string(),
-                source: "telegram".to_string(),
-                reason: reason.to_string(),
-                detail,
-                next_action: "review the owner channel incident; no automatic retry exists"
-                    .to_string(),
-                review_deadline_ms: None,
-                blocked_dependents: Vec::new(),
-            };
-            match store.record(&input, current_unix_millis()) {
-                Ok(incident) => Some(incident.id),
-                Err(error) => {
-                    bridge_core::service::log_event(
-                        "error",
-                        "owner_channel_incident_record_failed",
-                        &[("error", &error)],
-                    );
-                    None
+            stream.set_nonblocking(false).unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).ok()?;
+            let mut length = 0;
+            loop {
+                let mut header = String::new();
+                if reader.read_line(&mut header).ok()? == 0 {
+                    return Some((request_line, String::new()));
+                }
+                if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+                if header == "\r\n" {
+                    break;
                 }
             }
-        }
-        (outcome, None) => {
-            bridge_core::service::log_event(
-                "warn",
-                "owner_channel_failed_without_ref",
-                &[("outcome", &serde_json::to_string(outcome).unwrap_or_default())],
-            );
-            None
-        }
-    };
-    (outcome, incident_id)
-}
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).ok()?;
+            let mut stream = stream;
+            match mode {
+                Stub::Answer(status, text) => {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{text}",
+                        text.len()
+                    );
+                }
+                Stub::Close => drop(stream),
+                Stub::Silent => std::thread::sleep(Duration::from_millis(2500)),
+            }
+            Some((request_line, String::from_utf8(body).unwrap()))
+        });
+        (port, handle)
+    }
 
-/// Current wall clock in Unix epoch milliseconds.
-fn current_unix_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_millis() as u64)
-        .unwrap_or(0)
+    /// A valid configuration with a protected token file in `dir`.
+    fn config(dir: &TestDir) -> TelegramConfig {
+        let token_file = dir.path().join("token");
+        std::fs::write(&token_file, TOKEN).unwrap();
+        std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        TelegramConfig {
+            token_file,
+            chat_id: "4242".into(),
+            api_base: TELEGRAM_API.into(),
+            timeout_ms: 1000,
+        }
+    }
+
+    /// Sends through a stub and returns the outcome and the observed request.
+    fn exchange(mode: Stub) -> (SendOutcome, Option<(String, String)>) {
+        let dir = TestDir::new("tg");
+        let (port, handle) = stub(mode);
+        let outcome = send(Some(&config(&dir)), &transport(port), "incident #1");
+        (outcome, handle.join().unwrap())
+    }
+
+    #[test]
+    fn provider_acceptance_is_only_acceptance() {
+        let (outcome, request) = exchange(Stub::Answer(
+            200,
+            r#"{"ok":true,"result":{"message_id":7}}"#.into(),
+        ));
+        assert_eq!(
+            outcome,
+            SendOutcome::ProviderAccepted {
+                message_id: Some(7)
+            }
+        );
+        let (line, body) = request.unwrap();
+        assert!(line.starts_with(&format!("POST /bot{TOKEN}/sendMessage ")));
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body, json!({"chat_id": "4242", "text": "incident #1"}));
+    }
+
+    #[test]
+    fn refusals_rate_limits_and_server_errors_are_classified() {
+        let (refused, _) = exchange(Stub::Answer(
+            400,
+            r#"{"ok":false,"description":"chat not found"}"#.into(),
+        ));
+        assert!(matches!(
+            refused,
+            SendOutcome::KnownRefusal {
+                retry_after_ms: None,
+                ..
+            }
+        ));
+        let (limited, _) = exchange(Stub::Answer(
+            429,
+            r#"{"ok":false,"description":"slow down","parameters":{"retry_after":3}}"#.into(),
+        ));
+        assert!(matches!(
+            limited,
+            SendOutcome::KnownRefusal {
+                retry_after_ms: Some(3000),
+                ..
+            }
+        ));
+        let (server, _) = exchange(Stub::Answer(502, "bad gateway".into()));
+        assert!(matches!(server, SendOutcome::PossibleSend { .. }));
+        let (odd, _) = exchange(Stub::Answer(200, r#"{"ok":false}"#.into()));
+        assert!(matches!(odd, SendOutcome::PossibleSend { .. }));
+    }
+
+    #[test]
+    fn provider_echo_of_the_token_never_reaches_the_outcome() {
+        let secret = TOKEN.split_once(':').unwrap().1;
+        // The verbatim token straddles the 200-character cut; the encoded
+        // form and the bare secret part follow.
+        let description = format!(
+            "{}{TOKEN} url=/bot{} secret={secret}",
+            "x".repeat(190),
+            TOKEN.replace(':', "%3A")
+        );
+        let (outcome, _) = exchange(Stub::Answer(
+            400,
+            json!({"ok": false, "description": description}).to_string(),
+        ));
+        let SendOutcome::KnownRefusal { detail, .. } = outcome else {
+            panic!("unexpected {outcome:?}");
+        };
+        for fragment in [&TOKEN[..9], &secret[..6], "%3ATEST"] {
+            assert!(!detail.contains(fragment), "{fragment:?} leaked: {detail}");
+        }
+        let short = format!(
+            "bad {TOKEN} or %3a form {} or {secret}",
+            TOKEN.replace(':', "%3a")
+        );
+        let (outcome, _) = exchange(Stub::Answer(
+            401,
+            json!({"ok": false, "description": short}).to_string(),
+        ));
+        let rendered = serde_json::to_string(&outcome).unwrap();
+        assert!(!rendered.contains(secret), "{rendered}");
+        assert!(rendered.contains(REDACTED), "{rendered}");
+    }
+
+    /// A transport that echoes the token through its non-HTTP replies.
+    struct Echo(bool);
+
+    impl Transport for Echo {
+        /// Echoes the URL (which holds the token) as a diagnostic.
+        fn post(&self, url: &str, _body: &str, _timeout: Duration) -> TransportReply {
+            if self.0 {
+                TransportReply::NotSent(format!("refused {url}"))
+            } else {
+                TransportReply::Uncertain(format!("lost {url}"))
+            }
+        }
+    }
+
+    #[test]
+    fn transport_diagnostics_are_redacted() {
+        let dir = TestDir::new("tgecho");
+        for not_sent in [true, false] {
+            let outcome = send(Some(&config(&dir)), &Echo(not_sent), "x");
+            let rendered = serde_json::to_string(&outcome).unwrap();
+            assert!(!rendered.contains("TEST-token"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn lost_and_silent_answers_are_possible_sends() {
+        let (lost, _) = exchange(Stub::Close);
+        assert!(matches!(lost, SendOutcome::PossibleSend { .. }), "{lost:?}");
+        let (silent, _) = exchange(Stub::Silent);
+        assert!(
+            matches!(silent, SendOutcome::PossibleSend { .. }),
+            "{silent:?}"
+        );
+    }
+
+    #[test]
+    fn partial_config_delivery_is_a_possible_send() {
+        let dir = TestDir::new("tgpart");
+        let (port, handle) = stub(Stub::Answer(
+            200,
+            r#"{"ok":true,"result":{"message_id":9}}"#.into(),
+        ));
+        let mut transport = transport(port);
+        // Everything but the final newline reaches the real curl process,
+        // which may still act on it: the request can go out.
+        transport.hooks.withhold_tail = Some(1);
+        let outcome = send(Some(&config(&dir)), &transport, "x");
+        let received = handle.join().unwrap();
+        assert!(
+            matches!(outcome, SendOutcome::PossibleSend { .. }),
+            "{outcome:?} (stub received a request: {})",
+            received.is_some()
+        );
+    }
+
+    #[test]
+    fn refused_connection_and_invalid_config_are_known_unsent_before_effect() {
+        let dir = TestDir::new("tgunsent");
+        let port = {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let config = config(&dir);
+        let outcome = send(Some(&config), &transport(port), "x");
+        assert!(
+            matches!(outcome, SendOutcome::KnownUnsent { .. }),
+            "{outcome:?}"
+        );
+        /// Counts calls; must never be reached.
+        struct Never(std::cell::Cell<u32>);
+        impl Transport for Never {
+            /// Records an unexpected call.
+            fn post(&self, _: &str, _: &str, _: Duration) -> TransportReply {
+                self.0.set(self.0.get() + 1);
+                TransportReply::Uncertain(String::new())
+            }
+        }
+        let never = Never(std::cell::Cell::new(0));
+        for bad in [
+            TelegramConfig {
+                api_base: "https://evil.example".into(),
+                ..config.clone()
+            },
+            TelegramConfig {
+                timeout_ms: 0,
+                ..config.clone()
+            },
+            TelegramConfig {
+                chat_id: "1\"\nurl = \"x".into(),
+                ..config.clone()
+            },
+        ] {
+            assert!(matches!(
+                send(Some(&bad), &never, "x"),
+                SendOutcome::KnownUnsent { .. }
+            ));
+        }
+        std::fs::set_permissions(&config.token_file, std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        assert!(matches!(
+            send(Some(&config), &never, "x"),
+            SendOutcome::KnownUnsent { .. }
+        ));
+        assert!(matches!(
+            send(None, &never, "x"),
+            SendOutcome::KnownUnsent { .. }
+        ));
+        assert_eq!(never.0.get(), 0, "no request for invalid configuration");
+    }
+
+    #[test]
+    fn the_token_never_reaches_argv() {
+        let args = CurlTransport::default().args(Duration::from_secs(5));
+        assert!(
+            args.iter()
+                .all(|arg| !arg.contains("bot") && !arg.contains(':'))
+        );
+        assert!(args.contains(&"=https".to_string()));
+        assert_eq!(args.first().map(String::as_str), Some("--disable"));
+    }
 }
