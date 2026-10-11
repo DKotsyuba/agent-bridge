@@ -23,6 +23,7 @@ impl Scratch {
     /// root with mode `0700`; never reuses an existing path. The root must leave
     /// room for descendant sockets within macOS's approximately 104-byte ceiling.
     /// Panics after 16 failed creation attempts; drop removes only this tree.
+    /// Entropy, permission-setting or canonicalization failures panic immediately.
     fn new() -> Scratch {
         for _ in 0..16 {
             let random = bridge_adapters::os::random_bytes().unwrap();

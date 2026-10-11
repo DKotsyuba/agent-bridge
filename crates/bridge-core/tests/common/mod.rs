@@ -63,6 +63,7 @@ impl Drop for TempDir {
 /// The process counter prevents clock-resolution collisions between parallel
 /// calls. No path is created; the caller owns socket creation and cleanup.
 /// The short `bl-` prefix retains the same tag, PID, timestamp and counter.
+/// Panics if the system clock precedes the Unix epoch.
 /// The caller must configure a root short enough for the generated basename and
 /// the macOS AF_UNIX ceiling of about 104 bytes; no nested test tree is added.
 #[allow(dead_code)]

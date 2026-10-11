@@ -43,6 +43,7 @@ impl Scratch {
     /// root with mode `0700`; panics after 16 failed creation attempts. The root
     /// must leave room for sockets within macOS's approximately 104-byte ceiling.
     /// Drop removes only the returned canonical tree.
+    /// Entropy, permission-setting or canonicalization failures panic immediately.
     fn new() -> Scratch {
         for _ in 0..16 {
             let random = bridge_adapters::os::random_bytes().unwrap();
