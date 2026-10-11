@@ -91,6 +91,9 @@ struct Inbox {
 /// By default the sender half-closes and stays connected until the
 /// receiver closes, so its kernel identity stays readable. With `close`
 /// it disconnects immediately after writing (an unverifiable sender).
+/// `status` may be a comma-separated sequence (`held,delivered`), sent as
+/// consecutive frames of the one connection, so ordered receipts reach the
+/// carrier back to back.
 fn send_receipt(from: &str, msg_id: &str, status: &str, close: bool) -> bool {
     let Some(path) = from.strip_prefix("uds:") else {
         return false;
@@ -98,8 +101,14 @@ fn send_receipt(from: &str, msg_id: &str, status: &str, close: bool) -> bool {
     let Ok(mut stream) = UnixStream::connect(path) else {
         return false;
     };
-    let frame = json!({"type":"control","action":"peer_message_status","orig_msg_id":msg_id,"status":status});
-    if stream.write_all(format!("{frame}\n").as_bytes()).is_err() {
+    let frames: String = status
+        .split(',')
+        .map(|status| {
+            let frame = json!({"type":"control","action":"peer_message_status","orig_msg_id":msg_id,"status":status});
+            format!("{frame}\n")
+        })
+        .collect();
+    if stream.write_all(frames.as_bytes()).is_err() {
         return false;
     }
     if !close {

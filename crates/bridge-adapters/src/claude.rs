@@ -44,7 +44,11 @@
 //! `held` is a
 //! non-terminal hold with a recheck deadline, `delivered` is native
 //! acceptance, a refusal before any hold is known-unsent, and silence is
-//! the ordinary `written_no_receipt`. Later receipts are recorded straight
+//! the ordinary `written_no_receipt`. Receipts that race the first one are
+//! kept in order: a `held` followed by a terminal receipt inside the same
+//! window settles on the terminal one (`delivered` accepted, any negative
+//! unknown), so the second is never lost to the window's single waiter.
+//! Later receipts are recorded straight
 //! into core: release after hold is acceptance; any negative after a hold
 //! is an unknown outcome (no proof the loaded native classification means
 //! no context acceptance). A written-without-receipt hand-off is
@@ -188,6 +192,10 @@ struct Hub {
     callbacks: Mutex<HashMap<String, BoundCallback>>,
     /// Bound of `callbacks` ([`ClaudeTiming::max_callbacks`]).
     max_callbacks: usize,
+    /// Recheck horizon of a held hand-off in milliseconds
+    /// ([`ClaudeTiming::held_recheck_ms`]); used by every path that holds,
+    /// first-window or late.
+    held_recheck_ms: u64,
     /// Serializes message capability changes (dispatch attestation and the
     /// periodic sweep), so an observation and its core record and registry
     /// commit are never interleaved with another change. Taken before, and
@@ -247,13 +255,26 @@ fn owned_json(path: &Path, uid: u32) -> Option<serde_json::Map<String, Value>> {
     }
 }
 
-/// Sorted entries of the store's session registry.
-fn registry_entries(store: &Path) -> Vec<PathBuf> {
+/// Sorted entries of the store's session registry that satisfy `keep`, at
+/// most `MAX_DESCRIPTORS`.
+///
+/// `keep` is a name-only test applied while listing, before the bound, so
+/// unrelated entries of a wide store can never push a wanted file out of
+/// the bounded window; no file is opened here. Listing is one directory
+/// pass (ponytail: O(entries) names, no I/O per entry; a per-process
+/// subdirectory in the harness layout would make it O(1)).
+fn registry_entries(store: &Path, keep: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = std::fs::read_dir(store.join("sessions"))
-        .map(|entries| entries.filter_map(Result::ok).map(|e| e.path()).collect())
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| keep(path))
+                .collect()
+        })
         .unwrap_or_default();
     paths.sort();
-    paths.truncate(MAX_DESCRIPTORS * 2);
+    paths.truncate(MAX_DESCRIPTORS);
     paths
 }
 
@@ -289,12 +310,12 @@ pub fn inbox_state(store: &Path, session: &str, pid: u32, uid: u32) -> InboxStat
     if let Some(state) = descriptor_state(&direct, session, pid, uid) {
         return state;
     }
-    registry_entries(store)
-        .into_iter()
-        .filter(|path| path.extension().is_some_and(|ext| ext == "json") && *path != direct)
-        .take(MAX_DESCRIPTORS)
-        .find_map(|path| descriptor_state(&path, session, pid, uid))
-        .unwrap_or(InboxState::Absent)
+    registry_entries(store, |path| {
+        path.extension().is_some_and(|ext| ext == "json") && *path != direct
+    })
+    .into_iter()
+    .find_map(|path| descriptor_state(&path, session, pid, uid))
+    .unwrap_or(InboxState::Absent)
 }
 
 /// The inbox state one descriptor file gives for `session` and `pid`.
@@ -318,23 +339,28 @@ fn descriptor_state(path: &Path, session: &str, pid: u32, uid: u32) -> Option<In
 }
 
 /// Reads the recipient process's own peer token (never logged).
+///
+/// Only `<pid>.*.key` entries of exactly `pid` are candidates (selected by
+/// name before the `MAX_DESCRIPTORS` bound, so a wide store cannot hide
+/// them) and each must pass [`owned_json`]: an owned, regular, bounded
+/// file, never a symlink. A token of another process is never read. No
+/// candidate or no valid token is `None`.
 fn peer_token(store: &Path, pid: u32, uid: u32) -> Option<String> {
     let prefix = format!("{pid}.");
-    registry_entries(store)
-        .into_iter()
-        .filter(|path| {
-            path.extension().is_some_and(|ext| ext == "key")
-                && path
-                    .file_name()
-                    .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
-        })
-        .find_map(|path| {
-            owned_json(&path, uid)?
-                .get("peerToken")?
-                .as_str()
-                .filter(|token| !token.is_empty() && token.len() <= 4096)
-                .map(String::from)
-        })
+    registry_entries(store, |path| {
+        path.extension().is_some_and(|ext| ext == "key")
+            && path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+    })
+    .into_iter()
+    .find_map(|path| {
+        owned_json(&path, uid)?
+            .get("peerToken")?
+            .as_str()
+            .filter(|token| !token.is_empty() && token.len() <= 4096)
+            .map(String::from)
+    })
 }
 
 /// Parses one receipt line correlated to an attempt message id.
@@ -680,6 +706,12 @@ impl Hub {
 
     /// Routes one correlated receipt from the kernel-identified sender
     /// `pid`, which must be the attempt's recipient PID.
+    ///
+    /// While `send` is inside its window the status is queued for it (under
+    /// the pending lock, in arrival order); afterwards a `delivered` is
+    /// acceptance, a `held` after silence holds until
+    /// [`ClaudeTiming::held_recheck_ms`] from now, and any other status is
+    /// an unknown outcome.
     fn route(&self, msg_id: &str, status: &str, pid: u32) {
         let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
         let Some(entry) = pending.get_mut(msg_id) else {
@@ -698,7 +730,7 @@ impl Hub {
                     evidence: format!("late native receipt delivered for {msg_id}"),
                 },
                 "held" if matches!(entry.waiting, Waiting::NoReceipt { .. }) => {
-                    let recheck_ms = current_unix_millis().saturating_add(10 * 60_000);
+                    let recheck_ms = current_unix_millis().saturating_add(self.held_recheck_ms);
                     entry.waiting = Waiting::Held {
                         until_ms: recheck_ms,
                     };
@@ -854,6 +886,16 @@ impl Hub {
 /// framing). Entries of other sessions, other senders or other attempts,
 /// and entries without a peer origin, are no evidence. Unreadable,
 /// foreign-owned or non-regular files yield none.
+///
+/// At most the last `MAX_TRANSCRIPT_TAIL` bytes are read. When the file is
+/// longer, the first (possibly partial, possibly split inside a multibyte
+/// character) line of that window is skipped, so only whole lines are
+/// parsed and a large non-ASCII transcript still closes; a window with no
+/// line break yields none. A line that is exactly at the cut (the byte
+/// before the window is a line break) is whole and kept. Each whole line is
+/// parsed as strict UTF-8 JSON bytes: a line with malformed UTF-8 is not
+/// evidence (it is never repaired into text that could match the
+/// manifest), and a suffix of a skipped partial line is never parsed.
 pub fn transcript_has_handoff(
     path: &Path,
     manifest: &str,
@@ -870,18 +912,30 @@ pub fn transcript_has_handoff(
     let Ok(mut file) = std::fs::File::open(path) else {
         return false;
     };
-    let start = metadata.len().saturating_sub(MAX_TRANSCRIPT_TAIL);
-    let mut text = String::new();
+    // Read one byte before the tail so a cut exactly on a line start is
+    // told from a cut inside a line; everything up to the first newline of
+    // that window is a possibly partial line (and possibly a split
+    // multibyte character) and is dropped, so the rest is whole lines.
+    let start = metadata.len().saturating_sub(MAX_TRANSCRIPT_TAIL + 1);
+    let mut bytes = Vec::new();
     if file.seek(SeekFrom::Start(start)).is_err()
         || file
-            .take(MAX_TRANSCRIPT_TAIL)
-            .read_to_string(&mut text)
+            .take(MAX_TRANSCRIPT_TAIL + 1)
+            .read_to_end(&mut bytes)
             .is_err()
     {
         return false;
     }
-    text.lines().any(|line| {
-        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+    if start > 0 {
+        let Some(newline) = bytes.iter().position(|&byte| byte == b'\n') else {
+            return false;
+        };
+        bytes.drain(..=newline);
+    }
+    bytes.split(|&byte| byte == b'\n').any(|line| {
+        // Strict: a line with any invalid UTF-8 is not JSON, so no byte
+        // sequence is ever repaired into manifest text.
+        let Ok(entry) = serde_json::from_slice::<Value>(line) else {
             return false;
         };
         if entry.get("type").and_then(Value::as_str) != Some("user")
@@ -927,6 +981,7 @@ impl ClaudeLaterCarrier {
             pending: Mutex::new(HashMap::new()),
             callbacks: Mutex::new(HashMap::new()),
             max_callbacks: timing.max_callbacks,
+            held_recheck_ms: timing.held_recheck_ms,
             sync: Mutex::new(()),
             uid,
             secret: os::random_bytes()?,
@@ -1034,6 +1089,14 @@ impl DispatchCarrier for ClaudeLaterCarrier {
     }
 
     /// One `later` hand-off of the frozen manifest.
+    ///
+    /// Waits up to [`ClaudeTiming::receipt_wait`] for the first receipt,
+    /// then, under the pending lock that `Hub::route` also holds while it
+    /// queues a receipt, collects every receipt that raced it. The first
+    /// terminal receipt decides (`delivered` is accepted; a negative is
+    /// known-unsent, or unknown when a `held` came first); `held` alone
+    /// holds until [`ClaudeTiming::held_recheck_ms`]; silence is written
+    /// without receipt. A hand-off is never repeated here.
     fn send(&mut self, attempt: &AttemptRecord) -> Outcome {
         let unsent = |evidence: String| Outcome::KnownUnsent { evidence };
         let Ok(address) = NativeAddress::parse(&attempt.fence.recipient) else {
@@ -1110,16 +1173,31 @@ impl DispatchCarrier for ClaudeLaterCarrier {
             self.hub.release(&msg_id);
             return outcome;
         }
-        let status = first.recv_timeout(self.timing.receipt_wait).ok();
+        let mut receipts: Vec<String> = first
+            .recv_timeout(self.timing.receipt_wait)
+            .ok()
+            .into_iter()
+            .collect();
         let now = current_unix_millis();
         let mut pending = self.hub.pending.lock().unwrap_or_else(|p| p.into_inner());
+        // `Hub::route` sends under this lock, so receipts that raced the
+        // first one (a `held` followed at once by its release) are all in
+        // the channel now, and every later one sees the state set below.
+        receipts.extend(first.try_iter());
+        let held_first = receipts.first().map(String::as_str) == Some("held");
+        // The first terminal receipt decides; `held` only when none came.
+        let status = receipts
+            .iter()
+            .find(|status| status.as_str() != "held")
+            .or(receipts.first())
+            .map(String::as_str);
         let settled = |pending: std::sync::MutexGuard<'_, HashMap<String, Pending>>,
                        outcome: Outcome| {
             drop(pending);
             self.hub.release(&msg_id);
             outcome
         };
-        match status.as_deref() {
+        match status {
             Some("held") => {
                 let recheck_ms = now.saturating_add(self.timing.held_recheck_ms);
                 if let Some(entry) = pending.get_mut(&msg_id) {
@@ -1139,6 +1217,14 @@ impl DispatchCarrier for ClaudeLaterCarrier {
                 pending,
                 Outcome::OutcomeUnknown {
                     reason: "native dropped receipt; context acceptance not excluded".into(),
+                },
+            ),
+            Some(other) if held_first => settled(
+                pending,
+                Outcome::OutcomeUnknown {
+                    reason: format!(
+                        "native {other} after a possible hand-off; no proof of no context acceptance"
+                    ),
                 },
             ),
             Some(other) => settled(
@@ -1206,6 +1292,7 @@ mod tests {
             pending: Mutex::new(pending),
             callbacks: Mutex::new(HashMap::new()),
             max_callbacks: MAX_CALLBACKS,
+            held_recheck_ms: 10 * 60_000,
             sync: Mutex::new(()),
             uid: os::process_facts(std::process::id()).unwrap().uid.unwrap(),
             secret: [7; 32],
@@ -1278,5 +1365,149 @@ mod tests {
         let (server, _kept) = receipt_stream(false);
         hub.accept_receipt(server, "msg-known");
         assert_eq!(receiver.try_recv().unwrap(), "delivered");
+    }
+}
+
+#[cfg(test)]
+mod transcript_tests {
+    //! Bounded transcript-tail evidence over large non-ASCII transcripts.
+
+    use super::*;
+
+    /// A transcript larger than the tail bound whose cut falls inside a
+    /// multibyte character still yields the exact accepted marker of the
+    /// right session and callback, and never evidence of another session
+    /// or sender.
+    #[test]
+    fn multibyte_transcript_over_the_tail_bound_still_closes() {
+        let dir = std::env::temp_dir().join(format!("m2tail{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+        let entry = |session: &str, from: &str, manifest: &str| {
+            json!({"type": "user", "sessionId": session, "origin": {"kind": "peer", "from": from},
+                   "message": {"content": format!("peer says {manifest}")}})
+            .to_string()
+        };
+        let mut text = format!("{{\"type\":\"x\",\"t\":\"{}\"}}\n", "€".repeat(3_000_000));
+        text.push_str(&entry("other-session", "uds:/cb", "MANIFEST-1"));
+        text.push('\n');
+        text.push_str(&entry("sess", "uds:/other-cb", "MANIFEST-1"));
+        text.push('\n');
+        std::fs::write(&path, &text).unwrap();
+        let uid = os::process_facts(std::process::id()).unwrap().uid.unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let cut = bytes.len() - MAX_TRANSCRIPT_TAIL as usize;
+        assert_eq!(bytes[cut] & 0xC0, 0x80, "the tail must start mid-character");
+
+        // Only foreign evidence so far: nothing closes.
+        assert!(!transcript_has_handoff(
+            &path,
+            "MANIFEST-1",
+            uid,
+            "sess",
+            "uds:/cb"
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "{}", entry("sess", "uds:/cb", "MANIFEST-1")).unwrap();
+        assert!(transcript_has_handoff(
+            &path,
+            "MANIFEST-1",
+            uid,
+            "sess",
+            "uds:/cb"
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A peer entry as one transcript line.
+    fn entry_line(session: &str, from: &str, content: &str) -> String {
+        json!({"type": "user", "sessionId": session, "origin": {"kind": "peer", "from": from},
+               "message": {"content": content}})
+        .to_string()
+    }
+
+    /// This process's uid.
+    fn own_uid() -> u32 {
+        os::process_facts(std::process::id()).unwrap().uid.unwrap()
+    }
+
+    /// A line with malformed UTF-8 is never repaired into manifest text: a
+    /// manifest that itself contains U+FFFD does not match the invalid
+    /// bytes a lossy decoder would turn into it, while the same text
+    /// validly encoded does close.
+    #[test]
+    fn malformed_utf8_never_becomes_manifest_text() {
+        let dir = std::env::temp_dir().join(format!("m2bad{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+        let manifest = "MANIFEST\u{fffd}2";
+        let valid = entry_line("sess", "uds:/cb", &format!("peer says {manifest}"));
+        let mut bytes = valid.replace('\u{fffd}', "\u{1}").into_bytes();
+        let at = bytes.iter().position(|&byte| byte == 1).unwrap();
+        bytes.splice(at..=at, [0xff]);
+        bytes.push(b'\n');
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(!transcript_has_handoff(
+            &path,
+            manifest,
+            own_uid(),
+            "sess",
+            "uds:/cb"
+        ));
+        std::fs::write(&path, format!("{valid}\n")).unwrap();
+        assert!(transcript_has_handoff(
+            &path,
+            manifest,
+            own_uid(),
+            "sess",
+            "uds:/cb"
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The cut decides which lines are whole: when the tail starts inside a
+    /// line whose remainder is itself a complete valid entry, that remainder
+    /// is not evidence; when the byte before the tail is a line break the
+    /// first line is whole and closes.
+    #[test]
+    fn cut_suffix_is_skipped_but_a_line_at_the_cut_is_kept() {
+        let dir = std::env::temp_dir().join(format!("m2cut{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+        let bare = entry_line("sess", "uds:/cb", "MANIFEST-3");
+        // Pad the entry so that it is exactly the tail plus its line break.
+        let entry = entry_line(
+            "sess",
+            "uds:/cb",
+            &format!(
+                "MANIFEST-3{}",
+                "x".repeat(MAX_TRANSCRIPT_TAIL as usize - 1 - bare.len(),)
+            ),
+        );
+        assert_eq!(entry.len() as u64, MAX_TRANSCRIPT_TAIL - 1);
+        let uid = own_uid();
+        // The tail starts exactly at the entry, mid-line (after a space, so
+        // the first line of the window is itself valid JSON): skipped.
+        std::fs::write(&path, format!("garbage-prefix {entry}\n")).unwrap();
+        assert!(!transcript_has_handoff(
+            &path,
+            "MANIFEST-3",
+            uid,
+            "sess",
+            "uds:/cb"
+        ));
+        // The same entry after a line break is a whole line at the cut.
+        std::fs::write(&path, format!("whole line\n{entry}\n")).unwrap();
+        assert!(transcript_has_handoff(
+            &path,
+            "MANIFEST-3",
+            uid,
+            "sess",
+            "uds:/cb"
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

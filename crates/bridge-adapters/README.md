@@ -5,8 +5,12 @@ registry, quiet root hooks and qualified message carriers. They consume core's
 single custody and attempt state (`DispatchCarrier`, `observe_binding`,
 `drain_inject`, `record_outcome`); there is no second attempt or hook store.
 
-Status: implemented and tested against owned fixture processes. Real loaded
-Codex / Claude qualification is **not** established (see the end).
+Status: implemented and tested against owned fixture processes. The Root has
+recorded native Q2 / Q3 / Auto passes of owned frontends on the builds named in
+this document (source/binary gate `root-native-core5-r10-binaries.json`); that
+qualifies those owned builds and that observed scope only. Working GUI, apps,
+chats and global hooks were not touched and are not qualified, native Q4 is a
+separate Root step, and what is not established is listed at the end.
 
 ## Components
 
@@ -29,18 +33,38 @@ Codex / Claude qualification is **not** established (see the end).
   started (loaded build = disk build), and whose own store (`CODEX_HOME` /
   `CLAUDE_CONFIG_DIR`, else `$HOME/.codex` / `$HOME/.claude`, read from that
   process's own environment) is that profile's store. PID, UID, cwd, argv or
-  a process name alone never qualify.
+  a process name alone never qualify. `Registry::new` (so every consumer that
+  constructs and then serves a registry, the daemon included) hashes every
+  configured harness and relay executable once before it returns
+  (`executable_digests_warmed` logs the daemon's cached/skipped counts; about
+  one streamed read of those files, roughly 1.6 s per 246 MB optimized and
+  several times longer unoptimized), and keeps
+  the real digest per exact file identity (path, device and inode, length,
+  nanosecond mtime). Serving never hashes: a hook or relay request never reads
+  an executable under the registry lock. A file that was missing or unreadable
+  at startup, or is installed, replaced or modified afterwards (even a
+  same-size rewrite in the same second), has no digest for its identity and is
+  refused as unqualified (`NotEvidence`) until the daemon is restarted, which
+  re-hashes the then-current files; other warmed executables keep attesting.
+  After installing or updating a harness build, update its configured digest
+  and restart the daemon.
 - **Binding and epoch.** The harness process incarnation (PID + start time)
-  owns its session addresses. The first hook, a `SessionStart`, or a new
+  owns its session addresses. The first hook, the owner's own non-`compact`
+  `SessionStart` (not a Claude child's, whose events share the root's address,
+  and not a `compact` restart, which keep binding, epoch and state), or a new
   incarnation (after the old one died) renews the binding with a strictly
   larger epoch; older records become stale. A second *live* incarnation
   claiming a bound address is refused as conflicting.
 - **Lifecycle.** From the owner session's own hooks: prompt/tool events are
-  active; `Stop` or an idle-prompt notification is inactive; permission
-  requests, permission notifications and `AskUserQuestion` await input;
-  `SessionEnd`, a dead incarnation, or no binding (e.g. after a daemon
-  restart) is unknown. Unknown is never inactive. Bridge never answers a
-  permission request.
+  active; the owner's `Stop`, idle-prompt notification or a non-`compact`
+  `SessionStart` is inactive; permission requests, permission notifications
+  and `AskUserQuestion` await input; `SessionEnd`, a dead incarnation, or no
+  binding (e.g. after a daemon restart) is unknown. A new or renewed binding
+  starts unknown and only those positive owner events leave it: a first
+  `SubagentStop`, a child's `Stop` / `SessionStart` / `SessionEnd` / idle
+  notification, another notification type or a `compact` restart never make
+  it inactive, and none of them changes an established state. Unknown is
+  never inactive. Bridge never answers a permission request.
 - **Root caller.** `PreToolUse` records the per-call id with the actual actor
   (`agent_id` or the session's root). A caller is attested by joining the MCP
   request's `_meta` call id to exactly one fresh, unconsumed record of the
@@ -86,7 +110,9 @@ Codex / Claude qualification is **not** established (see the end).
   session *and* the attested harness PID (the per-process
   `sessions/<pid>.json` that 2.1.296 writes is read directly; only when it
   is missing or names another session does a bounded scan of at most 512
-  other descriptors run), and the inbox socket's kernel peer
+  other descriptors run; the session's own `<pid>.*.key` peer token is
+  selected by name before the same 512 bound, so a wide store cannot hide it,
+  and must be an owned regular non-symlink file), and the inbox socket's kernel peer
   must be that PID before the session's own peer token is sent. Only
   `priority = "later"` is sent; peer inject is prohibited. Receipts go to a
   callback socket bound in the inbox directory for that one attempt (named
@@ -106,8 +132,15 @@ Codex / Claude qualification is **not** established (see the end).
   ignored and logged `claude_receipt_unverifiable` — fail closed, the
   attempt stays held/unreceipted until core's overdue incident. `held` is non-terminal, `delivered` is acceptance, a refusal
   before any hold is known-unsent, any negative after a hold is unknown, and
-  silence is `written_no_receipt`. That hand-off is reconciled against the
-  addressed session's own native transcript (shapes observed on 2.1.296):
+  silence is `written_no_receipt`. A `held` followed by a terminal receipt
+  inside the same first-receipt window settles on the terminal one in order
+  (`delivered` accepted, a negative unknown); the hold horizon of both the
+  first-window and the late `held` path is `held_recheck_ms`. That hand-off is
+  reconciled against the
+  addressed session's own native transcript (shapes observed on 2.1.296; at
+  most the last 8 MiB is read, its first partial line skipped, and each whole
+  line is parsed as strict UTF-8 JSON, so a large non-ASCII transcript still
+  closes while malformed bytes are never repaired into manifest text):
   only a peer-origin user entry of that session whose `origin.from` names
   this attempt's own callback and that contains the exact manifest records
   `context_observed`. The `queue-operation` `enqueue` is not evidence: it
@@ -252,24 +285,30 @@ did once; they are not release qualification.
 
 ## Not yet established
 
-- No real Claude Code or Codex session has run these hooks or carriers:
-  hook installation, timeouts, output visibility (Codex `additionalContext`
-  in particular) and coexistence with other hooks are unqualified.
+- Only the Root's owned-frontend native runs (Q2 / Q3 / Auto, builds named in
+  this document) have exercised these hooks and carriers; hook installation
+  into working applications, timeouts beyond the observed runs, output
+  visibility (Codex `additionalContext` in particular) and coexistence with
+  other hooks are unqualified, and no working GUI, app, chat or global hook
+  was touched. Native Q4 is a separate Root step.
 - Claude's acceptance of a per-attempt callback name as the frame's reply
-  address, and the matching `origin.from`, are not re-qualified on a real
-  build; the root's Q2 run decides it.
+  address, and the matching `origin.from`, are qualified only as far as the
+  Root's recorded Q2 run (transcript closure) observed them.
 - Codex `approval_mode = "approve"` semantics: Q3 shows the parsed value and
   the host boundary, not that this value is what allows `bridge_me`.
-- Codex caller join assumes `_meta.callId` equals the same call's
+- Codex caller join relies on `_meta.callId` equalling the same call's
   `PreToolUse` `tool_use_id`; the `_meta` keys themselves (`threadId`,
   `callId`, `x-codex-turn-metadata`) were captured from Codex
-  0.162.0-alpha.17.2, the equality was not.
+  0.162.0-alpha.17.2, and the Root's Q3 root join shows the equality for that
+  build only. On any other build a mismatch finds no record and refuses.
 - The real Claude inbox's receipt behaviour for `later` (held/release/drop
   timing, and whether it stays connected long enough for its PID to be read)
-  is not re-qualified. If it closes first, every receipt is ignored by
-  design and those hand-offs rely on transcript closure or the overdue
-  incident; that would make held-release unsupported, never silently
-  accepted.
+  is established only as far as the Root's Q2 run observed it (transcript
+  closure). An early `held` immediately followed by a terminal receipt in the
+  first window is proven against the fixture inbox only, not natively. If the
+  inbox closes first, every receipt is ignored by design and those hand-offs
+  rely on transcript closure or the overdue incident; that would make
+  held-release unsupported, never silently accepted.
 - Codex queue acceptance on a real build is not established. The root's Q1
   run on Codex 0.162.0-alpha.17.2 (source 0210a732) got native -32603 "no
   rollout found" for a model-less owned thread: a thread needs a persisted

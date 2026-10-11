@@ -300,7 +300,7 @@ fn lost_hook_reply_is_retained_unknown_and_never_reoffered() {
     harness.stop();
 }
 
-/// Unknown, active, permission-wait, paused and disconnected recipients never receive a message.
+/// Unknown, permission-wait, paused and disconnected recipients hold messages; an active Auto recipient waits for its own context hook instead of using the message carrier.
 #[test]
 fn lifecycle_holds_unknown_input_waits_pause_and_ended_sessions() {
     let lab = Lab::new("lh");
@@ -2100,4 +2100,447 @@ fn multibyte_version_label_is_bounded_in_proof_references() {
         assert!(proof.len() <= 256, "{}", proof.len());
         assert!(proof.contains("🙂"), "{proof}");
     }
+}
+
+/// Lifecycle of a recipient as the message carrier would see it.
+fn recipient_lifecycle(lab: &Lab, session: &str) -> bridge_core::dispatch::Lifecycle {
+    let registry = lab.registry.lock().unwrap();
+    let (attestation, _) = registry
+        .attest_recipient(&lab.claude_address(session))
+        .expect("bound recipient");
+    attestation.lifecycle()
+}
+
+/// A binding first seen through an event that is not a positive root idle/active observation (child events, unrelated notifications, compaction restarts) stays unknown, fresh or renewed; positive root events still transition.
+#[test]
+fn first_event_without_positive_root_evidence_is_never_inactive() {
+    use bridge_core::dispatch::Lifecycle::{Active, AwaitingInput, Inactive, Unknown};
+    let lab = Lab::new("lf");
+    let mut harness = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    let claude = Harness::ClaudeCode;
+    let child = |event: &str, session: &str| {
+        let mut payload = hook(event, session);
+        payload["agent_id"] = json!("agent-a");
+        payload
+    };
+    let note = |session: &str, kind: &str| {
+        let mut payload = hook("Notification", session);
+        payload["notification_type"] = json!(kind);
+        payload
+    };
+
+    // Fresh bindings created by events that say nothing about the root.
+    for (session, payload) in [
+        ("s-sub", child("SubagentStop", "s-sub")),
+        ("s-cstop", child("Stop", "s-cstop")),
+        ("s-cend", child("SessionEnd", "s-cend")),
+        ("s-note", note("s-note", "auth_success")),
+        ("s-cidle", {
+            let mut payload = note("s-cidle", "idle_prompt");
+            payload["agent_id"] = json!("agent-a");
+            payload
+        }),
+        ("s-compact", {
+            let mut payload = hook("SessionStart", "s-compact");
+            payload["source"] = json!("compact");
+            payload
+        }),
+    ] {
+        harness.hook(&lab.socket, claude, payload);
+        assert_eq!(recipient_lifecycle(&lab, session), Unknown, "{session}");
+    }
+
+    // Positive root observations still move the state, and unrelated
+    // events afterwards keep the last positive state.
+    harness.hook(&lab.socket, claude, hook("SessionStart", "s-pos"));
+    assert_eq!(recipient_lifecycle(&lab, "s-pos"), Inactive);
+    harness.hook(&lab.socket, claude, hook("UserPromptSubmit", "s-pos"));
+    assert_eq!(recipient_lifecycle(&lab, "s-pos"), Active);
+    harness.hook(&lab.socket, claude, child("SubagentStop", "s-pos"));
+    harness.hook(&lab.socket, claude, note("s-pos", "auth_success"));
+    assert_eq!(recipient_lifecycle(&lab, "s-pos"), Active);
+    harness.hook(&lab.socket, claude, hook("PermissionRequest", "s-pos"));
+    assert_eq!(recipient_lifecycle(&lab, "s-pos"), AwaitingInput);
+    harness.hook(&lab.socket, claude, hook("Stop", "s-pos"));
+    assert_eq!(recipient_lifecycle(&lab, "s-pos"), Inactive);
+    harness.hook(&lab.socket, claude, child("Stop", "s-pos"));
+    assert_eq!(recipient_lifecycle(&lab, "s-pos"), Inactive);
+    harness.hook(&lab.socket, claude, hook("UserPromptSubmit", "s-pos"));
+    harness.hook(&lab.socket, claude, note("s-pos", "idle_prompt"));
+    assert_eq!(recipient_lifecycle(&lab, "s-pos"), Inactive);
+
+    // A renewed binding (root session ended, then a first unrelated event)
+    // restarts as unknown rather than inheriting or defaulting to idle.
+    harness.hook(&lab.socket, claude, hook("SessionEnd", "s-pos"));
+    harness.hook(&lab.socket, claude, child("SubagentStop", "s-pos"));
+    assert_eq!(recipient_lifecycle(&lab, "s-pos"), Unknown);
+    harness.stop();
+}
+
+/// Dispatches one message to `session` after `prepare` shaped the store's `sessions` directory, returning the report and the frames the fixture inbox received.
+fn dispatch_with_store(
+    tag: &str,
+    session: &str,
+    prepare: impl FnOnce(&std::path::Path, u32),
+) -> (DispatchReport, usize) {
+    let lab = Lab::new(tag);
+    let address = lab.claude_address(session);
+    let custody = Arc::clone(&lab.storage) as Arc<dyn Custody>;
+    let mut carrier =
+        ClaudeLaterCarrier::new(Arc::clone(&lab.registry), custody, ClaudeTiming::default())
+            .unwrap();
+    let mut harness = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    harness.cmd(json!({"cmd": "inbox", "session_id": session, "behavior": "delivered"}));
+    prepare(&lab.claude_store.join("sessions"), harness.child.id());
+    harness.hook(
+        &lab.socket,
+        Harness::ClaudeCode,
+        hook("SessionStart", session),
+    );
+    harness.hook(&lab.socket, Harness::ClaudeCode, hook("Stop", session));
+    lab.publish("evt-tok", &address, Mode::Message, "token payload");
+    let report = dispatch_message(
+        &lab.storage,
+        &mut carrier,
+        &address,
+        &now,
+        &DispatchTiming::default(),
+    )
+    .unwrap();
+    let frames = harness.cmd(json!({"cmd": "frames"}))["frames"]
+        .as_array()
+        .unwrap()
+        .len();
+    harness.stop();
+    (report, frames)
+}
+
+/// The recipient's own `<pid>.*.key` peer token is found when more than the scan bound of other session-registry entries sort before it.
+#[test]
+fn peer_token_is_not_starved_by_a_wide_store() {
+    let (report, frames) = dispatch_with_store("wt", "sess-wt", |sessions, _| {
+        for index in 0..1_200 {
+            std::fs::write(
+                sessions.join(format!("0{index:05}.other.key")),
+                json!({"peerToken": "foreign-token"}).to_string(),
+            )
+            .unwrap();
+        }
+    });
+    assert!(
+        matches!(
+            report,
+            DispatchReport::Sent {
+                state: AttemptState::NativeAccepted,
+                ..
+            }
+        ),
+        "{report:?}"
+    );
+    assert_eq!(frames, 1);
+}
+
+/// Another process's token and an unsafe (symlinked) token of the right process are never used: nothing is sent.
+#[test]
+fn foreign_and_symlinked_peer_tokens_are_refused() {
+    let (report, frames) = dispatch_with_store("ft", "sess-ft", |sessions, pid| {
+        let own = sessions.join(format!("{pid}.fixture.key"));
+        let valid = std::fs::read_to_string(&own).unwrap();
+        std::fs::remove_file(&own).unwrap();
+        // Right content under another process's name, and a symlink under
+        // the right name.
+        std::fs::write(sessions.join(format!("{}.fixture.key", pid + 1)), &valid).unwrap();
+        let target = sessions.join("target.txt");
+        std::fs::write(&target, valid).unwrap();
+        std::os::unix::fs::symlink(&target, sessions.join(format!("{pid}.link.key"))).unwrap();
+    });
+    assert!(
+        matches!(
+            report,
+            DispatchReport::Sent {
+                state: AttemptState::KnownUnsent,
+                ..
+            }
+        ),
+        "{report:?}"
+    );
+    assert_eq!(frames, 0);
+}
+
+/// Dispatches one message to a fixture inbox that answers with the receipt sequence `behavior`, returning the report, the stored attempt state and the number of frames the inbox received.
+fn dispatch_with_receipts(
+    tag: &str,
+    behavior: &str,
+) -> (DispatchReport, Option<AttemptState>, usize) {
+    let lab = Lab::new(tag);
+    let session = format!("sess-{tag}");
+    let address = lab.claude_address(&session);
+    let custody = Arc::clone(&lab.storage) as Arc<dyn Custody>;
+    let timing = ClaudeTiming {
+        receipt_wait: Duration::from_millis(3_000),
+        ..ClaudeTiming::default()
+    };
+    let mut carrier = ClaudeLaterCarrier::new(Arc::clone(&lab.registry), custody, timing).unwrap();
+    let mut harness = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    harness.cmd(json!({"cmd": "inbox", "session_id": session, "behavior": behavior}));
+    harness.hook(
+        &lab.socket,
+        Harness::ClaudeCode,
+        hook("SessionStart", &session),
+    );
+    harness.hook(&lab.socket, Harness::ClaudeCode, hook("Stop", &session));
+    lab.publish("evt-rc", &address, Mode::Message, "receipt payload");
+    let report = dispatch_message(
+        &lab.storage,
+        &mut carrier,
+        &address,
+        &now,
+        &DispatchTiming::default(),
+    )
+    .unwrap();
+    // Let any receipt that raced the first one reach the hub.
+    std::thread::sleep(Duration::from_millis(500));
+    let state = lab.attempt("evt-rc").map(|attempt| attempt.state);
+    let frames = harness.cmd(json!({"cmd": "frames"}))["frames"]
+        .as_array()
+        .unwrap()
+        .len();
+    harness.stop();
+    (report, state, frames)
+}
+
+/// A `held` receipt followed at once by its terminal receipt, both inside the first-receipt window, settles on the terminal evidence instead of leaving the attempt held, and nothing is resent.
+#[test]
+fn held_then_terminal_receipts_in_the_first_window_settle_once() {
+    let (report, state, frames) = dispatch_with_receipts("hd", "held,delivered");
+    assert!(
+        matches!(
+            report,
+            DispatchReport::Sent {
+                state: AttemptState::NativeAccepted,
+                ..
+            }
+        ),
+        "{report:?}"
+    );
+    assert_eq!(state, Some(AttemptState::NativeAccepted));
+    assert_eq!(frames, 1);
+
+    let (report, state, frames) = dispatch_with_receipts("hr", "held,dropped");
+    let refused = dispatch_with_receipts("hf", "held,refused");
+    assert!(
+        matches!(
+            refused.0,
+            DispatchReport::Sent {
+                state: AttemptState::OutcomeUnknown,
+                ..
+            }
+        ),
+        "{:?}",
+        refused.0
+    );
+    assert_eq!(
+        (refused.1, refused.2),
+        (Some(AttemptState::OutcomeUnknown), 1)
+    );
+    assert!(
+        matches!(
+            report,
+            DispatchReport::Sent {
+                state: AttemptState::OutcomeUnknown,
+                ..
+            }
+        ),
+        "{report:?}"
+    );
+    assert_eq!(state, Some(AttemptState::OutcomeUnknown));
+    assert_eq!(frames, 1);
+}
+
+/// Both hold paths (first-window `held` and a late `held` after silence) use the configured recheck horizon, not a fixed ten minutes.
+#[test]
+fn held_recheck_horizon_honors_the_configured_timing_on_both_paths() {
+    let horizon = 3_600_000;
+    let lab = Lab::new("hz");
+    let address = lab.claude_address("sess-hz");
+    let custody = Arc::clone(&lab.storage) as Arc<dyn Custody>;
+    let timing = ClaudeTiming {
+        receipt_wait: Duration::from_millis(800),
+        held_recheck_ms: horizon,
+        ..ClaudeTiming::default()
+    };
+    let mut carrier = ClaudeLaterCarrier::new(Arc::clone(&lab.registry), custody, timing).unwrap();
+    let mut harness = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    harness.cmd(json!({"cmd": "inbox", "session_id": "sess-hz", "behavior": "held"}));
+    harness.hook(
+        &lab.socket,
+        Harness::ClaudeCode,
+        hook("SessionStart", "sess-hz"),
+    );
+    harness.hook(&lab.socket, Harness::ClaudeCode, hook("Stop", "sess-hz"));
+    let near_horizon = |event: &str| {
+        let recheck = lab.attempt(event).unwrap().recheck_ms.unwrap();
+        recheck.abs_diff(now() + horizon) < 60_000
+    };
+
+    // First-window hold.
+    lab.publish("evt-first", &address, Mode::Message, "first");
+    dispatch_message(
+        &lab.storage,
+        &mut carrier,
+        &address,
+        &now,
+        &DispatchTiming::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        lab.attempt("evt-first").unwrap().state,
+        AttemptState::NativeHeld
+    );
+    assert!(near_horizon("evt-first"));
+
+    // Late hold: silence first, then the recipient reports `held`.
+    let first_frames = harness.cmd(json!({"cmd": "frames"}))["frames"]
+        .as_array()
+        .unwrap()
+        .len();
+    let first_msg = harness.cmd(json!({"cmd": "frames"}))["frames"][0]["msg_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    harness.cmd(json!({"cmd": "receipt", "msg_id": first_msg, "status": "delivered"}));
+    assert!(eventually(3_000, || lab
+        .attempt("evt-first")
+        .unwrap()
+        .state
+        == AttemptState::NativeAccepted));
+    harness.cmd(json!({"cmd": "inbox", "session_id": "sess-hz", "behavior": "none"}));
+    lab.publish("evt-late", &address, Mode::Message, "late");
+    dispatch_message(
+        &lab.storage,
+        &mut carrier,
+        &address,
+        &now,
+        &DispatchTiming::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        lab.attempt("evt-late").unwrap().state,
+        AttemptState::WrittenNoReceipt
+    );
+    let late_msg = harness.cmd(json!({"cmd": "frames"}))["frames"][first_frames]["msg_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    harness.cmd(json!({"cmd": "receipt", "msg_id": late_msg, "status": "held"}));
+    assert!(eventually(3_000, || lab.attempt("evt-late").unwrap().state
+        == AttemptState::NativeHeld));
+    assert!(near_horizon("evt-late"));
+    harness.stop();
+}
+
+/// Lifecycle and endpoint epoch of the binding at `address`.
+fn binding_state(
+    lab: &Lab,
+    address: &bridge_core::NativeAddress,
+) -> (bridge_core::dispatch::Lifecycle, u64) {
+    let registry = lab.registry.lock().unwrap();
+    let (attestation, _) = registry.attest_recipient(address).expect("bound recipient");
+    (attestation.lifecycle(), attestation.endpoint_epoch())
+}
+
+/// Only the owner's own non-compact `SessionStart` establishes idleness and renews the binding: a Claude child's `SessionStart`, and a root `compact` restart, keep the owner's lifecycle, epoch and call records; startup, resume and clear renew with a larger epoch; a Codex child owns its separate address.
+#[test]
+fn only_an_own_non_compact_session_start_renews_or_idles_the_owner() {
+    use bridge_core::dispatch::Lifecycle::{Active, AwaitingInput, Inactive, Unknown};
+    let lab = Lab::new("ss");
+    let claude = Harness::ClaudeCode;
+    let mut harness = Harnessed::start(claude, &lab.claude_store);
+    let start = |session: &str, agent: Option<&str>, source: Option<&str>| {
+        let mut payload = hook("SessionStart", session);
+        if let Some(agent) = agent {
+            payload["agent_id"] = json!(agent);
+        }
+        if let Some(source) = source {
+            payload["source"] = json!(source);
+        }
+        payload
+    };
+
+    // A child's SessionStart that creates the binding says nothing about
+    // the owner.
+    let fresh = lab.claude_address("s-fresh");
+    harness.hook(&lab.socket, claude, start("s-fresh", Some("agent-a"), None));
+    assert_eq!(binding_state(&lab, &fresh).0, Unknown);
+
+    // An active owner: a child SessionStart and a compact restart keep the
+    // lifecycle, the epoch and the unconsumed call record.
+    let owner = lab.claude_address("s-own");
+    harness.hook(&lab.socket, claude, start("s-own", None, Some("startup")));
+    assert_eq!(binding_state(&lab, &owner).0, Inactive);
+    harness.hook(&lab.socket, claude, hook("UserPromptSubmit", "s-own"));
+    let (lifecycle, epoch) = binding_state(&lab, &owner);
+    assert_eq!(lifecycle, Active);
+    for (step, wait) in [("child", Active), ("compact", Active)] {
+        harness.hook(
+            &lab.socket,
+            claude,
+            tool_hook("PreToolUse", "s-own", &format!("tu-{step}"), None),
+        );
+        let payload = match step {
+            "child" => start("s-own", Some("agent-a"), None),
+            _ => start("s-own", None, Some("compact")),
+        };
+        harness.hook(&lab.socket, claude, payload);
+        assert_eq!(binding_state(&lab, &owner), (wait, epoch), "{step}");
+        let caller = harness.mcp(&lab.socket, claude_meta(&format!("tu-{step}")));
+        assert_eq!(caller["ok"]["role"], "root", "{step}: {caller}");
+        assert_eq!(caller["ok"]["may_act_as_address"], true);
+    }
+    // The same while the owner awaits input.
+    harness.hook(&lab.socket, claude, hook("PermissionRequest", "s-own"));
+    for payload in [
+        start("s-own", Some("agent-a"), None),
+        start("s-own", None, Some("compact")),
+    ] {
+        harness.hook(&lab.socket, claude, payload);
+        assert_eq!(binding_state(&lab, &owner), (AwaitingInput, epoch));
+    }
+
+    // Real owner startup, resume and clear renew with a larger epoch and
+    // are idle.
+    let mut previous = epoch;
+    for source in ["startup", "resume", "clear"] {
+        harness.hook(&lab.socket, claude, hook("UserPromptSubmit", "s-own"));
+        harness.hook(&lab.socket, claude, start("s-own", None, Some(source)));
+        let (lifecycle, epoch) = binding_state(&lab, &owner);
+        assert_eq!(lifecycle, Inactive, "{source}");
+        assert!(epoch > previous, "{source} must renew the epoch");
+        previous = epoch;
+    }
+    harness.stop();
+
+    // A Codex child is its own owner at its own address; the root's state
+    // is unaffected.
+    let mut codex = Harnessed::start(Harness::Codex, &lab.codex_store);
+    let root = lab.codex_address("thread-r");
+    let child = lab.codex_address("thread-c");
+    codex.hook(
+        &lab.socket,
+        Harness::Codex,
+        hook("SessionStart", "thread-r"),
+    );
+    codex.hook(
+        &lab.socket,
+        Harness::Codex,
+        hook("UserPromptSubmit", "thread-r"),
+    );
+    let root_before = binding_state(&lab, &root);
+    assert_eq!(root_before.0, Active);
+    let mut child_start = hook("SessionStart", "thread-r");
+    child_start["agent_id"] = json!("thread-c");
+    codex.hook(&lab.socket, Harness::Codex, child_start);
+    assert_eq!(binding_state(&lab, &child).0, Inactive);
+    assert_eq!(binding_state(&lab, &root), root_before);
+    codex.stop();
 }

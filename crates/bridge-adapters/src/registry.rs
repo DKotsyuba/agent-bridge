@@ -11,14 +11,19 @@
 //! it.
 //!
 //! - **Bindings.** The first hook of an address from a harness incarnation,
-//!   a `SessionStart`, or a different live incarnation renews the binding
+//!   the owner's own non-`compact` `SessionStart` (never a Claude child's,
+//!   never a `compact` restart, which keep the binding, its epoch and its
+//!   records), or a different live incarnation renews the binding
 //!   with a strictly larger endpoint epoch; every older record becomes
 //!   stale. A binding held by another live incarnation refuses the
 //!   newcomer as conflicting.
 //! - **Lifecycle.** Hook events are the owner session's own lifecycle feed:
-//!   prompt/tool events are active, `Stop` is idle, permission and
-//!   question prompts are awaiting input, `SessionEnd` and a dead
-//!   incarnation are unknown. Unknown is never inactive.
+//!   prompt/tool events are active, the owner's `Stop` is idle, permission
+//!   and question prompts are awaiting input, `SessionEnd` and a dead
+//!   incarnation are unknown. A new or renewed binding starts unknown and
+//!   leaves it only on such a positive owner event (a first `SubagentStop`,
+//!   a child's event or an unrelated notification never makes it idle).
+//!   Unknown is never inactive.
 //! - **Call records.** Each `PreToolUse` records its per-call id
 //!   (`tool_use_id`, the same value the harness later presents as Claude
 //!   `claudecode/toolUseId` or Codex `callId`) with the actual actor. A
@@ -36,7 +41,6 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
 use bridge_core::dispatch::{Attestation, Capabilities, Lifecycle};
 use bridge_core::{Harness, NativeAddress};
@@ -269,8 +273,9 @@ pub enum CallerChannel {
 /// inside) are the top-level `_meta` keys captured from real Claude Code
 /// 2.1.294 and Codex 0.162.0-alpha.17.2 MCP `tools/call` requests during
 /// reconnaissance. That the Codex `callId` equals the same call's
-/// `PreToolUse` hook `tool_use_id` is not yet qualified by Bridge evidence;
-/// when it does not hold, the join finds no record and refuses.
+/// `PreToolUse` hook `tool_use_id` was observed only on the build the
+/// Root's native Q3 run exercised; it is not a general guarantee, and on a
+/// build where it does not hold the join finds no record and refuses.
 ///
 /// [`PresentedMeta::Sealed`] is not native metadata: it is Bridge-owned
 /// enrichment, a registry-issued single-use proof forwarded by a
@@ -641,6 +646,11 @@ pub struct HookPayload {
     /// Native transcript file of the session.
     #[serde(default)]
     pub transcript_path: Option<String>,
+    /// Claude `SessionStart` source (`startup`, `resume`, `clear`,
+    /// `compact`); `compact` can fire in the middle of a turn, so it is not
+    /// evidence that the root is idle.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 /// What the registry decided about one admitted hook event.
@@ -680,7 +690,9 @@ struct Binding {
     qualified: Capabilities,
     /// Qualified build label for proof references.
     version: String,
-    /// Owner-session lifecycle from the latest hook.
+    /// Owner-session lifecycle from the latest hook; a new or renewed
+    /// binding starts [`Lifecycle::Unknown`] and leaves it only on a
+    /// positive owner-actor observation ([`next_lifecycle`]).
     lifecycle: Lifecycle,
     /// Session transcript inside the profile store, when reported.
     transcript: Option<PathBuf>,
@@ -722,8 +734,37 @@ struct HarnessMatch {
     executable: usize,
 }
 
-/// Cache key of a verified executable digest: path, length, mtime.
-type FileKey = (PathBuf, u64, u64);
+/// Identity of one exact executable file, the key of its hashed digest.
+///
+/// Besides the path it holds the device and inode (a replacement by
+/// rename gets another inode), the length and the modification time with
+/// nanoseconds (an in-place rewrite changes it), so a same-size replacement
+/// within the same second still gets another key and can never reuse a
+/// digest hashed from the previous file.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FileKey {
+    /// Path as configured.
+    path: PathBuf,
+    /// Device and inode.
+    inode: (u64, u64),
+    /// Length in bytes.
+    len: u64,
+    /// Modification time: whole seconds and nanoseconds since the Unix epoch.
+    mtime: (i64, i64),
+}
+
+/// The identity of the file at `path` (following symlinks, as the kernel
+/// resolves a started executable), or `None` when it is unreadable.
+fn file_key(path: &Path) -> Option<FileKey> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(FileKey {
+        path: path.to_path_buf(),
+        inode: (metadata.dev(), metadata.ino()),
+        len: metadata.len(),
+        mtime: (metadata.mtime(), metadata.mtime_nsec()),
+    })
+}
 
 /// Recipient view for the message carriers.
 #[derive(Debug, Clone)]
@@ -754,7 +795,8 @@ pub struct Registry {
     calls: HashMap<String, Vec<CallRecord>>,
     /// Call ids in insertion order, for bounded eviction.
     call_order: VecDeque<String>,
-    /// Verified executable digests keyed by (path, length, mtime).
+    /// Executable digests hashed by [`Registry::warm_digests`], keyed by the
+    /// exact file identity; never filled while serving.
     digests: HashMap<FileKey, String>,
     /// Outstanding sealed proofs by SHA-256 of the proof text.
     sealed: HashMap<String, Sealed>,
@@ -821,6 +863,15 @@ impl Registry {
     ///
     /// Refuses a configuration with relative paths, an empty namespace or
     /// host id, or a malformed digest.
+    ///
+    /// Before returning, hashes every configured harness and relay
+    /// executable once ([`Registry::warm_digests`]), so a registry that is
+    /// shared and served afterwards never reads an executable while
+    /// handling a request and no caller has to remember a separate warm-up
+    /// step. The call therefore blocks for about one streamed read of those
+    /// files (about 1.6 s per 246 MB optimized, tens of seconds
+    /// unoptimized); a missing or unreadable file does not fail the
+    /// constructor, it just stays unqualified.
     pub fn new(config: RegistryConfig, owner_uid: u32) -> Result<Self, String> {
         checked_id(&config.host_id, "host_id")?;
         for profile in &config.profiles {
@@ -839,7 +890,7 @@ impl Registry {
                 }
             }
         }
-        Ok(Registry {
+        let mut registry = Registry {
             config,
             owner_uid,
             bindings: HashMap::new(),
@@ -849,7 +900,9 @@ impl Registry {
             sealed: HashMap::new(),
             max_calls: DEFAULT_MAX_CALL_RECORDS,
             message_disabled: Vec::new(),
-        })
+        };
+        registry.warm_digests();
+        Ok(registry)
     }
 
     /// Never grants the message capability for `harness` (the host cannot
@@ -864,6 +917,7 @@ impl Registry {
     /// Whether the file at `exe` is still a qualified build of some
     /// profile (same path and digest) — checked before a carrier launches
     /// it, so a replaced file is never started as the qualified build.
+    /// Reads no file: a file replaced since the startup hash is refused.
     pub fn executable_qualified(&mut self, exe: &Path) -> bool {
         let qualified: Vec<String> = self
             .config
@@ -949,38 +1003,93 @@ impl Registry {
         })
     }
 
+    /// Hashes every configured harness and relay executable into the digest
+    /// cache. This is the only place an executable is ever hashed: serving
+    /// never reads one, so no hook or relay request can stall the registry
+    /// lock on a whole (possibly hundreds of MB) file.
+    ///
+    /// [`Registry::new`] already runs this, so consumers need not. Calling
+    /// it again is idempotent: a file whose identity is already cached is
+    /// not read again (it only reports the counts, as the daemon does for
+    /// its log), and only a file that changed since is re-hashed. Never call
+    /// it on a registry that is shared and serving, since that would hash
+    /// under the lock. The work is one streamed read per distinct
+    /// configured path, bounded by
+    /// the file sizes (about 1.6 s for 246 MB in an optimized build, tens
+    /// of seconds unoptimized). Each file is hashed for real, never trusted
+    /// from its configured digest, and cached only when its file identity
+    /// (path, device and inode, length, nanosecond mtime) is the same
+    /// before and after the read.
+    ///
+    /// Qualified afterwards: exactly those files, unchanged since. Not
+    /// qualified, with a `NotEvidence` refusal from every route that needs
+    /// the file: a configured file that was missing, unreadable or changing
+    /// at this call, and any file installed, replaced or modified later
+    /// (even by a same-size rewrite within the same second); other cached
+    /// executables keep attesting. The operator's next action is to restart
+    /// the daemon, which re-hashes the then-current files. Returns
+    /// `(cached, skipped)` path counts.
+    pub fn warm_digests(&mut self) -> (usize, usize) {
+        let mut paths: Vec<&Path> = self
+            .config
+            .profiles
+            .iter()
+            .flat_map(|profile| profile.executables.iter().map(|e| e.path.as_path()))
+            .chain(self.config.relays.iter().map(|relay| relay.path.as_path()))
+            .collect();
+        paths.sort();
+        paths.dedup();
+        let paths: Vec<PathBuf> = paths.into_iter().map(Path::to_path_buf).collect();
+        let (mut cached, mut skipped) = (0, 0);
+        for path in paths {
+            let Some(key) = file_key(&path) else {
+                skipped += 1;
+                continue;
+            };
+            if self.digests.contains_key(&key) {
+                cached += 1;
+                continue;
+            }
+            match file_sha256(&path) {
+                Ok(digest) if file_key(&path).as_ref() == Some(&key) => {
+                    self.digests.insert(key, digest);
+                    cached += 1;
+                }
+                _ => skipped += 1,
+            }
+        }
+        (cached, skipped)
+    }
+
     /// Proves the loaded build: the file was not modified after the process
-    /// started (disk is still what was loaded) and hashes to the qualified
-    /// digest. Digests are cached per (path, length, mtime).
+    /// started (`started` is the process start in Unix seconds, or
+    /// `u64::MAX` when no process is involved) and its digest, hashed by
+    /// [`Registry::warm_digests`] for this exact file identity, equals
+    /// `qualified`.
+    ///
+    /// Never reads the file: a file without a warmed digest (installed,
+    /// replaced or changed since startup, or missing at startup) is refused
+    /// as unqualified until the daemon restarts, so this is safe under the
+    /// registry lock.
     fn verify_loaded(
         &mut self,
         exe: &Path,
         started: u64,
         qualified: &str,
     ) -> Result<(), CorrelationError> {
-        let metadata = std::fs::metadata(exe)
-            .map_err(|_| CorrelationError::NotEvidence("harness executable unreadable".into()))?;
-        let mtime = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .map(|duration| duration.as_secs())
-            .ok_or_else(|| CorrelationError::NotEvidence("harness mtime unreadable".into()))?;
-        if mtime > started {
+        let key = file_key(exe)
+            .ok_or_else(|| CorrelationError::NotEvidence("harness executable unreadable".into()))?;
+        if i128::from(key.mtime.0) > i128::from(started) {
             return Err(CorrelationError::NotEvidence(
                 "harness executable changed on disk after the process started; loaded build unproven"
                     .into(),
             ));
         }
-        let key = (exe.to_path_buf(), metadata.len(), mtime);
-        let digest = match self.digests.get(&key) {
-            Some(digest) => digest.clone(),
-            None => {
-                let digest = file_sha256(exe)
-                    .map_err(|_| CorrelationError::NotEvidence("harness unreadable".into()))?;
-                self.digests.insert(key, digest.clone());
-                digest
-            }
+        let Some(digest) = self.digests.get(&key) else {
+            return Err(CorrelationError::NotEvidence(
+                "harness executable was not hashed unchanged at daemon startup (new, replaced or modified since); unqualified until the daemon restarts"
+                    .into(),
+            ));
         };
         if !digest.eq_ignore_ascii_case(qualified) {
             return Err(CorrelationError::NotEvidence(
@@ -993,7 +1102,8 @@ impl Registry {
     /// Admits one hook event from a channel peer.
     ///
     /// Verifies the peer's harness, parses the payload, renews the binding
-    /// when needed (new incarnation, `SessionStart`, first sight), applies
+    /// when needed (new incarnation, the owner's own non-`compact`
+    /// `SessionStart`, first sight), applies
     /// the lifecycle transition, records `PreToolUse` calls and decides
     /// whether this event may drain inject. Refuses (and changes nothing)
     /// on a non-harness peer, a malformed payload, or an address held by
@@ -1055,7 +1165,7 @@ impl Registry {
                 (true, Some(binding.epoch))
             }
             Some(binding) => (
-                kind == HookKind::SessionStart || binding.retired,
+                starts_own_session(kind, role, harness, payload) || binding.retired,
                 Some(binding.epoch),
             ),
             None => (true, None),
@@ -1073,7 +1183,7 @@ impl Registry {
                     capabilities,
                     qualified: capabilities,
                     version: qualified.version.clone(),
-                    lifecycle: Lifecycle::Inactive,
+                    lifecycle: Lifecycle::Unknown,
                     transcript: None,
                     store: profile.store.clone(),
                     executable: qualified.path.clone(),
@@ -1527,13 +1637,39 @@ impl Registry {
     }
 }
 
+/// Whether the actor is the owner of the address its event belongs to: the
+/// root, or a Codex child thread (which has its own address). A Claude
+/// child shares the root's address and is not its owner.
+fn owns_address(role: ActorRole, harness: Harness) -> bool {
+    role == ActorRole::Root || (harness == Harness::Codex && role == ActorRole::Child)
+}
+
+/// Whether one hook event is the address owner's own real session start
+/// (`startup`, `resume`, `clear` or an unlabeled `SessionStart`): the only
+/// event that renews the binding and establishes idleness on its own. A
+/// Claude child's `SessionStart` and a `compact` restart (which can fire
+/// mid-turn) are not.
+fn starts_own_session(
+    kind: HookKind,
+    role: ActorRole,
+    harness: Harness,
+    payload: &HookPayload,
+) -> bool {
+    kind == HookKind::SessionStart
+        && owns_address(role, harness)
+        && payload.source.as_deref() != Some("compact")
+}
+
 /// The next owner-session lifecycle after one hook event.
 ///
 /// Prompt and tool events are active (a child's tool event means the root
 /// awaits its subagent); `AskUserQuestion`, permission requests and
-/// permission notifications await input; `Stop` and an idle-prompt
-/// notification are idle; `SessionEnd` is unknown. Other events keep the
-/// current state.
+/// permission notifications await input; the owner's own `Stop`, idle-prompt
+/// notification and non-`compact` `SessionStart` are idle; the owner's
+/// `SessionEnd` is unknown. Every other event (`SubagentStop`, a Claude
+/// child's `Stop`, `SessionStart`, `SessionEnd` or idle notification, other
+/// notification types, a `compact` restart) keeps `current`, which for a new or renewed
+/// binding is unknown: only the owner's own events may establish idle.
 fn next_lifecycle(
     current: Lifecycle,
     kind: HookKind,
@@ -1541,9 +1677,12 @@ fn next_lifecycle(
     harness: Harness,
     payload: &HookPayload,
 ) -> Lifecycle {
-    let codex_child = harness == Harness::Codex && role == ActorRole::Child;
+    let owner = owns_address(role, harness);
     match kind {
-        HookKind::SessionStart => Lifecycle::Inactive,
+        HookKind::SessionStart if starts_own_session(kind, role, harness, payload) => {
+            Lifecycle::Inactive
+        }
+        HookKind::SessionStart => current,
         HookKind::UserPromptSubmit | HookKind::PostToolUse | HookKind::PostToolUseFailure => {
             Lifecycle::Active
         }
@@ -1557,12 +1696,12 @@ fn next_lifecycle(
         HookKind::PermissionRequest => Lifecycle::AwaitingInput,
         HookKind::Notification => match payload.notification_type.as_deref() {
             Some("permission_prompt" | "elicitation_dialog") => Lifecycle::AwaitingInput,
-            Some("idle_prompt") => Lifecycle::Inactive,
+            Some("idle_prompt") if owner => Lifecycle::Inactive,
             _ => current,
         },
-        HookKind::Stop if role == ActorRole::Root || codex_child => Lifecycle::Inactive,
+        HookKind::Stop if owner => Lifecycle::Inactive,
         HookKind::Stop | HookKind::SubagentStop => current,
-        HookKind::SessionEnd if role == ActorRole::Root || codex_child => Lifecycle::Unknown,
+        HookKind::SessionEnd if owner => Lifecycle::Unknown,
         HookKind::SessionEnd => current,
     }
 }
@@ -1608,4 +1747,143 @@ pub fn file_sha256(path: &Path) -> std::io::Result<String> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    //! The executable digest cache: warmed before serving, never trusted.
+
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A registry whose one Claude profile qualifies `executables` (path,
+    /// configured digest) and whose relays are empty.
+    fn registry_with(executables: &[(&Path, &str)]) -> Registry {
+        let config = RegistryConfig {
+            host_id: "h".into(),
+            profiles: vec![Profile {
+                namespace: "ns".into(),
+                harness: Harness::ClaudeCode,
+                store: PathBuf::from("/tmp/store"),
+                executables: executables
+                    .iter()
+                    .map(|(path, sha256)| QualifiedExecutable {
+                        path: path.to_path_buf(),
+                        sha256: (*sha256).into(),
+                        version: "t".into(),
+                        inject: true,
+                        message: true,
+                    })
+                    .collect(),
+            }],
+            intermediates: Vec::new(),
+            max_call_age_ms: 600_000,
+            relays: Vec::new(),
+        };
+        Registry::new(config, 0).unwrap()
+    }
+
+    /// A fresh temporary directory for one test.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("m2{tag}{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Construction alone (no manual warm) caches the real digest of every
+    /// readable configured file; a wrong configured digest is never trusted
+    /// over the hashed file, a missing file is skipped without affecting the
+    /// others, and warming again reads nothing (proved with a file that can
+    /// no longer be opened).
+    #[test]
+    fn warming_hashes_real_files_and_never_trusts_the_configured_digest() {
+        let dir = scratch("warm");
+        let good = dir.join("good");
+        let wrong = dir.join("wrong");
+        let missing = dir.join("missing");
+        std::fs::write(&good, vec![7u8; 1 << 20]).unwrap();
+        std::fs::write(&wrong, vec![9u8; 1 << 20]).unwrap();
+        let good_digest = file_sha256(&good).unwrap();
+        let bad_config = "0".repeat(64);
+        let mut registry = registry_with(&[
+            (&good, &good_digest),
+            (&wrong, &bad_config),
+            (&missing, &good_digest),
+        ]);
+        registry
+            .verify_loaded(&good, u64::MAX, &good_digest)
+            .expect("the warmed, unchanged file attests");
+        std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(
+            registry.warm_digests(),
+            (2, 1),
+            "no re-read of an unchanged file"
+        );
+        std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            registry
+                .verify_loaded(&wrong, u64::MAX, &bad_config)
+                .is_err()
+        );
+        assert!(
+            registry
+                .verify_loaded(&missing, u64::MAX, &good_digest)
+                .is_err()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Serving never hashes: a file without a startup digest is unqualified even
+    /// when its contents match the configured digest, and a file replaced
+    /// after startup (by rename or in place, with the same size and within
+    /// the same second) or removed is refused too, while an unaffected
+    /// warmed path keeps attesting.
+    #[test]
+    fn changed_new_or_missing_files_fail_closed_without_hashing() {
+        let dir = scratch("chg");
+        let kept = dir.join("kept");
+        let renamed = dir.join("renamed");
+        let rewritten = dir.join("rewritten");
+        let removed = dir.join("removed");
+        let late = dir.join("late");
+        for path in [&kept, &renamed, &rewritten, &removed] {
+            std::fs::write(path, vec![1u8; 4096]).unwrap();
+        }
+        let digest = file_sha256(&kept).unwrap();
+        let all = [&kept, &renamed, &rewritten, &removed, &late];
+        let config: Vec<(&Path, &str)> =
+            all.iter().map(|p| (p.as_path(), digest.as_str())).collect();
+
+        // An unwarmed (cleared) cache: the digest would match, so only a
+        // refusal proves the request path did not hash.
+        let mut cold = registry_with(&config);
+        cold.digests.clear();
+        assert!(cold.verify_loaded(&kept, u64::MAX, &digest).is_err());
+
+        let mut registry = registry_with(&config);
+        assert_eq!(registry.warm_digests(), (4, 1), "late does not exist yet");
+        for path in [&kept, &renamed, &rewritten, &removed] {
+            registry.verify_loaded(path, u64::MAX, &digest).unwrap();
+        }
+        // Installed after startup, with the configured contents.
+        std::fs::write(&late, vec![1u8; 4096]).unwrap();
+        // Same size, same second, other content (so a reused digest would
+        // be wrong, and only the identity check can refuse it).
+        let other = dir.join("other");
+        std::fs::write(&other, vec![2u8; 4096]).unwrap();
+        std::fs::rename(&other, &renamed).unwrap();
+        std::fs::write(&rewritten, vec![2u8; 4096]).unwrap();
+        std::fs::remove_file(&removed).unwrap();
+        for path in [&renamed, &rewritten, &removed, &late] {
+            let error = registry.verify_loaded(path, u64::MAX, &digest);
+            assert!(error.is_err(), "{path:?} must be unqualified");
+        }
+        registry
+            .verify_loaded(&kept, u64::MAX, &digest)
+            .expect("an untouched warmed file still attests");
+        // A file modified after the process started is refused before any
+        // digest question.
+        assert!(registry.verify_loaded(&kept, 0, &digest).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

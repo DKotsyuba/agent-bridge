@@ -6,10 +6,12 @@
 //! bridge-adapters --test qualify_codex -- --ignored --nocapture`.
 //!
 //! Every App Server process here runs under the helper's own confinement
-//! policy (no network, no child processes) with a cleared environment whose
-//! `CODEX_HOME` and `HOME` are a fresh, unpredictably named directory this
-//! test creates (never an existing one), so no user store, credential or
-//! model is touched. The owner step creates one thread in that store and
+//! policy (no network, no child processes) with a cleared environment.
+//! `CODEX_HOME` is a fresh, unpredictably named directory this test creates
+//! (never an existing one); the owner and reader also use it as `HOME`,
+//! while the product helper inherits normal `HOME`, as in production.
+//! The test uses the owned Codex store and no model. The owner step creates
+//! one thread in that store and
 //! exits; the product helper then queues to it while no process has it
 //! loaded; a separate confined reader lists the queue. Every process is
 //! killed and reaped on every path (including panics), and each session

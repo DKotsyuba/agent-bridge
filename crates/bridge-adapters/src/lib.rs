@@ -18,7 +18,8 @@
 //! - [`client`]: the hook command's client and the cross-process
 //!   [`client::RegistryAttestor`].
 //! - [`codex`]: the queue-only, OS-confined Codex message carrier.
-//! - [`claude`]: the Claude `later` message carrier with a stable callback.
+//! - [`claude`]: the Claude `later` message carrier with a callback socket
+//!   unique to each attempt.
 //!
 //! Binaries: `bridge-hook` (installed as the harness hook command) and
 //! `bridge-native-daemon` (core service + carriers + channel).
@@ -27,7 +28,9 @@
 //! build, not liveness. Same-user code running inside a harness's own tool
 //! sandbox shares its process ancestry and is outside the claimed
 //! isolation (see [`registry`]). Library tests use owned fixture processes
-//! and do not establish delivery to, or context in, a real model.
+//! and do not establish delivery to, or context in, a real model; native
+//! qualification is the Root's separate, recorded run of owned frontends and
+//! covers only the builds it names.
 
 pub mod claude;
 pub mod client;
