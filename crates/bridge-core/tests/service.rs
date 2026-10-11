@@ -19,6 +19,7 @@ use common::TempDir;
 const GRANT_TOKEN: &str = "6f6f-test-grant-token-0001";
 const ADMIN_TOKEN: &str = "6f6f-admin-grant-token-0001";
 const OTHER_TOKEN: &str = "6f6f-other-grant-token-0002";
+const SECOND_TOKEN: &str = "6f6f-second-publisher-token-0003";
 
 /// The canonical recipient the grant allows.
 fn recipient_text() -> String {
@@ -65,6 +66,15 @@ fn test_config(dir: &TempDir) -> Config {
                 modes: vec![],
                 policies: vec![],
                 admin: true,
+            },
+            GrantConfig {
+                token: SECOND_TOKEN.to_string(),
+                publisher: "agent-ide".to_string(),
+                recipients: vec![recipient_text()],
+                kinds: vec!["worker.completed".to_string()],
+                modes: vec!["message".to_string()],
+                policies: vec!["keep_all".to_string()],
+                admin: false,
             },
         ],
     }
@@ -269,14 +279,18 @@ fn status_discloses_only_the_callers_own_events() {
 
     // Another publisher's token never discloses it (its publisher scope
     // has no such event), even with the event id known.
+    let (foreign, foreign_delivery) = client.status(SECOND_TOKEN, "evt-own").unwrap();
+    assert!(foreign.is_none() && foreign_delivery.is_none());
+    // An operator grant is a different realm and cannot read publisher
+    // status at all.
     let response = raw_round_trip(
         &socket,
         &serde_json::json!({"op": "status", "token": ADMIN_TOKEN, "event_id": "evt-own"})
             .to_string(),
     );
     match response {
-        Response::Status { receipt, .. } => assert!(receipt.is_none()),
-        other => panic!("expected empty status, got {other:?}"),
+        Response::Error { class, .. } => assert_eq!(class, "forbidden"),
+        other => panic!("expected a forbidden refusal, got {other:?}"),
     }
 
     // Unknown ids are simply absent, not an error.
@@ -492,11 +506,11 @@ fn claims_stale_socket() {
     let socket = running.socket_path().to_path_buf();
     running.shutdown();
     running.join();
-    // Simulated dead daemon: recreate the socket file with no listener.
-    std::os::unix::net::UnixListener::bind(&socket).unwrap();
-    drop(std::os::unix::net::UnixListener::bind(&socket).err());
-    let _ = std::fs::remove_file(&socket);
-    std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    // Simulated dead daemon: a socket file whose listener is gone (a
+    // dropped listener leaves its file behind, like a killed process).
+    drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+    assert!(socket.exists());
+    assert!(std::os::unix::net::UnixStream::connect(&socket).is_err());
     let reclaimed = service::start(config);
     assert!(reclaimed.is_ok(), "stale socket must be claimable");
     let reclaimed = reclaimed.unwrap();
@@ -551,7 +565,7 @@ fn idle_clients_and_publish_after_stop_are_fenced() {
     assert!(wait_listening(&socket, Duration::from_secs(5)));
 
     // A pile of idle connections (well under the admission cap).
-    let mut idle: Vec<std::os::unix::net::UnixStream> = (0..8)
+    let idle: Vec<std::os::unix::net::UnixStream> = (0..8)
         .filter_map(|_| std::os::unix::net::UnixStream::connect(&socket).ok())
         .collect();
     assert_eq!(idle.len(), 8);
@@ -566,7 +580,7 @@ fn idle_clients_and_publish_after_stop_are_fenced() {
         started.elapsed() < Duration::from_secs(5),
         "idle clients must not make shutdown unbounded"
     );
-    drop(&mut idle);
+    drop(idle);
 
     // A publish racing after the stop is refused with no custody row.
     // The socket is gone; a connect now fails, proving the fence by
