@@ -229,7 +229,10 @@ pub struct IncidentView {
     pub attempt_seq: Option<u64>,
     /// Incident class: `unknown_handoff`, `held_overdue`, `receipt_overdue`,
     /// `permanent_refusal`, `retries_exhausted`, `recipient_held`,
-    /// `storage_integrity` or `migrated_unverified`.
+    /// `storage_integrity`, `migrated_unverified` or
+    /// `lineage_authority_lost` (an unhanded event whose producer lost the
+    /// stream lineage through an audited transfer or an ambiguous
+    /// migration).
     pub kind: String,
     /// Current state.
     pub state: IncidentState,

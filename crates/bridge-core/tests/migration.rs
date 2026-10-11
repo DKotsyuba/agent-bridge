@@ -731,3 +731,42 @@ fn ambiguous_migrated_pending_work_is_held_not_dispatched() {
         .unwrap();
     assert_eq!(row.envelope_hash, pending.envelope_hash());
 }
+
+/// The root witness scenario: a v4 database with ONE historical producer
+/// migrates with the authority backfilled from retained evidence, so a
+/// different producer's first publication is fenced without the original
+/// producer having to publish again first.
+#[test]
+fn version_four_single_legacy_owner_fences_a_new_producer_immediately() {
+    let dir = TempDir::new("migrate-v4-single");
+    let path = dir.path("v4s.db");
+    {
+        let mut storage = Storage::open(&path, Limits::new(100)).unwrap();
+        let mut envelope = lineage_event("source-a", "a12", 12);
+        envelope.mode = Mode::Auto;
+        storage.publish(&envelope, 1_000).unwrap();
+        drop(storage);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE stream_lineages;
+                 UPDATE schema_meta SET value = '4' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+    }
+
+    let mut storage = Storage::open(&path, Limits::new(100)).unwrap();
+    let mut challenger = lineage_event("source-b", "b1", 1);
+    challenger.mode = Mode::Auto;
+    assert!(
+        matches!(
+            storage.publish(&challenger, 2_000),
+            Err(CoreError::Fence(_))
+        ),
+        "a migrated legacy producer's stream must fence a different producer at once"
+    );
+    // The legacy producer itself still owns its stream.
+    let mut owner = lineage_event("source-a", "a13", 13);
+    owner.mode = Mode::Auto;
+    storage.publish(&owner, 2_100).unwrap();
+}
