@@ -85,7 +85,8 @@ pub enum DeliveryState {
     HookSubmitted,
     /// Permanently refused before acceptance (incident retained).
     Refused,
-    /// Closed by an audited operator disposition; never delivered.
+    /// Closed by an audited operator disposition; no further automatic Core dispatch.
+    /// A prior possible hand-off is not undone or disproved, and processing is not proved.
     Disposed,
 }
 
@@ -229,7 +230,13 @@ pub struct IncidentView {
     pub attempt_seq: Option<u64>,
     /// Incident class: `unknown_handoff`, `held_overdue`, `receipt_overdue`,
     /// `permanent_refusal`, `retries_exhausted`, `recipient_held`,
-    /// `storage_integrity` or `migrated_unverified`.
+    /// `predecessor_missing` (a dependent waits for a predecessor that was
+    /// never accepted), `predecessor_expired` (the awaited predecessor
+    /// expired before delivery; only an audited waiver or disposition
+    /// releases the dependent), `storage_integrity`, `migrated_unverified` or
+    /// `lineage_authority_lost` (an unhanded event whose producer lost the
+    /// stream lineage through an audited transfer or an ambiguous
+    /// migration).
     pub kind: String,
     /// Current state.
     pub state: IncidentState,
@@ -507,7 +514,8 @@ pub struct MaintenanceReport {
     pub unknown_handoffs: usize,
     /// Held or unreceipted attempts that became overdue incidents.
     pub overdue_rechecks: usize,
-    /// Long recipient holds escalated to incidents.
+    /// New incidents raised for long recipient holds, predecessors that
+    /// never arrived and dependents blocked behind an expired predecessor.
     pub escalated_holds: usize,
 }
 
@@ -760,6 +768,10 @@ impl Storage {
              FROM incidents WHERE {filter}
              ORDER BY (state = 'open') DESC, next_check_ms, incident_seq LIMIT ?1"
         ))?;
+        /// One `incidents` row in `SELECT` order: incident number, publisher,
+        /// event, attempt, kind, state, reason, created, updated, next check,
+        /// review deadline, responsible parties, duplicate-risk flag and
+        /// resolution. States are parsed into [`IncidentState`] afterwards.
         type Row = (
             i64,
             String,
@@ -1250,7 +1262,8 @@ impl Storage {
         tx.execute(
             "UPDATE incidents SET state = 'disposed', resolved_ms = ?1, updated_ms = ?1,
                  resolution = ?2
-             WHERE publisher_id = ?3 AND event_id = ?4 AND kind = 'predecessor_missing'
+             WHERE publisher_id = ?3 AND event_id = ?4
+               AND kind IN ('predecessor_missing', 'predecessor_expired')
                AND state = 'open'",
             params![
                 to_sql(now_ms)?,
@@ -1598,8 +1611,8 @@ impl Storage {
     }
 
     /// Runs one bounded reconciliation pass: expiry of unhanded events,
-    /// lease and recheck handling, and escalation of long recipient holds
-    /// to incidents.
+    /// lease and recheck handling, and escalation of long recipient holds,
+    /// missing predecessors and expired predecessors to incidents.
     pub fn run_maintenance(&mut self, now_ms: u64) -> Result<MaintenanceReport, CoreError> {
         let expired_events = self.expire_due(now_ms)?;
         let (reclaimed_reservations, unknown_handoffs, overdue_rechecks) =
@@ -1616,13 +1629,40 @@ impl Storage {
 
     /// Escalates holds older than the hold threshold to incidents on the
     /// recipient's oldest waiting event and resolves stale ones.
+    ///
+    /// Also raises `predecessor_missing` for a dependent whose predecessor
+    /// was never accepted (after the hold threshold) and
+    /// `predecessor_expired` for one whose predecessor expired before
+    /// delivery (at once; expiry is final). Neither releases the dependent;
+    /// both close when the dependent is waived, disposed or no longer
+    /// waiting, and `predecessor_expired` also closes (and is not raised
+    /// again) once the predecessor reaches a state that satisfies the dispatch
+    /// dependency rule (accepted, hook-submitted or disposed),
+    /// with a neutral resolution text that claims no particular decision.
+    /// Returns how many incidents were newly opened.
+    ///
+    /// Each candidate query is bounded by `MAINTENANCE_BATCH` and skips
+    /// items that already have an open incident of its kind, so a backlog
+    /// larger than one batch is exposed over successive passes instead of
+    /// re-selecting the same oldest items forever; an incident that was
+    /// closed (resolved, disposed or authorized) no longer suppresses its
+    /// item, and nothing here ever releases a dependent.
     fn escalate_holds(&mut self, now_ms: u64) -> Result<usize, CoreError> {
         let threshold = to_sql(now_ms.saturating_sub(HOLD_INCIDENT_AFTER_MS))?;
         let tx = self.begin()?;
         let holds: Vec<(String, String)> = tx
             .prepare(
-                "SELECT recipient, reason FROM recipient_holds
-                 WHERE since_ms <= ?1 ORDER BY since_ms LIMIT ?2",
+                "SELECT h.recipient, h.reason FROM recipient_holds h
+                 WHERE h.since_ms <= ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM incidents i
+                       WHERE i.kind = 'recipient_held' AND i.state = 'open'
+                         AND (i.publisher_id, i.event_id) = (
+                             SELECT o.publisher_id, o.event_id FROM events o
+                             WHERE o.state = 'pending' AND o.delivery = 'unhanded'
+                               AND o.recipient = h.recipient
+                             ORDER BY o.acceptance_seq LIMIT 1))
+                 ORDER BY h.since_ms LIMIT ?2",
             )?
             .query_map(params![threshold, MAINTENANCE_BATCH], |row| {
                 Ok((row.get(0)?, row.get(1)?))
@@ -1638,6 +1678,10 @@ impl Storage {
                    AND NOT EXISTS (SELECT 1 FROM events p
                                    WHERE p.publisher_id = e.publisher_id
                                      AND p.event_id = e.predecessor)
+                   AND NOT EXISTS (SELECT 1 FROM incidents i
+                                   WHERE i.publisher_id = e.publisher_id
+                                     AND i.event_id = e.event_id
+                                     AND i.kind = 'predecessor_missing' AND i.state = 'open')
                  ORDER BY e.acceptance_seq LIMIT ?2",
             )?
             .query_map(params![threshold, MAINTENANCE_BATCH], |row| {
@@ -1657,6 +1701,42 @@ impl Storage {
                 escalated += 1;
             }
         }
+        // A predecessor that expired before delivery can never produce the
+        // evidence its dependent waits for; the dependent keeps its order
+        // and becomes an explicit incident until an audited waiver or
+        // disposition.
+        let expired: Vec<(String, String, String)> = tx
+            .prepare(
+                "SELECT e.publisher_id, e.event_id, e.predecessor FROM events e
+                 JOIN events p ON p.publisher_id = e.publisher_id AND p.event_id = e.predecessor
+                 WHERE e.state = 'pending' AND e.delivery = 'unhanded'
+                   AND e.predecessor_waived = 0 AND p.state = 'expired'
+                   AND p.delivery NOT IN ('accepted', 'hook_submitted', 'disposed')
+                   AND NOT EXISTS (SELECT 1 FROM incidents i
+                                   WHERE i.publisher_id = e.publisher_id
+                                     AND i.event_id = e.event_id
+                                     AND i.kind = 'predecessor_expired' AND i.state = 'open')
+                 ORDER BY e.acceptance_seq LIMIT ?1",
+            )?
+            .query_map(params![MAINTENANCE_BATCH], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<_, _>>()?;
+        for (publisher, event_id, predecessor) in expired {
+            if open_incident_in(
+                &tx,
+                &publisher,
+                &event_id,
+                None,
+                "predecessor_expired",
+                &format!(
+                    "predecessor {predecessor} expired before delivery; an audited waiver or disposition is required"
+                ),
+                now_ms,
+            )? {
+                escalated += 1;
+            }
+        }
         tx.execute(
             "UPDATE incidents SET state = 'resolved', resolved_ms = ?1, updated_ms = ?1,
                  resolution = 'the predecessor was accepted'
@@ -1665,6 +1745,32 @@ impl Storage {
                              ON p.publisher_id = e.publisher_id AND p.event_id = e.predecessor
                            WHERE e.publisher_id = incidents.publisher_id
                              AND e.event_id = incidents.event_id)",
+            params![to_sql(now_ms)?],
+        )?;
+        // Once the predecessor reaches a releasing delivery state, the
+        // dispatch eligibility rule releases its dependent on its own; the
+        // incident closes without asserting which outcome satisfied the rule.
+        tx.execute(
+            "UPDATE incidents SET state = 'resolved', resolved_ms = ?1, updated_ms = ?1,
+                 resolution = 'the predecessor now satisfies the dispatch dependency rule (accepted, hook-submitted or disposed)'
+             WHERE kind = 'predecessor_expired' AND state = 'open'
+               AND EXISTS (SELECT 1 FROM events e JOIN events p
+                             ON p.publisher_id = e.publisher_id AND p.event_id = e.predecessor
+                           WHERE e.publisher_id = incidents.publisher_id
+                             AND e.event_id = incidents.event_id
+                             AND p.delivery IN ('accepted', 'hook_submitted', 'disposed'))",
+            params![to_sql(now_ms)?],
+        )?;
+        // A dependent that expired, was disposed or was waived no longer waits.
+        tx.execute(
+            "UPDATE incidents SET state = 'resolved', resolved_ms = ?1, updated_ms = ?1,
+                 resolution = 'the dependent is no longer waiting'
+             WHERE kind IN ('predecessor_missing', 'predecessor_expired') AND state = 'open'
+               AND NOT EXISTS (SELECT 1 FROM events e
+                               WHERE e.publisher_id = incidents.publisher_id
+                                 AND e.event_id = incidents.event_id
+                                 AND e.state = 'pending' AND e.delivery = 'unhanded'
+                                 AND e.predecessor_waived = 0)",
             params![to_sql(now_ms)?],
         )?;
         for (recipient, reason) in holds {

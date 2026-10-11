@@ -180,7 +180,9 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', li
 });
 `;
 
-if (process.argv[2] === '--self-test-config') configControls();
+if (require.main !== module) {
+  // Loaded as a library by `codex-lifecycle-probe.cjs`: nothing runs.
+} else if (process.argv[2] === '--self-test-config') configControls();
 else if (process.argv[2] === '--config-control-case') configControl(process.argv[3]);
 else run('m2xp', 20 * 60_000, REQUIRED, async probe => {
   const codex = fs.realpathSync(process.env.CODEX_EXE || '/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex');
@@ -626,3 +628,8 @@ async function appServer(probe, codex, store, label, flags, requests, cleanup = 
   probe.checks[`${label}_exit`] = await probe.exited(child, 5000);
   return responses;
 }
+
+/** The proven Q3 isolation/config building blocks, reused unchanged by
+ * `codex-lifecycle-probe.cjs` (loading this file runs nothing).
+ * @type {{MODEL: string, EFFORT: string, POLICY: string, DISABLED: string[], EVENTS: string[], ME_APPROVAL: string, gateRead: (probe: import('./probe-lib.cjs').Probe, codex: string, store: string, label: string, flags: string[], ownCommand: string) => Promise<{hooks: {key: string|null, source: string|null, eventName: string|null, enabled: boolean|null, trustStatus: string|null, currentHash: string|null, own: boolean}[]|null, effective: {enabled_tools?: string[], tools?: {[tool: string]: {approval_mode?: string}}, default_tools_approval_mode?: string}|null, overrideRejected: boolean}>, stateOverride: (hooks: {key: string, own: boolean, currentHash: string|null}[]) => string[], ownApprovalParsed: (effective: {enabled_tools?: string[], tools?: {[tool: string]: {approval_mode?: string}}, default_tools_approval_mode?: string}|null) => boolean, appServer: (probe: import('./probe-lib.cjs').Probe, codex: string, store: string, label: string, flags: string[], requests: [string, {[param: string]: unknown}][], cleanup?: boolean, keep?: (line: string) => string|null, stderrMatch?: RegExp) => Promise<({id: number, result?: {[field: string]: unknown}, error?: {code?: number, message?: string}}|undefined)[]>}} */
+module.exports = { MODEL, EFFORT, POLICY, DISABLED, EVENTS, ME_APPROVAL, gateRead, stateOverride, ownApprovalParsed, appServer };

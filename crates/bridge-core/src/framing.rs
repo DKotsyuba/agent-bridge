@@ -196,6 +196,8 @@ mod tests {
         .unwrap()
     }
 
+    /// Hostile markup in the payload is escaped and the fixed provenance
+    /// statement is present.
     #[test]
     fn escapes_hostile_content() {
         let framed = frame("agent-run", &envelope("evt-1", "<script>\"&'")).unwrap();
@@ -205,6 +207,8 @@ mod tests {
         assert!(framed.contains(PROVENANCE_STATEMENT));
     }
 
+    /// Forbidden control characters and non-allowlistable tags refuse the
+    /// framing; ordinary tabs and newlines pass.
     #[test]
     fn rejects_forbidden_controls_and_bad_tags() {
         assert!(frame("agent-run", &envelope("e", "bad\u{1}char")).is_err());
@@ -215,6 +219,8 @@ mod tests {
         assert!(frame("agent-run", &envelope("e", "tab\tand\nnewline ok")).is_ok());
     }
 
+    /// Oversize rendered results refuse instead of truncating, while a
+    /// full-size plain payload still fits.
     #[test]
     fn bounds_rendered_result_without_truncating() {
         assert!(frame("agent-run", &envelope("e", &"a".repeat(64 * 1024))).is_ok());
@@ -223,6 +229,8 @@ mod tests {
         assert!(check_renderable(&envelope("e", "fine")).is_ok());
     }
 
+    /// A manifest renders one source block per member, preserving order
+    /// and per-member identity.
     #[test]
     fn manifest_keeps_a_separate_source_block_per_member() {
         let one = envelope("evt-1", "one");

@@ -135,6 +135,9 @@ fn drive_to(running: &service::Running, event: &str, outcome: Outcome, now: u64)
     })
 }
 
+/// The operator realm is disjoint from publisher grants and serves the
+/// core's own incident state over the wire: publishers cannot read or
+/// mutate recovery, and operators see real incidents only.
 #[test]
 fn operator_realm_is_disjoint_and_serves_the_cores_own_incident_state() {
     let dir = TempDir::new("life-operator");
@@ -284,15 +287,19 @@ fn operator_realm_is_disjoint_and_serves_the_cores_own_incident_state() {
 struct Shared(Arc<Mutex<ScriptedCarrier>>);
 
 impl DispatchCarrier for Shared {
+    /// Returns this fixture's attestation for the recipient.
     fn attest(&mut self, recipient: &NativeAddress) -> Result<Attestation, String> {
         self.0.lock().unwrap().attest(recipient)
     }
 
+    /// Applies this fixture's scripted outcome to the frozen attempt.
     fn send(&mut self, attempt: &AttemptRecord) -> Outcome {
         self.0.lock().unwrap().send(attempt)
     }
 }
 
+/// Registered synthetic carriers deliver over the message path and the
+/// durable pause policy is respected end to end through the service.
 #[test]
 fn registered_carriers_deliver_over_the_message_path_and_respect_pause() {
     let dir = TempDir::new("life-carrier");
@@ -358,6 +365,7 @@ struct Flaky {
 }
 
 impl DispatchCarrier for Flaky {
+    /// Returns this fixture's attestation for the recipient.
     fn attest(&mut self, recipient: &NativeAddress) -> Result<Attestation, String> {
         if self.panics_left > 0 {
             self.panics_left -= 1;
@@ -366,11 +374,14 @@ impl DispatchCarrier for Flaky {
         self.inner.attest(recipient)
     }
 
+    /// Applies this fixture's scripted outcome to the frozen attempt.
     fn send(&mut self, attempt: &AttemptRecord) -> Outcome {
         self.inner.send(attempt)
     }
 }
 
+/// A panicking carrier attestation is contained: the recovery loop
+/// continues and the event stays retained.
 #[test]
 fn a_panicking_carrier_attestation_does_not_end_the_recovery_loop() {
     let dir = TempDir::new("life-panic");
@@ -407,16 +418,20 @@ struct Hanging {
 }
 
 impl DispatchCarrier for Hanging {
+    /// Returns this fixture's attestation for the recipient.
     fn attest(&mut self, recipient: &NativeAddress) -> Result<Attestation, String> {
         Ok(attest(recipient, Lifecycle::Inactive, 1))
     }
 
+    /// Applies this fixture's scripted outcome (attempt ignored).
     fn send(&mut self, _attempt: &AttemptRecord) -> Outcome {
         let _ = self.release.recv();
         ScriptedCarrier::accepted()
     }
 }
 
+/// A carrier that never returns cannot make the stop unbounded; the
+/// event stays retained for review.
 #[test]
 fn a_hanging_carrier_cannot_make_the_stop_unbounded_and_stays_retained() {
     let dir = TempDir::new("life-hang");
@@ -470,6 +485,9 @@ fn fake_daemon(path: &Path, answer: Vec<u8>) -> std::thread::JoinHandle<()> {
 /// Valid custody receipts acknowledge only the exact requested identity and bytes.
 /// Own fake endpoints return real storage receipts; a matching receipt passes,
 /// while unrelated publication or status receipts cannot release sender intent.
+/// Client custody acknowledgements bind to the exact requested event
+/// bytes: a wrong-event acknowledgement reports the mismatch, never a
+/// false success.
 #[test]
 fn client_acknowledgements_are_bound_to_requested_event_bytes() {
     let request = body("requested-event");
@@ -528,6 +546,8 @@ fn client_acknowledgements_are_bound_to_requested_event_bytes() {
     );
 }
 
+/// The client distrusts invalid, oversized or malformed responses
+/// instead of misreading them as success.
 #[test]
 fn the_client_distrusts_invalid_oversized_and_malformed_responses() {
     // An incident listing with a number no storage could have produced.
@@ -578,6 +598,8 @@ fn the_client_distrusts_invalid_oversized_and_malformed_responses() {
     let _ = std::fs::remove_file(&socket);
 }
 
+/// Unsupported modes are refused over the wire before acceptance, with
+/// no custody row created.
 #[test]
 fn unsupported_modes_are_refused_over_the_wire_before_acceptance() {
     let dir = TempDir::new("life-unsupported");
@@ -618,6 +640,8 @@ fn unsupported_modes_are_refused_over_the_wire_before_acceptance() {
     );
 }
 
+/// After the stop request, new work is fenced while every acknowledged
+/// publish remains durable in storage.
 #[test]
 fn shutdown_fences_new_work_and_every_acknowledged_publish_is_durable() {
     let dir = TempDir::new("life-fence");
@@ -674,6 +698,8 @@ fn shutdown_fences_new_work_and_every_acknowledged_publish_is_durable() {
     }
 }
 
+/// Idle and stalled connections are closed within their timeouts and
+/// ordinary clients reconnect cleanly.
 #[test]
 fn idle_and_stalled_connections_are_closed_and_clients_reconnect() {
     let dir = TempDir::new("life-timeouts");
@@ -713,6 +739,8 @@ fn idle_and_stalled_connections_are_closed_and_clients_reconnect() {
     running.join();
 }
 
+/// Concurrent connections beyond the configured cap are refused
+/// admission while earlier clients keep working.
 #[test]
 fn connection_admission_is_bounded_by_the_configured_cap() {
     let dir = TempDir::new("life-cap");
@@ -774,6 +802,9 @@ fn connection_admission_is_bounded_by_the_configured_cap() {
     running.join();
 }
 
+/// Socket ownership preserves foreign paths (regular files, symlinks,
+/// directories) and the stop removes only the inode this instance
+/// bound.
 #[test]
 fn socket_ownership_preserves_foreign_paths_and_only_removes_its_own_inode() {
     let dir = TempDir::new("life-owner");
@@ -836,6 +867,8 @@ fn socket_ownership_preserves_foreign_paths_and_only_removes_its_own_inode() {
     std::fs::remove_file(&socket).unwrap();
 }
 
+/// Two racing starts on one endpoint never replace a live daemon: the
+/// second refuses and the first keeps its socket.
 #[test]
 fn racing_starts_on_one_endpoint_never_replace_a_live_daemon() {
     for stale in [false, true] {
@@ -890,6 +923,8 @@ fn racing_starts_on_one_endpoint_never_replace_a_live_daemon() {
     }
 }
 
+/// The daemon exits 0 on SIGTERM after a drained stop and never logs
+/// configuration secrets, including on parse failure.
 #[test]
 fn daemon_exits_cleanly_on_sigterm_and_never_logs_config_secrets() {
     let dir = TempDir::new("life-daemon");
@@ -959,6 +994,7 @@ fn daemon_exits_cleanly_on_sigterm_and_never_logs_config_secrets() {
     assert!(!log.contains("1234567890123456789"), "{log}");
 }
 
+/// Malformed grants refuse startup before any request is served.
 #[test]
 fn grant_configuration_is_validated_before_anything_is_served() {
     let dir = TempDir::new("life-grants");
@@ -983,6 +1019,8 @@ fn grant_configuration_is_validated_before_anything_is_served() {
     reject(&|c| c.limits.idle_timeout_ms = 0);
 }
 
+/// Both TOML grant table spellings parse and missing limits take their
+/// documented defaults.
 #[test]
 fn both_toml_grant_table_names_parse_and_limits_default_sensibly() {
     let grant = "token = \"0123456789abcdef-token\"\npublisher = \"agent-run\"\n\
@@ -999,6 +1037,7 @@ fn both_toml_grant_table_names_parse_and_limits_default_sensibly() {
     }
 }
 
+/// Token credentials never appear in debug output or error details.
 #[test]
 fn credentials_never_appear_in_debug_output_or_error_details() {
     let secret = "CANARY-TOKEN-0123456789ABCDEF";
@@ -1037,4 +1076,191 @@ fn credentials_never_appear_in_debug_output_or_error_details() {
     }
     running.shutdown();
     running.join();
+}
+
+/// A canonical Codex address for the multi-recipient service checks.
+fn thread(name: &str) -> NativeAddress {
+    NativeAddress::new("host-1", Harness::Codex, "default", name).unwrap()
+}
+
+/// Waits until `event` reports `native_accepted` or the budget runs out.
+fn wait_accepted(client: &mut BridgeClient, event: &str, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        let (_, delivery) = client.status(RUN_TOKEN, event).unwrap();
+        if delivery.is_some_and(|d| d.attempt_state == "native_accepted") {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// Recipients whose pending work the message path can never take (here
+/// inject-only events) must not occupy the bounded dispatch listing
+/// forever: a seventeenth, younger recipient with real message work is
+/// still served by the service loop.
+#[test]
+fn quiet_inject_only_recipients_cannot_starve_a_later_message_recipient() {
+    let dir = TempDir::new("life-fair");
+    let quiet: Vec<NativeAddress> = (0..16)
+        .map(|index| thread(&format!("quiet-{index:02}")))
+        .collect();
+    let busy = thread("zz-busy");
+    let mut cfg = config(&dir, "fair");
+    cfg.grants[0].recipients = quiet
+        .iter()
+        .chain([&busy])
+        .map(NativeAddress::to_canonical_string)
+        .collect();
+    let script = Arc::new(Mutex::new(ScriptedCarrier::new(
+        Lifecycle::Inactive,
+        ScriptedCarrier::accepted(),
+    )));
+    let running =
+        service::start_with_carriers(cfg, vec![Box::new(Shared(Arc::clone(&script)))]).unwrap();
+    let mut client = BridgeClient::connect(running.socket_path()).unwrap();
+    for (index, address) in quiet.iter().enumerate() {
+        let mut inject = body(&format!("evt-quiet-{index:02}"));
+        inject.recipient = address.clone();
+        inject.mode = Mode::Inject;
+        client.publish(RUN_TOKEN, &inject).unwrap();
+        std::thread::sleep(Duration::from_millis(3));
+    }
+    let mut work = body("evt-busy");
+    work.recipient = busy;
+    client.publish(RUN_TOKEN, &work).unwrap();
+
+    assert!(
+        wait_accepted(&mut client, "evt-busy", Duration::from_secs(10)),
+        "the younger message recipient starved behind quiet inject-only recipients"
+    );
+    assert_eq!(script.lock().unwrap().sends.len(), 1);
+    running.shutdown();
+    running.join();
+}
+
+/// A carrier whose attestation panics for one recipient on every call.
+struct Poisoned {
+    /// The recipient whose attestation always panics.
+    bad: NativeAddress,
+    /// The well-behaved carrier used for every other recipient.
+    inner: ScriptedCarrier,
+}
+
+impl DispatchCarrier for Poisoned {
+    /// Panics for the poisoned recipient; otherwise attests normally.
+    fn attest(&mut self, recipient: &NativeAddress) -> Result<Attestation, String> {
+        assert!(
+            *recipient != self.bad,
+            "scripted persistent attestation panic"
+        );
+        self.inner.attest(recipient)
+    }
+
+    /// Applies this fixture's scripted outcome to the frozen attempt.
+    fn send(&mut self, attempt: &AttemptRecord) -> Outcome {
+        self.inner.send(attempt)
+    }
+}
+
+/// A carrier attestation that panics on every pass for one recipient is
+/// isolated to that recipient: the recipient shows a visible hold and its
+/// event stays unaccepted, while another recipient still gets delivered.
+#[test]
+fn a_persistently_panicking_attestation_is_isolated_to_its_recipient() {
+    let dir = TempDir::new("life-poison");
+    let (bad, good) = (thread("a-bad"), thread("b-good"));
+    let mut cfg = config(&dir, "poison");
+    cfg.grants[0].recipients = vec![bad.to_canonical_string(), good.to_canonical_string()];
+    let running = service::start_with_carriers(
+        cfg,
+        vec![Box::new(Poisoned {
+            bad: bad.clone(),
+            inner: ScriptedCarrier::new(Lifecycle::Inactive, ScriptedCarrier::accepted()),
+        })],
+    )
+    .unwrap();
+    let mut client = BridgeClient::connect(running.socket_path()).unwrap();
+    let mut first = body("evt-bad");
+    first.recipient = bad;
+    client.publish(RUN_TOKEN, &first).unwrap();
+    std::thread::sleep(Duration::from_millis(3));
+    let mut second = body("evt-good");
+    second.recipient = good;
+    client.publish(RUN_TOKEN, &second).unwrap();
+
+    assert!(
+        wait_accepted(&mut client, "evt-good", Duration::from_secs(10)),
+        "a persistent attestation panic for one recipient stopped other deliveries"
+    );
+    let (_, bad_status) = client.status(RUN_TOKEN, "evt-bad").unwrap();
+    assert!(
+        bad_status.is_none_or(|d| d.attempt_state != "native_accepted"),
+        "a panicking attestation must never fabricate native acceptance"
+    );
+    let holds = client.holds(OPS_TOKEN, None).unwrap();
+    assert_eq!(holds.len(), 1, "the poisoned recipient is visibly held");
+    assert!(holds[0].reason.contains("panicked"), "{}", holds[0].reason);
+    running.shutdown();
+    running.join();
+}
+
+/// A carrier whose attestation always refuses with one fixed reason.
+struct Refusing {
+    /// The refusal text this carrier reports for every recipient.
+    reason: &'static str,
+}
+
+impl DispatchCarrier for Refusing {
+    /// Always refuses to attest, with the fixed reason.
+    fn attest(&mut self, _recipient: &NativeAddress) -> Result<Attestation, String> {
+        Err(self.reason.to_string())
+    }
+
+    /// Never reached: a refused attestation must not lead to a hand-off.
+    fn send(&mut self, _attempt: &AttemptRecord) -> Outcome {
+        unreachable!("a refusing carrier is never asked to send")
+    }
+}
+
+/// When several carriers refuse a recipient, the visible hold keeps every
+/// carrier's reason (bounded), not only the last one, so the meaningful
+/// refusal of the matching carrier ("the harness process is gone") is not
+/// hidden by an unrelated carrier's "not my harness" answer. Nothing is
+/// attempted for the recipient.
+#[test]
+fn a_hold_keeps_every_carriers_refusal_reason_and_attempts_nothing() {
+    let dir = TempDir::new("life-reasons");
+    let running = service::start_with_carriers(
+        config(&dir, "reasons"),
+        vec![
+            Box::new(Refusing {
+                reason: "harness process is gone",
+            }),
+            Box::new(Refusing {
+                reason: "not a Claude recipient",
+            }),
+        ],
+    )
+    .unwrap();
+    let mut client = BridgeClient::connect(running.socket_path()).unwrap();
+    client.publish(RUN_TOKEN, &body("evt-dead")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let reason = loop {
+        if let Some(hold) = client.holds(OPS_TOKEN, None).unwrap().first() {
+            break hold.reason.clone();
+        }
+        assert!(Instant::now() < deadline, "no hold was recorded");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    running.shutdown();
+    running.join();
+    assert!(reason.contains("harness process is gone"), "{reason}");
+    assert!(reason.contains("not a Claude recipient"), "{reason}");
+    let connection = rusqlite::Connection::open(dir.path("bridge.db")).unwrap();
+    let attempts: i64 = connection
+        .query_row("SELECT COUNT(*) FROM attempts", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(attempts, 0, "a refused endpoint is never handed anything");
 }

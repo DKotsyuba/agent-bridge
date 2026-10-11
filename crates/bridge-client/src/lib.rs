@@ -625,6 +625,8 @@ mod tests {
         )
     }
 
+    /// The builder produces a fully validated publisher-less body with the
+    /// attached metadata and expiry.
     #[test]
     fn builder_produces_validated_body() {
         let body = request("evt-42", "done")
@@ -649,6 +651,8 @@ mod tests {
     }
 
     #[test]
+    /// The builder surfaces metadata bound violations as invalid-envelope
+    /// errors.
     fn builder_surfaces_metadata_violations() {
         let mut oversized = request("evt-43", "x");
         for index in 0..17 {
@@ -663,6 +667,8 @@ mod tests {
     }
 
     #[test]
+    /// The builder refuses events whose framing could never render (bad
+    /// tag or unbounded content) before they reach the wire.
     fn builder_refuses_events_that_could_never_be_rendered() {
         assert!(request("evt-44", "bad\u{1}control").into_body().is_err());
         assert!(

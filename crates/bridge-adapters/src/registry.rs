@@ -1117,9 +1117,16 @@ impl Registry {
     /// alone shows nothing. Times are whole seconds, so a change in the very
     /// second the process was born is ambiguous and refused; restarting the
     /// harness a second or more after the last change to the file resolves
-    /// it, as does a restart after any benign chmod or link change. It does
-    /// not defend against code that already runs as the user with the
-    /// ability to move the system clock backwards.
+    /// the birth-second ambiguity. A benign chmod or link change also moves
+    /// the nanosecond ctime, which is part of the daemon-start digest cache
+    /// identity too, so any change after the daemon warmed needs BOTH a
+    /// daemon restart (to hash the current file again, never under this
+    /// lock) and a harness restart (a new birth second). A run that wants
+    /// to show the stock binary was not touched should record its
+    /// inode, mtime and ctime before and after; nothing here claims the
+    /// operating system can never write it. It does not defend against code
+    /// that already runs as the user with the ability to move the system
+    /// clock backwards.
     ///
     /// Never reads the file: a file without a warmed digest (installed,
     /// replaced or changed since startup, or missing at startup) is refused
