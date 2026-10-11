@@ -21,7 +21,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use bridge_core::service::{PublishBody, Request, Response};
+use bridge_core::service::{DeliveryEvidence, PublishBody, Request, Response};
 
 /// A client's typed view of one protocol refusal.
 ///
@@ -92,19 +92,22 @@ impl BridgeClient {
         }
     }
 
-    /// Looks up the caller's own event status (custody only, never another
-    /// publisher's).
+    /// Looks up the caller's own event status: custody receipt plus the
+    /// newest delivery-evidence tier (never another publisher's).
+    ///
+    /// `delivery` is `None` until a dispatch attempt exists; callers must
+    /// treat that as not_available, never as delivered.
     pub fn status(
         &mut self,
         token: &str,
         event_id: &str,
-    ) -> Result<Option<CustodyReceipt>, ProtocolError> {
+    ) -> Result<(Option<CustodyReceipt>, Option<DeliveryEvidence>), ProtocolError> {
         let request = Request::Status {
             token: token.to_string(),
             event_id: event_id.to_string(),
         };
         match self.round_trip(&request) {
-            Response::Status { receipt } => Ok(receipt),
+            Response::Status { receipt, delivery } => Ok((receipt, delivery)),
             Response::Error { class, detail } => Err(ProtocolError {
                 class: class.to_string(),
                 detail,
