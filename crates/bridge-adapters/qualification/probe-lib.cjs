@@ -117,33 +117,56 @@ class Probe {
    * stderr to files in the evidence directory.
    *
    * The stderr file descriptor is closed in this process right after the
-   * spawn (the child keeps its own copy). `closed` resolves only when the
+   * spawn (the child keeps its own copy). With `stderrMatch`, stderr is
+   * never written anywhere instead: it is read through a pipe and reduced
+   * in memory to `child.stderrSummary` = `{stderr_bytes, matched}`
+   * (`matched`: `stderrMatch` matched the stream, checked across chunk
+   * boundaries over a 256-character carry), so no file holds raw stderr on
+   * any path, including a signal, a thrown error or a child that keeps
+   * writing after it should have exited. `closed` resolves only when the
    * child exited *and* all its stdio ended (or the spawn failed), so every
    * stdout line, including a final line without newline, is logged before
    * the log is ended. A spawn failure records `spawn_error:<name>`.
    * @param {string} name Label (log file prefix).
    * @param {string} file Executable.
    * @param {string[]} args Arguments (never secrets).
-   * @param {{cwd?: string, env?: NodeJS.ProcessEnv, stdin?: boolean, cleanup?: boolean}} [options] Extra spawn options; `cleanup` marks a registered cleanup action's own process.
-   * @param {(line: string) => void} [onLine] Called for each stdout line.
+   * @param {{cwd?: string, env?: NodeJS.ProcessEnv, stdin?: boolean, cleanup?: boolean, keep?: (line: string) => string|null, stderrMatch?: RegExp}} [options] Extra spawn options; `cleanup` marks a registered cleanup action's own process; `keep` maps each stdout line *before* it is logged or handed to `onLine` (null drops it), so a line it rewrites is never written or retained anywhere; `stderrMatch` (a non-global RegExp) replaces the stderr file by the in-memory summary above.
+   * @param {(line: string) => void} [onLine] Called for each kept stdout line.
    * @returns {import('node:child_process').ChildProcess} The child.
    */
   spawn(name, file, args, options = {}, onLine) {
     this.fence(name, options.cleanup === true);
     if (args.some(arg => this.secrets.some(secret => arg.includes(secret)))) throw new Error('secret in argv');
-    const fd = fs.openSync(path.join(this.dir, `${name}.stderr`), 'w');
+    const reduce = options.stderrMatch instanceof RegExp;
+    const fd = reduce ? null : fs.openSync(path.join(this.dir, `${name}.stderr`), 'w');
     let child;
     try {
       child = spawn(file, args, {
         cwd: options.cwd || this.dir,
         env: options.env || process.env,
         detached: true,
-        stdio: [options.stdin ? 'pipe' : 'ignore', 'pipe', fd],
+        stdio: [options.stdin ? 'pipe' : 'ignore', 'pipe', reduce ? 'pipe' : fd],
       });
-    } finally { fs.closeSync(fd); }
+    } finally { if (fd !== null) fs.closeSync(fd); }
+    if (reduce) {
+      const summary = { stderr_bytes: 0, matched: false };
+      let carry = '';
+      child.stderr.on('data', chunk => {
+        summary.stderr_bytes += chunk.length;
+        const text = carry + chunk.toString('latin1');
+        if (options.stderrMatch.test(text)) summary.matched = true;
+        carry = text.slice(-256);
+      });
+      child.stderrSummary = summary;
+    }
     const log = fs.createWriteStream(path.join(this.dir, `${name}.stdout`));
     const lines = readline.createInterface({ input: child.stdout });
-    lines.on('line', line => { log.write(line + '\n'); if (onLine) onLine(line); });
+    lines.on('line', raw => {
+      const line = options.keep ? options.keep(raw) : raw;
+      if (line === null) return;
+      log.write(line + '\n');
+      if (onLine) onLine(line);
+    });
     const exit = new Promise(resolve => {
       child.once('error', error => { this.fail(`spawn_error:${name}`); resolve({ error: error.code || String(error) }); });
       child.once('exit', (code, signal) => resolve({ code, signal }));
@@ -178,8 +201,13 @@ class Probe {
     const entry = this.children.find(c => c.child === child);
     const bound = Math.min(ms, this.remaining());
     if (bound <= 0) { this.fail('budget_exhausted'); return null; }
-    const timer = new Promise(r => setTimeout(() => r(null), bound));
-    return Promise.race([entry.exit, timer]);
+    // Dispose the losing timer so a completed child does not keep the probe
+    // alive until the bound expires (root-observed 8-minute wrapper hang).
+    let timeout;
+    try {
+      const timer = new Promise(r => { timeout = setTimeout(() => r(null), bound); });
+      return await Promise.race([entry.exit, timer]);
+    } finally { clearTimeout(timeout); }
   }
 
   /** Runs a short local command (no model) and returns trimmed stdout.
@@ -243,7 +271,12 @@ class Probe {
     for (const entry of this.children) {
       const closed = await Promise.race([entry.closed, new Promise(r => setTimeout(() => r(false), 3000))]);
       const exit = await Promise.race([entry.exit, new Promise(r => setTimeout(() => r(null), 100))]);
-      if (!closed) { this.fail(`unclosed:${entry.name}`); if (entry.child.stdout) entry.child.stdout.destroy(); entry.lines.close(); }
+      if (!closed) {
+        this.fail(`unclosed:${entry.name}`);
+        if (entry.child.stdout) entry.child.stdout.destroy();
+        if (entry.child.stderr) entry.child.stderr.destroy();
+        entry.lines.close();
+      }
       if (!exit) this.fail(`unreaped:${entry.name}`);
       exits[entry.name] = exit || { unreaped: true };
       await new Promise(r => entry.log.end(r));
@@ -310,7 +343,57 @@ function run(name, budgetMs, required, main) {
     .then(() => { clearTimeout(timer); return done(); });
 }
 
-module.exports = { Probe, run };
+/** Tracks native turn and background-task state from a Claude stream-json
+ * receiver, so a probe can wait for an *authoritative* idle state instead
+ * of trusting model text.
+ *
+ * A turn starts with `system/init` and ends with `result`; a background
+ * child starts with `system/task_started` and ends with
+ * `system/task_notification` (its `status`), both carrying the same
+ * `task_id`. The receiver is idle when every started turn has a result,
+ * no task is still running, and no event arrived for `quietMs` (a
+ * completion notification can start a follow-up turn shortly after).
+ */
+class TurnTracker {
+  /** @param {() => number} [clock] Millisecond clock (injectable for the control). */
+  constructor(clock = Date.now) {
+    /** @type {() => number} Clock. */
+    this.clock = clock;
+    /** @type {number} Turns started (`system/init`). */
+    this.started = 0;
+    /** @type {number} Turns finished (`result`). */
+    this.finished = 0;
+    /** @type {Map<string, string>} Background task id -> `running` or its final status. */
+    this.tasks = new Map();
+    /** @type {number} Time of the latest turn/task event. */
+    this.lastEventAt = clock();
+  }
+
+  /** Feeds one parsed stream-json event.
+   * @param {{type?: string, subtype?: string, task_id?: string, status?: string}} event Event.
+   */
+  observe(event) {
+    if (event.type === 'system' && event.subtype === 'init') this.started++;
+    else if (event.type === 'result') this.finished++;
+    else if (event.type === 'system' && event.subtype === 'task_started' && event.task_id) this.tasks.set(event.task_id, 'running');
+    else if (event.type === 'system' && event.subtype === 'task_notification' && event.task_id) this.tasks.set(event.task_id, String(event.status || 'unknown'));
+    else return;
+    this.lastEventAt = this.clock();
+  }
+
+  /** Task ids still running. @returns {string[]} */
+  running() { return [...this.tasks].filter(([, state]) => state === 'running').map(([id]) => id); }
+
+  /** Whether the receiver is authoritatively idle for at least `quietMs`.
+   * @param {number} quietMs Required quiet interval in milliseconds.
+   * @returns {boolean}
+   */
+  idle(quietMs) {
+    return this.started === this.finished && this.running().length === 0 && this.clock() - this.lastEventAt >= quietMs;
+  }
+}
+
+module.exports = { Probe, run, TurnTracker };
 
 /** The exact failure set the lifecycle self-test must produce. */
 const SELF_TEST_EXPECTED = ['cleanup_failed:boom', 'late_spawn:unmarked', 'spawn_error:missing', 'unclosed:escaper', 'orphan_processes',
@@ -325,6 +408,32 @@ const SELF_TEST_EXPECTED = ['cleanup_failed:boom', 'late_spawn:unmarked', 'spawn
 // the written result; a missing required check fails; an exhausted budget
 // refuses a local command before running it; registered cleanups run and a
 // throwing one is reported; after cleanup no process or command starts.
+/** Child-completion sequencing control, modelled on the native Q2 stream
+ * (task started in the child turn, completion notification arriving
+ * during a later turn, then a follow-up turn): idle must not be reported
+ * before the follow-up turn ended and the quiet interval passed.
+ * @returns {boolean} Whether the tracker sequenced the stream correctly.
+ */
+function turnTrackerControl() {
+  let now = 0;
+  const tracker = new TurnTracker(() => now);
+  const feed = (event, at) => { now = at; tracker.observe(event); };
+  feed({ type: 'system', subtype: 'init' }, 1); feed({ type: 'result' }, 2);
+  feed({ type: 'system', subtype: 'init' }, 3);
+  feed({ type: 'system', subtype: 'task_started', task_id: 't1' }, 4);
+  feed({ type: 'result' }, 5); // the model says the child is in the background
+  now = 30; const whileChildRuns = tracker.idle(10);
+  feed({ type: 'system', subtype: 'init' }, 31);
+  feed({ type: 'system', subtype: 'task_notification', task_id: 't1', status: 'completed' }, 32);
+  feed({ type: 'result' }, 33);
+  feed({ type: 'system', subtype: 'init' }, 36); // follow-up turn reporting the child
+  now = 40; const duringFollowUp = tracker.idle(1);
+  feed({ type: 'result' }, 41);
+  now = 45; const tooSoon = tracker.idle(10);
+  now = 52; const quiet = tracker.idle(10);
+  return !whileChildRuns && !duringFollowUp && !tooSoon && quiet;
+}
+
 if (require.main === module && process.argv[2] === '--self-test') {
   const keep = 'setInterval(() => {}, 1000)';
   run('m2st', 30000, ['spawned', 'never_set'], async probe => {
@@ -366,8 +475,9 @@ if (require.main === module && process.argv[2] === '--self-test') {
     let lateRefused = false;
     try { probe.spawn('late', process.execPath, ['-e', '0', probe.dir]); } catch { lateRefused = probe.failures.includes('late_spawn:late'); }
     const localRefused = probe.local('/bin/echo', ['x']) === 'error:probe_closing';
-    const pass = JSON.stringify(failures) === JSON.stringify(SELF_TEST_EXPECTED) && trailing && leakRedacted && resultRedacted && refused && cleanupRan && lateRefused && localRefused && probe.checks.unmarked_refused === true;
-    console.log(JSON.stringify({ self_test: pass ? 'PASS' : 'FAIL', failures, expected: SELF_TEST_EXPECTED, trailing, leakRedacted, resultRedacted, refused, cleanupRan, lateRefused, localRefused }));
+    const sequencing = turnTrackerControl();
+    const pass = JSON.stringify(failures) === JSON.stringify(SELF_TEST_EXPECTED) && trailing && leakRedacted && resultRedacted && refused && cleanupRan && lateRefused && localRefused && probe.checks.unmarked_refused === true && sequencing;
+    console.log(JSON.stringify({ self_test: pass ? 'PASS' : 'FAIL', failures, expected: SELF_TEST_EXPECTED, trailing, leakRedacted, resultRedacted, refused, cleanupRan, lateRefused, localRefused, sequencing }));
     process.exitCode = pass ? 0 : 1;
   });
 }

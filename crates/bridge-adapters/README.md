@@ -83,18 +83,49 @@ Codex / Claude qualification is **not** established (see the end).
   the Codex message capability is never granted (publication refuses before
   acceptance).
 - **Claude message**: the descriptor in `<store>/sessions` must name the
-  session *and* the attested harness PID, and the inbox socket's kernel peer
+  session *and* the attested harness PID (the per-process
+  `sessions/<pid>.json` that 2.1.296 writes is read directly; only when it
+  is missing or names another session does a bounded scan of at most 512
+  other descriptors run), and the inbox socket's kernel peer
   must be that PID before the session's own peer token is sent. Only
   `priority = "later"` is sent; peer inject is prohibited. Receipts go to a
-  stable daemon callback in the inbox directory. A receipt counts only when
-  it names the attempt's unguessable message id *and* its sender's kernel
+  callback socket bound in the inbox directory for that one attempt (named
+  from its message id, unlinked when the attempt settles or expires, at most
+  64 at once by default; while all are held by unsettled hand-offs the
+  recipient's attestation holds visibly, so core reserves no attempt and the
+  payload stays pending until a slot frees; that check releases only held
+  hand-offs past their recheck horizon, in memory, and reads no transcript;
+  written-without-receipt slots are freed by the background pass, which
+  checks the transcript first; passes are 2 s apart by default, plus
+  transcript scan time); earlier candidates shared one callback per daemon and inbox
+  directory, which let a historical peer entry settle a later same-manifest
+  attempt after a manual retry. A receipt counts only on the attempt's own
+  callback, when it names that attempt's unguessable message id *and* its sender's kernel
   identity, read first thing after accept, is the attested recipient PID as
   this user; a sender that already closed (its PID is no longer readable) is
   ignored and logged `claude_receipt_unverifiable` — fail closed, the
   attempt stays held/unreceipted until core's overdue incident. `held` is non-terminal, `delivered` is acceptance, a refusal
   before any hold is known-unsent, any negative after a hold is unknown, and
-  silence is `written_no_receipt`, closed positively only when the session's
-  own transcript holds the exact manifest as a user message. A daemon restart
+  silence is `written_no_receipt`. That hand-off is reconciled against the
+  addressed session's own native transcript (shapes observed on 2.1.296):
+  only a peer-origin user entry of that session whose `origin.from` names
+  this attempt's own callback and that contains the exact manifest records
+  `context_observed`. The `queue-operation` `enqueue` is not evidence: it
+  carries no attempt identity and a retry re-sends the same manifest. No
+  message id is assumed and absence never retries. A session descriptor
+  without an inbox (restricted session) is positive disablement: the
+  message capability is withdrawn and recorded in core, so later message
+  publications refuse before acceptance; a missing descriptor is only a
+  transient hold. An inbox that appears later in the same incarnation
+  restores the capability only if the loaded profile qualified `message`
+  (a profile with `message = false` stays refused). Every such change is
+  recorded in core first and applied to the registry only after that
+  succeeded (a failed core write is retried, never left half-applied), and
+  only to the exact binding observed: a renewed epoch or incarnation since
+  the observation makes it a hold and a re-attestation. Withdrawn but
+  qualified bindings are re-checked every 2 s even with nothing pending
+  (publications refuse while message is withdrawn, so no dispatch would
+  otherwise look). A daemon restart
   forgets callbacks; core's recheck deadlines then raise incidents, never
   replays (a stopped carrier removes its own callback sockets). Manifests
   over 4096 bytes are refused before any write.
@@ -153,9 +184,10 @@ Build first: `cargo +1.98.1 build --offline -p bridge-adapters --bins`.
 | Probe | Model | Command | Passing evidence |
 |---|---|---|---|
 | Q1 Codex helper classification | no | `BRIDGE_QUALIFY_CODEX_EXE=<codex> cargo +1.98.1 test --offline -p bridge-adapters --test qualify_codex -- --ignored --nocapture` | conservative classification only: native errors after the write (model-less unpersisted thread, missing thread) are never known-unsent; any acceptance has a native readback. Not positive queue qualification |
-| Q2 Claude hooks, caller, inject, `later`, pause | haiku, low, 0.5 USD cap | `node qualification/claude-native-probe.cjs` | `checks.json` with no failures: root/child attested from the real `toolUseId`, the hook-injected marker quoted while the planted project-memory canary is absent, a message answered in a distinct unprompted turn, pause applied with the paused event held (no attempt, no-wake hold reason) and no turn while the receiver was alive with budget, then a distinct turn after resume; `daemon_events` shows whether real receipts were verifiable |
-| Q3 Codex gate only | no | `CODEX_PROBE_GATE_ONLY=1 node qualification/codex-native-probe.cjs` | `hooks_isolated: true` (ends with `gate_only_run` by design) |
-| Q3 Codex hooks, caller, inject, child, queue | gpt-6-luna, low | `node qualification/codex-native-probe.cjs` | `checks.json` with no failures: model in the build catalog, hooks isolated, root join succeeded (shows callId = tool_use_id for that build), marker in the reply, child attested on its own thread, the helper's correlated `native_accepted` with native readback on the persisted thread, and the probe's own queue item removed and verified gone |
+| Q2 Claude hooks, caller, inject, `later`, pause | haiku, low, 0.5 USD cap | `node qualification/claude-native-probe.cjs` | `checks.json` with no failures: closed native tool inventory and manual/default permissions, root/child attested from the real `toolUseId`, the hook-injected marker quoted while the planted project-memory canary is absent, the background child's native completion (and any follow-up turn) before the idle steps, a message answered in a distinct unprompted turn with actor-bound evidence (a verified receipt's `native_accepted` or this attempt's transcript `context_observed`), pause applied with the paused event held (no attempt, no-wake hold reason) and no turn start or result in the paused window while the receiver was alive with budget, then a distinct turn after resume |
+| Q3 config control | no (fake App Server) | `node qualification/codex-native-probe.cjs --self-test-config` | `config_control: PASS`: the own `bridge_probe` subtree survives the pre-write projection, the own hook is recognized and the state override trusts it and disables the foreign one, the stderr override warning is detected, kept `hooks/list` entries carry only the minimal fields, and fake credentials planted in a foreign hook command, the config tree, a notification, an unparsable line and stderr are in no retained file or console output of a completed gate, a gate interrupted by SIGTERM, or a gate whose server ignores SIGTERM and keeps writing without any override warning (which must still be rejected, by the non-exit check alone), with no surviving process |
+| Q3 Codex gate only | no | `CODEX_PROBE_GATE_ONLY=1 node qualification/codex-native-probe.cjs` | `hooks_isolated` and `approval_config_effective` true (ends with `gate_only_run` by design) |
+| Q3 Codex hooks, caller, inject, child, queue | gpt-6-luna, low | `node qualification/codex-native-probe.cjs` | `checks.json` with no failures: model in the build catalog, hooks isolated, exact-tool approval effective, the read-only `bridge_me` root join succeeded (shows callId = tool_use_id for that build), the externally published marker in the reply, the unapproved `bridge_unlisted` refused by the host and never executed (this proves the caller, the host approval boundary and the parsed config, not that the `approve` value itself caused `bridge_me` to run), child attested on its own thread, the helper's correlated `native_accepted` with native readback on the persisted thread, and the probe's own queue item removed and verified gone |
 
 Shared lifecycle (`qualification/probe-lib.cjs`): one absolute total budget
 (a local command is refused once it is spent); a lifecycle fence refuses any
@@ -172,7 +204,17 @@ not exactly `true` is a failure. `node qualification/probe-lib.cjs
 --self-test` exercises all of this without any model and passes only on its
 exact expected failure set.
 
-Isolation: Q2 uses `--setting-sources ''`, `--restricted`, `--no-chrome`,
+`Probe.spawn` takes an optional `keep` that rewrites or drops each stdout
+line before it is logged or handed on; without it lines are logged as is.
+
+Isolation: Q2 uses `--setting-sources ''`, only the Agent tool (native `Task`)
+plus the fixture MCP tool checked against the native inventory (the fixture
+server is started with only `bridge_probe`: the root's 2.1.296 run listed
+every tool the server offered; Q3 starts it with `bridge_me,bridge_unlisted`),
+an open first-turn scope or a gone receiver stops Q2 before any later step
+(their checks stay missing), an explicit
+private `--messaging-socket-path` (not `--restricted`: the 2.1.296 bundle
+ignores the messaging socket in a restricted session), `--no-chrome`,
 `--permission-prompts none`, `--strict-mcp-config`, its own settings/agent,
 and the installed build's memory switches (`CLAUDE_CODE_DISABLE_CLAUDE_MDS`,
 `CLAUDE_CODE_DISABLE_AUTO_MEMORY`, `CLAUDE_CODE_DISABLE_ORG_MEMORY`), checked
@@ -184,7 +226,21 @@ whole-map override `-c hooks.state={"<key>"={...},...}` (hook keys contain
 dots, so per-leaf dotted `-c` paths are split and ignored by 0.162.0-alpha.17.2,
 as the root's gate run on the previous candidate showed). A second listing
 must confirm it and the build must report no ignored setting; otherwise the
-probe stops with `isolation_unavailable`. No trust bypass, no coexistence
+probe stops with `isolation_unavailable`. Every gate App Server stdout line is projected before
+it is logged or parsed (the root's r6 gate logs held the user config and
+foreign hook commands raw): `hooks/list` entries keep only `key`, `source`,
+`eventName`, `enabled`, `trustStatus`, `currentHash` and an `own` flag
+computed from the exact own command; `config/read` keeps only
+`result.config.mcp_servers.bridge_probe`; other answers keep their id or
+error code, notifications their method; unparsable lines are dropped. The
+gate's stderr never reaches a file: it is piped and reduced in memory to
+its size and whether it reported an ignored setting, and only that summary
+is written once the gate ends, so a signal, a thrown error or a gate
+process that keeps writing leaves no raw stderr behind. The `config/read` path is the shape this probe expects, not one
+proven against the build, and an absent subtree fails the gate. The model
+phases, queue App Server sessions and the queue helper still log stdout and
+stderr unfiltered; those channels are not claimed free of configuration
+diagnostics. No trust bypass, no coexistence
 override, nothing persisted. Gate-only runs on this candidate (no model,
 no network, no child processes) showed all 7 user hooks disabled and the 5
 probe hooks enabled and trusted, with `~/.codex` files unmodified; the
@@ -199,6 +255,11 @@ did once; they are not release qualification.
 - No real Claude Code or Codex session has run these hooks or carriers:
   hook installation, timeouts, output visibility (Codex `additionalContext`
   in particular) and coexistence with other hooks are unqualified.
+- Claude's acceptance of a per-attempt callback name as the frame's reply
+  address, and the matching `origin.from`, are not re-qualified on a real
+  build; the root's Q2 run decides it.
+- Codex `approval_mode = "approve"` semantics: Q3 shows the parsed value and
+  the host boundary, not that this value is what allows `bridge_me`.
 - Codex caller join assumes `_meta.callId` equals the same call's
   `PreToolUse` `tool_use_id`; the `_meta` keys themselves (`threadId`,
   `callId`, `x-codex-turn-metadata`) were captured from Codex

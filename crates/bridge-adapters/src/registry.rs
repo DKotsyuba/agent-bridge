@@ -671,8 +671,13 @@ struct Binding {
     harness: (u32, u64),
     /// Monotonic endpoint epoch.
     epoch: u64,
-    /// Qualified capabilities of the harness build.
+    /// Current capabilities of this binding (a carrier may withdraw message
+    /// on positive runtime disablement, and restore it only up to
+    /// `qualified`).
     capabilities: Capabilities,
+    /// The capabilities the loaded build is qualified for at renewal (the
+    /// profile's, minus host-level unsupported paths); never exceeded.
+    qualified: Capabilities,
     /// Qualified build label for proof references.
     version: String,
     /// Owner-session lifecycle from the latest hook.
@@ -759,6 +764,24 @@ pub struct Registry {
     /// example no OS confinement launcher): never granted, so publication
     /// refuses before acceptance.
     message_disabled: Vec<Harness>,
+}
+
+/// Checks that `binding` is live and is still the binding `expected` was
+/// taken from: same endpoint epoch and same harness incarnation.
+///
+/// # Errors
+///
+/// The binding is retired, or was renewed since the snapshot.
+fn same_binding(binding: &Binding, expected: &RecipientBinding) -> Result<(), String> {
+    if binding.retired {
+        return Err("the recipient session ended (unknown, not inactive)".into());
+    }
+    if binding.epoch != expected.epoch || binding.harness != expected.harness {
+        return Err(
+            "the recipient binding was renewed since this observation (holding; re-attest)".into(),
+        );
+    }
+    Ok(())
 }
 
 /// Validates one native identifier: non-empty, bounded, no controls.
@@ -1048,6 +1071,7 @@ impl Registry {
                     harness: matched.incarnation,
                     epoch,
                     capabilities,
+                    qualified: capabilities,
                     version: qualified.version.clone(),
                     lifecycle: Lifecycle::Inactive,
                     transcript: None,
@@ -1339,6 +1363,119 @@ impl Registry {
             ));
         }
         Ok(sealed.caller.into_relayed())
+    }
+
+    /// Computes the attestation that records a change of the message
+    /// capability of `address` to `message`, without applying it.
+    ///
+    /// A carrier calls this after observing the native inbox under the
+    /// snapshot `expected` (from [`Registry::attest_recipient`]): `true`
+    /// when the same session and incarnation advertises its inbox (a late
+    /// binding), `false` when it positively runs with the inbox disabled.
+    /// An absent or not-yet-advertised inbox is transient and must not call
+    /// this. The carrier records the returned attestation in core first and
+    /// only then applies it with [`Registry::commit_message`], so the
+    /// registry never grants message while core still refuses it, and a
+    /// failed core write leaves the binding unchanged for the next check.
+    /// A withdrawal lasts until the binding is renewed (a new
+    /// `SessionStart` or incarnation takes capabilities from the profile
+    /// again) or the same incarnation later advertises its inbox.
+    ///
+    /// Returns `Ok(None)` when nothing would change: the capability already
+    /// has that value, or `message` is `true` but the loaded build is not
+    /// qualified for it (a late inbox never promotes beyond `qualified`).
+    /// The endpoint epoch, lifecycle and actor are the binding's own.
+    ///
+    /// # Errors
+    ///
+    /// The binding is gone, retired, or was renewed since `expected` was
+    /// taken (another endpoint epoch or harness incarnation): an
+    /// observation of an old incarnation never changes a renewed binding;
+    /// the caller holds and re-attests.
+    pub fn message_change(
+        &self,
+        address: &NativeAddress,
+        expected: &RecipientBinding,
+        message: bool,
+    ) -> Result<Option<Attestation>, String> {
+        let binding = self
+            .bindings
+            .get(&address.to_canonical_string())
+            .ok_or_else(|| {
+                "no attested binding for this recipient (unknown, not inactive)".to_string()
+            })?;
+        same_binding(binding, expected)?;
+        if binding.capabilities.message == message || (message && !binding.qualified.message) {
+            return Ok(None);
+        }
+        let label = if message {
+            "message-restored"
+        } else {
+            "message-disabled"
+        };
+        Attestation::verified(
+            binding.address.clone(),
+            binding.address.native_session_id.clone(),
+            binding.epoch,
+            binding.lifecycle,
+            Capabilities {
+                message,
+                ..binding.capabilities
+            },
+            proof(format!(
+                "{label}:{}@{}:{}:epoch{}",
+                binding.harness.0, binding.harness.1, binding.version, binding.epoch
+            )),
+        )
+        .map(Some)
+        .map_err(|error| error.to_string())
+    }
+
+    /// Applies a message capability change that core has already recorded
+    /// (see [`Registry::message_change`]) to the binding `expected` was
+    /// taken from. Never grants message beyond `qualified`.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Registry::message_change`]: gone, retired or renewed
+    /// since `expected`; nothing is changed then.
+    pub fn commit_message(
+        &mut self,
+        address: &NativeAddress,
+        expected: &RecipientBinding,
+        message: bool,
+    ) -> Result<(), String> {
+        let binding = self
+            .bindings
+            .get_mut(&address.to_canonical_string())
+            .ok_or_else(|| {
+                "no attested binding for this recipient (unknown, not inactive)".to_string()
+            })?;
+        same_binding(binding, expected)?;
+        binding.capabilities.message = message && binding.qualified.message;
+        Ok(())
+    }
+
+    /// Addresses of live `harness` bindings whose message capability was
+    /// withdrawn at runtime although the loaded build is qualified for it.
+    ///
+    /// A carrier re-checks these periodically, independent of pending
+    /// work, so a late inbox restores message even when no event waits
+    /// (publications are refused while it is withdrawn, so no work would
+    /// otherwise trigger the check). Retired bindings and builds not
+    /// qualified for message are never listed. The list is bounded by the
+    /// registry's own binding bound.
+    pub fn message_withdrawn(&self, harness: Harness) -> Vec<NativeAddress> {
+        self.bindings
+            .values()
+            .filter(|binding| {
+                binding.address.harness == harness
+                    && !binding.retired
+                    && binding.qualified.message
+                    && !binding.capabilities.message
+            })
+            .map(|binding| binding.address.clone())
+            .collect()
     }
 
     /// Attests a recipient endpoint for a message carrier right now.
