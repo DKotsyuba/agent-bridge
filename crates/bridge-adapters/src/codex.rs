@@ -134,15 +134,22 @@ pub struct Helper<'a> {
 }
 
 /// A running helper with its line reader.
+///
+/// One total budget bounds everything: a watchdog kills the helper at the
+/// deadline, which also unblocks a write stuck on a full pipe and ends the
+/// reader. Dropping it (on every path, including a panic) closes stdin,
+/// gives the helper a short grace, then kills and reaps it.
 struct Running {
-    /// The confined helper process.
-    child: Child,
-    /// Its stdin (requests).
-    stdin: ChildStdin,
+    /// The confined helper process, shared with the watchdog.
+    child: Arc<Mutex<Child>>,
+    /// Its stdin (requests); taken on drop.
+    stdin: Option<ChildStdin>,
     /// Lines from its stdout.
     lines: Receiver<String>,
     /// Next request id.
     next_id: u64,
+    /// Dropping this sender stops the watchdog.
+    _watchdog: mpsc::Sender<()>,
 }
 
 impl Running {
@@ -150,8 +157,12 @@ impl Running {
     fn write(&mut self, message: &Value) -> std::io::Result<()> {
         let mut line = serde_json::to_vec(message).map_err(std::io::Error::other)?;
         line.push(b'\n');
-        self.stdin.write_all(&line)?;
-        self.stdin.flush()
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("stdin closed"))?;
+        stdin.write_all(&line)?;
+        stdin.flush()
     }
 
     /// Sends one request of an allowlisted method; returns its id.
@@ -166,7 +177,8 @@ impl Running {
     }
 
     /// Waits for the response to `id` until `deadline`, skipping
-    /// notifications; `None` on EOF or timeout.
+    /// notifications (which never extend the deadline); `None` on EOF or
+    /// timeout.
     fn response(&self, id: u64, deadline: Instant) -> Option<Value> {
         loop {
             let wait = deadline.saturating_duration_since(Instant::now());
@@ -185,25 +197,34 @@ impl Running {
             }
         }
     }
+}
 
-    /// Closes stdin and reaps the helper, killing it after a short grace.
-    fn finish(mut self) {
-        drop(self.stdin);
-        let deadline = Instant::now() + Duration::from_millis(500);
-        while Instant::now() < deadline {
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
+impl Drop for Running {
+    /// Closes stdin, waits up to 500 ms for exit, then kills and reaps.
+    fn drop(&mut self) {
+        drop(self.stdin.take());
+        let grace = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < grace {
+            let exited = self
+                .child
+                .lock()
+                .map(|mut child| matches!(child.try_wait(), Ok(Some(_))))
+                .unwrap_or(false);
+            if exited {
                 return;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
 impl Helper<'_> {
-    /// Starts the confined helper.
-    fn start(&self) -> std::io::Result<Running> {
+    /// Starts the confined helper with a watchdog at `deadline`.
+    fn start(&self, deadline: Instant) -> std::io::Result<Running> {
         let mut command = Command::new(self.sandbox);
         command
             .args(["-p", HELPER_POLICY])
@@ -243,18 +264,30 @@ impl Helper<'_> {
                 }
             }
         });
+        let child = Arc::new(Mutex::new(child));
+        let (watchdog, stop) = mpsc::channel::<()>();
+        let watched = Arc::clone(&child);
+        std::thread::spawn(move || {
+            let budget = deadline.saturating_duration_since(Instant::now());
+            if let Err(RecvTimeoutError::Timeout) = stop.recv_timeout(budget)
+                && let Ok(mut child) = watched.lock()
+            {
+                let _ = child.kill();
+            }
+        });
         Ok(Running {
             child,
-            stdin,
+            stdin: Some(stdin),
             lines,
             next_id: 1,
+            _watchdog: watchdog,
         })
     }
 
     /// Adds `text` to `thread_id`'s native queue with `client_id`.
     pub fn queue_add(&self, thread_id: &str, client_id: &str, text: &str) -> Outcome {
         let deadline = Instant::now() + self.timeout;
-        let mut running = match self.start() {
+        let mut running = match self.start(deadline) {
             Ok(running) => running,
             Err(error) => {
                 return Outcome::KnownUnsent {
@@ -277,7 +310,7 @@ impl Helper<'_> {
                 .write(&json!({"method": "initialized", "params": {}}))
                 .is_ok();
         if !ready {
-            running.finish();
+            drop(running);
             return Outcome::KnownUnsent {
                 evidence: "helper did not initialize; thread/queue/add was never written".into(),
             };
@@ -292,7 +325,7 @@ impl Helper<'_> {
         ) {
             Ok(id) => id,
             Err(error) => {
-                running.finish();
+                drop(running);
                 // A failed write may have left part of the line in the pipe.
                 return Outcome::OutcomeUnknown {
                     reason: format!("thread/queue/add write failed: {error}"),
@@ -300,7 +333,7 @@ impl Helper<'_> {
             }
         };
         let response = running.response(id, deadline);
-        running.finish();
+        drop(running);
         match response {
             Some(value) if value.get("result").is_some() => Outcome::NativeAccepted {
                 evidence: format!(

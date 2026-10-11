@@ -20,18 +20,32 @@
 //!     key into `$CLAUDE_CONFIG_DIR/sessions`. Behaviors: `held`,
 //!     `delivered`, `refused`, `none`.
 //!   - `{"cmd":"frames"}` answers the user frames the inbox received.
-//!   - `{"cmd":"receipt","msg_id":..,"status":..}` sends a late receipt to
-//!     the frame's callback from this process.
+//!   - `{"cmd":"receipt","msg_id":..,"status":..,"close":bool}` sends a late
+//!     receipt to the frame's callback from this process, staying connected
+//!     until read unless `close` (disconnect at once: unverifiable sender).
+//!   - `{"cmd":"mcp_server","args":[channel,core,token,evidence],"requests":[..]}`
+//!     runs `bridge-fixture mcp-server` as its child, sends the JSON-RPC
+//!     requests and answers the responses of those with an id.
 //!   - `{"cmd":"exit"}` exits.
 //! - `bridge-fixture mcp <socket>` (or `mcp-seal`) with `_meta` JSON on
 //!   stdin: attests through `RegistryAttestor` (sealing a proof) and prints
 //!   the result. The harness `mcp` command takes `"seal": true`.
 //! - `bridge-fixture relay <socket>` with a sealed proof on stdin: redeems
 //!   it as a relay and prints the result.
+//! - `bridge-fixture publish <core> <token> <recipient> <mode> <event>
+//!   <payload>` and `bridge-fixture status <core> <token> <event>`: one
+//!   publisher request to the core socket (synthetic probe grant), printing
+//!   the response. `bridge-fixture pause <core> <admin-token> <recipient>
+//!   on|off` sets or clears the no-wake policy (synthetic operator grant).
+//! - `bridge-fixture mcp-server <channel> <core> <token> <evidence>`: a
+//!   minimal MCP stdio server with one `bridge_probe` tool for root-run
+//!   native probes (see `qualification/`).
 //! - `bridge-fixture app-server ...`: a fake Codex App Server speaking the
 //!   queue-only subset; records `thread/queue/add` params to
 //!   `$CODEX_HOME/queue.jsonl`. `$CODEX_HOME/behavior` = `refuse` answers
-//!   an error, `silent` never answers the add. On `initialize` it probes
+//!   an error, `silent` never answers the add, `flood` also streams
+//!   notifications forever after `initialize`, and `stall` stops reading
+//!   stdin after `initialize`. On `initialize` it probes
 //!   its own confinement (TCP connect to the port in
 //!   `$CODEX_HOME/probe_port`, spawning `/usr/bin/true`) and records the
 //!   results in `$CODEX_HOME/probe.json`.
@@ -63,7 +77,11 @@ struct Inbox {
 }
 
 /// Sends one receipt frame to a `uds:` callback.
-fn send_receipt(from: &str, msg_id: &str, status: &str) -> bool {
+///
+/// By default the sender half-closes and stays connected until the
+/// receiver closes, so its kernel identity stays readable. With `close`
+/// it disconnects immediately after writing (an unverifiable sender).
+fn send_receipt(from: &str, msg_id: &str, status: &str, close: bool) -> bool {
     let Some(path) = from.strip_prefix("uds:") else {
         return false;
     };
@@ -71,7 +89,15 @@ fn send_receipt(from: &str, msg_id: &str, status: &str) -> bool {
         return false;
     };
     let frame = json!({"type":"control","action":"peer_message_status","orig_msg_id":msg_id,"status":status});
-    stream.write_all(format!("{frame}\n").as_bytes()).is_ok()
+    if stream.write_all(format!("{frame}\n").as_bytes()).is_err() {
+        return false;
+    }
+    if !close {
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let _ = std::io::copy(&mut stream, &mut std::io::sink());
+    }
+    true
 }
 
 /// Starts the fake inbox and writes its descriptor and key; a repeated
@@ -128,7 +154,7 @@ fn start_inbox(state: Arc<Mutex<Inbox>>, session: &str, behavior: String) -> Val
                     inbox.behavior.clone()
                 };
                 if behavior != "none" {
-                    send_receipt(&from, &msg_id, &behavior);
+                    send_receipt(&from, &msg_id, &behavior, false);
                 }
             }
         }
@@ -149,6 +175,7 @@ fn harness() {
         let reply = match command["cmd"].as_str().unwrap_or_default() {
             "hook" => run_hook(&command),
             "mcp" => run_mcp(&command),
+            "mcp_server" => run_mcp_server(&command),
             "inbox" => start_inbox(
                 Arc::clone(&inbox),
                 command["session_id"].as_str().unwrap_or_default(),
@@ -165,7 +192,7 @@ fn harness() {
                     .find(|(id, _)| id == msg_id)
                     .map(|(_, from)| from.clone())
                     .unwrap_or_default();
-                json!({"sent": send_receipt(&from, msg_id, command["status"].as_str().unwrap_or_default())})
+                json!({"sent": send_receipt(&from, msg_id, command["status"].as_str().unwrap_or_default(), command["close"].as_bool() == Some(true))})
             }
             "exit" => return,
             _ => json!({"error": "unknown command"}),
@@ -215,6 +242,45 @@ fn finish_closed(mut child: std::process::Child, command: &Value) -> Value {
     let _ = child.stderr.take().map(|mut e| e.read_to_string(&mut err));
     let status = child.wait().map(|s| s.code()).ok().flatten();
     json!({"stdout": "", "stderr": err, "status": status, "closed": true})
+}
+
+/// Runs `bridge-fixture mcp-server` as a child (the harness's MCP server),
+/// sends `requests` (JSON-RPC objects) and answers the response lines of
+/// those that carry an id.
+fn run_mcp_server(command: &Value) -> Value {
+    let exe = std::env::current_exe().expect("own exe");
+    let mut child = Command::new(exe)
+        .arg("mcp-server")
+        .args(
+            command["args"]
+                .as_array()
+                .map(|args| {
+                    args.iter()
+                        .filter_map(Value::as_str)
+                        .map(String::from)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp-server");
+    let mut stdin = child.stdin.take().expect("mcp-server stdin");
+    let mut reader = std::io::BufReader::new(child.stdout.take().expect("mcp-server stdout"));
+    let mut responses = Vec::new();
+    for request in command["requests"].as_array().cloned().unwrap_or_default() {
+        let _ = writeln!(stdin, "{request}");
+        let _ = stdin.flush();
+        if request.get("id").is_some() {
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            responses.push(serde_json::from_str::<Value>(&line).unwrap_or(Value::Null));
+        }
+    }
+    drop(stdin);
+    let _ = child.wait();
+    json!({"responses": responses})
 }
 
 /// Runs `bridge-fixture mcp` as a child (the harness's MCP server).
@@ -311,6 +377,22 @@ fn app_server() {
                     "{}",
                     json!({"id": id, "result": {"userAgent": "fixture"}})
                 );
+                let _ = stdout.flush();
+                match behavior.trim() {
+                    "flood" => {
+                        std::thread::spawn(|| {
+                            loop {
+                                println!(
+                                    "{}",
+                                    json!({"method": "thread/status/changed", "params": {}})
+                                );
+                                std::thread::sleep(Duration::from_millis(2));
+                            }
+                        });
+                    }
+                    "stall" => std::thread::sleep(Duration::from_secs(60)),
+                    _ => {}
+                }
             }
             "thread/queue/add" => {
                 let mut log = std::fs::OpenOptions::new()
@@ -320,7 +402,7 @@ fn app_server() {
                     .expect("queue log");
                 let _ = writeln!(log, "{}", message["params"]);
                 match behavior.trim() {
-                    "silent" => continue,
+                    "silent" | "flood" => continue,
                     "refuse" => {
                         let _ = writeln!(
                             stdout,
@@ -353,6 +435,196 @@ fn probe_confinement(home: &Path) {
     );
 }
 
+/// Sends one request line to the core service socket and returns the
+/// response line as JSON.
+fn core_call(core: &str, request: &bridge_core::Request) -> Value {
+    let Ok(mut stream) = UnixStream::connect(core) else {
+        return json!({"error": "core socket unreachable"});
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let line = serde_json::to_string(request).expect("request encodes");
+    if writeln!(stream, "{line}").is_err() {
+        return json!({"error": "core write failed"});
+    }
+    let mut response = String::new();
+    let _ = std::io::BufReader::new(&stream).read_line(&mut response);
+    serde_json::from_str(&response).unwrap_or(json!({"error": "no core response"}))
+}
+
+/// Publishes one keep_all event with a synthetic publisher grant token.
+fn publish(
+    core: &str,
+    token: &str,
+    recipient: &str,
+    mode: &str,
+    event_id: &str,
+    payload: &str,
+) -> Value {
+    let (Ok(recipient), Ok(mode)) = (
+        bridge_core::NativeAddress::parse(recipient),
+        bridge_core::Mode::parse(mode),
+    ) else {
+        return json!({"error": "invalid recipient or mode"});
+    };
+    core_call(
+        core,
+        &bridge_core::Request::Publish {
+            token: bridge_core::service::Token::new(token),
+            event: Box::new(bridge_core::PublishBody {
+                event_id: event_id.into(),
+                recipient,
+                kind: "bridge.probe".into(),
+                mode,
+                policy: bridge_core::Policy::KeepAll,
+                payload: payload.into(),
+                metadata: bridge_core::Metadata::new(),
+                expires_at: None,
+            }),
+        },
+    )
+}
+
+/// Sets (`on`) or clears the durable no-wake policy of a recipient with a
+/// synthetic operator grant token.
+fn pause(core: &str, token: &str, recipient: &str, on: bool) -> Value {
+    let Ok(recipient) = bridge_core::NativeAddress::parse(recipient) else {
+        return json!({"error": "invalid recipient"});
+    };
+    let token = bridge_core::service::Token::new(token);
+    core_call(
+        core,
+        &if on {
+            bridge_core::Request::Pause {
+                token,
+                recipient,
+                reason: "native qualification probe pause".into(),
+            }
+        } else {
+            bridge_core::Request::Resume { token, recipient }
+        },
+    )
+}
+
+/// Reads the publisher's own status of one event.
+fn status(core: &str, token: &str, event_id: &str) -> Value {
+    core_call(
+        core,
+        &bridge_core::Request::Status {
+            token: bridge_core::service::Token::new(token),
+            event_id: event_id.into(),
+        },
+    )
+}
+
+/// A minimal MCP stdio server with one tool, `bridge_probe`, for root-run
+/// native probes.
+///
+/// Each call attests its caller from the request's `_meta` through the
+/// registry (this process must be the harness-launched MCP server). When
+/// the caller may act as its address, it publishes one `inject` event with
+/// a fresh marker to that address, so the call's own `PostToolUse` hook can
+/// hand it to the model. The marker is written only to the evidence file
+/// (`evidence`, JSON lines), never into the tool result, so a model that
+/// reports it saw it through the hook context. Model arguments are
+/// recorded but never used as identity.
+fn mcp_server(channel: &str, core: &str, token: &str, evidence: &str) {
+    let attestor = RegistryAttestor::new(Path::new(channel), Duration::from_secs(5), 600_000);
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(evidence)
+        .expect("evidence file");
+    let mut stdout = std::io::stdout();
+    for line in std::io::stdin().lock().lines() {
+        let Ok(line) = line else { break };
+        let Ok(message) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let id = message["id"].clone();
+        let result = match message["method"].as_str().unwrap_or_default() {
+            "initialize" => json!({
+                "protocolVersion": message["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "bridge-probe", "version": env!("CARGO_PKG_VERSION")}
+            }),
+            "ping" => json!({}),
+            "tools/list" => json!({"tools": [{
+                "name": "bridge_probe",
+                "description": "Agent Bridge native qualification probe. Call with an empty object.",
+                "inputSchema": {"type": "object", "properties": {}}
+            }]}),
+            "tools/call" => {
+                let meta = message["params"]["_meta"]
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default();
+                let now = bridge_core::service::current_unix_millis();
+                let attested = PresentedMeta::from_mcp_meta(&meta)
+                    .and_then(|meta| attestor.attest(&meta, now));
+                let mut record = json!({
+                    "at": now,
+                    "meta_keys": meta.keys().collect::<Vec<_>>(),
+                    "arguments_ignored": message["params"]["arguments"],
+                });
+                let text = match attested {
+                    Ok(caller) => {
+                        record["caller"] = json!({
+                            "address": caller.address().to_canonical_string(),
+                            "role": caller.role(),
+                            "native_id": caller.native_id(),
+                            "epoch": caller.epoch(),
+                            "may_act_as_address": caller.may_act_as_address(),
+                        });
+                        if caller.may_act_as_address() {
+                            let marker = format!(
+                                "BRIDGE_CTX_{}",
+                                bridge_adapters::os::random_bytes().expect("random")[..6]
+                                    .iter()
+                                    .map(|byte| format!("{byte:02x}"))
+                                    .collect::<String>()
+                            );
+                            let event_id = format!("probe-inject-{now}");
+                            record["marker"] = json!(marker);
+                            record["event_id"] = json!(event_id);
+                            record["publish"] = publish(
+                                core,
+                                token,
+                                &caller.address().to_canonical_string(),
+                                "inject",
+                                &event_id,
+                                &format!("Synthetic Bridge qualification context marker {marker}."),
+                            );
+                        }
+                        format!("bridge_probe attested role={}", record["caller"]["role"])
+                    }
+                    Err(error) => {
+                        record["refused"] = json!(error.class());
+                        format!("bridge_probe refused: {}", error.class())
+                    }
+                };
+                let _ = writeln!(log, "{record}");
+                json!({"content": [{"type": "text", "text": text}]})
+            }
+            _ if message.get("id").is_none() => continue,
+            _ => {
+                let _ = writeln!(
+                    stdout,
+                    "{}",
+                    json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "method not found"}})
+                );
+                let _ = stdout.flush();
+                continue;
+            }
+        };
+        let _ = writeln!(
+            stdout,
+            "{}",
+            json!({"jsonrpc": "2.0", "id": id, "result": result})
+        );
+        let _ = stdout.flush();
+    }
+}
+
 /// Mode dispatch.
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -362,8 +634,21 @@ fn main() {
         Some("mcp-seal") => mcp(args.get(2).map(String::as_str).unwrap_or_default(), true),
         Some("relay") => relay(args.get(2).map(String::as_str).unwrap_or_default()),
         Some("app-server") => app_server(),
+        Some("publish") if args.len() == 8 => {
+            println!(
+                "{}",
+                publish(&args[2], &args[3], &args[4], &args[5], &args[6], &args[7])
+            );
+        }
+        Some("status") if args.len() == 5 => println!("{}", status(&args[2], &args[3], &args[4])),
+        Some("pause") if args.len() == 6 => {
+            println!("{}", pause(&args[2], &args[3], &args[4], args[5] == "on"));
+        }
+        Some("mcp-server") if args.len() == 6 => mcp_server(&args[2], &args[3], &args[4], &args[5]),
         _ => {
-            eprintln!("usage: bridge-fixture harness|mcp <socket>|app-server");
+            eprintln!(
+                "usage: bridge-fixture harness | mcp <socket> | relay <socket> | app-server | publish <core> <token> <recipient> <mode> <event> <payload> | status <core> <token> <event> | pause <core> <admin-token> <recipient> on|off | mcp-server <channel> <core> <token> <evidence>"
+            );
             std::process::exit(2);
         }
     }

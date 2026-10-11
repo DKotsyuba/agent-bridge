@@ -14,9 +14,13 @@
 //! keeps in the inbox's directory (the native reply-address rule). A
 //! receipt is correlated by the attempt's unguessable message id (known
 //! only to the recipient process through its authenticated inbox and to
-//! this daemon); when the sender is still connected its kernel identity
-//! must also be the recipient PID. The PID check is opportunistic because
-//! the kernel no longer reports the PID of a peer that already closed. Within the short receipt window: `held` is a
+//! this daemon) *and* by the sender's kernel identity, read first thing
+//! after accept: it must be this user and the attested recipient PID. A
+//! sender whose identity can no longer be read (it closed before the
+//! daemon asked; the kernel stops reporting a closed peer's PID) is
+//! ignored, fail closed — the attempt then stays held or unreceipted and
+//! core raises the overdue incident. Within the short receipt window:
+//! `held` is a
 //! non-terminal hold with a recheck deadline, `delivered` is native
 //! acceptance, a refusal before any hold is known-unsent, and silence is
 //! the ordinary `written_no_receipt`. Later receipts are recorded straight
@@ -113,6 +117,9 @@ struct Pending {
     waiting: Waiting,
 }
 
+/// A bound callback socket path and its inode identity `(dev, ino)`.
+type BoundCallback = (PathBuf, (u64, u64));
+
 /// Callback listeners and correlation shared by the carrier and its
 /// background threads.
 struct Hub {
@@ -120,8 +127,9 @@ struct Hub {
     custody: Arc<dyn Custody>,
     /// In-flight hand-offs by message id.
     pending: Mutex<HashMap<String, Pending>>,
-    /// Callback socket path per inbox directory.
-    listeners: Mutex<HashMap<PathBuf, PathBuf>>,
+    /// Callback socket path and its bound inode `(dev, ino)` per inbox
+    /// directory; the inode lets drop remove only sockets this hub bound.
+    listeners: Mutex<HashMap<PathBuf, BoundCallback>>,
     /// This user's uid.
     uid: u32,
     /// Random per-process secret (from the OS) that makes message ids and
@@ -249,7 +257,7 @@ impl Hub {
     /// starting its listener on first use.
     fn callback_for(self: &Arc<Self>, directory: &Path) -> std::io::Result<PathBuf> {
         let mut listeners = self.listeners.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(path) = listeners.get(directory)
+        if let Some((path, _)) = listeners.get(directory)
             && std::fs::symlink_metadata(path).is_ok()
         {
             return Ok(path.clone());
@@ -260,6 +268,8 @@ impl Hub {
         );
         let path = directory.join(name);
         let listener = UnixListener::bind(&path)?;
+        let bound = std::fs::symlink_metadata(&path)?;
+        let identity = (bound.dev(), bound.ino());
         let hub = Arc::clone(self);
         std::thread::Builder::new()
             .name("bridge-claude-callback".into())
@@ -269,8 +279,21 @@ impl Hub {
                     hub.accept_receipt(stream);
                 }
             })?;
-        listeners.insert(directory.to_path_buf(), path.clone());
+        listeners.insert(directory.to_path_buf(), (path.clone(), identity));
         Ok(path)
+    }
+
+    /// Removes every callback socket this hub bound, only while the path is
+    /// still the exact inode it bound (a replacement is never touched).
+    fn remove_callbacks(&self) {
+        let listeners = self.listeners.lock().unwrap_or_else(|p| p.into_inner());
+        for (path, identity) in listeners.values() {
+            if std::fs::symlink_metadata(path)
+                .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == *identity)
+            {
+                let _ = std::fs::remove_file(path);
+            }
+        }
     }
 
     /// Derives an unguessable per-purpose value from this hub's secret.
@@ -282,17 +305,23 @@ impl Hub {
 
     /// Reads one bounded receipt connection and routes it.
     ///
-    /// The kernel identity of a receipt peer is only readable while it is
-    /// still connected; a native inbox may write and close first. A peer
-    /// whose identity *is* readable must be this user and, per receipt,
-    /// the recipient PID. Otherwise the receipt is bound only by the
-    /// unguessable per-attempt message id, which only the recipient
-    /// process (through its authenticated inbox) and this daemon know.
+    /// The sender's kernel identity is read before anything else. A sender
+    /// whose identity is unreadable (already closed) or of another user is
+    /// ignored without reading: a receipt never counts without the
+    /// recipient PID, whatever message id it names.
     fn accept_receipt(&self, stream: UnixStream) {
-        let peer = os::peer_identity(&stream).ok();
-        if peer.is_some_and(|peer| peer.uid != self.uid) {
-            return;
-        }
+        let peer = match os::peer_identity(&stream) {
+            Ok(peer) if peer.uid == self.uid => peer,
+            Ok(_) => return,
+            Err(_) => {
+                log_event(
+                    "warn",
+                    "claude_receipt_unverifiable",
+                    &[("reason", "sender identity unreadable; receipt ignored")],
+                );
+                return;
+            }
+        };
         let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
         let mut text = String::new();
         if (&stream)
@@ -305,19 +334,19 @@ impl Hub {
         }
         for line in text.lines() {
             if let Some((msg_id, status)) = receipt(line) {
-                self.route(&msg_id, &status, peer.map(|peer| peer.pid));
+                self.route(&msg_id, &status, peer.pid);
             }
         }
     }
 
-    /// Routes one correlated receipt; a known sender PID must be the
-    /// recipient's.
-    fn route(&self, msg_id: &str, status: &str, pid: Option<u32>) {
+    /// Routes one correlated receipt from the kernel-identified sender
+    /// `pid`, which must be the attempt's recipient PID.
+    fn route(&self, msg_id: &str, status: &str, pid: u32) {
         let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
         let Some(entry) = pending.get_mut(msg_id) else {
             return;
         };
-        if pid.is_some_and(|pid| pid != entry.recipient_pid) {
+        if pid != entry.recipient_pid {
             return;
         }
         let late = match &entry.waiting {
@@ -550,6 +579,15 @@ impl ClaudeLaterCarrier {
     }
 }
 
+impl Drop for ClaudeLaterCarrier {
+    /// Removes the callback sockets this carrier bound in inbox
+    /// directories, so a stopped daemon leaves no endpoint behind.
+    /// Unresolved hand-offs stay with core (recheck deadlines, incidents).
+    fn drop(&mut self) {
+        self.hub.remove_callbacks();
+    }
+}
+
 impl DispatchCarrier for ClaudeLaterCarrier {
     /// Attests Claude recipients from the registry; anything else is not
     /// this carrier's.
@@ -682,5 +720,97 @@ impl DispatchCarrier for ClaudeLaterCarrier {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Receipt authentication at the callback.
+
+    use super::*;
+    use bridge_core::Storage;
+
+    /// A hub with one pending first-receipt wait for `recipient_pid`.
+    fn hub_waiting(recipient_pid: u32) -> (Hub, Receiver<String>) {
+        let limits = serde_json::from_value(json!({"max_admitted_events": 10})).unwrap();
+        let custody: Arc<dyn Custody> =
+            Arc::new(Mutex::new(Storage::open_in_memory(limits).unwrap()));
+        let (sender, receiver) = mpsc::channel();
+        let mut pending = HashMap::new();
+        pending.insert(
+            "msg-known".to_string(),
+            Pending {
+                fence: AttemptFence {
+                    attempt_seq: 1,
+                    recipient: "r".into(),
+                    endpoint_epoch: 1,
+                    manifest_hash: "h".into(),
+                },
+                recipient_pid,
+                waiting: Waiting::First(sender),
+            },
+        );
+        let hub = Hub {
+            custody,
+            pending: Mutex::new(pending),
+            listeners: Mutex::new(HashMap::new()),
+            uid: os::process_facts(std::process::id()).unwrap().uid.unwrap(),
+            secret: [7; 32],
+        };
+        (hub, receiver)
+    }
+
+    /// Writes one receipt naming the known message id and returns the
+    /// accepted server end; with `close_first` the sender is gone before
+    /// the server accepts (its PID is no longer readable).
+    fn receipt_stream(close_first: bool) -> (UnixStream, Option<UnixStream>) {
+        let dir = std::env::temp_dir().join(format!(
+            "m2rcpt{}{}",
+            std::process::id(),
+            &crate::server::sha256_hex(&os::random_bytes().unwrap())[..8]
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("c.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let mut client = UnixStream::connect(&path).unwrap();
+        let line = json!({"type":"control","action":"peer_message_status","orig_msg_id":"msg-known","status":"delivered"});
+        writeln!(client, "{line}").unwrap();
+        let kept = if close_first {
+            drop(client);
+            None
+        } else {
+            client.shutdown(std::net::Shutdown::Write).unwrap();
+            Some(client)
+        };
+        let (server, _) = listener.accept().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        (server, kept)
+    }
+
+    /// A sender that closed before its identity was read is ignored even
+    /// with the known message id and the right uid.
+    #[test]
+    fn disconnected_sender_with_known_id_is_ignored() {
+        let (hub, receiver) = hub_waiting(std::process::id());
+        let (server, _) = receipt_stream(true);
+        hub.accept_receipt(server);
+        assert!(
+            receiver.try_recv().is_err(),
+            "an unverifiable receipt was routed"
+        );
+    }
+
+    /// A connected sender with the known id but another PID is ignored;
+    /// the same receipt from the recipient PID is routed.
+    #[test]
+    fn connected_sender_must_be_the_recipient_pid() {
+        let (hub, receiver) = hub_waiting(std::process::id() + 1);
+        let (server, _kept) = receipt_stream(false);
+        hub.accept_receipt(server);
+        assert!(receiver.try_recv().is_err(), "a foreign PID was routed");
+        let (hub, receiver) = hub_waiting(std::process::id());
+        let (server, _kept) = receipt_stream(false);
+        hub.accept_receipt(server);
+        assert_eq!(receiver.try_recv().unwrap(), "delivered");
     }
 }

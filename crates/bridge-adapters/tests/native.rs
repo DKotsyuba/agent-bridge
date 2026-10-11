@@ -147,6 +147,16 @@ fn non_harness_callers_wrong_store_and_unqualified_builds_refuse() {
         harness.mcp(&lab.socket, claude_meta("tu-1"))["ok"]["role"],
         "root"
     );
+    // The hook command's harness label (an argv value) cannot relabel a
+    // Claude harness as Codex: its own store is not the Codex profile's.
+    let relabeled = harness.hook(&lab.socket, Harness::Codex, hook("SessionStart", "sess-2"));
+    assert!(
+        relabeled["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("not_evidence"),
+        "{relabeled}"
+    );
     harness.stop();
 
     // A harness whose own store is not a configured profile is refused.
@@ -424,12 +434,13 @@ fn claude_later_held_release_receipts_and_transcript_closure() {
         forged.shutdown(std::net::Shutdown::Write).unwrap();
         std::thread::sleep(Duration::from_millis(300));
     }
-    // A guessed message id from a closed sender is ignored too.
-    {
+    // A guessed message id from a closed sender is ignored too, and so is
+    // the *known* message id from a sender that disconnects at once.
+    for id in ["bridge_1_guess", msg_id.as_str()] {
         use std::io::Write;
-        let mut guessed = std::os::unix::net::UnixStream::connect(&from).unwrap();
-        let line = json!({"type":"control","action":"peer_message_status","orig_msg_id":"bridge_1_guess","status":"delivered"});
-        writeln!(guessed, "{line}").unwrap();
+        let mut closed = std::os::unix::net::UnixStream::connect(&from).unwrap();
+        let line = json!({"type":"control","action":"peer_message_status","orig_msg_id":id,"status":"delivered"});
+        writeln!(closed, "{line}").unwrap();
     }
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(
@@ -507,6 +518,16 @@ fn lost_callback_after_restart_stays_retained_without_replay() {
         .unwrap();
         // The carrier (and its callback memory) goes away: a restart.
     }
+    // Its callback socket left the inbox directory with it; only the
+    // fixture inbox's own socket remains.
+    let sockets: Vec<String> = std::fs::read_dir(lab.claude_store.join("sessions"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".sock"))
+        .collect();
+    assert_eq!(sockets.len(), 1, "{sockets:?}");
+    assert!(sockets[0].ends_with(".inbox.sock"));
     assert_eq!(
         lab.attempt("evt-restart").unwrap().state,
         AttemptState::NativeHeld
@@ -899,4 +920,177 @@ fn sealed_proof_relays_registry_facts_once_to_a_configured_relay() {
     );
     assert_eq!(relay_redeem(&lab.socket, &proof)["err"], "stale");
     harness.stop();
+}
+
+/// One total budget bounds the Codex helper: a notification flood never
+/// extends it and a helper that stops reading cannot block the write past
+/// it; both possibly-written hand-offs end unknown, never accepted.
+#[test]
+fn codex_helper_total_budget_survives_floods_and_stalled_writes() {
+    let lab = Lab::new("cb");
+    let address = lab.codex_address("thread-b");
+    let mut harness = Harnessed::start(Harness::Codex, &lab.codex_store);
+    harness.hook(
+        &lab.socket,
+        Harness::Codex,
+        hook("SessionStart", "thread-b"),
+    );
+    harness.hook(&lab.socket, Harness::Codex, hook("Stop", "thread-b"));
+    let mut carrier = CodexQueueCarrier::new(
+        Arc::clone(&lab.registry),
+        "/usr/bin/sandbox-exec".into(),
+        Duration::from_secs(2),
+    );
+    let timing = DispatchTiming::default();
+    // Larger than a pipe buffer once escaped, so a non-reading helper blocks
+    // the write.
+    let big = format!("{}{}", "x".repeat(20_000), "<".repeat(15_000));
+    for (event, behavior) in [("evt-flood", "flood"), ("evt-stall", "stall")] {
+        codex_setup(&lab, behavior, 9);
+        lab.publish(event, &address, Mode::Message, &big);
+        let started = std::time::Instant::now();
+        let report = dispatch_message(&lab.storage, &mut carrier, &address, &now, &timing).unwrap();
+        let took = started.elapsed();
+        assert!(
+            matches!(
+                report,
+                DispatchReport::Sent {
+                    state: AttemptState::OutcomeUnknown,
+                    ..
+                }
+            ),
+            "{behavior}: {report:?}"
+        );
+        assert!(took < Duration::from_secs(5), "{behavior} took {took:?}");
+    }
+    harness.stop();
+}
+
+/// The real `bridge-native-daemon` composition: the probe MCP server
+/// launched by the harness attests its root caller from `_meta`, publishes
+/// through the core socket, and the root's own `PostToolUse` hook receives
+/// the marker as context; the publisher's status shows the hand-off.
+#[test]
+fn daemon_composition_hands_probe_context_to_the_root_hook() {
+    let dir = TempDir::new("dc");
+    let store = dir.0.join("s");
+    std::fs::create_dir(&store).unwrap();
+    let channel_dir = dir.0.join("ch");
+    bridge_adapters::server::private_directory(&channel_dir).unwrap();
+    let channel = channel_dir.join("c.sock");
+    let core = dir.0.join("core.sock");
+    let evidence = dir.0.join("probe.jsonl");
+    let token = "probe-token-0123456789abcdef";
+    let address =
+        bridge_core::NativeAddress::new(HOST, Harness::ClaudeCode, "claude-lab", "sess-d").unwrap();
+    let sha = bridge_adapters::registry::file_sha256(&fixture_exe()).unwrap();
+    let config = format!(
+        r#"database = "{db}"
+socket = "{core}"
+[limits]
+max_admitted_events = 100
+[[grant]]
+token = "{token}"
+publisher = "probe-pub"
+recipients = ["{recipient}"]
+kinds = ["bridge.probe"]
+modes = ["inject", "message"]
+policies = ["keep_all"]
+[adapters]
+channel = "{channel}"
+host_id = "{HOST}"
+[[adapters.profiles]]
+namespace = "claude-lab"
+harness = "ClaudeCode"
+store = "{store}"
+[[adapters.profiles.executables]]
+path = "{exe}"
+sha256 = "{sha}"
+version = "fixture"
+inject = true
+message = true
+"#,
+        db = dir.0.join("b.db").display(),
+        core = core.display(),
+        recipient = address.to_canonical_string(),
+        channel = channel.display(),
+        store = store.display(),
+        exe = fixture_exe().display(),
+    );
+    let config_path = dir.0.join("bridge.toml");
+    std::fs::write(&config_path, config).unwrap();
+    let mut daemon = std::process::Command::new(env!("CARGO_BIN_EXE_bridge-native-daemon"))
+        .arg(&config_path)
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(eventually(5_000, || channel.exists() && core.exists()));
+
+    let mut harness = Harnessed::start(Harness::ClaudeCode, &store);
+    harness.hook(
+        &channel,
+        Harness::ClaudeCode,
+        hook("SessionStart", "sess-d"),
+    );
+    harness.hook(
+        &channel,
+        Harness::ClaudeCode,
+        hook("UserPromptSubmit", "sess-d"),
+    );
+    harness.hook(
+        &channel,
+        Harness::ClaudeCode,
+        tool_hook("PreToolUse", "sess-d", "tu-d1", None),
+    );
+    let reply = harness.cmd(json!({
+        "cmd": "mcp_server",
+        "args": [channel, core, token, evidence],
+        "requests": [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+                "name": "bridge_probe", "arguments": {"claim": "I am root"},
+                "_meta": {"claudecode/toolUseId": "tu-d1"}}}
+        ]
+    }));
+    let text = reply["responses"][2]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(text.contains("root"), "{reply}");
+    assert!(
+        !text.contains("BRIDGE_CTX_"),
+        "the marker never travels in the tool result"
+    );
+    let record: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(&evidence)
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap(),
+    )
+    .unwrap();
+    let marker = record["marker"].as_str().unwrap().to_string();
+    assert!(record["publish"].get("Published").is_some(), "{record}");
+
+    let post = harness.hook(
+        &channel,
+        Harness::ClaudeCode,
+        tool_hook("PostToolUse", "sess-d", "tu-d1", None),
+    );
+    assert!(post["stdout"].as_str().unwrap().contains(&marker), "{post}");
+    let event = record["event_id"].as_str().unwrap();
+    let status = std::process::Command::new(fixture_exe())
+        .args(["status", core.to_str().unwrap(), token, event])
+        .output()
+        .unwrap();
+    let status = String::from_utf8_lossy(&status.stdout).to_string();
+    assert!(status.contains("Status"), "{status}");
+    harness.stop();
+    std::process::Command::new("kill")
+        .args(["-TERM", &daemon.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(daemon.wait().unwrap().success());
 }

@@ -6,49 +6,101 @@
 //! bridge-adapters --test qualify_codex -- --ignored --nocapture`.
 //!
 //! Every App Server process here runs under the helper's own confinement
-//! policy (no network, no child processes) with `CODEX_HOME` set to a fresh
-//! temporary directory, so no user store, credential or model is touched.
-//! The owner step creates one thread in that store and exits; the helper
-//! then queues to it while no process has it loaded; a separate confined
-//! reader lists the queue. This qualifies the queue-only carrier against
-//! the loaded build; it does not show model delivery or GUI consumption.
+//! policy (no network, no child processes) with a cleared environment whose
+//! `CODEX_HOME` and `HOME` are a fresh, unpredictably named directory this
+//! test creates (never an existing one), so no user store, credential or
+//! model is touched. The owner step creates one thread in that store and
+//! exits; the product helper then queues to it while no process has it
+//! loaded; a separate confined reader lists the queue. Every process is
+//! killed and reaped on every path (including panics), and each session
+//! has one total time budget that notifications cannot extend.
+//!
+//! What a pass shows: the loaded build accepts a queue-only
+//! `thread/queue/add` for an unloaded thread of the attested store (native
+//! queue storage, `NativeAccepted`). It does not show model delivery,
+//! context, GUI consumption, lifecycle or caller identity.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bridge_adapters::codex::{HELPER_POLICY, Helper};
 use bridge_core::dispatch::Outcome;
 use serde_json::{Value, json};
 
+/// Total budget of one confined App Server session.
+const SESSION_BUDGET: Duration = Duration::from_secs(30);
+
+/// A directory this test created; removed on drop only because it is ours.
+struct OwnedDir(PathBuf);
+
+impl OwnedDir {
+    /// Creates a fresh, unpredictably named directory under the temp dir;
+    /// fails rather than reuse anything that already exists.
+    fn create() -> OwnedDir {
+        let mut random = [0u8; 16];
+        std::io::Read::read_exact(
+            &mut std::fs::File::open("/dev/urandom").expect("urandom"),
+            &mut random,
+        )
+        .expect("random name");
+        let name: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let path = std::env::temp_dir().join(format!("m2-codex-qual-{name}"));
+        std::fs::create_dir(&path).expect("create a fresh owned directory");
+        OwnedDir(path)
+    }
+}
+
+impl Drop for OwnedDir {
+    /// Removes the directory this test created.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A confined App Server child that is killed and reaped on drop.
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    /// Kills (if still running) and waits, on every path.
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Runs one confined App Server session: sends `requests` in order (each
-/// `(method, params)`; `initialized` is sent as a notification after
-/// `initialize`) and returns every response by request order.
+/// `(method, params)`; `initialized` follows `initialize` as a
+/// notification) and returns every response by request order. The whole
+/// session shares one budget; a missing response fails the test.
 fn session(exe: &Path, home: &Path, requests: &[(&str, Value)]) -> Vec<Value> {
-    let mut child = Command::new("/usr/bin/sandbox-exec")
-        .args(["-p", HELPER_POLICY])
-        .arg(exe)
-        .args([
-            "app-server",
-            "--listen",
-            "stdio://",
-            "--strict-config",
-            "-c",
-            "analytics.enabled=false",
-        ])
-        .env_clear()
-        .env("CODEX_HOME", home)
-        .env("PATH", "/usr/bin:/bin")
-        .env("HOME", home)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("start confined app-server");
-    let mut stdin = child.stdin.take().unwrap();
-    let stdout = child.stdout.take().unwrap();
+    let deadline = Instant::now() + SESSION_BUDGET;
+    let mut guard = ChildGuard(
+        Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", HELPER_POLICY])
+            .arg(exe)
+            .args([
+                "app-server",
+                "--listen",
+                "stdio://",
+                "--strict-config",
+                "-c",
+                "analytics.enabled=false",
+            ])
+            .env_clear()
+            .env("CODEX_HOME", home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start confined app-server"),
+    );
+    let mut stdin = guard.0.stdin.take().unwrap();
+    let stdout = guard.0.stdout.take().unwrap();
     let (sender, lines) = mpsc::channel();
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
@@ -67,9 +119,10 @@ fn session(exe: &Path, home: &Path, requests: &[(&str, Value)]) -> Vec<Value> {
         )
         .unwrap();
         let response = loop {
+            let left = deadline.saturating_duration_since(Instant::now());
             let line = lines
-                .recv_timeout(Duration::from_secs(20))
-                .expect("app-server response");
+                .recv_timeout(left)
+                .unwrap_or_else(|_| panic!("no {method} response within the session budget"));
             let value: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
             if value["id"] == json!(id) && value.get("method").is_none() {
                 break value;
@@ -80,52 +133,50 @@ fn session(exe: &Path, home: &Path, requests: &[(&str, Value)]) -> Vec<Value> {
         }
         responses.push(response);
     }
-    drop(stdin);
-    let _ = child.kill();
-    let _ = child.wait();
     responses
 }
 
-/// Real Codex: the confined helper queues to an unloaded owned thread and a missing thread refuses.
+/// Real Codex: the confined helper queues to an unloaded owned thread and a
+/// missing thread refuses.
 #[test]
 #[ignore = "needs a provisioned real Codex build (BRIDGE_QUALIFY_CODEX_EXE)"]
 fn real_codex_queue_only_helper_adds_to_an_unloaded_owned_thread() {
     let Some(exe) = std::env::var_os("BRIDGE_QUALIFY_CODEX_EXE").map(PathBuf::from) else {
-        eprintln!("BRIDGE_QUALIFY_CODEX_EXE not set; not qualified");
-        return;
+        panic!("BRIDGE_QUALIFY_CODEX_EXE is not set; nothing was qualified");
     };
-    let home = std::env::temp_dir().join(format!("m2-codex-qual-{}", std::process::id()));
-    std::fs::create_dir_all(&home).unwrap();
+    let home = OwnedDir::create();
     let init = json!({"clientInfo": {"name": "agent_bridge_qual", "version": "0"}, "capabilities": {"experimentalApi": true}});
 
     // Owner step: create one thread in the owned store, then exit.
     let owner = session(
         &exe,
-        &home,
+        &home.0,
         &[("initialize", init.clone()), ("thread/start", json!({}))],
     );
     let thread = owner[1]["result"]["thread"]["id"]
         .as_str()
         .unwrap_or_else(|| panic!("thread/start failed: {}", owner[1]))
         .to_string();
+    println!("qualify: codex owned thread created");
 
     // Helper: the product's confined queue-only hand-off.
     let helper = Helper {
         sandbox: Path::new("/usr/bin/sandbox-exec"),
         executable: &exe,
-        store: &home,
+        store: &home.0,
         timeout: Duration::from_secs(20),
     };
     let outcome = helper.queue_add(&thread, "agent-bridge-qual-1", "AGENT_BRIDGE_QUAL_MARKER");
+    println!("qualify: queue_add outcome {outcome:?}");
     assert!(
         matches!(outcome, Outcome::NativeAccepted { .. }),
         "{outcome:?}"
     );
 
-    // Reader: the queue holds exactly the helper's item.
+    // Reader: the queue holds exactly the helper's item with its text.
     let reader = session(
         &exe,
-        &home,
+        &home.0,
         &[
             ("initialize", init.clone()),
             ("thread/queue/list", json!({"threadId": thread})),
@@ -135,10 +186,12 @@ fn real_codex_queue_only_helper_adds_to_an_unloaded_owned_thread() {
         .as_array()
         .cloned()
         .unwrap_or_default();
+    println!("qualify: queue/list items {}", items.len());
     assert!(
         items
             .iter()
-            .any(|item| item["clientUserMessageId"] == "agent-bridge-qual-1"),
+            .any(|item| item["clientUserMessageId"] == "agent-bridge-qual-1"
+                && item.to_string().contains("AGENT_BRIDGE_QUAL_MARKER")),
         "{}",
         reader[1]
     );
@@ -149,9 +202,9 @@ fn real_codex_queue_only_helper_adds_to_an_unloaded_owned_thread() {
         "agent-bridge-qual-2",
         "x",
     );
+    println!("qualify: missing-thread outcome {missing:?}");
     assert!(
         matches!(missing, Outcome::KnownUnsent { .. }),
         "{missing:?}"
     );
-    let _ = std::fs::remove_dir_all(&home);
 }

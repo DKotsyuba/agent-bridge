@@ -69,7 +69,10 @@ Codex / Claude qualification is **not** established (see the end).
 - **Codex message**: `sandbox-exec -p '(version 1)(allow default)(deny
   network*)(deny process-fork)' <qualified codex> app-server --listen
   stdio://` with a scrubbed environment and `CODEX_HOME` = the attested store;
-  only `initialize`, `initialized` and `thread/queue/add` are sent. Failure
+  only `initialize`, `initialized` and `thread/queue/add` are sent. One total
+  budget bounds the exchange: a watchdog kills the helper at the deadline
+  (unblocking a stalled write), notifications never extend it, and the helper
+  is always killed and reaped. Failure
   before the add is written is known-unsent; a native error is a positive
   refusal; silence after the write is unknown. Queue acceptance is storage,
   not delivery; `clientUserMessageId` never deduplicates. Without the launcher
@@ -79,14 +82,18 @@ Codex / Claude qualification is **not** established (see the end).
   session *and* the attested harness PID, and the inbox socket's kernel peer
   must be that PID before the session's own peer token is sent. Only
   `priority = "later"` is sent; peer inject is prohibited. Receipts go to a
-  stable daemon callback in the inbox directory, correlated by an unguessable
-  per-attempt message id (and the recipient PID when the sender is still
-  connected): `held` is non-terminal, `delivered` is acceptance, a refusal
+  stable daemon callback in the inbox directory. A receipt counts only when
+  it names the attempt's unguessable message id *and* its sender's kernel
+  identity, read first thing after accept, is the attested recipient PID as
+  this user; a sender that already closed (its PID is no longer readable) is
+  ignored and logged `claude_receipt_unverifiable` — fail closed, the
+  attempt stays held/unreceipted until core's overdue incident. `held` is non-terminal, `delivered` is acceptance, a refusal
   before any hold is known-unsent, any negative after a hold is unknown, and
   silence is `written_no_receipt`, closed positively only when the session's
   own transcript holds the exact manifest as a user message. A daemon restart
   forgets callbacks; core's recheck deadlines then raise incidents, never
-  replays. Manifests over 4096 bytes are refused before any write.
+  replays (a stopped carrier removes its own callback sockets). Manifests
+  over 4096 bytes are refused before any write.
 
 ## Configuration
 
@@ -134,6 +141,23 @@ custody with `bridge-fixture` processes as harnesses, Claude inboxes and a
 Codex App Server (inside the real confinement, with a positive control).
 `tests/qualify_codex.rs` is the gated real-Codex queue-only qualification.
 
+## Root-run native qualification probes
+
+Each probe needs explicit root provisioning; none runs in `cargo test`.
+Build first: `cargo +1.98.1 build --offline -p bridge-adapters --bins`.
+
+| Probe | Model | Command | Passing evidence |
+|---|---|---|---|
+| Codex queue helper | no | `BRIDGE_QUALIFY_CODEX_EXE=<codex> cargo +1.98.1 test --offline -p bridge-adapters --test qualify_codex -- --ignored --nocapture` | `NativeAccepted` for an unloaded owned thread, queue/list shows the item and text, missing thread `KnownUnsent` |
+| Claude hooks, caller, inject, `later`, pause | yes (haiku, 0.5 USD cap) | `node qualification/claude-native-probe.cjs` | `checks.json`: root/child attested from real `toolUseId`, the hook-injected marker quoted by the model, a message marker answered in a distinct unprompted turn, no turn while paused and one after resume; `daemon_events` shows whether real receipts were verifiable |
+| Codex hooks, caller (callId = tool_use_id), inject, child thread | yes | `node qualification/codex-native-probe.cjs` | `checks.json`: root join succeeded (proves the callId/tool_use_id equality for that build), marker in the reply, child attested on its own thread address |
+
+All probes use fresh owned Bridge state, a new session/thread, a daemon grant
+naming only it, the probe MCP server (`bridge-fixture mcp-server`, which
+attests from `_meta` only and never returns the marker in the tool result),
+and terminate their children. They show what the named build did once; they
+are not release qualification.
+
 ## Not yet established
 
 - No real Claude Code or Codex session has run these hooks or carriers:
@@ -144,8 +168,11 @@ Codex App Server (inside the real confinement, with a positive control).
   `callId`, `x-codex-turn-metadata`) were captured from Codex
   0.162.0-alpha.17.2, the equality was not.
 - The real Claude inbox's receipt behaviour for `later` (held/release/drop
-  timing, whether it stays connected) is modelled from earlier observations,
-  not re-qualified.
+  timing, and whether it stays connected long enough for its PID to be read)
+  is not re-qualified. If it closes first, every receipt is ignored by
+  design and those hand-offs rely on transcript closure or the overdue
+  incident; that would make held-release unsupported, never silently
+  accepted.
 - The Codex helper has not been run against the real App Server here (see
   the gated test); Linux has no confinement launcher, so Codex message is
   unsupported there.
