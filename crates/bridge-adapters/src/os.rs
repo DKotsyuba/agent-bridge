@@ -131,6 +131,15 @@ pub fn incarnation_alive(pid: u32, start_time: u64) -> bool {
     process_facts(pid).is_some_and(|facts| facts.start_time == start_time)
 }
 
+/// Reads 32 random bytes from the OS (`/dev/urandom`), for unguessable
+/// proofs and message ids.
+pub fn random_bytes() -> std::io::Result<[u8; 32]> {
+    use std::io::Read;
+    let mut bytes = [0u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
 /// Reads one variable from a process's own environment as the OS reports
 /// it (never from a peer's message).
 ///
@@ -159,6 +168,7 @@ mod tests {
 
     use super::*;
 
+    /// Peer credentials of a socket pair name this process and leave the stream usable.
     #[test]
     fn peer_identity_reports_this_process() {
         let (left, right) = UnixStream::pair().unwrap();
@@ -172,6 +182,7 @@ mod tests {
         assert_eq!(&byte, b"x");
     }
 
+    /// Ancestry starts with this process and its exact incarnation is alive.
     #[test]
     fn ancestry_starts_with_self_and_incarnation_is_alive() {
         let chain = ancestry(std::process::id());

@@ -105,6 +105,39 @@ pub struct RegistryConfig {
     /// Largest age of a joinable call record, in milliseconds.
     #[serde(default = "default_call_age")]
     pub max_call_age_ms: u64,
+    /// Bridge-owned relay builds (for example the restricted MCP's root
+    /// daemon) that may redeem sealed caller proofs. Empty: redemption
+    /// always refuses.
+    #[serde(default)]
+    pub relays: Vec<RelayExecutable>,
+}
+
+/// One relay build allowed to redeem sealed caller proofs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayExecutable {
+    /// Absolute resolved executable path of the relay process.
+    pub path: PathBuf,
+    /// Lowercase hex SHA-256 of the qualified relay build.
+    pub sha256: String,
+}
+
+/// Lifetime of a sealed caller proof, in milliseconds.
+pub const SEALED_PROOF_TTL_MS: u64 = 30_000;
+
+/// Most sealed proofs outstanding at once; sealing refuses beyond it.
+const MAX_SEALED: usize = 1_024;
+
+/// One outstanding sealed proof.
+#[derive(Debug, Clone)]
+struct Sealed {
+    /// The caller facts fixed at issue time.
+    caller: VerifiedCaller,
+    /// Canonical address of the caller's binding.
+    binding: String,
+    /// Harness incarnation of the issuing frontend.
+    harness: (u32, u64),
+    /// Expiry (Unix epoch ms).
+    expires_ms: u64,
 }
 
 /// Shells that may sit between a harness and its hook command.
@@ -227,8 +260,22 @@ pub enum CallerChannel {
 /// request: Claude's `claudecode/toolUseId`, or Codex's `threadId` and
 /// `callId` together with its `x-codex-turn-metadata` object. Model
 /// arguments, display names, cwd, environment and caller-asserted actors
-/// have no field here. Build it only with [`PresentedMeta::from_mcp_meta`]
-/// on the `_meta` object the MCP framework separated from arguments.
+/// have no field here. Build the native variants only with
+/// [`PresentedMeta::from_mcp_meta`] on the `_meta` object the MCP framework
+/// separated from arguments.
+///
+/// Field provenance: Claude `claudecode/toolUseId` and the Codex keys
+/// `threadId`, `callId` and `x-codex-turn-metadata` (with `thread_id`
+/// inside) are the top-level `_meta` keys captured from real Claude Code
+/// 2.1.294 and Codex 0.162.0-alpha.17.2 MCP `tools/call` requests during
+/// reconnaissance. That the Codex `callId` equals the same call's
+/// `PreToolUse` hook `tool_use_id` is not yet qualified by Bridge evidence;
+/// when it does not hold, the join finds no record and refuses.
+///
+/// [`PresentedMeta::Sealed`] is not native metadata: it is Bridge-owned
+/// enrichment, a registry-issued single-use proof forwarded by a
+/// harness-launched frontend to a relay process (see
+/// [`crate::client::RegistryAttestor::attest_sealed`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "host", rename_all = "snake_case")]
 pub enum PresentedMeta {
@@ -244,6 +291,41 @@ pub enum PresentedMeta {
         /// `_meta.callId`: the per-call identifier.
         call_id: String,
     },
+    /// A sealed proof issued by the registry for an already attested
+    /// caller; redeemable once, only by a configured relay executable.
+    Sealed {
+        /// The opaque proof text.
+        proof: SealedProof,
+    },
+}
+
+/// An opaque, unguessable, single-use caller proof issued by the registry.
+///
+/// It carries no caller facts: redeeming it returns exactly the facts the
+/// registry stored at issue time, once, to a configured relay process
+/// within a short lifetime. `Debug` never prints the value.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SealedProof(String);
+
+impl SealedProof {
+    /// Wraps proof text received from a frontend over a relay's own
+    /// transport; validity is decided only by redemption.
+    pub fn from_wire(text: impl Into<String>) -> Self {
+        SealedProof(text.into())
+    }
+
+    /// The proof text to forward (treat as a secret; never log).
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SealedProof {
+    /// Prints a placeholder instead of the proof.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SealedProof(<redacted>)")
+    }
 }
 
 impl PresentedMeta {
@@ -270,16 +352,27 @@ impl PresentedMeta {
         };
         match (codex, claude) {
             (true, false) => {
-                if !meta
+                let Some(turn) = meta
                     .get("x-codex-turn-metadata")
-                    .is_some_and(serde_json::Value::is_object)
-                {
+                    .and_then(serde_json::Value::as_object)
+                else {
                     return Err(CorrelationError::NotEvidence(
                         "_meta x-codex-turn-metadata object missing".into(),
                     ));
+                };
+                let thread_id = field("threadId")?;
+                // The turn metadata names the same thread when it names one.
+                if turn
+                    .get("thread_id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|turn_thread| turn_thread != thread_id)
+                {
+                    return Err(CorrelationError::Conflicting(
+                        "_meta threadId differs from the turn metadata thread".into(),
+                    ));
                 }
                 Ok(PresentedMeta::Codex {
-                    thread_id: field("threadId")?,
+                    thread_id,
                     call_id: field("callId")?,
                 })
             }
@@ -292,19 +385,18 @@ impl PresentedMeta {
         }
     }
 
-    /// The per-call identifier joined against hook records.
-    fn call_id(&self) -> &str {
-        match self {
-            PresentedMeta::Claude { tool_use_id } => tool_use_id,
-            PresentedMeta::Codex { call_id, .. } => call_id,
-        }
+    /// Presents a sealed proof received from a frontend.
+    pub fn sealed(proof: SealedProof) -> Self {
+        PresentedMeta::Sealed { proof }
     }
 
-    /// The harness this metadata belongs to.
-    fn harness(&self) -> Harness {
+    /// The per-call identifier and harness of native metadata; `None` for
+    /// a sealed proof.
+    fn native(&self) -> Option<(&str, Harness)> {
         match self {
-            PresentedMeta::Claude { .. } => Harness::ClaudeCode,
-            PresentedMeta::Codex { .. } => Harness::Codex,
+            PresentedMeta::Claude { tool_use_id } => Some((tool_use_id, Harness::ClaudeCode)),
+            PresentedMeta::Codex { call_id, .. } => Some((call_id, Harness::Codex)),
+            PresentedMeta::Sealed { .. } => None,
         }
     }
 }
@@ -333,6 +425,9 @@ pub struct VerifiedCaller {
     observed_at_ms: u64,
     /// Which correlation produced it.
     channel: CallerChannel,
+    /// Whether it was obtained by redeeming a sealed proof in a relay
+    /// process rather than directly by the harness-launched frontend.
+    relayed: bool,
 }
 
 impl VerifiedCaller {
@@ -352,7 +447,19 @@ impl VerifiedCaller {
             epoch,
             observed_at_ms,
             channel,
+            relayed: false,
         }
+    }
+
+    /// The same caller marked as obtained through a relay redemption.
+    pub(crate) fn into_relayed(mut self) -> Self {
+        self.relayed = true;
+        self
+    }
+
+    /// Whether this caller was obtained by redeeming a sealed proof.
+    pub fn relayed(&self) -> bool {
+        self.relayed
     }
 
     /// Explicit fixture constructor for consumer tests only; never
@@ -644,6 +751,8 @@ pub struct Registry {
     call_order: VecDeque<String>,
     /// Verified executable digests keyed by (path, length, mtime).
     digests: HashMap<FileKey, String>,
+    /// Outstanding sealed proofs by SHA-256 of the proof text.
+    sealed: HashMap<String, Sealed>,
     /// Bound of retained call records.
     max_calls: usize,
     /// Harnesses whose message carrier is unavailable on this host (for
@@ -698,6 +807,7 @@ impl Registry {
             calls: HashMap::new(),
             call_order: VecDeque::new(),
             digests: HashMap::new(),
+            sealed: HashMap::new(),
             max_calls: DEFAULT_MAX_CALL_RECORDS,
             message_disabled: Vec::new(),
         })
@@ -1053,9 +1163,13 @@ impl Registry {
         meta: &PresentedMeta,
         now_ms: u64,
     ) -> Result<VerifiedCaller, CorrelationError> {
-        let call = meta.call_id().to_string();
+        let (call, harness) = match meta {
+            PresentedMeta::Sealed { proof } => return self.redeem(peer, proof, now_ms),
+            native => native.native().expect("native metadata"),
+        };
+        let call = call.to_string();
         checked_id(&call, "call id").map_err(CorrelationError::NotEvidence)?;
-        let matched = self.harness_of(peer, meta.harness())?;
+        let matched = self.harness_of(peer, harness)?;
         let max_age = self.config.max_call_age_ms;
         let records = self
             .calls
@@ -1107,11 +1221,108 @@ impl Registry {
             record.native_id.clone(),
             binding.epoch,
             record.observed_ms,
-            match meta {
-                PresentedMeta::Claude { .. } => CallerChannel::ClaudeToolUse,
-                PresentedMeta::Codex { .. } => CallerChannel::CodexCall,
+            match harness {
+                Harness::ClaudeCode => CallerChannel::ClaudeToolUse,
+                Harness::Codex => CallerChannel::CodexCall,
             },
         ))
+    }
+
+    /// Attests a caller like [`Registry::attest_caller`] (native metadata
+    /// only) and issues a sealed single-use proof of exactly that result
+    /// for the frontend to forward to a configured relay.
+    pub fn attest_and_seal(
+        &mut self,
+        peer: PeerIdentity,
+        meta: &PresentedMeta,
+        now_ms: u64,
+    ) -> Result<(VerifiedCaller, SealedProof), CorrelationError> {
+        if matches!(meta, PresentedMeta::Sealed { .. }) {
+            return Err(CorrelationError::NotEvidence(
+                "a sealed proof cannot be resealed".into(),
+            ));
+        }
+        let caller = self.attest_caller(peer, meta, now_ms)?;
+        self.sealed.retain(|_, sealed| sealed.expires_ms > now_ms);
+        if self.sealed.len() >= MAX_SEALED {
+            return Err(CorrelationError::Unavailable(
+                "too many outstanding sealed proofs".into(),
+            ));
+        }
+        let random = crate::os::random_bytes()
+            .map_err(|error| CorrelationError::Unavailable(error.to_string()))?;
+        let proof: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let binding = caller.address.to_canonical_string();
+        let harness = self
+            .bindings
+            .get(&binding)
+            .map(|binding| binding.harness)
+            .ok_or_else(|| CorrelationError::Missing("binding vanished".into()))?;
+        self.sealed.insert(
+            crate::server::sha256_hex(proof.as_bytes()),
+            Sealed {
+                caller: caller.clone(),
+                binding,
+                harness,
+                expires_ms: now_ms.saturating_add(SEALED_PROOF_TTL_MS),
+            },
+        );
+        Ok((caller, SealedProof(proof)))
+    }
+
+    /// Redeems a sealed proof for a configured relay process, once.
+    ///
+    /// The peer must run as the owner from a configured relay executable,
+    /// unmodified since it started and with the configured digest. The
+    /// proof is consumed by any redemption attempt that finds it; an
+    /// expired proof, or one whose binding was renewed, retired or lost its
+    /// harness since issue, is stale.
+    fn redeem(
+        &mut self,
+        peer: PeerIdentity,
+        proof: &SealedProof,
+        now_ms: u64,
+    ) -> Result<VerifiedCaller, CorrelationError> {
+        if peer.uid != self.owner_uid {
+            return Err(CorrelationError::NotEvidence(
+                "relay runs as another user".into(),
+            ));
+        }
+        let facts = os::process_facts(peer.pid)
+            .ok_or_else(|| CorrelationError::NotEvidence("relay process is gone".into()))?;
+        let exe = facts
+            .exe
+            .clone()
+            .ok_or_else(|| CorrelationError::NotEvidence("relay executable unreadable".into()))?;
+        let digest = self
+            .config
+            .relays
+            .iter()
+            .find(|relay| relay.path == exe)
+            .map(|relay| relay.sha256.clone())
+            .ok_or_else(|| {
+                CorrelationError::NotEvidence("peer is not a configured relay".into())
+            })?;
+        self.verify_loaded(&exe, facts.start_time, &digest)?;
+        let sealed = self
+            .sealed
+            .remove(&crate::server::sha256_hex(proof.as_str().as_bytes()))
+            .ok_or_else(|| CorrelationError::Missing("sealed proof".into()))?;
+        if sealed.expires_ms <= now_ms {
+            return Err(CorrelationError::Stale("sealed proof expired".into()));
+        }
+        let current = self.bindings.get(&sealed.binding).is_some_and(|binding| {
+            !binding.retired
+                && binding.harness == sealed.harness
+                && binding.epoch == sealed.caller.epoch
+                && os::incarnation_alive(binding.harness.0, binding.harness.1)
+        });
+        if !current {
+            return Err(CorrelationError::Stale(
+                "binding changed since sealing".into(),
+            ));
+        }
+        Ok(sealed.caller.into_relayed())
     }
 
     /// Attests a recipient endpoint for a message carrier right now.

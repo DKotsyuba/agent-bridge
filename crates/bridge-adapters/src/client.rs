@@ -17,7 +17,9 @@ use std::time::Duration;
 use bridge_core::Harness;
 
 use crate::os;
-use crate::registry::{CallerAttestor, CorrelationError, PresentedMeta, VerifiedCaller};
+use crate::registry::{
+    CallerAttestor, CorrelationError, PresentedMeta, SealedProof, VerifiedCaller,
+};
 use crate::server::{ChannelRequest, ChannelResponse, sha256_hex};
 
 /// Largest hook payload read from the harness, in bytes.
@@ -157,12 +159,22 @@ impl ChannelClient {
 }
 
 /// The cross-process [`CallerAttestor`]: asks the Bridge daemon's
-/// registry, from the process that holds the native MCP connection, to
-/// attest the caller.
+/// registry to attest the caller of one MCP request.
 ///
-/// The daemon identifies *this* process by kernel peer credentials and
-/// requires it to be a qualified harness's own MCP server; the presented
-/// metadata alone attests nothing.
+/// The daemon identifies *this* process by kernel peer credentials; the
+/// presented metadata alone attests nothing. Two compositions exist:
+///
+/// - **Frontend.** A harness-launched MCP server (a qualified harness's own
+///   descendant) presents native `_meta` with [`CallerAttestor::attest`],
+///   or with [`RegistryAttestor::attest_sealed`] to also receive a sealed
+///   single-use proof of the result.
+/// - **Relay.** A process that is not a harness descendant (the restricted
+///   MCP's root daemon) receives that proof from its frontend over its own
+///   transport and presents [`PresentedMeta::sealed`]; the registry admits
+///   it only from a configured relay build, once, within
+///   [`crate::registry::SEALED_PROOF_TTL_MS`], while the binding is
+///   unchanged. The relay learns exactly the facts the registry stored —
+///   never labels the frontend chose.
 #[derive(Debug, Clone)]
 pub struct RegistryAttestor {
     /// Channel client.
@@ -179,6 +191,70 @@ impl RegistryAttestor {
             max_age_ms,
         }
     }
+
+    /// Frontend attestation that also returns a sealed proof to forward to
+    /// a relay. Refuses like [`CallerAttestor::attest`]; a sealed `meta`
+    /// cannot be resealed.
+    pub fn attest_sealed(
+        &self,
+        meta: &PresentedMeta,
+        now_ms: u64,
+    ) -> Result<(VerifiedCaller, SealedProof), CorrelationError> {
+        let (caller, proof) = self.request(meta, true, now_ms)?;
+        let proof =
+            proof.ok_or_else(|| CorrelationError::Unavailable("no sealed proof issued".into()))?;
+        Ok((caller, proof))
+    }
+
+    /// One attestation exchange and its validation.
+    fn request(
+        &self,
+        meta: &PresentedMeta,
+        seal: bool,
+        now_ms: u64,
+    ) -> Result<(VerifiedCaller, Option<SealedProof>), CorrelationError> {
+        let (response, _, _) = self
+            .client
+            .exchange(&ChannelRequest::Attest {
+                meta: meta.clone(),
+                seal,
+            })
+            .map_err(|error| CorrelationError::Unavailable(error.to_string()))?;
+        match response {
+            ChannelResponse::Caller {
+                address,
+                role,
+                native_id,
+                epoch,
+                observed_at_ms,
+                channel,
+                relayed,
+                proof,
+            } => {
+                if observed_at_ms > now_ms.saturating_add(60_000)
+                    || now_ms.saturating_sub(observed_at_ms) > self.max_age_ms
+                {
+                    return Err(CorrelationError::Stale("caller record age".into()));
+                }
+                let caller =
+                    VerifiedCaller::new(address, role, native_id, epoch, observed_at_ms, channel);
+                Ok((
+                    if relayed {
+                        caller.into_relayed()
+                    } else {
+                        caller
+                    },
+                    proof,
+                ))
+            }
+            ChannelResponse::Refused { class, detail } => {
+                Err(CorrelationError::from_wire(&class, detail))
+            }
+            _ => Err(CorrelationError::Unavailable(
+                "unexpected channel response".into(),
+            )),
+        }
+    }
 }
 
 impl CallerAttestor for RegistryAttestor {
@@ -189,39 +265,6 @@ impl CallerAttestor for RegistryAttestor {
         meta: &PresentedMeta,
         now_ms: u64,
     ) -> Result<VerifiedCaller, CorrelationError> {
-        let (response, _, _) = self
-            .client
-            .exchange(&ChannelRequest::Attest { meta: meta.clone() })
-            .map_err(|error| CorrelationError::Unavailable(error.to_string()))?;
-        match response {
-            ChannelResponse::Caller {
-                address,
-                role,
-                native_id,
-                epoch,
-                observed_at_ms,
-                channel,
-            } => {
-                if observed_at_ms > now_ms.saturating_add(60_000)
-                    || now_ms.saturating_sub(observed_at_ms) > self.max_age_ms
-                {
-                    return Err(CorrelationError::Stale("caller record age".into()));
-                }
-                Ok(VerifiedCaller::new(
-                    address,
-                    role,
-                    native_id,
-                    epoch,
-                    observed_at_ms,
-                    channel,
-                ))
-            }
-            ChannelResponse::Refused { class, detail } => {
-                Err(CorrelationError::from_wire(&class, detail))
-            }
-            _ => Err(CorrelationError::Unavailable(
-                "unexpected channel response".into(),
-            )),
-        }
+        self.request(meta, false, now_ms).map(|(caller, _)| caller)
     }
 }

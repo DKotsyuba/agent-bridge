@@ -53,6 +53,11 @@ automatically repeated after a possible handoff.
   (validating builder), `BridgeClient` (publish / status plus the operator
   operations, bounded reads and writes, one safe reconnect after an idle
   close, every response revalidated) and re-exports of the canonical types.
+- `crates/bridge-adapters` — native Codex / Claude Code adapters: protected
+  caller registry and root-caller ABI, quiet root hooks (`bridge-hook`),
+  OS-confined Codex queue and Claude `later` message carriers, and the
+  `bridge-native-daemon`. See `crates/bridge-adapters/README.md` for its
+  trust model, configuration and unqualified native gaps.
 
 ## Dispatch contract (what an adapter implements and calls)
 

@@ -134,10 +134,14 @@ pub(crate) enum ChannelRequest {
         /// The native hook payload as the harness wrote it.
         payload: serde_json::Value,
     },
-    /// Caller attestation of the presenting process.
+    /// Caller attestation of the presenting process (native metadata from
+    /// a harness-launched frontend, or a sealed proof from a relay).
     Attest {
-        /// Protected MCP metadata.
+        /// Protected MCP metadata or a sealed proof.
         meta: PresentedMeta,
+        /// Also issue a sealed single-use proof of the result.
+        #[serde(default)]
+        seal: bool,
     },
     /// Hook confirmation that the reply was fully written and flushed.
     Flushed {
@@ -173,6 +177,12 @@ pub(crate) enum ChannelResponse {
         observed_at_ms: u64,
         /// Correlation channel.
         channel: CallerChannel,
+        /// Obtained by redeeming a sealed proof.
+        #[serde(default)]
+        relayed: bool,
+        /// Sealed proof of this result, when requested.
+        #[serde(default)]
+        proof: Option<crate::registry::SealedProof>,
     },
     /// Refused; nothing was admitted or disclosed.
     Refused {
@@ -410,11 +420,21 @@ fn serve(stream: UnixStream, state: &ChannelState) {
         }
     };
     match request {
-        ChannelRequest::Attest { meta } => {
+        ChannelRequest::Attest { meta, seal } => {
             let now = current_unix_millis();
-            let result = lock_registry(&state.registry).attest_caller(peer, &meta, now);
+            let result = if seal {
+                lock_registry(&state.registry)
+                    .attest_and_seal(peer, &meta, now)
+                    .map(|(caller, proof)| (caller, Some(proof)))
+            } else {
+                lock_registry(&state.registry)
+                    .attest_caller(peer, &meta, now)
+                    .map(|caller| (caller, None))
+            };
             let response = match result {
-                Ok(caller) => ChannelResponse::Caller {
+                Ok((caller, proof)) => ChannelResponse::Caller {
+                    relayed: caller.relayed(),
+                    proof,
                     address: caller.address().clone(),
                     role: caller.role(),
                     native_id: caller.native_id().to_string(),

@@ -11,9 +11,12 @@
 //! inject is prohibited here; quiet inject is the root hook drain.
 //!
 //! Receipts: the user frame names a long-lived callback socket this daemon
-//! keeps in the inbox's directory (the native reply-address rule), and
-//! receipts are accepted only from the recipient PID, correlated by the
-//! attempt's own message id. Within the short receipt window: `held` is a
+//! keeps in the inbox's directory (the native reply-address rule). A
+//! receipt is correlated by the attempt's unguessable message id (known
+//! only to the recipient process through its authenticated inbox and to
+//! this daemon); when the sender is still connected its kernel identity
+//! must also be the recipient PID. The PID check is opportunistic because
+//! the kernel no longer reports the PID of a peer that already closed. Within the short receipt window: `held` is a
 //! non-terminal hold with a recheck deadline, `delivered` is native
 //! acceptance, a refusal before any hold is known-unsent, and silence is
 //! the ordinary `written_no_receipt`. Later receipts are recorded straight
@@ -32,7 +35,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bridge_core::dispatch::{AttemptFence, AttemptRecord, Attestation, DispatchCarrier, Outcome};
 use bridge_core::service::{current_unix_millis, log_event};
@@ -121,6 +124,9 @@ struct Hub {
     listeners: Mutex<HashMap<PathBuf, PathBuf>>,
     /// This user's uid.
     uid: u32,
+    /// Random per-process secret (from the OS) that makes message ids and
+    /// callback names unguessable.
+    secret: [u8; 32],
 }
 
 /// One `later` frame to write.
@@ -250,15 +256,7 @@ impl Hub {
         }
         let name = format!(
             "{}.sock",
-            &crate::server::sha256_hex(
-                format!(
-                    "{}-{}-{:?}",
-                    std::process::id(),
-                    current_unix_millis(),
-                    Instant::now()
-                )
-                .as_bytes(),
-            )[..12]
+            &self.derive(&format!("callback:{}", directory.display()))[..12]
         );
         let path = directory.join(name);
         let listener = UnixListener::bind(&path)?;
@@ -275,12 +273,24 @@ impl Hub {
         Ok(path)
     }
 
+    /// Derives an unguessable per-purpose value from this hub's secret.
+    fn derive(&self, purpose: &str) -> String {
+        let mut material = self.secret.to_vec();
+        material.extend_from_slice(purpose.as_bytes());
+        crate::server::sha256_hex(&material)
+    }
+
     /// Reads one bounded receipt connection and routes it.
+    ///
+    /// The kernel identity of a receipt peer is only readable while it is
+    /// still connected; a native inbox may write and close first. A peer
+    /// whose identity *is* readable must be this user and, per receipt,
+    /// the recipient PID. Otherwise the receipt is bound only by the
+    /// unguessable per-attempt message id, which only the recipient
+    /// process (through its authenticated inbox) and this daemon know.
     fn accept_receipt(&self, stream: UnixStream) {
-        let Ok(peer) = os::peer_identity(&stream) else {
-            return;
-        };
-        if peer.uid != self.uid {
+        let peer = os::peer_identity(&stream).ok();
+        if peer.is_some_and(|peer| peer.uid != self.uid) {
             return;
         }
         let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
@@ -295,18 +305,19 @@ impl Hub {
         }
         for line in text.lines() {
             if let Some((msg_id, status)) = receipt(line) {
-                self.route(&msg_id, &status, peer.pid);
+                self.route(&msg_id, &status, peer.map(|peer| peer.pid));
             }
         }
     }
 
-    /// Routes one correlated receipt from `pid`.
-    fn route(&self, msg_id: &str, status: &str, pid: u32) {
+    /// Routes one correlated receipt; a known sender PID must be the
+    /// recipient's.
+    fn route(&self, msg_id: &str, status: &str, pid: Option<u32>) {
         let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
         let Some(entry) = pending.get_mut(msg_id) else {
             return;
         };
-        if entry.recipient_pid != pid {
+        if pid.is_some_and(|pid| pid != entry.recipient_pid) {
             return;
         }
         let late = match &entry.waiting {
@@ -473,6 +484,7 @@ impl ClaudeLaterCarrier {
             pending: Mutex::new(HashMap::new()),
             listeners: Mutex::new(HashMap::new()),
             uid,
+            secret: os::random_bytes()?,
         });
         let closer = Arc::downgrade(&hub);
         std::thread::Builder::new()
@@ -588,7 +600,10 @@ impl DispatchCarrier for ClaudeLaterCarrier {
         let msg_id = format!(
             "bridge_{}_{}",
             attempt.fence.attempt_seq,
-            &attempt.fence.manifest_hash[..24.min(attempt.fence.manifest_hash.len())]
+            &self.hub.derive(&format!(
+                "msg:{}:{}",
+                attempt.fence.attempt_seq, attempt.fence.manifest_hash
+            ))[..32]
         );
         let (sender, first): (Sender<String>, Receiver<String>) = mpsc::channel();
         self.hub
