@@ -18,6 +18,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bridge-adapters"
+version = "0.1.0"
+dependencies = [
+ "bridge-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bridge-client"
 version = "0.1.0"
 dependencies = [
