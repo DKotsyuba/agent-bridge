@@ -735,6 +735,16 @@ pub enum CoreError {
         /// Human description of the exhausted limit.
         limit: String,
     },
+    /// Dispatch was refused by a durable recipient policy (no-wake/pause).
+    PolicyHold {
+        /// Canonical recipient address text.
+        recipient: String,
+        /// Why the recipient is held.
+        reason: String,
+    },
+    /// A fenced dispatch transition was refused (stale fence, foreign
+    /// state, unresolved uncertainty or missing event); nothing was invoked.
+    Fence(String),
     /// A SQLite-level failure; transaction state is reported by SQLite.
     Storage(rusqlite::Error),
 }
@@ -753,6 +763,10 @@ impl fmt::Display for CoreError {
                 "conflict on event {event_id}: stored {stored_hash} != submitted {submitted_hash}"
             ),
             CoreError::Capacity { limit } => write!(f, "capacity limit reached: {limit}"),
+            CoreError::PolicyHold { recipient, reason } => {
+                write!(f, "recipient {recipient} is held: {reason}")
+            }
+            CoreError::Fence(detail) => write!(f, "dispatch fence refused: {detail}"),
             CoreError::Storage(error) => write!(f, "storage failure: {error}"),
         }
     }

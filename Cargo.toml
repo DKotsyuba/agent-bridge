@@ -1,5 +1,9 @@
 [workspace]
-members = ["crates/bridge-core", "crates/bridge-client"]
+members = [
+    "crates/bridge-core",
+    "crates/bridge-client",
+    "crates/bridge-adapters",
+]
 resolver = "3"
 
 [workspace.package]
