@@ -737,10 +737,13 @@ struct HarnessMatch {
 /// Identity of one exact executable file, the key of its hashed digest.
 ///
 /// Besides the path it holds the device and inode (a replacement by
-/// rename gets another inode), the length and the modification time with
-/// nanoseconds (an in-place rewrite changes it), so a same-size replacement
-/// within the same second still gets another key and can never reuse a
-/// digest hashed from the previous file.
+/// rename gets another inode), the length, the modification time and the
+/// status-change time (ctime), both with nanoseconds. The kernel sets the
+/// status-change time on every write, rename-into-place, chmod or link
+/// change and a program cannot set it back (unlike mtime, which `cp -p`,
+/// `install -p` and `touch` restore), so a same-size or timestamp-preserving
+/// replacement still gets another key and can never reuse a digest hashed
+/// from the previous file.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FileKey {
     /// Path as configured.
@@ -751,6 +754,8 @@ struct FileKey {
     len: u64,
     /// Modification time: whole seconds and nanoseconds since the Unix epoch.
     mtime: (i64, i64),
+    /// Status-change time: whole seconds and nanoseconds since the Unix epoch.
+    ctime: (i64, i64),
 }
 
 /// The identity of the file at `path` (following symlinks, as the kernel
@@ -763,6 +768,7 @@ fn file_key(path: &Path) -> Option<FileKey> {
         inode: (metadata.dev(), metadata.ino()),
         len: metadata.len(),
         mtime: (metadata.mtime(), metadata.mtime_nsec()),
+        ctime: (metadata.ctime(), metadata.ctime_nsec()),
     })
 }
 
@@ -1061,11 +1067,59 @@ impl Registry {
         (cached, skipped)
     }
 
-    /// Proves the loaded build: the file was not modified after the process
-    /// started (`started` is the process start in Unix seconds, or
+    /// How many configured harness and relay executable entries cannot
+    /// attest right now: the file is missing, unreadable, changed since it
+    /// was hashed or not hashed, or its real hashed digest differs from the
+    /// configured one. One entry counts once, so the number is bounded by
+    /// the configuration.
+    ///
+    /// It only stats files and compares the cached real digests with the
+    /// configured ones (never trusting the configured value, never reading
+    /// a file), so it is cheap and safe at startup, after
+    /// [`Registry::new`], to tell the operator that a route is
+    /// unqualified. It does not look at process start times.
+    pub fn unqualified_executables(&self) -> usize {
+        let profiles = self
+            .config
+            .profiles
+            .iter()
+            .flat_map(|profile| profile.executables.iter().map(|e| (&e.path, &e.sha256)));
+        let relays = self
+            .config
+            .relays
+            .iter()
+            .map(|relay| (&relay.path, &relay.sha256));
+        profiles
+            .chain(relays)
+            .filter(|(path, configured)| {
+                !file_key(path)
+                    .and_then(|key| self.digests.get(&key))
+                    .is_some_and(|actual| actual.eq_ignore_ascii_case(configured))
+            })
+            .count()
+    }
+
+    /// Proves the loaded build: both the modification second and the
+    /// status-change (ctime) second of the file are strictly before the
+    /// process start (`started` is the process start in Unix seconds, or
     /// `u64::MAX` when no process is involved) and its digest, hashed by
-    /// [`Registry::warm_digests`] for this exact file identity, equals
-    /// `qualified`.
+    /// [`Registry::warm_digests`] for this exact file identity (which
+    /// includes the nanosecond ctime), equals `qualified`.
+    ///
+    /// What this proves: since before the process was born, the file at the
+    /// path has not been written, replaced, renamed into place or chmod-ed,
+    /// so the bytes on disk, hashed at startup, are the bytes the process
+    /// started from. mtime alone is not enough: an installer that restores
+    /// timestamps (`cp -p`, `install -p`, `touch`) keeps an old mtime, but
+    /// the kernel sets ctime on every such change and a program cannot set
+    /// it back, and the OS keeps reporting the same executable path for the
+    /// live process after a replacement (probed on macOS), so the path
+    /// alone shows nothing. Times are whole seconds, so a change in the very
+    /// second the process was born is ambiguous and refused; restarting the
+    /// harness a second or more after the last change to the file resolves
+    /// it, as does a restart after any benign chmod or link change. It does
+    /// not defend against code that already runs as the user with the
+    /// ability to move the system clock backwards.
     ///
     /// Never reads the file: a file without a warmed digest (installed,
     /// replaced or changed since startup, or missing at startup) is refused
@@ -1079,9 +1133,9 @@ impl Registry {
     ) -> Result<(), CorrelationError> {
         let key = file_key(exe)
             .ok_or_else(|| CorrelationError::NotEvidence("harness executable unreadable".into()))?;
-        if i128::from(key.mtime.0) > i128::from(started) {
+        if i128::from(key.mtime.0.max(key.ctime.0)) >= i128::from(started) {
             return Err(CorrelationError::NotEvidence(
-                "harness executable changed on disk after the process started; loaded build unproven"
+                "harness executable written or changed on disk at or after the process start second; loaded build unproven"
                     .into(),
             ));
         }
@@ -1754,7 +1808,6 @@ mod tests {
     //! The executable digest cache: warmed before serving, never trusted.
 
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     /// A registry whose one Claude profile qualifies `executables` (path,
     /// configured digest) and whose relays are empty.
@@ -1793,8 +1846,9 @@ mod tests {
     /// Construction alone (no manual warm) caches the real digest of every
     /// readable configured file; a wrong configured digest is never trusted
     /// over the hashed file, a missing file is skipped without affecting the
-    /// others, and warming again reads nothing (proved with a file that can
-    /// no longer be opened).
+    /// others, and warming again reads nothing (proved by a sentinel digest
+    /// planted under the unchanged file's identity, which a re-read would
+    /// overwrite).
     #[test]
     fn warming_hashes_real_files_and_never_trusts_the_configured_digest() {
         let dir = scratch("warm");
@@ -1813,13 +1867,14 @@ mod tests {
         registry
             .verify_loaded(&good, u64::MAX, &good_digest)
             .expect("the warmed, unchanged file attests");
-        std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o000)).unwrap();
-        assert_eq!(
-            registry.warm_digests(),
-            (2, 1),
-            "no re-read of an unchanged file"
-        );
-        std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let sentinel = "5".repeat(64);
+        registry
+            .digests
+            .insert(file_key(&good).unwrap(), sentinel.clone());
+        assert_eq!(registry.warm_digests(), (2, 1));
+        registry
+            .verify_loaded(&good, u64::MAX, &sentinel)
+            .expect("an unchanged file's cached digest is not re-read");
         assert!(
             registry
                 .verify_loaded(&wrong, u64::MAX, &bad_config)
@@ -1884,6 +1939,167 @@ mod tests {
         // A file modified after the process started is refused before any
         // digest question.
         assert!(registry.verify_loaded(&kept, 0, &digest).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The process start time and the file mtime are both whole seconds, so
+    /// a file written in the very second a process was born may be the bytes
+    /// that process loaded or newer ones written right after it loaded the
+    /// old ones; that second is unknown and refused. Only a file strictly
+    /// older than the process start (or no process at all, `u64::MAX`)
+    /// attests.
+    #[test]
+    fn a_file_written_in_the_process_birth_second_is_not_proven_loaded() {
+        let dir = scratch("birth");
+        let exe = dir.join("exe");
+        std::fs::write(&exe, vec![5u8; 4096]).unwrap();
+        let digest = file_sha256(&exe).unwrap();
+        let mut registry = registry_with(&[(&exe, &digest)]);
+        let second = u64::try_from(file_key(&exe).unwrap().mtime.0).unwrap();
+        assert!(
+            registry.verify_loaded(&exe, second, &digest).is_err(),
+            "same second as the process birth is ambiguous"
+        );
+        assert!(registry.verify_loaded(&exe, second - 1, &digest).is_err());
+        registry
+            .verify_loaded(&exe, second + 1, &digest)
+            .expect("strictly older than the process start attests");
+        registry
+            .verify_loaded(&exe, u64::MAX, &digest)
+            .expect("no process involved");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The startup diagnostic count covers every way a configured entry
+    /// cannot attest: a missing file, a real hashed digest that differs
+    /// from the configured one (the configured value is never trusted), and
+    /// a file changed after it was hashed; matching files are not counted.
+    #[test]
+    fn unqualified_count_covers_missing_mismatched_and_changed_entries() {
+        let dir = scratch("unq");
+        let good = dir.join("good");
+        let wrong = dir.join("wrong");
+        let changed = dir.join("changed");
+        let missing = dir.join("missing");
+        for path in [&good, &wrong, &changed] {
+            std::fs::write(path, vec![3u8; 4096]).unwrap();
+        }
+        let digest = file_sha256(&good).unwrap();
+        let other = "1".repeat(64);
+        let mut registry = registry_with(&[
+            (&good, &digest),
+            (&wrong, &other),
+            (&changed, &digest),
+            (&missing, &digest),
+        ]);
+        // wrong: hashed digest differs from the configured one; missing:
+        // no file; good and changed qualify so far.
+        assert_eq!(registry.warm_digests(), (3, 1));
+        assert_eq!(registry.unqualified_executables(), 2);
+        std::fs::write(&changed, vec![4u8; 4096]).unwrap();
+        assert_eq!(
+            registry.unqualified_executables(),
+            3,
+            "changed since hashed"
+        );
+        // A second configured entry for the same good path with a wrong
+        // digest counts separately.
+        let again = registry_with(&[(&good, &digest), (&good, &other)]);
+        assert_eq!(again.unqualified_executables(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Sets the modification time of `path` to a fixed time long ago, as an
+    /// installer that preserves timestamps (`cp -p`, `install -p`) would.
+    fn backdate(path: &Path) {
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_833_200);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+
+    /// Whole second of the last status change (ctime) of `path`.
+    fn status_change_second(path: &Path) -> i64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).unwrap().ctime()
+    }
+
+    /// Blocks until the wall clock is in whole second `second`.
+    fn wait_until_second(second: u64) {
+        while std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            < second
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// An ordinary update that keeps an old mtime (installer-style: new bytes
+    /// written, mtime backdated, renamed over the path) after the process
+    /// started is still refused, because the kernel status-change time of
+    /// the new file is not before the process birth second, even though the
+    /// configured digest matches the new bytes and the mtime looks old. The
+    /// process's own reported executable path does not change in this case
+    /// (probed on this platform), so the file times are the only evidence.
+    #[test]
+    fn backdated_replacement_after_process_start_is_not_proven_loaded() {
+        let dir = scratch("upd");
+        let exe = dir.join("exe");
+        std::fs::write(&exe, vec![1u8; 4096]).unwrap();
+        backdate(&exe);
+        let installed = u64::try_from(status_change_second(&exe)).unwrap();
+        let born = installed + 1;
+        let digest_old = file_sha256(&exe).unwrap();
+        let mut before = registry_with(&[(&exe, &digest_old)]);
+        before
+            .verify_loaded(&exe, born, &digest_old)
+            .expect("installed before the process was born");
+
+        // The update happens after the process birth second.
+        wait_until_second(born);
+        let staged = dir.join("staged");
+        std::fs::write(&staged, vec![2u8; 4096]).unwrap();
+        backdate(&staged);
+        std::fs::rename(&staged, &exe).unwrap();
+        let digest_new = file_sha256(&exe).unwrap();
+        assert_ne!(digest_old, digest_new);
+        // A daemon constructed after the update warms and is configured
+        // with the new digest.
+        let mut after = registry_with(&[(&exe, &digest_new)]);
+        assert!(
+            after.verify_loaded(&exe, born, &digest_new).is_err(),
+            "the old process cannot have loaded the new bytes"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An in-place same-size rewrite whose mtime is restored after startup
+    /// cannot reuse the digest hashed before it: the status-change time is
+    /// part of the file identity.
+    #[test]
+    fn restored_mtime_after_an_in_place_rewrite_does_not_reuse_the_warmed_digest() {
+        let dir = scratch("inp");
+        let exe = dir.join("exe");
+        std::fs::write(&exe, vec![1u8; 4096]).unwrap();
+        backdate(&exe);
+        let digest = file_sha256(&exe).unwrap();
+        let mut registry = registry_with(&[(&exe, &digest)]);
+        registry
+            .verify_loaded(&exe, u64::MAX, &digest)
+            .expect("warmed and unchanged");
+        // Same size, other bytes, original mtime put back.
+        wait_until_second(u64::try_from(status_change_second(&exe)).unwrap() + 1);
+        std::fs::write(&exe, vec![2u8; 4096]).unwrap();
+        backdate(&exe);
+        assert!(
+            registry.verify_loaded(&exe, u64::MAX, &digest).is_err(),
+            "the stale digest must not vouch for the rewritten file"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

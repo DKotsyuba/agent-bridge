@@ -2544,3 +2544,84 @@ fn only_an_own_non_compact_session_start_renews_or_idles_the_owner() {
     assert_eq!(binding_state(&lab, &root), root_before);
     codex.stop();
 }
+
+/// Receipts of one window: a native negative (alone or repeated) and contradictory receipts (a refusal next to a delivery or a hold) are an unknown outcome, never known-unsent; single or repeated delivery and plain holds keep their exact classification; nothing is resent.
+#[test]
+fn contradictory_receipts_in_one_window_are_unknown_not_known_unsent() {
+    use AttemptState::{NativeAccepted, NativeHeld, OutcomeUnknown};
+    let table = [
+        ("refused", OutcomeUnknown),
+        ("delivered", NativeAccepted),
+        ("refused,refused", OutcomeUnknown),
+        ("delivered,delivered", NativeAccepted),
+        ("held,held", NativeHeld),
+        ("refused,delivered", OutcomeUnknown),
+        ("delivered,refused", OutcomeUnknown),
+        ("refused,held", OutcomeUnknown),
+        ("delivered,held", OutcomeUnknown),
+    ];
+    for (index, (behavior, expected)) in table.into_iter().enumerate() {
+        let (report, state, frames) = dispatch_with_receipts(&format!("cr{index}"), behavior);
+        assert!(
+            matches!(report, DispatchReport::Sent { state: reported, .. } if reported == expected),
+            "{behavior}: {report:?}"
+        );
+        assert_eq!(state, Some(expected), "{behavior}");
+        assert_eq!(frames, 1, "{behavior}: a hand-off is never repeated");
+    }
+}
+
+/// A native negative status after the write is not proof that nothing was handed off: the attempt is an unknown outcome, so a delivery that arrives later on another connection (after the callback closed) cannot be turned into an automatic second hand-off.
+#[test]
+fn native_refusal_after_the_write_is_unknown_and_never_repeats() {
+    let lab = Lab::new("nr");
+    let address = lab.claude_address("sess-nr");
+    let custody = Arc::clone(&lab.storage) as Arc<dyn Custody>;
+    let mut carrier =
+        ClaudeLaterCarrier::new(Arc::clone(&lab.registry), custody, ClaudeTiming::default())
+            .unwrap();
+    let mut harness = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    harness.cmd(json!({"cmd": "inbox", "session_id": "sess-nr", "behavior": "refused"}));
+    harness.hook(
+        &lab.socket,
+        Harness::ClaudeCode,
+        hook("SessionStart", "sess-nr"),
+    );
+    harness.hook(&lab.socket, Harness::ClaudeCode, hook("Stop", "sess-nr"));
+    lab.publish("evt-nr", &address, Mode::Message, "refused payload");
+    let timing = DispatchTiming::default();
+    let report = dispatch_message(&lab.storage, &mut carrier, &address, &now, &timing).unwrap();
+    assert!(
+        matches!(
+            report,
+            DispatchReport::Sent {
+                state: AttemptState::OutcomeUnknown,
+                ..
+            }
+        ),
+        "{report:?}"
+    );
+    // The delivery the refusal did not exclude arrives later on another
+    // connection; the attempt stays unknown and nothing is sent again.
+    let frames = harness.cmd(json!({"cmd": "frames"}));
+    let msg_id = frames["frames"][0]["msg_id"].as_str().unwrap().to_string();
+    harness.cmd(json!({"cmd": "receipt", "msg_id": msg_id, "status": "delivered"}));
+    std::thread::sleep(Duration::from_millis(500));
+    for _ in 0..3 {
+        let again = dispatch_message(&lab.storage, &mut carrier, &address, &now, &timing).unwrap();
+        assert!(!matches!(again, DispatchReport::Sent { .. }), "{again:?}");
+    }
+    assert_eq!(
+        lab.attempt("evt-nr").unwrap().state,
+        AttemptState::OutcomeUnknown
+    );
+    assert_eq!(
+        harness.cmd(json!({"cmd": "frames"}))["frames"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "no automatic repeat of a possible hand-off"
+    );
+    harness.stop();
+}

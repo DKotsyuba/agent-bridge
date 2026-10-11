@@ -43,11 +43,18 @@
 //! core raises the overdue incident. Within the short receipt window:
 //! `held` is a
 //! non-terminal hold with a recheck deadline, `delivered` is native
-//! acceptance, a refusal before any hold is known-unsent, and silence is
-//! the ordinary `written_no_receipt`. Receipts that race the first one are
+//! acceptance, any native negative status (a refusal included) is an unknown
+//! outcome because it comes after the write and its no-effect meaning is not
+//! qualified for the supported build (only local failures before any byte is
+//! written are known-unsent), and silence is the ordinary `written_no_receipt`. Receipts that race the first one are
 //! kept in order: a `held` followed by a terminal receipt inside the same
 //! window settles on the terminal one (`delivered` accepted, any negative
 //! unknown), so the second is never lost to the window's single waiter.
+//! Contradictory receipts in one window (a different status after the first
+//! terminal one, such as `delivered` then `held`) are an unknown outcome as
+//! well. Nothing is retried automatically, and a delivery arriving later on
+//! another connection after a negative was settled is ignored (the callback
+//! is closed), leaving the unknown outcome and its incident.
 //! Later receipts are recorded straight
 //! into core: release after hold is acceptance; any negative after a hold
 //! is an unknown outcome (no proof the loaded native classification means
@@ -695,12 +702,36 @@ impl Hub {
         {
             return;
         }
-        for line in text.lines() {
-            if let Some((msg_id, status)) = receipt(line)
-                && msg_id == expected
+        let statuses: Vec<String> = text
+            .lines()
+            .filter_map(receipt)
+            .filter(|(msg_id, _)| msg_id == expected)
+            .map(|(_, status)| status)
+            .collect();
+        self.route_batch(expected, &statuses, peer.pid);
+    }
+
+    /// Routes the receipts of one connection, in order, as one step.
+    ///
+    /// While `send` is inside its window all of them are queued for it
+    /// under one hold of the pending lock, so frames that arrived together
+    /// are always seen together (and judged by `send` as one window).
+    /// Otherwise each goes through [`Hub::route`] separately.
+    fn route_batch(&self, msg_id: &str, statuses: &[String], pid: u32) {
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(entry) = pending.get_mut(msg_id)
+                && pid == entry.recipient_pid
+                && let Waiting::First(sender) = &entry.waiting
             {
-                self.route(&msg_id, &status, peer.pid);
+                for status in statuses {
+                    let _ = sender.send(status.clone());
+                }
+                return;
             }
+        }
+        for status in statuses {
+            self.route(msg_id, status, pid);
         }
     }
 
@@ -708,7 +739,8 @@ impl Hub {
     /// `pid`, which must be the attempt's recipient PID.
     ///
     /// While `send` is inside its window the status is queued for it (under
-    /// the pending lock, in arrival order); afterwards a `delivered` is
+    /// the pending lock, in arrival order; [`Hub::route_batch`] queues a
+    /// whole connection at once); afterwards a `delivered` is
     /// acceptance, a `held` after silence holds until
     /// [`ClaudeTiming::held_recheck_ms`] from now, and any other status is
     /// an unknown outcome.
@@ -1093,8 +1125,10 @@ impl DispatchCarrier for ClaudeLaterCarrier {
     /// Waits up to [`ClaudeTiming::receipt_wait`] for the first receipt,
     /// then, under the pending lock that `Hub::route` also holds while it
     /// queues a receipt, collects every receipt that raced it. The first
-    /// terminal receipt decides (`delivered` is accepted; a negative is
-    /// known-unsent, or unknown when a `held` came first); `held` alone
+    /// terminal receipt decides (`delivered` is accepted; any negative is
+    /// an unknown outcome, since it follows the write), unless a later
+    /// receipt of the window contradicts it (another status, or a `held`
+    /// after it), which is unknown; `held` alone
     /// holds until [`ClaudeTiming::held_recheck_ms`]; silence is written
     /// without receipt. A hand-off is never repeated here.
     fn send(&mut self, attempt: &AttemptRecord) -> Outcome {
@@ -1184,7 +1218,13 @@ impl DispatchCarrier for ClaudeLaterCarrier {
         // first one (a `held` followed at once by its release) are all in
         // the channel now, and every later one sees the state set below.
         receipts.extend(first.try_iter());
-        let held_first = receipts.first().map(String::as_str) == Some("held");
+        // After the first terminal receipt, any different receipt (another
+        // terminal status, or a `held`) contradicts it: a possible effect
+        // was reported next to a refusal, so it cannot be a known non-send.
+        let contradictory = receipts
+            .iter()
+            .position(|status| status != "held")
+            .is_some_and(|first| receipts[first + 1..].iter().any(|s| *s != receipts[first]));
         // The first terminal receipt decides; `held` only when none came.
         let status = receipts
             .iter()
@@ -1198,6 +1238,13 @@ impl DispatchCarrier for ClaudeLaterCarrier {
             outcome
         };
         match status {
+            Some(_) if contradictory => settled(
+                pending,
+                Outcome::OutcomeUnknown {
+                    reason: "contradictory native receipts in one window; no proof of no context acceptance"
+                        .into(),
+                },
+            ),
             Some("held") => {
                 let recheck_ms = now.saturating_add(self.timing.held_recheck_ms);
                 if let Some(entry) = pending.get_mut(&msg_id) {
@@ -1219,18 +1266,16 @@ impl DispatchCarrier for ClaudeLaterCarrier {
                     reason: "native dropped receipt; context acceptance not excluded".into(),
                 },
             ),
-            Some(other) if held_first => settled(
+            // Any other native status is written after the hand-off: its
+            // no-effect meaning is not qualified for the supported build,
+            // so it is never known-unsent (only local failures before the
+            // write are), and it is never retried automatically.
+            Some(other) => settled(
                 pending,
                 Outcome::OutcomeUnknown {
                     reason: format!(
                         "native {other} after a possible hand-off; no proof of no context acceptance"
                     ),
-                },
-            ),
-            Some(other) => settled(
-                pending,
-                Outcome::KnownUnsent {
-                    evidence: format!("native inbox {other} the message before any hold"),
                 },
             ),
             None => {

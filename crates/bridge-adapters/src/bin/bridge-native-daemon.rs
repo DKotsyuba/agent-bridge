@@ -14,8 +14,11 @@
 //! the idempotent `Registry::warm_digests`), so no hook request
 //! reads a whole executable under the registry lock; startup takes about
 //! one streamed read of those files (about 1.6 s per 246 MB optimized, far
-//! longer unoptimized) and logs `executable_digests_warmed` with the cached
-//! and skipped counts. Serving never hashes: a configured file that was
+//! longer unoptimized) and logs `executable_digests_warmed` with the cached,
+//! skipped and unqualified counts (a warning when either of the last two is
+//! non-zero: a file is missing, unreadable or changing, or its real hash is
+//! not the configured digest; counts only, no paths or contents). Serving
+//! never hashes: a configured file that was
 //! missing or unreadable at startup, or is installed, replaced or modified
 //! later, is refused as unqualified until the daemon is restarted (other
 //! warmed executables keep attesting); after updating a harness build,
@@ -111,12 +114,21 @@ fn main() -> ExitCode {
     // anything is served; this idempotent call re-reads nothing and only
     // reports the counts.
     let (cached, skipped) = registry.warm_digests();
+    let unqualified = registry.unqualified_executables();
+    // Counts only, never paths, digests or file contents. A warning means
+    // some configured route cannot attest until the files or the
+    // configured digests are fixed and the daemon is restarted.
     service::log_event(
-        "info",
+        if skipped > 0 || unqualified > 0 {
+            "warn"
+        } else {
+            "info"
+        },
         "executable_digests_warmed",
         &[
             ("cached", &cached.to_string()),
             ("skipped", &skipped.to_string()),
+            ("unqualified", &unqualified.to_string()),
         ],
     );
     let registry = Arc::new(Mutex::new(registry));

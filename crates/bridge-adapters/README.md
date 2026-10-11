@@ -29,18 +29,29 @@ separate Root step, and what is not established is listed at the end.
   credentials (PID, UID). A peer is a *hook of a harness* only if it runs as
   the daemon's user and its nearest ancestor that is not an allowlisted shell
   (`intermediates`) is a configured harness executable whose resolved path and
-  SHA-256 match a profile, whose file was not modified after that process
-  started (loaded build = disk build), and whose own store (`CODEX_HOME` /
+  SHA-256 match a profile, whose file was last modified *and* last changed
+  (kernel ctime, which `cp -p` / `install -p` / `touch` cannot restore)
+  strictly before the whole second that process started, so the bytes
+  hashed at daemon startup are the bytes it started from (a replacement or
+  in-place rewrite after the start, even with a preserved mtime, and a change
+  in the start second itself are unproven: restart the harness a second or
+  more after installing a build; a benign chmod or link change after the
+  start also makes the file unproven until the harness restarts; the OS keeps
+  reporting the same executable path for the live process after a
+  replacement, so the path proves nothing, and none of this defends against
+  code that can move the clock backwards), and whose own store (`CODEX_HOME` /
   `CLAUDE_CONFIG_DIR`, else `$HOME/.codex` / `$HOME/.claude`, read from that
   process's own environment) is that profile's store. PID, UID, cwd, argv or
   a process name alone never qualify. `Registry::new` (so every consumer that
   constructs and then serves a registry, the daemon included) hashes every
   configured harness and relay executable once before it returns
-  (`executable_digests_warmed` logs the daemon's cached/skipped counts; about
+  (`executable_digests_warmed` logs the daemon's cached/skipped/unqualified
+  counts, as a warning when a file is missing, unreadable or changing or its
+  real hash differs from the configured digest, never paths or contents; about
   one streamed read of those files, roughly 1.6 s per 246 MB optimized and
   several times longer unoptimized), and keeps
   the real digest per exact file identity (path, device and inode, length,
-  nanosecond mtime). Serving never hashes: a hook or relay request never reads
+  nanosecond mtime and ctime). Serving never hashes: a hook or relay request never reads
   an executable under the registry lock. A file that was missing or unreadable
   at startup, or is installed, replaced or modified afterwards (even a
   same-size rewrite in the same second), has no digest for its identity and is
@@ -130,11 +141,18 @@ separate Root step, and what is not established is listed at the end.
   identity, read first thing after accept, is the attested recipient PID as
   this user; a sender that already closed (its PID is no longer readable) is
   ignored and logged `claude_receipt_unverifiable` — fail closed, the
-  attempt stays held/unreceipted until core's overdue incident. `held` is non-terminal, `delivered` is acceptance, a refusal
-  before any hold is known-unsent, any negative after a hold is unknown, and
-  silence is `written_no_receipt`. A `held` followed by a terminal receipt
+  attempt stays held/unreceipted until core's overdue incident. `held` is non-terminal, `delivered` is acceptance, any other
+  native status after the write (a refusal included, with or without a hold)
+  is an unknown outcome, never known-unsent, since its no-effect meaning is
+  not qualified for the supported build and a delivery on another connection
+  could still follow; only local failures before any byte is written are
+  known-unsent; silence is `written_no_receipt`. A `held` followed by a terminal receipt
   inside the same first-receipt window settles on the terminal one in order
-  (`delivered` accepted, a negative unknown); the hold horizon of both the
+  (`delivered` accepted, a negative unknown); contradictory receipts in one
+  window (a different status after the first terminal one) are unknown too;
+  a delivery that arrives later on another connection after a negative was
+  settled is ignored, leaving the unknown outcome (no automatic repeat); the
+  hold horizon of both the
   first-window and the late `held` path is `held_recheck_ms`. That hand-off is
   reconciled against the
   addressed session's own native transcript (shapes observed on 2.1.296; at

@@ -59,10 +59,23 @@ impl Drop for TempDir {
 }
 
 /// Resolved path of the fixture executable.
+///
+/// The registry refuses a build written or changed (mtime or ctime) in the
+/// same whole second a process started or later (the loaded bytes are then
+/// unproven), so when the fixture was linked this very second the call first waits,
+/// honestly, until the clock is in a later second; any process started from it afterwards is born
+/// strictly after its mtime and ctime. An older fixture costs nothing.
 pub fn fixture_exe() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_bridge-fixture"))
+    use std::os::unix::fs::MetadataExt;
+    let path = PathBuf::from(env!("CARGO_BIN_EXE_bridge-fixture"))
         .canonicalize()
-        .unwrap()
+        .unwrap();
+    let metadata = std::fs::metadata(&path).unwrap();
+    let written = metadata.mtime().max(metadata.ctime());
+    while i64::try_from(now() / 1000).unwrap() <= written {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    path
 }
 
 /// Path of the product hook executable.
