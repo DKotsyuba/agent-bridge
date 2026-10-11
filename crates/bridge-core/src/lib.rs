@@ -18,12 +18,15 @@
 //! and are intentionally absent here. Storage callers pass an
 //! already-authenticated publisher identity.
 
+pub mod dispatch;
+pub mod framing;
 pub mod service;
 pub mod storage;
 pub mod types;
 
 pub use service::{
-    Config, GrantConfig, PublishBody, Request, Response, Running, start as start_service,
+    Config, DeliveryEvidence, GrantConfig, PublishBody, Request, Response, Running,
+    start as start_service,
 };
 pub use storage::{CustodyReceipt, EventState, Limits, PublishOutcome, Storage};
 pub use types::{

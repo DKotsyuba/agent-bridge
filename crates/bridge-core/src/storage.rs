@@ -21,25 +21,50 @@ use crate::types::{CoreError, Envelope, EnvelopeHash, Policy};
 /// A database whose version differs is refused rather than migrated
 /// implicitly; migration is a deliberate later-task operation. Version 2
 /// scopes latest-stream watermarks by publisher, recipient, kind, mode,
-/// project/task and stream instead of one global stream key.
-const STORAGE_SCHEMA_VERSION: u32 = 2;
+/// project/task and stream instead of one global stream key. Version 3
+/// adds dispatch attempts, recovery incidents and recipient no-wake
+/// policies.
+const STORAGE_SCHEMA_VERSION: u32 = 3;
 
 /// Operational limits applied at admission.
 ///
-/// Bounds are explicit errors, never silent truncation or eviction. The hard
-/// cap counts admitted (non-terminal) events: when it is reached, new
-/// admission is refused explicitly rather than evicting dedup history.
+/// Bounds are explicit errors, never silent truncation or eviction. The
+/// global hard cap counts admitted (non-terminal) events: when it is
+/// reached, new admission is refused explicitly rather than evicting dedup
+/// history. The per-publisher item quota and the per-recipient replaceable-
+/// snapshot quota implement admission fairness: keep_all events are exempt
+/// from the snapshot quota so a diagnostics flood cannot fill storage
+/// before independent completions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Limits {
     /// Maximum number of admitted, not-yet-terminal events.
     pub max_admitted_events: usize,
+    /// Maximum pending events per publisher (item quota).
+    #[serde(default = "default_max_per_publisher")]
+    pub max_pending_per_publisher: usize,
+    /// Maximum pending `latest` snapshots per recipient; keep_all events
+    /// do not count against this reserve.
+    #[serde(default = "default_max_latest_per_recipient")]
+    pub max_pending_latest_per_recipient: usize,
+}
+
+/// Default per-publisher item quota.
+const fn default_max_per_publisher() -> usize {
+    10_000
+}
+
+/// Default per-recipient snapshot quota.
+const fn default_max_latest_per_recipient() -> usize {
+    128
 }
 
 impl Limits {
-    /// Limits with the given hard cap.
+    /// Limits with the given global hard cap and default fairness quotas.
     pub const fn new(max_admitted_events: usize) -> Self {
         Limits {
             max_admitted_events,
+            max_pending_per_publisher: 10_000,
+            max_pending_latest_per_recipient: 128,
         }
     }
 }
@@ -112,7 +137,9 @@ pub struct PublishOutcome {
 /// at a higher level (the service task owns threading). Not `Sync`; open one
 /// per thread if ever needed.
 pub struct Storage {
-    connection: Connection,
+    /// The single SQLite connection; crate-visible for the dispatch and
+    /// service modules that share this store.
+    pub(crate) connection: Connection,
     limits: Limits,
 }
 
@@ -163,8 +190,12 @@ impl Storage {
                  acceptance_seq INTEGER NOT NULL,
                  accepted_at_ms INTEGER NOT NULL,
                  expires_at_ms INTEGER,
+                 recipient TEXT NOT NULL DEFAULT '',
+                 policy_class TEXT NOT NULL DEFAULT '',
                  PRIMARY KEY (publisher_id, event_id)
              );
+             CREATE INDEX IF NOT EXISTS events_dispatch
+                 ON events (state, recipient, policy_class, acceptance_seq);
              CREATE TABLE IF NOT EXISTS counters (
                  name TEXT PRIMARY KEY,
                  value INTEGER NOT NULL
@@ -180,7 +211,45 @@ impl Storage {
                  stream_id TEXT NOT NULL,
                  revision INTEGER NOT NULL,
                  PRIMARY KEY (publisher_id, recipient, kind, mode, project, task, stream_id)
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS attempts (
+                 attempt_seq INTEGER PRIMARY KEY,
+                 publisher_id TEXT NOT NULL,
+                 event_id TEXT NOT NULL,
+                 state TEXT NOT NULL,
+                 effective_mode TEXT NOT NULL,
+                 manifest_hash TEXT NOT NULL,
+                 lease_expires_ms INTEGER,
+                 created_ms INTEGER NOT NULL,
+                 updated_ms INTEGER NOT NULL,
+                 note TEXT
+             );
+             CREATE INDEX IF NOT EXISTS attempts_by_event
+                 ON attempts (publisher_id, event_id, attempt_seq);
+             CREATE TABLE IF NOT EXISTS incidents (
+                 incident_seq INTEGER PRIMARY KEY,
+                 publisher_id TEXT NOT NULL,
+                 event_id TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 reason TEXT NOT NULL,
+                 state TEXT NOT NULL DEFAULT 'open',
+                 created_ms INTEGER NOT NULL,
+                 updated_ms INTEGER NOT NULL,
+                 next_check_ms INTEGER,
+                 review_deadline_ms INTEGER,
+                 blocked_dependents TEXT NOT NULL DEFAULT '[]',
+                 resolution TEXT
+             );
+             CREATE INDEX IF NOT EXISTS incidents_open
+                 ON incidents (state, next_check_ms);
+             CREATE TABLE IF NOT EXISTS recipient_policies (
+                 recipient TEXT PRIMARY KEY,
+                 no_wake INTEGER NOT NULL,
+                 reason TEXT,
+                 set_ms INTEGER NOT NULL
+             );
+             INSERT OR IGNORE INTO counters (name, value) VALUES ('attempt_seq', 0);
+             INSERT OR IGNORE INTO counters (name, value) VALUES ('incident_seq', 0);",
         )?;
         let stored: Option<String> = tx
             .query_row(
@@ -294,14 +363,46 @@ impl Storage {
                     limit: format!("max_admitted_events {}", self.limits.max_admitted_events),
                 });
             }
+            let per_publisher: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE state = 'pending' AND publisher_id = ?1",
+                params![envelope.publisher.as_str()],
+                |row| row.get(0),
+            )?;
+            if per_publisher >= self.limits.max_pending_per_publisher as i64 {
+                return Err(CoreError::Capacity {
+                    limit: format!(
+                        "max_pending_per_publisher {}",
+                        self.limits.max_pending_per_publisher
+                    ),
+                });
+            }
+            if matches!(envelope.policy, Policy::Latest { .. }) {
+                let recipient = envelope.recipient.to_canonical_string();
+                let snapshots: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM events
+                     WHERE state = 'pending' AND policy_class = 'latest'
+                       AND recipient = ?1",
+                    params![recipient],
+                    |row| row.get(0),
+                )?;
+                if snapshots >= self.limits.max_pending_latest_per_recipient as i64 {
+                    return Err(CoreError::Capacity {
+                        limit: format!(
+                            "max_pending_latest_per_recipient {} (keep_all is exempt)",
+                            self.limits.max_pending_latest_per_recipient
+                        ),
+                    });
+                }
+            }
         }
 
         let acceptance_seq = Self::next_acceptance_seq(&tx)?;
         tx.execute(
             "INSERT INTO events
                  (publisher_id, event_id, envelope_hash, envelope_json, state,
-                  acceptance_seq, accepted_at_ms, expires_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                  acceptance_seq, accepted_at_ms, expires_at_ms, recipient, policy_class)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 envelope.publisher.as_str(),
                 envelope.event_id.as_str(),
@@ -313,6 +414,8 @@ impl Storage {
                 envelope
                     .expires_at
                     .map(|expiry| expiry.unix_millis() as i64),
+                envelope.recipient.to_canonical_string(),
+                envelope.policy.as_str(),
             ],
         )?;
 

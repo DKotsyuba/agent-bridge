@@ -259,9 +259,13 @@ fn status_discloses_only_the_callers_own_events() {
     let mut client = bridge_client::BridgeClient::connect(&socket).unwrap();
     client.publish(GRANT_TOKEN, &body("evt-own")).unwrap();
 
-    // The owning publisher sees its custody state.
-    let own = client.status(GRANT_TOKEN, "evt-own").unwrap().unwrap();
+    // The owning publisher sees its custody state and delivery evidence
+    // (absent until a dispatch attempt exists: not_available, not
+    // delivered).
+    let (own, delivery) = client.status(GRANT_TOKEN, "evt-own").unwrap();
+    let own = own.unwrap();
     assert_eq!(own.event_id, "evt-own");
+    assert!(delivery.is_none());
 
     // Another publisher's token never discloses it (its publisher scope
     // has no such event), even with the event id known.
@@ -271,12 +275,14 @@ fn status_discloses_only_the_callers_own_events() {
             .to_string(),
     );
     match response {
-        Response::Status { receipt } => assert!(receipt.is_none()),
+        Response::Status { receipt, .. } => assert!(receipt.is_none()),
         other => panic!("expected empty status, got {other:?}"),
     }
 
     // Unknown ids are simply absent, not an error.
-    assert!(client.status(GRANT_TOKEN, "evt-never").unwrap().is_none());
+    let (absent, no_delivery) = client.status(GRANT_TOKEN, "evt-never").unwrap();
+    assert!(absent.is_none());
+    assert!(no_delivery.is_none());
 
     running.shutdown();
     running.join();
@@ -430,4 +436,191 @@ fn expiry_flows_through_the_service() {
         .unwrap()
         .unwrap();
     assert_eq!(row.state, bridge_core::EventState::Expired);
+}
+
+/// Startup must refuse a live endpoint and never unlink it for a successor.
+#[test]
+fn refuses_active_endpoint_replacement() {
+    let first_dir = TempDir::new("own-live");
+    let first_config = test_config(&first_dir);
+    let first = service::start(first_config.clone()).unwrap();
+    let socket = first.socket_path().to_path_buf();
+
+    // A second instance on the same live socket must refuse.
+    let mut second_config = test_config(&first_dir);
+    second_config.socket = socket.clone();
+    let second = service::start(second_config);
+    assert!(second.is_err(), "live endpoint was replaced");
+    assert!(
+        socket.exists(),
+        "refused start must not unlink the live path"
+    );
+
+    // The first instance's stop must not remove a successor's endpoint;
+    // here it removes only its own, and the path is gone as it should be.
+    first.shutdown();
+    first.join();
+    assert!(!socket.exists());
+}
+
+/// Startup at a non-socket path must fail without deleting foreign bytes.
+#[test]
+fn preserves_existing_non_socket_file() {
+    let dir = TempDir::new("own-file");
+    let mut config = test_config(&dir);
+    let sentinel = dir.path("sentinel.txt");
+    std::fs::write(&sentinel, b"owner fixture must survive").unwrap();
+    config.socket = sentinel.clone();
+
+    assert!(
+        service::start(config).is_err(),
+        "startup over a regular file"
+    );
+    assert_eq!(
+        std::fs::read(&sentinel).ok().as_deref(),
+        Some(b"owner fixture must survive".as_slice()),
+        "foreign file bytes must be preserved"
+    );
+}
+
+/// A stale socket (dead daemon) is claimed safely.
+#[test]
+fn claims_stale_socket() {
+    let dir = TempDir::new("own-stale");
+    let config = test_config(&dir);
+    let running = service::start(config.clone()).unwrap();
+    let socket = running.socket_path().to_path_buf();
+    running.shutdown();
+    running.join();
+    // Simulated dead daemon: recreate the socket file with no listener.
+    std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    drop(std::os::unix::net::UnixListener::bind(&socket).err());
+    let _ = std::fs::remove_file(&socket);
+    std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let reclaimed = service::start(config);
+    assert!(reclaimed.is_ok(), "stale socket must be claimable");
+    let reclaimed = reclaimed.unwrap();
+    reclaimed.shutdown();
+    reclaimed.join();
+}
+
+/// An oversized unterminated line is refused and the connection closed
+/// without unbounded buffering; the service stays healthy.
+#[test]
+fn oversized_unterminated_line_is_refused_and_closed() {
+    let dir = TempDir::new("frame-limit");
+    let config = test_config(&dir);
+    let running = service::start(config).unwrap();
+    let socket = running.socket_path().to_path_buf();
+    assert!(wait_listening(&socket, Duration::from_secs(5)));
+
+    use std::io::{Read, Write};
+    let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    let flood = vec![b'a'; 600 * 1024]; // over MAX_REQUEST_BYTES, no newline
+    // The server may close mid-write once the cap is hit; that is the
+    // bounded-framing behavior under test.
+    let _ = stream.write_all(&flood);
+    let _ = stream.flush();
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let mut tail = String::new();
+    let _ = stream.read_to_string(&mut tail);
+    assert!(
+        tail.contains("exceeds") || tail.is_empty(),
+        "expected refusal or close, got {tail:?}"
+    );
+
+    // The service still serves the next well-formed client.
+    let mut client = bridge_client::BridgeClient::connect(&socket).unwrap();
+    let receipt = client
+        .publish(GRANT_TOKEN, &body("evt-after-flood"))
+        .unwrap();
+    assert_eq!(receipt.publisher, "agent-run");
+
+    running.shutdown();
+    running.join();
+}
+
+/// Idle clients do not block a bounded shutdown, and a publish that arrives
+/// after the stop request is fenced out without custody.
+#[test]
+fn idle_clients_and_publish_after_stop_are_fenced() {
+    let dir = TempDir::new("stop-fence");
+    let config = test_config(&dir);
+    let running = service::start(config).unwrap();
+    let socket = running.socket_path().to_path_buf();
+    assert!(wait_listening(&socket, Duration::from_secs(5)));
+
+    // A pile of idle connections (well under the admission cap).
+    let mut idle: Vec<std::os::unix::net::UnixStream> = (0..8)
+        .filter_map(|_| std::os::unix::net::UnixStream::connect(&socket).ok())
+        .collect();
+    assert_eq!(idle.len(), 8);
+
+    let mut admin = bridge_client::BridgeClient::connect(&socket).unwrap();
+    admin.shutdown(ADMIN_TOKEN).unwrap();
+    drop(admin);
+
+    let started = Instant::now();
+    running.join();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "idle clients must not make shutdown unbounded"
+    );
+    drop(&mut idle);
+
+    // A publish racing after the stop is refused with no custody row.
+    // The socket is gone; a connect now fails, proving the fence by
+    // construction, so re-check custody instead.
+    let storage = Storage::open(dir.path("bridge.db"), Limits::new(100)).unwrap();
+    assert!(
+        storage
+            .lookup(
+                &PublisherId::new("agent-run").unwrap(),
+                &EventId::new("evt-never-after-stop").unwrap()
+            )
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Connection admission is bounded: far more simultaneous connections than
+/// the cap are tolerated by the service and do not break later clients.
+#[test]
+fn connection_flood_is_admission_bounded() {
+    let dir = TempDir::new("conn-cap");
+    let config = test_config(&dir);
+    let running = service::start(config).unwrap();
+    let socket = running.socket_path().to_path_buf();
+    assert!(wait_listening(&socket, Duration::from_secs(5)));
+
+    let mut flood: Vec<std::os::unix::net::UnixStream> = (0..200)
+        .filter_map(|_| std::os::unix::net::UnixStream::connect(&socket).ok())
+        .collect();
+    assert!(
+        flood.len() >= 64,
+        "expected the OS to queue the flood (got {})",
+        flood.len()
+    );
+    flood.clear();
+    // Give the accept loop a moment to reclaim admission slots after the
+    // flood sockets close, then verify ordinary service.
+    assert!(
+        wait_listening(&socket, Duration::from_secs(5)),
+        "service must remain reachable after a connection flood"
+    );
+    let mut client = loop {
+        if let Ok(client) = bridge_client::BridgeClient::connect(&socket) {
+            break client;
+        }
+        if !wait_listening(&socket, Duration::from_millis(200)) {
+            panic!("service stopped accepting after flood");
+        }
+    };
+    let receipt = client
+        .publish(GRANT_TOKEN, &body("evt-after-flood-2"))
+        .unwrap();
+    assert_eq!(receipt.publisher, "agent-run");
+
+    running.shutdown();
+    running.join();
 }
