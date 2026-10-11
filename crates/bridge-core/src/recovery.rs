@@ -1479,7 +1479,16 @@ impl Storage {
         Ok(escalated)
     }
 
-    /// Counts events by delivery state (diagnostics and tests).
+    /// Counts currently open incidents (operator count surface).
+    pub fn open_incident_count(&self) -> Result<u64, CoreError> {
+        count(
+            &self.connection,
+            "SELECT COUNT(*) FROM incidents WHERE state = 'open'",
+            params![],
+        )
+    }
+
+    /// Counts events in `state` for diagnostics and protected operator totals.
     pub fn count_delivery(&self, state: DeliveryState) -> Result<u64, CoreError> {
         let text = match state {
             DeliveryState::Unhanded => delivery::UNHANDED,

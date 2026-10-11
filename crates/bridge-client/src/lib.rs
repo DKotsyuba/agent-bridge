@@ -15,7 +15,7 @@
 //! by the service, but only for requests that are safe to repeat.
 
 pub use bridge_core::recovery::{EvidenceTier, HoldView, IncidentView};
-pub use bridge_core::service::DeliveryEvidence;
+pub use bridge_core::service::{DeliveryCounts, DeliveryEvidence};
 pub use bridge_core::{
     CoreError, CustodyReceipt, Envelope, EnvelopeHash, EventId, ExpiresAt, Harness, Kind, Metadata,
     Mode, NativeAddress, Payload, Policy, PublisherId, SCHEMA_VERSION, StreamId,
@@ -270,7 +270,26 @@ impl BridgeClient {
         })
     }
 
+    /// Reads bounded delivery counts (events per tier plus open
+    /// incidents); operator grants only.
+    pub fn counts(&mut self, token: &str) -> Result<DeliveryCounts, ProtocolError> {
+        match self.round_trip(
+            &Request::Counts {
+                token: Token::new(token),
+            },
+            false,
+        )? {
+            Response::Counts { counts } => Ok(counts),
+            Response::Error { class, detail } => Err(ProtocolError { class, detail }),
+            other => Err(ProtocolError {
+                class: "internal".into(),
+                detail: format!("unexpected response to counts: {other:?}"),
+            }),
+        }
+    }
+
     /// Sets the durable no-wake policy for a recipient.
+    ///
     pub fn pause(
         &mut self,
         token: &str,
