@@ -50,6 +50,17 @@
  * Only the read-only fixture tools `bridge_me` (approved) and
  * `bridge_unlisted` (the host negative boundary: the host must refuse it with
  * an approval refusal and the fixture must never see it) are added.
+ * The config gate reads configuration, not the thread runtime. Before the FIRST
+ * paid turn (after `thread/start` and the daemon start, because the thread id
+ * must exist and the daemon's grant names it) the driver therefore observes the
+ * exact own server on the exact own thread with the build's
+ * `mcpServerStatus/list` (`serverName: bridge_probe`, `threadId`, `detail:
+ * toolsAndAuthOnly`, complete pagination, up to 60 s): `runtimeStatus` must be
+ * `connected`, `toolsError` empty and both `bridge_me` and `bridge_unlisted`
+ * advertised (`mcpInventoryVerdict`); anything unavailable, failed, malformed,
+ * incomplete or timed out aborts BEFORE any model turn (`mcp_inventory_ready`).
+ * Only the own fields are kept in `mcp_inventory`. This observes readiness; it
+ * does not prove the model will call the tool.
  *
  * One backend process "A" (an unconfined `codex app-server` over stdio, the
  * supported frontend) starts a thread T1 BEFORE the daemon so the daemon's
@@ -123,6 +134,10 @@ const { MODEL, EFFORT, POLICY, DISABLED, EVENTS, ME_APPROVAL, gateRead, stateOve
  * @typedef {{last: {totalTokens: number}, total: {totalTokens: number}}} TokenUsage */
 /** One retained App Server notification (no request id); only the parameter fields this probe reads are named, every other field is ignored.
  * @typedef {{method: string, params?: {threadId?: string, turnId?: string, turn?: {id?: string, status?: string}, run?: {eventName?: string, status?: string, source?: string}, item?: {type?: string, text?: string, tool?: string, status?: string, error?: JsonValue}, tokenUsage?: TokenUsage}}} Notification */
+/** One `mcpServerStatus/list` request and the response it got (null when none arrived in time), kept together so the exact parameters sent can be checked.
+ * @typedef {{params: RpcParams, response: RpcResponse|null}} McpExchange */
+/** Verdict of one MCP inventory read: whether the own server is connected on the own thread with both own tools, why not, whether the state is terminal (no waiting can fix it), and ONLY the own fields observed.
+ * @typedef {{ready: boolean, terminal: boolean, reason: string, runtime_status: string|null, tools: string[], pages: number}} McpVerdict */
 /** A hook run the frontend reported (`hook/completed`): camelCase event name, run status and hook source (`sessionFlags` is this probe's own per-launch hook).
  * @typedef {{event: string, status: string, source: string}} HookRun */
 /** One row of the Core `events` table as this probe selects it.
@@ -159,6 +174,16 @@ const MAX_TURNS = 3;
  */
 const TOKEN_STOP = 150_000;
 /**
+ * Total elapsed readiness budget, in milliseconds, shared by inventory requests before the first paid turn.
+ * @type {number}
+ */
+const MCP_READY_MS = 60_000;
+/**
+ * Most `mcpServerStatus/list` pages one inventory read follows; a longer listing counts as incomplete.
+ * @type {number}
+ */
+const MAX_MCP_PAGES = 5;
+/**
  * Longest wait for a turn's native `turn/completed`, in milliseconds; a turn without it is interrupted and the run aborts.
  * @type {number}
  */
@@ -191,7 +216,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
  */
 const REQUIRED = [
   'versions_recorded', 'model_in_catalog', 'network_fence_witnessed', 'hooks_isolated', 'approval_config_effective', 'foreign_mcp_disabled',
-  'config_residual_closed', 'daemon_started', 't1_thread_started', 'turn1_completed', 't1_root_attested', 't1_binding_matches_caller', 't1_hooks_observed', 't1_hooks_clean',
+  'config_residual_closed', 'daemon_started', 't1_thread_started', 'mcp_inventory_ready', 'turn1_completed', 't1_root_attested', 't1_binding_matches_caller', 't1_hooks_observed', 't1_hooks_clean',
   'unlisted_refused_by_host', 'unlisted_not_executed', 'loaded_process_identified',
   'archive_ok', 'archived_inject_pending_without_pause', 'unarchive_ok',
   'backend_a_dead', 'dead_message_held_fail_closed', 'dead_message_disposed_unsent', 'inject_pending_through_disconnect', 'old_epoch_retained_while_dead',
@@ -268,6 +293,86 @@ function hooksPositive(runs, failures, required) {
 function approvalRefusal(call) {
   const text = call.error && typeof call.error === 'object' && !Array.isArray(call.error) ? call.error.message : call.error;
   return call.status === 'failed' && typeof text === 'string' && /approval/i.test(text);
+}
+
+/** Judges one complete inventory read of the own MCP server on the own thread.
+ *
+ * The read is a chain of `mcpServerStatus/list` exchanges. Every request must
+ * carry EXACTLY `serverName: bridge_probe`, `threadId: <thread>` and
+ * `detail: toolsAndAuthOnly` (a read for another server or thread proves
+ * nothing about this one); the first has no cursor and each later one the
+ * previous response's `nextCursor`; every response is a success whose `data`
+ * is an array; the last page has no `nextCursor` (a listing cut short or
+ * longer than the page bound is incomplete). Across the pages exactly one row
+ * named `bridge_probe` must exist (rows of other servers are ignored and
+ * never retained), whose `runtimeStatus` is `connected` (the thread-runtime
+ * connection state; `starting`/`notStarted`/explicit null are waited for,
+ * while missing, malformed, unsupported or unusable values are terminal), whose
+ * `toolsError` is null or absent, and whose `tools` catalog holds both
+ * `bridge_me` and `bridge_unlisted` (by catalog key or tool name). Any
+ * malformed, errored, missing or incomplete response is terminal.
+ * @param {string} thread The own native thread id.
+ * @param {McpExchange[]} exchanges The exchanges of one read, in order.
+ * @returns {McpVerdict} The verdict; `tools` lists only the two own tool names found.
+ */
+function mcpInventoryVerdict(thread, exchanges) {
+  /** Builds a verdict with the page count of this read.
+   * @param {boolean} ready Whether the gate may open.
+   * @param {boolean} terminal Whether waiting cannot fix the state.
+   * @param {string} reason Short cause.
+   * @param {string|null} [status] Observed runtime status.
+   * @param {string[]} [tools] Own tool names found.
+   * @returns {McpVerdict}
+   */
+  const verdict = (ready, terminal, reason, status = null, tools = []) => ({ ready, terminal, reason, runtime_status: status, tools, pages: exchanges.length });
+  if (exchanges.length === 0 || exchanges.length > MAX_MCP_PAGES) return verdict(false, true, 'no or too many pages');
+  const rows = [];
+  let cursor = null;
+  for (const [index, { params, response }] of exchanges.entries()) {
+    if (!params || params.serverName !== 'bridge_probe' || params.threadId !== thread || params.detail !== 'toolsAndAuthOnly') return verdict(false, true, 'request is not for the own server on the own thread');
+    if ((params.cursor || null) !== cursor) return verdict(false, true, 'pagination chain broken');
+    if (!response || response.error || !response.result || !Array.isArray(response.result.data)) return verdict(false, true, 'inventory unavailable or malformed');
+    rows.push(...response.result.data);
+    const next = response.result.nextCursor;
+    const last = index === exchanges.length - 1;
+    if (last ? (next !== null && next !== undefined) : typeof next !== 'string' || next === '') return verdict(false, true, 'pagination incomplete');
+    cursor = typeof next === 'string' ? next : null;
+  }
+  const own = rows.filter(row => row && row.name === 'bridge_probe');
+  if (own.length !== 1) return verdict(false, true, own.length === 0 ? 'own server not listed' : 'own server listed more than once');
+  const [row] = own;
+  const status = typeof row.runtimeStatus === 'string' ? row.runtimeStatus : null;
+  if (row.toolsError !== null && row.toolsError !== undefined) return verdict(false, true, 'tool discovery failed', status);
+  if (row.runtimeStatus === null) return verdict(false, false, 'server runtime status not available yet', null);
+  if (status === null) return verdict(false, true, 'malformed server runtime status', null);
+  if (status === 'starting' || status === 'notStarted') return verdict(false, false, 'server runtime not connected yet', status);
+  if (status !== 'connected') return verdict(false, true, 'unsupported or unusable server runtime status', status);
+  const catalog = row.tools && typeof row.tools === 'object' && !Array.isArray(row.tools) ? row.tools : null;
+  if (!catalog) return verdict(false, true, 'tool catalog missing', status);
+  const names = new Set(Object.entries(catalog).flatMap(([key, tool]) => [key, tool && tool.name]));
+  const found = ['bridge_me', 'bridge_unlisted'].filter(name => names.has(name));
+  if (found.length !== 2) return verdict(false, true, 'own tools not both advertised', status, found);
+  return verdict(true, false, 'connected with both own tools', status, found);
+}
+
+/** Remaining time available for one inventory request or for accepting its result.
+ * @param {number} deadline Monotonic readiness deadline in milliseconds.
+ * @param {number} runRemaining Total probe budget left in milliseconds.
+ * @param {number} now Current monotonic time in milliseconds.
+ * @returns {number} The request bound, at most 15 seconds and preserving 60 seconds for cleanup; non-positive means expired.
+ */
+function mcpRequestBudget(deadline, runRemaining, now) {
+  return Math.min(15_000, deadline - now, runRemaining - 60_000);
+}
+
+/** Refuses an otherwise-ready MCP listing if its bounded read finished too late.
+ * @param {string} thread Own native thread id.
+ * @param {McpExchange[]} exchanges One complete inventory read.
+ * @param {number} remainingBudgetMs Positive time left before both readiness and cleanup limits, or zero/negative if expired.
+ * @returns {McpVerdict} The normal inventory verdict while in budget, otherwise a closed readiness verdict.
+ */
+function mcpInventoryWithinBudget(thread, exchanges, remainingBudgetMs) {
+  return mcpInventoryVerdict(thread, remainingBudgetMs > 0 ? exchanges : []);
 }
 
 /** Whether a help text lists a command-line flag as an option (an exact whitespace- or comma-delimited token, so `--ignore-user-config` is not found
@@ -439,6 +544,65 @@ function selfTest() {
   assert.equal(approvalRefusal({ status: 'completed', error: { message: 'approval' } }), false); // not a failed call
   assert.equal(approvalRefusal({ status: 'failed', error: { message: 42 } }), false);
   const help = '  -c, --config <key=value>\n      --enable <FEATURE>\n      --ignore-user-config\n      --ignore-rules  Skip rules\n';
+  /** A synthetic own thread id for the inventory assertions.
+   * @type {string} */
+  const T = '00000000-0000-4000-8000-000000000b01';
+  /** The exact request a read of thread `thread` must send.
+   * @param {string|null} cursor Continuation cursor, or null for the first page.
+   * @param {string} [thread] Thread id asked about (default: the own thread).
+   * @returns {RpcParams}
+   */
+  const askFor = (cursor, thread = T) => ({ serverName: 'bridge_probe', threadId: thread, detail: 'toolsAndAuthOnly', ...(cursor ? { cursor } : {}) });
+  /** A minimal advertised tool.
+   * @param {string} name Tool name.
+   * @returns {{name: string, inputSchema: {}}}
+   */
+  const tool = name => ({ name, inputSchema: {} });
+  const goodRow = { name: 'bridge_probe', runtimeStatus: 'connected', toolsError: null, tools: { bridge_me: tool('bridge_me'), bridge_unlisted: tool('bridge_unlisted') } };
+  /** A successful listing page.
+   * @param {JsonValue[]} data Server rows.
+   * @param {string|null} [next] Continuation cursor, or null for the last page.
+   * @returns {RpcResponse}
+   */
+  const page = (data, next = null) => ({ id: 1, result: { data, nextCursor: next } });
+  /** A single-page read of one row.
+   * @param {JsonValue} row The server row.
+   * @returns {McpExchange[]}
+   */
+  const one = row => [{ params: askFor(), response: page([row]) }];
+  assert.deepEqual(mcpInventoryVerdict(T, one(goodRow)), { ready: true, terminal: false, reason: 'connected with both own tools', runtime_status: 'connected', tools: ['bridge_me', 'bridge_unlisted'], pages: 1 });
+  assert.equal(mcpInventoryVerdict(T, [{ params: askFor(), response: page([{ name: 'other', runtimeStatus: 'connected' }], 'c1') }, { params: askFor('c1'), response: page([goodRow]) }]).ready, true); // follows a complete chain, ignores other servers
+  const keyed = { ...goodRow, tools: { bridge_me: tool('bridge_me'), x: tool('bridge_unlisted') } };
+  assert.equal(mcpInventoryVerdict(T, one(keyed)).ready, true); // advertised by tool name as well as by catalog key
+  const starting = mcpInventoryVerdict(T, one({ ...goodRow, runtimeStatus: 'starting' }));
+  assert.deepEqual([starting.ready, starting.terminal], [false, false]); // tools present but runtime not ready: wait, never open the gate
+  assert.equal(mcpInventoryVerdict(T, one({ ...goodRow, runtimeStatus: null })).ready, false);
+  assert.equal(mcpInventoryVerdict(T, one({ ...goodRow, runtimeStatus: 'notStarted' })).terminal, false);
+  for (const status of ['failed', 'cancelled', 'disabled', 'authenticationRequired']) assert.deepEqual([status, mcpInventoryVerdict(T, one({ ...goodRow, runtimeStatus: status })).terminal], [status, true]);
+  assert.equal(mcpInventoryVerdict(T, one({ ...goodRow, runtimeStatus: 'unexpected' })).terminal, true);
+  assert.equal(mcpInventoryVerdict(T, one({ ...goodRow, runtimeStatus: 7 })).terminal, true);
+  assert.equal(mcpInventoryVerdict(T, one({ ...goodRow, runtimeStatus: undefined })).terminal, true);
+  assert.equal(mcpRequestBudget(6000, 120000, 1000), 5000);
+  assert.equal(mcpRequestBudget(120000, 60001, 0), 1); // retain the fixed cleanup allowance
+  assert.equal(mcpRequestBudget(1000, 120000, 1000), 0); // do not start after expiry
+  assert.equal(mcpInventoryWithinBudget(T, one(goodRow), 1).ready, true);
+  assert.equal(mcpInventoryWithinBudget(T, one(goodRow), 0).ready, false); // late connected result cannot open the gate
+  assert.equal(mcpInventoryVerdict(T, one({ ...goodRow, toolsError: 'discovery failed' })).ready, false); // discovery error
+  assert.equal(mcpInventoryVerdict(T, one({ ...goodRow, tools: { bridge_me: tool('bridge_me') } })).ready, false); // a tool missing
+  assert.equal(mcpInventoryVerdict(T, one({ ...goodRow, tools: {} })).ready, false);
+  assert.equal(mcpInventoryVerdict(T, one({ ...goodRow, tools: undefined })).ready, false);
+  assert.equal(mcpInventoryVerdict(T, one({ ...goodRow, name: 'other' })).ready, false); // wrong server row
+  assert.equal(mcpInventoryVerdict(T, [{ params: askFor(), response: page([goodRow, goodRow]) }]).ready, false); // listed twice
+  assert.equal(mcpInventoryVerdict(T, [{ params: askFor(null, 'another-thread'), response: page([goodRow]) }]).ready, false); // read for another thread
+  assert.equal(mcpInventoryVerdict(T, [{ params: { ...askFor(), serverName: 'other' }, response: page([goodRow]) }]).ready, false); // read for another server
+  assert.equal(mcpInventoryVerdict(T, [{ params: { ...askFor(), detail: 'full' }, response: page([goodRow]) }]).ready, false);
+  assert.equal(mcpInventoryVerdict(T, [{ params: askFor(), response: page([goodRow], 'c1') }]).ready, false); // listing cut short
+  assert.equal(mcpInventoryVerdict(T, [{ params: askFor(), response: page([], 'c1') }, { params: askFor('wrong'), response: page([goodRow]) }]).ready, false); // broken chain
+  assert.equal(mcpInventoryVerdict(T, Array.from({ length: MAX_MCP_PAGES + 1 }, () => ({ params: askFor(), response: page([]) }))).ready, false); // longer than the bound
+  assert.equal(mcpInventoryVerdict(T, [{ params: askFor(), response: { id: 1, error: { code: -32603, message: 'x' } } }]).ready, false);
+  assert.equal(mcpInventoryVerdict(T, [{ params: askFor(), response: null }]).terminal, true); // timed out
+  assert.equal(mcpInventoryVerdict(T, [{ params: askFor(), response: { id: 1, result: {} } }]).ready, false); // malformed
+  assert.equal(mcpInventoryVerdict(T, []).ready, false);
   assert.equal(supportsFlag(help, '--ignore-user-config'), true);
   assert.equal(supportsFlag(help, '--ignore-rules'), true);
   assert.equal(supportsFlag('      --ignore-user-config-extra\n', '--ignore-user-config'), false); // longer flag is not the flag
@@ -877,6 +1041,56 @@ async function main(probe) {
   probe.checks.daemon_started = await probe.until(() => fs.existsSync(channel) && fs.existsSync(core), 10000);
   if (!probe.checks.daemon_started) throw new Error('daemon did not start');
 
+  // Paid gate: the OWN MCP server must be connected on the OWN thread with
+  // both own tools before any model turn. The thread exists since thread/start
+  // (before the daemon, so its grant can name it); the runtime connection of
+  // its MCP servers is observed only AFTER that, with the build's own
+  // `mcpServerStatus/list` (thread-scoped, own server only, complete
+  // pagination), polled within MCP_READY_MS and the remaining run budget
+  // (preserving 60 s for cleanup); only the own fields are kept.
+  /** Reads the own MCP server's inventory within the shared readiness and cleanup budgets, following at most five pages.
+   * @param {number} deadline Monotonic `performance.now()` deadline in milliseconds.
+   * @returns {Promise<McpExchange[]>} The exchanges, in order (a null response ends the chain).
+   */
+  const readMcpInventory = async deadline => {
+    const exchanges = [];
+    let cursor = null;
+    for (let page = 0; page < MAX_MCP_PAGES; page += 1) {
+      const remaining = mcpRequestBudget(deadline, probe.remaining(), performance.now());
+      if (remaining <= 0) break;
+      const params = { serverName: 'bridge_probe', threadId: t1, detail: 'toolsAndAuthOnly', ...(cursor ? { cursor } : {}) };
+      let timer;
+      const response = await Promise.race([
+        backendA.request('mcpServerStatus/list', params, remaining),
+        new Promise(resolve => { timer = setTimeout(() => resolve(null), remaining); }),
+      ]);
+      clearTimeout(timer);
+      exchanges.push({ params, response });
+      if (performance.now() >= deadline || probe.remaining() <= 60_000) break;
+      const next = response && response.result ? response.result.nextCursor : null;
+      if (typeof next !== 'string' || next === '') break;
+      cursor = next;
+    }
+    return exchanges;
+  };
+  const mcpStarted = performance.now();
+  const mcpDeadline = mcpStarted + MCP_READY_MS;
+  let mcpVerdict = mcpInventoryVerdict(t1, []);
+  let mcpPolls = 0;
+  while (performance.now() < mcpDeadline && probe.remaining() > 60_000) {
+    mcpPolls += 1;
+    const exchanges = await readMcpInventory(mcpDeadline);
+    const remainingBudgetMs = mcpRequestBudget(mcpDeadline, probe.remaining(), performance.now());
+    mcpVerdict = mcpInventoryWithinBudget(t1, exchanges, remainingBudgetMs);
+    if (remainingBudgetMs <= 0) break;
+    if (mcpVerdict.ready || mcpVerdict.terminal) break;
+    const pollDelayMs = Math.min(1000, mcpDeadline - performance.now(), probe.remaining() - 60_000);
+    if (pollDelayMs > 0) await new Promise(r => setTimeout(r, pollDelayMs));
+  }
+  probe.checks.mcp_inventory = { server: 'bridge_probe', thread: t1, ...mcpVerdict, polls: mcpPolls, waited_ms: Math.round(performance.now() - mcpStarted) };
+  probe.checks.mcp_inventory_ready = mcpVerdict.ready === true;
+  if (!probe.checks.mcp_inventory_ready) { probe.fail('mcp_inventory_unavailable'); throw new Error(`own MCP server not ready on the own thread (${mcpVerdict.reason}); no paid turn started`); }
+
   const turn1 = await turn(backendA, t1, 'turn1', 'This is an isolated Agent Bridge qualification run. First call the bridge_me MCP tool exactly once with {}. Then call the bridge_unlisted MCP tool exactly once with {}; it is expected to be refused, do not retry it. Finally reply READY. Do not read files or run commands.');
   probe.checks.turn1_completed = turn1.status === 'completed';
   await probe.until(() => epochOf(t1) !== null, 15000);
@@ -1010,4 +1224,4 @@ if (require.main === module) {
     process.exitCode = 2;
   } else run('m2q4x', 15 * 60_000, REQUIRED, main);
 }
-module.exports = { hookRuns, ownHooksOnly, agentText, toolCalls, usageIncrement, hookFailures, daemonWarnings, hooksPositive, approvalRefusal, supportsFlag, instructionsClosed, pendingUntouched, heldByDeadIncarnation, handedByHook, keepLive };
+module.exports = { hookRuns, ownHooksOnly, agentText, toolCalls, mcpInventoryVerdict, usageIncrement, hookFailures, daemonWarnings, hooksPositive, approvalRefusal, supportsFlag, instructionsClosed, pendingUntouched, heldByDeadIncarnation, handedByHook, keepLive };
