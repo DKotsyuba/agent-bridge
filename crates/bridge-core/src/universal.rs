@@ -197,6 +197,8 @@ impl Storage {
     /// Atomically commits route/request/global-use facts from genuinely reserved
     /// native input. Exact request replay is historical and consumes no new use.
     /// Clock sampling occurs after BEGIN IMMEDIATE, including lock contention.
+    /// A shared-address child requires explicit SharedSession policy; SelfActor
+    /// is admitted only for a root or a child with its independently addressed ID.
     pub fn register_call(
         &mut self,
         credential: &str,
@@ -236,6 +238,15 @@ impl Storage {
             let origin = verified
                 .ok_or_else(|| failure(ErrorClass::Unavailable, "needs_new_attestation"))?;
             origin.validate(now)?;
+            if params.reply_policy == ReplyPolicy::SelfActor
+                && origin.actor_role == ActorRole::Child
+                && origin.native_actor_id != origin.caller_address.native_session_id
+            {
+                return Err(failure(
+                    ErrorClass::Forbidden,
+                    "shared_session_policy_required",
+                ));
+            }
             if !grant.allows_native_scope(&origin.caller_address)
                 || !grant.allows_recipient(&origin.destination.to_canonical_string())
                 || !policy

@@ -753,3 +753,278 @@ fn root_and_child_scopes_remain_distinct_with_same_destination() {
     assert_ne!(root.caller_scope, child.caller_scope);
     assert_eq!(root.destination_scope, child.destination_scope);
 }
+
+/// Exact schema-five fixture preserves accepted bytes/hash, unknown attempt and
+/// evidence through the additive migration; legacy replay never creates v1 intent.
+#[test]
+fn exact_schema_five_migration_preserves_unknown_and_legacy_identity() {
+    use sha2::{Digest, Sha256};
+    let dir = TempDir::new("universal-v5");
+    let path = dir.path("state.db");
+    let recipient = codex("legacy-recipient");
+    let envelope = common::keep_all(
+        "report-maker",
+        "legacy-v5",
+        &recipient,
+        bridge_core::Mode::Message,
+    );
+    let bytes = envelope.canonical_bytes();
+    let hash = envelope.envelope_hash();
+    let manifest = bridge_core::framing::frame_manifest(&[("report-maker", &envelope)]).unwrap();
+    let manifest_hash = format!("{:x}", Sha256::digest(manifest.as_bytes()));
+    {
+        let sql = rusqlite::Connection::open(&path).unwrap();
+        sql.execute_batch(include_str!("fixtures/schema-v5.sql"))
+            .unwrap();
+        sql.execute(
+            "INSERT INTO schema_meta(key,value) VALUES('schema_version','5')",
+            [],
+        )
+        .unwrap();
+        sql.execute("UPDATE counters SET value=1 WHERE name IN('acceptance_seq','retained_events','attempt_seq','evidence_seq')",[]).unwrap();
+        sql.execute(
+            "INSERT INTO source_tags(publisher_id,tag) VALUES('report-maker','report-maker')",
+            [],
+        )
+        .unwrap();
+        sql.execute("INSERT INTO events(publisher_id,event_id,envelope_hash,envelope_json,state,acceptance_seq,accepted_at_ms,recipient,policy_class,delivery,attempt_seq,mode,attempts_made) VALUES('report-maker','legacy-v5',?1,?2,'pending',1,900,?3,'keep_all','review',1,'message',1)",rusqlite::params![hash.as_str(),bytes,recipient.to_canonical_string()]).unwrap();
+        sql.execute("INSERT INTO attempts(attempt_seq,state,requested_mode,effective_mode,recipient,actor,endpoint_epoch,granted,manifest,manifest_hash,deadline_ms,created_ms,updated_ms,proof_ref) VALUES(1,'outcome_unknown','message','message',?1,'legacy-recipient',1,'inject,message',?2,?3,1000,900,901,'legacy-proof')",rusqlite::params![recipient.to_canonical_string(),manifest,manifest_hash]).unwrap();
+        sql.execute("INSERT INTO attempt_members(attempt_seq,ordinal,publisher_id,event_id,envelope_hash) VALUES(1,0,'report-maker','legacy-v5',?1)",rusqlite::params![hash.as_str()]).unwrap();
+        sql.execute("INSERT INTO evidence(evidence_seq,publisher_id,event_id,attempt_seq,tier,detail,at_ms) VALUES(1,'report-maker','legacy-v5',1,'unknown','fixture unresolved handoff',901)",[]).unwrap();
+    }
+    let mut storage = store(&path);
+    let sql = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        sql.query_row(
+            "SELECT value FROM schema_meta WHERE key='schema_version'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "6"
+    );
+    let after:(Vec<u8>,String,String,String)=sql.query_row("SELECT envelope_json,envelope_hash,delivery,delivery_scope_key FROM events WHERE event_id='legacy-v5'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+    assert_eq!(
+        after,
+        (bytes, hash.as_str().into(), "review".into(), "".into())
+    );
+    assert_eq!(
+        sql.query_row("SELECT state FROM attempts WHERE attempt_seq=1", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap(),
+        "outcome_unknown"
+    );
+    assert_eq!(
+        sql.query_row("SELECT tier FROM evidence WHERE evidence_seq=1", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap(),
+        "unknown"
+    );
+    assert!(storage.publish(&envelope, 2000).unwrap().receipt.replayed);
+    let Selection::Idle = storage
+        .reserve_next(
+            &attest(&recipient, Lifecycle::Inactive, 1),
+            EffectiveMode::Message,
+            2000,
+            &DispatchTiming::default(),
+        )
+        .unwrap()
+    else {
+        panic!("unknown effect was replayed")
+    };
+    let mut v1 = publication("unused", "legacy-v5", None);
+    v1.destination = Destination::Address {
+        address: recipient.to_canonical_string(),
+    };
+    v1.kind = "done".into();
+    assert_eq!(
+        storage.publish_v1(TOKEN, &v1, &|| 2000).unwrap_err().reason,
+        "legacy_event_identity"
+    );
+    assert_eq!(
+        sql.query_row("SELECT COUNT(*) FROM publication_intents", [], |r| r
+            .get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+/// Shared-address children cannot implicitly return as independently addressed
+/// callers; real own-address children remain allowed without product branches.
+#[test]
+fn child_self_policy_requires_independent_actual_address() {
+    let dir = TempDir::new("universal-self-child");
+    let path = dir.path("state.db");
+    let mut storage = store(&path);
+    let mut child = origin("child-use", "child-1");
+    child.actor_role = ActorRole::Child;
+    assert_eq!(
+        storage
+            .register_call(
+                TOKEN,
+                "child",
+                &registration("child-job"),
+                Some(&child),
+                &|| 1000
+            )
+            .unwrap_err()
+            .reason,
+        "shared_session_policy_required"
+    );
+    assert_eq!(
+        storage
+            .registration_evidence_committed(TOKEN, "child", "child-use")
+            .unwrap()
+            .claim,
+        bridge_core::RegistrationClaimState::NotVisible
+    );
+    child.native_actor_id = child.caller_address.native_session_id.clone();
+    assert!(
+        storage
+            .register_call(
+                TOKEN,
+                "child",
+                &registration("child-job"),
+                Some(&child),
+                &|| 1001
+            )
+            .is_ok()
+    );
+}
+
+/// Two real SQLite writer connections exercise both deterministic commit orders
+/// for publication versus route/lifetime closure. The first clock barrier is
+/// reached only after BEGIN IMMEDIATE, so the competing mutation cannot pass it.
+#[test]
+fn publication_close_and_retirement_serialize_at_commit() {
+    for retire in [false, true] {
+        for fence_first in [false, true] {
+            let dir = TempDir::new("universal-race");
+            let path = dir.path("state.db");
+            let mut first = store(&path);
+            let route = first
+                .register_call(
+                    TOKEN,
+                    "register",
+                    &registration("job"),
+                    Some(&origin("use", "root")),
+                    &|| 1000,
+                )
+                .unwrap();
+            let auth = first.producer_authorizer().unwrap();
+            let mut second = Storage::open(&path, bridge_core::Limits::new(100)).unwrap();
+            second.install_producer_authorizer(auth).unwrap();
+            let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let first_route = route.route_key.clone();
+            let first_worker = std::thread::spawn(move || {
+                let clock = || {
+                    acquired_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .unwrap();
+                    1010
+                };
+                if fence_first {
+                    if retire {
+                        first
+                            .retire_delivery_scope(
+                                TOKEN,
+                                "fence",
+                                &RetireDeliveryScopeParams {
+                                    scope_key: "generation".into(),
+                                    action: RetirementAction::RetireUnhanded,
+                                },
+                                &clock,
+                            )
+                            .map(|_| ())
+                    } else {
+                        first
+                            .close_route(
+                                TOKEN,
+                                "fence",
+                                &CloseRouteParams {
+                                    route_key: first_route,
+                                    reason: None,
+                                },
+                                &clock,
+                            )
+                            .map(|_| ())
+                    }
+                } else {
+                    first
+                        .publish_v1(
+                            TOKEN,
+                            &publication(
+                                &first_route,
+                                "event",
+                                if retire { Some("generation") } else { None },
+                            ),
+                            &clock,
+                        )
+                        .map(|_| ())
+                }
+            });
+            acquired_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            let second_route = route.route_key;
+            let second_worker = std::thread::spawn(move || {
+                if fence_first {
+                    second
+                        .publish_v1(
+                            TOKEN,
+                            &publication(
+                                &second_route,
+                                "event",
+                                if retire { Some("generation") } else { None },
+                            ),
+                            &|| 1011,
+                        )
+                        .map(|_| ())
+                } else if retire {
+                    second
+                        .retire_delivery_scope(
+                            TOKEN,
+                            "fence",
+                            &RetireDeliveryScopeParams {
+                                scope_key: "generation".into(),
+                                action: RetirementAction::RetireUnhanded,
+                            },
+                            &|| 1011,
+                        )
+                        .map(|_| ())
+                } else {
+                    second
+                        .close_route(
+                            TOKEN,
+                            "fence",
+                            &CloseRouteParams {
+                                route_key: second_route,
+                                reason: None,
+                            },
+                            &|| 1011,
+                        )
+                        .map(|_| ())
+                }
+            });
+            release_tx.send(()).unwrap();
+            assert!(first_worker.join().unwrap().is_ok());
+            let second_result = second_worker.join().unwrap();
+            if fence_first {
+                assert!(second_result.is_err());
+            } else {
+                assert!(second_result.is_ok());
+            }
+            let sql = rusqlite::Connection::open(&path).unwrap();
+            assert_eq!(
+                sql.query_row("SELECT COUNT(*) FROM publication_intents", [], |r| r
+                    .get::<_, u64>(0))
+                    .unwrap(),
+                u64::from(!fence_first)
+            );
+        }
+    }
+}
