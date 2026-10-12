@@ -99,7 +99,8 @@ impl Request {
     }
 }
 /// One strictly correlated success or structured service error envelope.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Deserialization requires exactly one non-null result/error key; null is not absence.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Response {
     /// Selected public API version, never legacy schema version.
@@ -136,33 +137,101 @@ impl Response {
             error: Some(error),
         }
     }
-    /// Checks exclusive result/error shape, bounded DTOs and exact request binding.
-    pub fn validate_for(&self, request: &Request) -> Result<(), ProtocolError> {
-        if self.api_version != API_VERSION || self.request_id != request.request_id {
-            return Err(ProtocolError::new("response", "correlation mismatch"));
+    /// Validates envelope version/id/exclusive shape and bounded result/error DTOs.
+    /// Pure validation; request-specific identity binding remains validate_for.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.api_version != API_VERSION {
+            return Err(ProtocolError::new("response", "unsupported version"));
         }
+        validate_id("request_id", &self.request_id, MAX_ID_BYTES)?;
         match (self.success, &self.result, &self.error) {
-            (true, Some(result), None) => {
-                result.validate()?;
-                result.validate_binding(request)
-            }
-            (false, None, Some(error)) => {
-                error.validate()?;
-                if let Some(key) = &error.reconciliation
-                    && Some(key.clone()) != request.reconciliation()
-                {
-                    return Err(ProtocolError::new("error", "reconciliation mismatch"));
-                }
-                if request.reconciliation().is_none() && error.effect.is_some() {
-                    return Err(ProtocolError::new("error", "read has mutation effect"));
-                }
-                Ok(())
-            }
+            (true, Some(result), None) => result.validate(),
+            (false, None, Some(error)) => error.validate(),
             _ => Err(ProtocolError::new(
                 "response",
                 "invalid success/result/error shape",
             )),
         }
+    }
+    /// Checks validated envelope/DTOs and the exact immutable request binding.
+    pub fn validate_for(&self, request: &Request) -> Result<(), ProtocolError> {
+        self.validate()?;
+        if self.request_id != request.request_id {
+            return Err(ProtocolError::new("response", "correlation mismatch"));
+        }
+        if let Some(result) = &self.result {
+            return result.validate_binding(request);
+        }
+        if let Some(error) = &self.error {
+            if let Some(key) = &error.reconciliation
+                && Some(key.clone()) != request.reconciliation()
+            {
+                return Err(ProtocolError::new("error", "reconciliation mismatch"));
+            }
+            if request.reconciliation().is_none() && error.effect.is_some() {
+                return Err(ProtocolError::new("error", "read has mutation effect"));
+            }
+        }
+        Ok(())
+    }
+}
+/// Strict raw branches preserve top-level key presence without nullable fields.
+#[derive(Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+enum RawResponse {
+    /// Exactly one non-null success body, no error key at all.
+    Success {
+        /// Selected additive version, validated after decoding.
+        api_version: u16,
+        /// Exact exchange identity, validated after decoding.
+        request_id: String,
+        /// Success flag, checked by envelope validation.
+        success: bool,
+        /// Required non-null typed result.
+        result: Box<OperationResult>,
+    },
+    /// Exactly one non-null error body, no result key at all.
+    Failure {
+        /// Selected additive version, validated after decoding.
+        api_version: u16,
+        /// Exact exchange identity, validated after decoding.
+        request_id: String,
+        /// Failure flag, checked by envelope validation.
+        success: bool,
+        /// Required non-null typed error.
+        error: ApiError,
+    },
+}
+impl<'de> Deserialize<'de> for Response {
+    /// Preserves exclusive non-null key shape; decode_response additionally checks
+    /// duplicate JSON keys, DTO bounds and immutable request-specific correlation.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(match RawResponse::deserialize(d)? {
+            RawResponse::Success {
+                api_version,
+                request_id,
+                success,
+                result,
+            } => Self {
+                api_version,
+                request_id,
+                success,
+                result: Some(*result),
+                error: None,
+            },
+            RawResponse::Failure {
+                api_version,
+                request_id,
+                success,
+                error,
+            } => Self {
+                api_version,
+                request_id,
+                success,
+                result: None,
+                error: Some(error),
+            },
+        })
     }
 }
 /// Recursive strict JSON value, retaining no duplicate object keys at any depth.
@@ -287,8 +356,11 @@ pub fn decode_response(bytes: &[u8], request: &Request) -> Result<Response, Prot
     response.validate_for(request)?;
     Ok(response)
 }
-/// Encodes one bounded service envelope without newline; no response body logging.
+/// Validates and encodes one bounded service envelope without newline.
+/// Invalid version/id/exclusive shape/result/error domains refuse before encoding;
+/// request-specific binding is checked separately by decode_response. No logging.
 pub fn encode_response(response: &Response) -> Result<Vec<u8>, ProtocolError> {
+    response.validate()?;
     let bytes = serde_json::to_vec(response)
         .map_err(|_| ProtocolError::new("response", "encoding failed"))?;
     if bytes.len() > MAX_RESPONSE_BYTES {

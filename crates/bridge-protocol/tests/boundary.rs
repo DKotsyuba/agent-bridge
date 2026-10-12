@@ -40,7 +40,11 @@ fn public_wire_boundary() {
     let fixture: Value = serde_json::from_str(include_str!("wire-v1.json")).unwrap();
     for (request, response) in all.iter().zip(fixture["responses"].as_array().unwrap()) {
         let bytes = serde_json::to_vec(response).unwrap();
-        decode_response(&bytes, request).unwrap();
+        let response = decode_response(&bytes, request).unwrap();
+        assert_eq!(
+            decode_response(&encode_response(&response).unwrap(), request).unwrap(),
+            response
+        );
     }
     let mut bounded = all[1].clone();
     if let Operation::RegisterCall(p) = &mut bounded.operation {
@@ -83,6 +87,58 @@ fn public_wire_boundary() {
             replayed: false,
         }),
     );
+    // R1: top-level key presence is strict even when the extra value is null.
+    let safe_error = Response::error(
+        &request.request_id,
+        ApiError {
+            class: ErrorClass::Auth,
+            reason: "refused".into(),
+            retry_hint: RetryHint::Never,
+            effect: Some(MutationEffect::NotCommitted),
+            reconciliation: request.reconciliation(),
+            detail: "safe".into(),
+        },
+    );
+    for (response, extra_key) in [(&good, "error"), (&safe_error, "result")] {
+        let mut malformed = serde_json::to_value(response).unwrap();
+        malformed[extra_key] = Value::Null;
+        assert!(
+            serde_json::from_value::<Response>(malformed.clone()).is_err(),
+            "explicit-null extra response key accepted"
+        );
+        assert!(decode_response(&serde_json::to_vec(&malformed).unwrap(), request).is_err());
+    }
+    for key in ["result", "error"] {
+        let mut malformed =
+            json!({"api_version":1,"request_id":request.request_id,"success":key=="result"});
+        malformed[key] = Value::Null;
+        assert!(serde_json::from_value::<Response>(malformed).is_err());
+    }
+    // R2: all encoder envelopes and nested DTOs validate before serialization.
+    let mut invalid_receipt = good.clone();
+    if let Some(OperationResult::Publish(p)) = &mut invalid_receipt.result {
+        p.receipt.acceptance_seq = 0;
+    }
+    assert!(
+        encode_response(&invalid_receipt).is_err(),
+        "invalid receipt encoded"
+    );
+    let mut invalid_version = good.clone();
+    invalid_version.api_version = 2;
+    let mut invalid_id = good.clone();
+    invalid_id.request_id.clear();
+    let mut invalid_shape = good.clone();
+    invalid_shape.error = safe_error.error.clone();
+    let mut invalid_error = safe_error.clone();
+    if let Some(e) = &mut invalid_error.error {
+        e.effect = Some(MutationEffect::Unknown);
+        e.reconciliation = None;
+    }
+    for invalid in [invalid_version, invalid_id, invalid_shape, invalid_error] {
+        assert!(encode_response(&invalid).is_err());
+    }
+    let error_bytes = encode_response(&safe_error).unwrap();
+    assert_eq!(decode_response(&error_bytes, request).unwrap(), safe_error);
     let bytes = encode_response(&good).unwrap();
     assert_eq!(decode_response(&bytes, request).unwrap(), good);
     publication.payload = Payload::new("changed body").unwrap();
