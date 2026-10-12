@@ -22,14 +22,16 @@
 //! Lock order: the registry lock and the storage lock are never held at the
 //! same time, and neither is held across socket I/O.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+mod producer;
 
 use bridge_core::dispatch::{DispatchTiming, Outcome, Selection, lock_storage};
 use bridge_core::service::{current_unix_millis, log_event};
@@ -396,15 +398,31 @@ fn accept_loop(listener: UnixListener, state: Arc<ChannelState>) {
     }
 }
 
-/// Reads one bounded line, or `None` on EOF, oversize, timeout or error.
+/// Reads one bounded strict UTF-8 line under one absolute timeout. Partial
+/// traffic never renews the budget; EOF/oversize/timeout/errors return None.
 fn read_line(reader: &mut BufReader<UnixStream>) -> Option<String> {
-    let mut line = String::new();
-    let mut limited = reader.by_ref().take(MAX_REQUEST_BYTES as u64 + 1);
-    match limited.read_line(&mut line) {
-        Ok(0) => None,
-        Ok(_) if line.len() > MAX_REQUEST_BYTES || !line.ends_with('\n') => None,
-        Ok(_) => Some(line),
-        Err(_) => None,
+    let deadline = Instant::now() + IO_TIMEOUT;
+    let mut bytes = Vec::new();
+    loop {
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        reader.get_ref().set_read_timeout(Some(remaining)).ok()?;
+        let chunk = reader.fill_buf().ok()?;
+        if chunk.is_empty() {
+            return None;
+        }
+        let take = chunk
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(chunk.len(), |index| index + 1);
+        if bytes.len() + take > MAX_REQUEST_BYTES {
+            return None;
+        }
+        let complete = chunk[take - 1] == b'\n';
+        bytes.extend_from_slice(&chunk[..take]);
+        reader.consume(take);
+        if complete {
+            return String::from_utf8(bytes).ok();
+        }
     }
 }
 
@@ -430,6 +448,13 @@ fn serve(stream: UnixStream, state: &ChannelState) {
     let Some(line) = read_line(&mut reader) else {
         return;
     };
+    if serde_json::from_str::<serde_json::Value>(&line)
+        .ok()
+        .is_some_and(|value| value.get("api_version").is_some())
+    {
+        producer::serve_v1(&line, peer, state, &mut writer);
+        return;
+    }
     let request: ChannelRequest = match serde_json::from_str(&line) {
         Ok(request) => request,
         Err(_) => {

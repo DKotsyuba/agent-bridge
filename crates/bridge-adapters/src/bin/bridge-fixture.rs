@@ -194,6 +194,12 @@ fn harness() {
         let reply = match command["cmd"].as_str().unwrap_or_default() {
             "hook" => run_hook(&command),
             "mcp" => run_mcp(&command),
+            "v1" => run_v1_frontend(&command),
+            "v1_and_legacy" => run_v1_and_legacy(&command),
+            "v1_direct" => core_call(
+                command["socket"].as_str().unwrap_or_default(),
+                &command["request"],
+            ),
             "mcp_server" => run_mcp_server(&command),
             "inbox" => start_inbox(
                 Arc::clone(&inbox),
@@ -338,6 +344,87 @@ fn run_mcp(command: &Value) -> Value {
         .write_all(command["meta"].to_string().as_bytes());
     let output = child.wait_with_output().expect("mcp output");
     serde_json::from_slice(&output.stdout).unwrap_or(json!({"error": "no mcp output"}))
+}
+
+/// Runs one owned harness descendant that exchanges a public producer frame.
+/// Synthetic metadata originates in the test; kernel ancestry remains genuine.
+fn run_v1_frontend(command: &Value) -> Value {
+    let mut child = Command::new(std::env::current_exe().expect("own executable"))
+        .arg(if command["lose_ack"].as_bool() == Some(true) {
+            "v1-lost-ack"
+        } else {
+            "v1-frontend"
+        })
+        .arg(command["socket"].as_str().unwrap_or_default())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("owned v1 frontend");
+    let _ = child
+        .stdin
+        .take()
+        .expect("frontend input")
+        .write_all(command["request"].to_string().as_bytes());
+    let output = child.wait_with_output().expect("owned frontend output");
+    serde_json::from_slice(&output.stdout).unwrap_or(json!({"error": "frontend response missing"}))
+}
+
+/// Runs genuine sibling frontends for a controlled reservation/legacy race.
+/// The legacy result file is owned test evidence, never a credential or proof.
+fn run_v1_and_legacy(command: &Value) -> Value {
+    let mut first = Command::new(std::env::current_exe().expect("own executable"))
+        .arg("v1-frontend")
+        .arg(command["socket"].as_str().unwrap_or_default())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("owned frontend");
+    first
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(command["request"].to_string().as_bytes())
+        .unwrap();
+    // The controller starts legacy only after the claim-ready gate appears.
+    let gate = Path::new(command["claim_ready_file"].as_str().unwrap());
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !gate.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let legacy = run_mcp(command);
+    let _ = std::fs::write(
+        command["legacy_result_file"].as_str().unwrap(),
+        legacy.to_string(),
+    );
+    let output = first.wait_with_output().expect("owned frontend response");
+    json!({"first": serde_json::from_slice::<Value>(&output.stdout).unwrap_or(Value::Null), "legacy": legacy})
+}
+
+/// Exchanges exactly one typed public producer request under the owned frontend
+/// kernel identity. It adds no caller fields and uses no private registration op.
+fn v1_frontend(socket: &str, lose_ack: bool) {
+    let mut bytes = Vec::new();
+    let _ = std::io::stdin()
+        .take(bridge_protocol::MAX_REGISTRATION_BYTES as u64 + 1)
+        .read_to_end(&mut bytes);
+    match bridge_protocol::decode_request(&bytes) {
+        Ok(request) if lose_ack => {
+            let mut stream = UnixStream::connect(socket).expect("owned channel");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("owned deadline");
+            let mut encoded = bridge_protocol::encode_request(&request).expect("typed request");
+            encoded.push(b'\n');
+            stream.write_all(&encoded).expect("owned write");
+            let mut prefix = [0_u8; 1];
+            let observed = stream.read_exact(&mut prefix).is_ok();
+            // First response byte proves a response began, but never gives the
+            // frontend a correlated receipt. Deliberately discard the rest.
+            println!("{}", json!({"outcome_unknown": observed}));
+        }
+        Ok(request) => println!("{}", core_call(socket, &request)),
+        Err(_) => println!("{}", json!({"error": "invalid fixture request"})),
+    }
 }
 
 /// Renders an attestation result (or its refusal class) as one JSON line.
@@ -492,7 +579,7 @@ fn probe_confinement(home: &Path) {
 
 /// Sends one request line to the core service socket and returns the
 /// response line as JSON.
-fn core_call(core: &str, request: &bridge_core::Request) -> Value {
+fn core_call<T: serde::Serialize>(core: &str, request: &T) -> Value {
     let Ok(mut stream) = UnixStream::connect(core) else {
         return json!({"error": "core socket unreachable"});
     };
@@ -502,7 +589,9 @@ fn core_call(core: &str, request: &bridge_core::Request) -> Value {
         return json!({"error": "core write failed"});
     }
     let mut response = String::new();
-    let _ = std::io::BufReader::new(&stream).read_line(&mut response);
+    let _ = std::io::BufReader::new(&stream)
+        .take(bridge_protocol::MAX_RESPONSE_BYTES as u64 + 1)
+        .read_line(&mut response);
     serde_json::from_str(&response).unwrap_or(json!({"error": "no core response"}))
 }
 
@@ -595,7 +684,14 @@ const PROBE_TOOLS: [&str; 3] = ["bridge_probe", "bridge_me", "bridge_unlisted"];
 /// Every call appends one JSON line with the tool name to `evidence`. A
 /// marker is written only there, never into the tool result. Model
 /// arguments are recorded but never used as identity.
-fn mcp_server(channel: &str, core: &str, token: &str, evidence: &str, exposed: &[&str]) {
+fn mcp_server(
+    channel: &str,
+    core: &str,
+    token: &str,
+    evidence: &str,
+    exposed: &[&str],
+    universal: Option<&UniversalProbe>,
+) {
     let attestor = RegistryAttestor::new(Path::new(channel), Duration::from_secs(5), 600_000);
     let mut log = std::fs::OpenOptions::new()
         .create(true)
@@ -616,6 +712,13 @@ fn mcp_server(channel: &str, core: &str, token: &str, evidence: &str, exposed: &
                 "serverInfo": {"name": "bridge-probe", "version": env!("CARGO_PKG_VERSION")}
             }),
             "ping" => json!({}),
+            "tools/list" if universal.is_some() => {
+                let config = universal.expect("matched universal probe");
+                json!({"tools": [{"name": config.tool_name,
+                    "description": "Run the configured owned universal protocol check with an empty object.",
+                    "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+                    "annotations": {"readOnlyHint": false, "destructiveHint": false, "openWorldHint": false}}]})
+            }
             "tools/list" => {
                 let tools = json!([
                 {
@@ -657,6 +760,20 @@ fn mcp_server(channel: &str, core: &str, token: &str, evidence: &str, exposed: &
                 );
                 let _ = stdout.flush();
                 continue;
+            }
+            "tools/call" if universal.is_some() => {
+                let config = universal.expect("matched universal probe");
+                let meta = message["params"]["_meta"]
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default();
+                let result = universal_probe(channel, core, token, config, meta);
+                let _ = writeln!(
+                    log,
+                    "{}",
+                    json!({"tool": config.tool_name, "result": result})
+                );
+                json!({"content": [{"type": "text", "text": result.to_string()}]})
             }
             "tools/call" if message["params"]["name"] == "bridge_unlisted" => {
                 let record = json!({"at": bridge_core::service::current_unix_millis(), "tool": "bridge_unlisted", "unlisted_called": true});
@@ -737,6 +854,113 @@ fn mcp_server(channel: &str, core: &str, token: &str, evidence: &str, exposed: &
             json!({"jsonrpc": "2.0", "id": id, "result": result})
         );
         let _ = stdout.flush();
+    }
+}
+
+/// Runtime configuration for an owned generic qualification producer. Values
+/// are chosen after common artifact freeze; no name/kind catalog is compiled.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UniversalProbe {
+    /// Opaque configured MCP tool name; arguments contain no route or identity.
+    tool_name: String,
+    /// Stable registration request persisted in this owned fixture configuration.
+    request_id: String,
+    /// Opaque producer operation incarnation.
+    operation_key: String,
+    /// Stable custody identity, independent of the outer exchange request ID.
+    event_id: String,
+    /// Arbitrary permitted producer event kind.
+    kind: String,
+    /// Private hidden payload file; contents never appear in probe tool results.
+    payload_file: String,
+    /// Concrete requested delivery mode for the natural host verification.
+    mode: bridge_protocol::Mode,
+}
+
+/// Exchanges one public v1 frame and validates exact operation/receipt binding.
+/// Uses the existing fixture Unix sender; no SDK/core/private operation required.
+/// Errors are bounded static fixture categories, never body/proof/credential text.
+fn universal_exchange(
+    socket: &str,
+    request: &bridge_protocol::Request,
+) -> Result<bridge_protocol::OperationResult, &'static str> {
+    let response = core_call(socket, request);
+    let bytes = serde_json::to_vec(&response).map_err(|_| "response encoding failed")?;
+    let response =
+        bridge_protocol::decode_response(&bytes, request).map_err(|_| "v1 response refused")?;
+    response.result.ok_or("v1 request refused")
+}
+
+/// Registers from actual separated framework metadata, then publishes hidden
+/// payload through the returned route. No model argument, cwd or env is identity.
+/// Result contains receipt facts only; hidden payload visibility is independent.
+fn universal_probe(
+    channel: &str,
+    core: &str,
+    token: &str,
+    config: &UniversalProbe,
+    metadata: serde_json::Map<String, Value>,
+) -> Value {
+    use bridge_protocol::*;
+    let host = match PresentedMeta::from_mcp_meta(&metadata) {
+        Ok(PresentedMeta::Codex { .. }) => Host::Codex,
+        Ok(PresentedMeta::Claude { .. }) => Host::ClaudeCode,
+        _ => return json!({"error": "native evidence candidate refused"}),
+    };
+    let request = Request::new(
+        &config.request_id,
+        Secret::new(token),
+        Operation::RegisterCall(RegisterCallParams {
+            operation_key: config.operation_key.clone(),
+            evidence: Some(CallEvidence::Native { host, metadata }),
+            reply_policy: ReplyPolicy::SelfActor,
+            allowed_modes: Some(vec![config.mode]),
+            allowed_kinds: None,
+            max_payload_bytes: None,
+            route_expires_at_ms: None,
+            assertion_audience: None,
+            invocation_key: None,
+        }),
+    );
+    let Ok(request) = request else {
+        return json!({"error": "registration configuration refused"});
+    };
+    let Ok(OperationResult::RegisterCall(registration)) = universal_exchange(channel, &request)
+    else {
+        return json!({"error": "registration refused"});
+    };
+    let payload = match std::fs::read_to_string(&config.payload_file)
+        .ok()
+        .and_then(|value| Payload::new(value).ok())
+    {
+        Some(payload) => payload,
+        None => return json!({"error": "payload file refused"}),
+    };
+    let request = Request::new(
+        format!("publish-{}", config.request_id),
+        Secret::new(token),
+        Operation::Publish(PublishParams {
+            destination: Destination::Route {
+                route_key: registration.receipt.route_key.clone(),
+            },
+            event_id: config.event_id.clone(),
+            kind: config.kind.clone(),
+            payload,
+            mode: config.mode,
+            policy: Policy::KeepAll,
+            metadata: Metadata::new(),
+            expires_at_ms: None,
+            delivery_scope_key: None,
+        }),
+    );
+    let Ok(request) = request else {
+        return json!({"error": "publication configuration refused"});
+    };
+    match universal_exchange(core, &request) {
+        Ok(OperationResult::Publish(result)) => json!({"registration": registration.receipt,
+            "assertion_present": registration.assertion.is_some(), "publication": result.receipt}),
+        _ => json!({"error": "publication refused", "registration": registration.receipt}),
     }
 }
 
@@ -822,6 +1046,12 @@ fn main() {
         Some("mcp") => mcp(args.get(2).map(String::as_str).unwrap_or_default(), false),
         Some("mcp-seal") => mcp(args.get(2).map(String::as_str).unwrap_or_default(), true),
         Some("relay") => relay(args.get(2).map(String::as_str).unwrap_or_default()),
+        Some("v1-frontend") => {
+            v1_frontend(args.get(2).map(String::as_str).unwrap_or_default(), false)
+        }
+        Some("v1-lost-ack") => {
+            v1_frontend(args.get(2).map(String::as_str).unwrap_or_default(), true)
+        }
         Some("app-server") => app_server(),
         Some("publish") if args.len() == 8 => {
             println!(
@@ -856,6 +1086,21 @@ fn main() {
                 &credential(&args[4]),
                 &args[5],
                 &exposed,
+                None,
+            );
+        }
+        Some("universal-mcp") if args.len() == 7 => {
+            let config: UniversalProbe = serde_json::from_str(
+                &std::fs::read_to_string(&args[6]).expect("owned probe config"),
+            )
+            .expect("probe configuration");
+            mcp_server(
+                &args[2],
+                &args[3],
+                &credential(&args[4]),
+                &args[5],
+                &[config.tool_name.as_str()],
+                Some(&config),
             );
         }
         Some("queue-add") if args.len() == 8 => {

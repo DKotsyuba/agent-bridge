@@ -51,6 +51,10 @@ use sha2::{Digest, Sha256};
 
 use crate::os::{self, PeerIdentity, ProcessFacts};
 
+mod assertions;
+mod claims;
+pub(crate) use claims::EvidenceClaim;
+
 /// Largest accepted native identifier (session, agent, call id), in bytes.
 pub const MAX_NATIVE_ID_BYTES: usize = 256;
 
@@ -116,6 +120,9 @@ pub struct RegistryConfig {
     /// always refuses.
     #[serde(default)]
     pub relays: Vec<RelayExecutable>,
+    /// Optional generic backend audiences; absent preserves legacy deployments.
+    #[serde(default)]
+    pub audiences: Vec<BackendAudience>,
 }
 
 /// One relay build allowed to redeem sealed caller proofs.
@@ -125,6 +132,20 @@ pub struct RelayExecutable {
     pub path: PathBuf,
     /// Lowercase hex SHA-256 of the qualified relay build.
     pub sha256: String,
+}
+
+/// One generic detached backend audience, scoped to an authenticated producer.
+/// Names have no product meaning. Kernel peer ownership and this exact warmed
+/// executable build must match before invocation facts are consumed/disclosed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackendAudience {
+    /// Opaque configured audience name, nonempty and bounded to native ID limits.
+    pub name: String,
+    /// Stable authenticated core producer identity, independent of token rotation.
+    pub producer: String,
+    /// Exact backend executable path and qualified loaded-build digest.
+    pub executable: RelayExecutable,
 }
 
 /// Lifetime of a sealed caller proof, in milliseconds.
@@ -144,6 +165,12 @@ struct Sealed {
     harness: (u32, u64),
     /// Expiry (Unix epoch ms).
     expires_ms: u64,
+    /// Original source-use identity, unchanged through sealing.
+    source_use_key: String,
+    /// Original protected native per-call identifier.
+    native_call_id: String,
+    /// Positive native host-call classification retained through sealing.
+    tool_name: Option<String>,
 }
 
 /// Shells that may sit between a harness and its hook command.
@@ -708,6 +735,10 @@ struct Binding {
     retired: bool,
 }
 
+/// A verified native observation tuple: caller, actual harness incarnation,
+/// protected native call ID and optional bounded host tool classification.
+type NativeInspection = (VerifiedCaller, (u32, u64), String, Option<String>);
+
 /// One `PreToolUse` call record.
 #[derive(Debug, Clone)]
 struct CallRecord {
@@ -725,6 +756,10 @@ struct CallRecord {
     observed_ms: u64,
     /// Whether a caller join already consumed it.
     consumed: bool,
+    /// An exclusive registration claim is unresolved.
+    claimed: bool,
+    /// Bounded protected native tool classification, never producer meaning.
+    tool_name: Option<String>,
 }
 
 /// The harness a peer belongs to.
@@ -807,7 +842,8 @@ const MAX_ROUTE_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Protected native registry. Verified recipient routes can be journaled in the
 /// private channel directory and recovered only for the same live, qualified
-/// harness/store. Call records and sealed proofs remain strictly memory-only.
+/// harness/store. Call records, exclusive claims, sealed proofs and detached
+/// assertions remain strictly memory-only; route history is never fresh authority.
 #[derive(Debug)]
 pub struct Registry {
     /// Configuration.
@@ -827,6 +863,14 @@ pub struct Registry {
     digests: HashMap<FileKey, String>,
     /// Outstanding sealed proofs by SHA-256 of the proof text.
     sealed: HashMap<String, Sealed>,
+    /// Ephemeral issuer identity for globally unique native source-use keys.
+    issuer_boot: String,
+    /// Exclusive unresolved registration reservations by original source key.
+    claims: HashMap<String, claims::ClaimRecord>,
+    /// Bounded per-boot detached assertions and immutable consumption receipts.
+    assertions: HashMap<String, assertions::AssertionRecord>,
+    /// Precommit capacity reservations, never credentials or native authority.
+    assertion_slots: std::collections::HashSet<(String, String)>,
     /// Bound of retained call records.
     max_calls: usize,
     /// Harnesses whose message carrier is unavailable on this host (for
@@ -917,6 +961,25 @@ impl Registry {
                 }
             }
         }
+        let mut audience_names = Vec::new();
+        for audience in &config.audiences {
+            checked_id(&audience.name, "audience")?;
+            checked_id(&audience.producer, "producer")?;
+            if !audience.executable.path.is_absolute()
+                || audience.executable.sha256.len() != 64
+                || !audience
+                    .executable
+                    .sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err("audience executable requires absolute path and 64-hex digest".into());
+            }
+            if audience_names.contains(&(&audience.producer, &audience.name)) {
+                return Err("duplicate producer audience".into());
+            }
+            audience_names.push((&audience.producer, &audience.name));
+        }
         let mut registry = Registry {
             config,
             owner_uid,
@@ -926,6 +989,14 @@ impl Registry {
             call_order: VecDeque::new(),
             digests: HashMap::new(),
             sealed: HashMap::new(),
+            issuer_boot: crate::os::random_bytes()
+                .map_err(|error| error.to_string())?
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            claims: HashMap::new(),
+            assertions: HashMap::new(),
+            assertion_slots: std::collections::HashSet::new(),
             max_calls: DEFAULT_MAX_CALL_RECORDS,
             message_disabled: Vec::new(),
         };
@@ -1284,7 +1355,7 @@ impl Registry {
         })
     }
 
-    /// Hashes every configured harness and relay executable into the digest
+    /// Hashes every configured harness, relay and backend executable into the digest
     /// cache. This is the only place an executable is ever hashed: serving
     /// never reads one, so no hook or relay request can stall the registry
     /// lock on a whole (possibly hundreds of MB) file.
@@ -1317,6 +1388,12 @@ impl Registry {
             .iter()
             .flat_map(|profile| profile.executables.iter().map(|e| e.path.as_path()))
             .chain(self.config.relays.iter().map(|relay| relay.path.as_path()))
+            .chain(
+                self.config
+                    .audiences
+                    .iter()
+                    .map(|audience| audience.executable.path.as_path()),
+            )
             .collect();
         paths.sort();
         paths.dedup();
@@ -1462,6 +1539,9 @@ impl Registry {
             .map(|agent| checked_id(agent, "agent_id"))
             .transpose()
             .map_err(CorrelationError::NotEvidence)?;
+        if kind == HookKind::PreToolUse && payload.tool_use_id.is_some() {
+            self.ensure_call_capacity()?;
+        }
         let matched = self.harness_of(peer, harness)?;
         let profile = self.config.profiles[matched.profile].clone();
         let qualified = profile.executables[matched.executable].clone();
@@ -1569,6 +1649,11 @@ impl Registry {
                     epoch: binding.epoch,
                     observed_ms: now_ms,
                     consumed: false,
+                    claimed: false,
+                    tool_name: payload
+                        .tool_name
+                        .as_deref()
+                        .and_then(|name| checked_id(name, "tool_name").ok()),
                 },
             );
         }
@@ -1631,15 +1716,41 @@ impl Registry {
         self.calls.entry(call.clone()).or_default().push(record);
         self.call_order.push_back(call);
         while self.call_order.len() > self.max_calls {
-            if let Some(oldest) = self.call_order.pop_front()
-                && let Some(records) = self.calls.get_mut(&oldest)
-            {
+            // ponytail: bounded linear scan (8192 records); index if measured hot.
+            let Some(index) = self.call_order.iter().position(|call| {
+                self.calls
+                    .get(call)
+                    .and_then(|records| records.first())
+                    .is_some_and(|record| !record.claimed)
+            }) else {
+                break;
+            };
+            let oldest = self.call_order.remove(index).expect("known index");
+            if let Some(records) = self.calls.get_mut(&oldest) {
                 records.remove(0);
                 if records.is_empty() {
                     self.calls.remove(&oldest);
                 }
             }
         }
+    }
+
+    /// Refuses new observations before changing a binding when every available
+    /// eviction candidate is reserved. Unresolved claims cannot be evicted.
+    fn ensure_call_capacity(&self) -> Result<(), CorrelationError> {
+        if self.call_order.len() < self.max_calls
+            || self.call_order.iter().any(|call| {
+                self.calls
+                    .get(call)
+                    .and_then(|records| records.first())
+                    .is_some_and(|record| !record.claimed)
+            })
+        {
+            return Ok(());
+        }
+        Err(CorrelationError::Unavailable(
+            "native claim capacity exhausted".into(),
+        ))
     }
 
     /// Drops only dead process bindings at capacity; live retired tombstones must
@@ -1667,8 +1778,35 @@ impl Registry {
         meta: &PresentedMeta,
         now_ms: u64,
     ) -> Result<VerifiedCaller, CorrelationError> {
+        if let PresentedMeta::Sealed { proof } = meta {
+            return self.redeem(peer, proof, now_ms);
+        }
+        let (caller, harness, call, _) = self.inspect_native(peer, meta, now_ms, false)?;
+        let records = self.calls.get_mut(&call).expect("verified record");
+        records
+            .iter_mut()
+            .find(|record| record.harness == harness)
+            .expect("verified incarnation")
+            .consumed = true;
+        Ok(caller)
+    }
+
+    /// Validates a native source without spending it. `allow_spent` is only
+    /// historical replay origin inspection; it never returns fresh permission.
+    /// Result fixes caller, actual incarnation, native call and host tool name.
+    fn inspect_native(
+        &mut self,
+        peer: PeerIdentity,
+        meta: &PresentedMeta,
+        now_ms: u64,
+        allow_spent: bool,
+    ) -> Result<NativeInspection, CorrelationError> {
         let (call, harness) = match meta {
-            PresentedMeta::Sealed { proof } => return self.redeem(peer, proof, now_ms),
+            PresentedMeta::Sealed { .. } => {
+                return Err(CorrelationError::NotEvidence(
+                    "native metadata required".into(),
+                ));
+            }
             native => native.native().expect("native metadata"),
         };
         let call = call.to_string();
@@ -1677,16 +1815,21 @@ impl Registry {
         let max_age = self.config.max_call_age_ms;
         let records = self
             .calls
-            .get_mut(&call)
+            .get(&call)
             .ok_or_else(|| CorrelationError::Missing(call.clone()))?;
-        let mut same: Vec<&mut CallRecord> = records
-            .iter_mut()
+        let same: Vec<&CallRecord> = records
+            .iter()
             .filter(|record| record.harness == matched.incarnation)
             .collect();
         if same.is_empty() {
             return Err(CorrelationError::Missing(call));
         }
-        if same.iter().any(|record| record.consumed) {
+        if !allow_spent && same.iter().any(|record| record.claimed) {
+            return Err(CorrelationError::Unavailable(
+                "native evidence reserved".into(),
+            ));
+        }
+        if !allow_spent && same.iter().any(|record| record.consumed) {
             return Err(CorrelationError::Duplicate(call));
         }
         if same.len() > 1 {
@@ -1699,7 +1842,7 @@ impl Registry {
                 },
             );
         }
-        let record = &mut same[0];
+        let record = same[0];
         let binding = self
             .bindings
             .get(&record.address)
@@ -1718,17 +1861,21 @@ impl Registry {
         {
             return Err(CorrelationError::Conflicting(call));
         }
-        record.consumed = true;
-        Ok(VerifiedCaller::new(
-            binding.address.clone(),
-            record.role,
-            record.native_id.clone(),
-            binding.epoch,
-            record.observed_ms,
-            match harness {
-                Harness::ClaudeCode => CallerChannel::ClaudeToolUse,
-                Harness::Codex => CallerChannel::CodexCall,
-            },
+        Ok((
+            VerifiedCaller::new(
+                binding.address.clone(),
+                record.role,
+                record.native_id.clone(),
+                binding.epoch,
+                record.observed_ms,
+                match harness {
+                    Harness::ClaudeCode => CallerChannel::ClaudeToolUse,
+                    Harness::Codex => CallerChannel::CodexCall,
+                },
+            ),
+            matched.incarnation,
+            call,
+            record.tool_name.clone(),
         ))
     }
 
@@ -1746,8 +1893,19 @@ impl Registry {
                 "a sealed proof cannot be resealed".into(),
             ));
         }
+        let (source_caller, source_harness, native_call_id, tool_name) =
+            self.inspect_native(peer, meta, now_ms, false)?;
+        let source_use_key = self.source_use_key(
+            &native_call_id,
+            source_harness,
+            source_caller.epoch(),
+            source_caller.observed_at_ms(),
+        );
         let caller = self.attest_caller(peer, meta, now_ms)?;
-        self.sealed.retain(|_, sealed| sealed.expires_ms > now_ms);
+        let claims = &self.claims;
+        self.sealed.retain(|_, sealed| {
+            sealed.expires_ms > now_ms || claims.contains_key(&sealed.source_use_key)
+        });
         if self.sealed.len() >= MAX_SEALED {
             return Err(CorrelationError::Unavailable(
                 "too many outstanding sealed proofs".into(),
@@ -1769,6 +1927,9 @@ impl Registry {
                 binding,
                 harness,
                 expires_ms: now_ms.saturating_add(SEALED_PROOF_TTL_MS),
+                source_use_key,
+                native_call_id,
+                tool_name,
             },
         );
         Ok((caller, SealedProof(proof)))
@@ -1787,30 +1948,20 @@ impl Registry {
         proof: &SealedProof,
         now_ms: u64,
     ) -> Result<VerifiedCaller, CorrelationError> {
-        if peer.uid != self.owner_uid {
-            return Err(CorrelationError::NotEvidence(
-                "relay runs as another user".into(),
+        self.verify_relay(peer)?;
+        let digest = crate::server::sha256_hex(proof.as_str().as_bytes());
+        if self
+            .sealed
+            .get(&digest)
+            .is_some_and(|sealed| self.claims.contains_key(&sealed.source_use_key))
+        {
+            return Err(CorrelationError::Unavailable(
+                "sealed evidence reserved".into(),
             ));
         }
-        let facts = os::process_facts(peer.pid)
-            .ok_or_else(|| CorrelationError::NotEvidence("relay process is gone".into()))?;
-        let exe = facts
-            .exe
-            .clone()
-            .ok_or_else(|| CorrelationError::NotEvidence("relay executable unreadable".into()))?;
-        let digest = self
-            .config
-            .relays
-            .iter()
-            .find(|relay| relay.path == exe)
-            .map(|relay| relay.sha256.clone())
-            .ok_or_else(|| {
-                CorrelationError::NotEvidence("peer is not a configured relay".into())
-            })?;
-        self.verify_loaded(&exe, facts.start_time, &digest)?;
         let sealed = self
             .sealed
-            .remove(&crate::server::sha256_hex(proof.as_str().as_bytes()))
+            .remove(&digest)
             .ok_or_else(|| CorrelationError::Missing("sealed proof".into()))?;
         if sealed.expires_ms <= now_ms {
             return Err(CorrelationError::Stale("sealed proof expired".into()));
@@ -2132,6 +2283,7 @@ mod tests {
             intermediates: Vec::new(),
             max_call_age_ms: 600_000,
             relays: Vec::new(),
+            audiences: Vec::new(),
         };
         Registry::new(config, 0).unwrap()
     }

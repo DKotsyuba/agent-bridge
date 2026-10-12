@@ -37,16 +37,17 @@ impl TempDir {
     /// A fresh owned directory under `TMPDIR`, short enough for socket
     /// paths.
     pub fn new(tag: &str) -> TempDir {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos();
+        let nonce = u32::from_ne_bytes(
+            bridge_adapters::os::random_bytes().unwrap()[..4]
+                .try_into()
+                .unwrap(),
+        );
         let path = std::env::temp_dir().join(format!(
-            "m2{tag}{}{}",
+            "m2{tag}{}{:08x}",
             std::process::id() % 10_000,
-            nanos % 100_000
+            nonce
         ));
-        std::fs::create_dir_all(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
         TempDir(path.canonicalize().unwrap())
     }
 }
@@ -154,6 +155,7 @@ impl Lab {
                 path: fixture_exe(),
                 sha256: sha.clone(),
             }],
+            audiences: Vec::new(),
         };
         let registry = Arc::new(Mutex::new(Registry::new(config.clone(), owner).unwrap()));
         let limits = serde_json::from_value(json!({"max_admitted_events": 1000})).unwrap();

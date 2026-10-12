@@ -452,3 +452,17 @@ release build labels. A daemon update prefers its current build but can retain
 an older labelled frontend under a primary Node process; kernel PID/incarnation,
 protected channel and native signed-client checks still apply. An unavailable
 frontend holds before reservation, so reconnection consumes no delivery retries.
+
+## Universal producer ingress
+
+The adapter socket additionally serves authenticated v1 `capabilities`,
+`register_call` and `consume_assertion`; core publication/status/lifetime
+operations retain the separately configured core endpoint. The authority is
+shared with core, while native observation claims and audience assertions remain
+ephemeral. Historical route recovery is not invocation permission.
+
+See [the native provider contract](docs/producer-native-v1.md) for opaque
+producer onboarding, declaration of generic backend audiences, exact
+reserve/commit/finalize and retry rules, supported host grammar and the
+runtime-configured owned MCP qualification probe. No consumer migration or
+installed-service change is performed by this source feature.

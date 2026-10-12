@@ -2033,6 +2033,7 @@ fn drain_proof_with_label(label: &str) -> String {
             .collect(),
         max_call_age_ms: 600_000,
         relays: Vec::new(),
+        audiences: Vec::new(),
     };
     let registry = Arc::new(std::sync::Mutex::new(
         bridge_adapters::Registry::new(config, owner).unwrap(),
