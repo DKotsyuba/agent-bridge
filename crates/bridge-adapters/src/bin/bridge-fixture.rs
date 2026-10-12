@@ -193,6 +193,7 @@ fn harness() {
         };
         let reply = match command["cmd"].as_str().unwrap_or_default() {
             "hook" => run_hook(&command),
+            "delayed_hook" => run_delayed_hook(&command),
             "mcp" => run_mcp(&command),
             "v1" => run_v1_frontend(&command),
             "v1_and_legacy" => run_v1_and_legacy(&command),
@@ -240,6 +241,78 @@ fn harness() {
         let _ = writeln!(stdout, "{reply}");
         let _ = stdout.flush();
     }
+}
+
+/// Runs an owned qualified hook peer with controlled confirmation latency.
+/// The child uses the public native hook/flush wire; delay settings are fixture
+/// timing controls, never caller identity or production protocol fields.
+fn run_delayed_hook(command: &Value) -> Value {
+    let mut child = Command::new(std::env::current_exe().expect("own executable"))
+        .arg("delayed-hook")
+        .arg(command["socket"].as_str().unwrap_or_default())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("controlled hook");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(command.to_string().as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().expect("controlled hook output");
+    serde_json::from_slice(&output.stdout).unwrap_or(Value::Null)
+}
+
+/// Emits one real hook frame, receives the exact inject reply, then confirms its
+/// digest after a controlled delay or fragmented-gap schedule. It never prints
+/// hidden context. Result records whether reply/confirmation I/O succeeded;
+/// authoritative attempt state remains in actual core custody. EOF/setup errors
+/// refuse the fixture, and no generic hook framework or sender fallback exists.
+fn delayed_hook(socket: &str) {
+    let mut bytes = Vec::new();
+    std::io::stdin().read_to_end(&mut bytes).unwrap();
+    let command: Value = serde_json::from_slice(&bytes).unwrap();
+    let mut stream = UnixStream::connect(socket).expect("owned hook socket");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    writeln!(
+        stream,
+        "{}",
+        json!({"op": "hook", "harness": command["harness"], "payload": command["payload"]})
+    )
+    .unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(&stream)
+        .read_line(&mut line)
+        .unwrap();
+    let response: Value = serde_json::from_str(&line).unwrap();
+    let Some(digest) = response["digest"].as_str() else {
+        println!("{}", json!({"inject": false}));
+        return;
+    };
+    std::thread::sleep(Duration::from_millis(
+        command["delay_ms"].as_u64().unwrap_or(0),
+    ));
+    let confirmation = format!("{}\n", json!({"op": "flushed", "digest": digest}));
+    let mut sent = true;
+    let gap = command["fragment_gap_ms"].as_u64().unwrap_or(0);
+    if gap == 0 {
+        sent = stream.write_all(confirmation.as_bytes()).is_ok();
+    } else {
+        let third = confirmation.len() / 3;
+        for (index, part) in confirmation.as_bytes().chunks(third).enumerate() {
+            if index > 0 {
+                std::thread::sleep(Duration::from_millis(gap));
+            }
+            if stream.write_all(part).is_err() {
+                sent = false;
+                break;
+            }
+        }
+    }
+    println!("{}", json!({"inject": true, "confirmation_written": sent}));
 }
 
 /// Runs the real hook binary as a child through `/bin/sh`.
@@ -663,7 +736,11 @@ fn status(core: &str, token: &str, event_id: &str) -> Value {
 /// Every tool `mcp-server` can expose, in listing order.
 const PROBE_TOOLS: [&str; 3] = ["bridge_probe", "bridge_me", "bridge_unlisted"];
 
-/// A minimal MCP stdio server for root-run native probes, with three tools:
+/// Runs the owned minimal MCP stdio probe loop on stdin/stdout. `channel`
+/// and `core` are explicit protected local endpoints; `token` is privately
+/// loaded by the caller and never logged. `evidence` is an owned append-only
+/// file. Legacy mode (`universal=None`) exposes only the `exposed` subset of
+/// three built-in tools:
 ///
 /// - `bridge_probe` (not read-only: it publishes): attests its caller from
 ///   the request's `_meta` through the registry (this process must be the
@@ -681,9 +758,16 @@ const PROBE_TOOLS: [&str; 3] = ["bridge_probe", "bridge_me", "bridge_unlisted"];
 /// name is answered with an error and never runs or records anything, so a
 /// probe's closed tool inventory holds without host-side filtering.
 ///
-/// Every call appends one JSON line with the tool name to `evidence`. A
-/// marker is written only there, never into the tool result. Model
-/// arguments are recorded but never used as identity.
+/// With `universal=Some(config)`, list its single runtime-configured opaque
+/// tool name and require that name in `exposed`. Calls preserve actual framework
+/// `_meta` separately from arguments, register/publish using the public wire and
+/// return/log bounded receipt-only facts. Hidden payload file content never
+/// enters tool results, prompts, ordinary evidence or argument-based identity.
+/// Legacy mode records arguments but does not use them as identity; its marker
+/// is confined to the owned evidence file and the actual injected context.
+/// Unknown tool/method calls refuse; malformed lines are ignored, EOF ends the
+/// loop, and owned file/process setup failures panic the fixture. Successful
+/// responses flush stdout. This is test orchestration, never an MCP framework.
 fn mcp_server(
     channel: &str,
     core: &str,
@@ -1038,10 +1122,18 @@ fn desktop_child(channel: &str) {
     let _ = std::io::stdin().read(&mut byte);
 }
 
+/// Dispatches explicit owned fixture modes from argv; invalid arity/mode exits
+/// two with static usage. Credential-bearing modes load only private owned
+/// token files, never token values from argv. Modes perform the documented
+/// stdio, socket, owned-file or child-process actions, terminate at input EOF
+/// where applicable, and panic on fixture setup failures; no global install,
+/// consumer configuration, authority inference from model arguments or network
+/// package fetching is performed.
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("harness") => harness(),
+        Some("delayed-hook") => delayed_hook(args.get(2).map(String::as_str).unwrap_or_default()),
         Some("desktop-child") => desktop_child(args.get(2).unwrap()),
         Some("mcp") => mcp(args.get(2).map(String::as_str).unwrap_or_default(), false),
         Some("mcp-seal") => mcp(args.get(2).map(String::as_str).unwrap_or_default(), true),

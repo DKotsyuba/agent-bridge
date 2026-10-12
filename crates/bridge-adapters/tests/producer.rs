@@ -740,3 +740,136 @@ fn worker_death_before_and_after_commit_reconciles_without_reuse() {
         source.stop();
     }
 }
+
+/// Sealing a real native observation near its original deadline must not extend
+/// v1 registration/assertion validity. Absolute observed-time scheduling controls
+/// the expiry window; legacy proof redemption keeps its established lifetime.
+#[test]
+fn sealed_transfer_does_not_extend_original_observation_validity() {
+    let mut lab = lab(true);
+    lab.channel.take().unwrap().stop();
+    lab.config.max_call_age_ms = 3_000;
+    let owner = bridge_adapters::server::private_directory(lab.socket.parent().unwrap()).unwrap();
+    lab.registry = Arc::new(std::sync::Mutex::new(
+        bridge_adapters::Registry::new(lab.config.clone(), owner).unwrap(),
+    ));
+    lab.channel = Some(
+        ChannelServer::start(
+            &lab.socket,
+            Arc::clone(&lab.registry),
+            Arc::clone(&lab.storage) as Arc<dyn Custody>,
+            DispatchTiming::default(),
+        )
+        .unwrap(),
+    );
+    let mut source = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    let mut backend = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    source.hook(
+        &lab.socket,
+        Harness::ClaudeCode,
+        tool_hook("PreToolUse", "session", "original-expiry", None),
+    );
+    // First protected observation created this epoch at its actual observation time.
+    let observed = lab
+        .registry
+        .lock()
+        .unwrap()
+        .attest_recipient(&lab.claude_address("session"))
+        .unwrap()
+        .1
+        .epoch;
+    std::thread::sleep(std::time::Duration::from_millis(
+        (observed + 1_000).saturating_sub(now()),
+    ));
+    let issued = source.mcp_sealed(
+        &lab.socket,
+        json!({"claudecode/toolUseId": "original-expiry"}),
+    );
+    let proof = issued["proof"].as_str().expect("real sealed proof");
+    std::thread::sleep(std::time::Duration::from_millis(
+        (observed + 3_500).saturating_sub(now()),
+    ));
+    let mut request = registration("expired-sealed", "expired-operation", "unused");
+    if let Operation::RegisterCall(params) = &mut request.operation {
+        params.evidence = Some(CallEvidence::Sealed {
+            proof: Secret::new(proof),
+        });
+        params.assertion_audience = Some("aud-local".into());
+        params.invocation_key = Some("expired-invocation".into());
+    }
+    assert!(!call(&mut backend, &lab.socket, &request, true).success);
+    let params = match &request.operation {
+        Operation::RegisterCall(params) => params,
+        _ => unreachable!(),
+    };
+    assert!(
+        lab.storage
+            .lock()
+            .unwrap()
+            .registration_replay(TOKEN, &request.request_id, params)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(relay_redeem(&lab.socket, proof)["ok"]["role"], "root");
+    source.stop();
+    backend.stop();
+}
+
+/// Actual inject confirmation honors short and longer-than-initial read windows;
+/// small fragments cannot renew a short configured handoff deadline.
+#[test]
+fn hook_confirmation_preserves_each_configured_absolute_budget() {
+    for (handoff_ms, delay_ms, gap_ms, submitted) in [
+        (100, 250, 0, false),
+        (100, 0, 70, false),
+        (10_000, 5_500, 0, true),
+    ] {
+        let mut lab = lab(false);
+        lab.channel.take().unwrap().stop();
+        let timing = DispatchTiming {
+            handoff_ms,
+            ..DispatchTiming::default()
+        };
+        lab.channel = Some(
+            ChannelServer::start(
+                &lab.socket,
+                Arc::clone(&lab.registry),
+                Arc::clone(&lab.storage) as Arc<dyn Custody>,
+                timing,
+            )
+            .unwrap(),
+        );
+        let mut source = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+        source.hook(
+            &lab.socket,
+            Harness::ClaudeCode,
+            hook("SessionStart", "session"),
+        );
+        lab.publish(
+            "flush-window",
+            &lab.claude_address("session"),
+            bridge_core::Mode::Inject,
+            "owned hidden handoff",
+        );
+        let result = source.cmd(json!({"cmd": "delayed_hook", "socket": lab.socket, "harness": "ClaudeCode",
+            "payload": tool_hook("PostToolUse", "session", "flush-call", None), "delay_ms": delay_ms, "fragment_gap_ms": gap_ms}));
+        assert_eq!(result["inject"], true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while lab
+            .attempt("flush-window")
+            .is_some_and(|record| record.state == bridge_core::dispatch::AttemptState::Invoking)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            lab.attempt("flush-window").unwrap().state,
+            if submitted {
+                bridge_core::dispatch::AttemptState::HookSubmitted
+            } else {
+                bridge_core::dispatch::AttemptState::OutcomeUnknown
+            }
+        );
+        source.stop();
+    }
+}

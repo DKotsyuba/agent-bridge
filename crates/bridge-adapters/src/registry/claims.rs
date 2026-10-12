@@ -119,7 +119,8 @@ impl Registry {
                     .sealed
                     .get(&digest)
                     .ok_or_else(|| CorrelationError::Missing("sealed proof".into()))?;
-                if sealed.expires_ms <= now_ms || !self.sealed_current(sealed) {
+                let source_expiry = sealed.source_expires_at_ms(self.config.max_call_age_ms);
+                if source_expiry <= now_ms || !self.sealed_current(sealed) {
                     return Err(CorrelationError::Stale(
                         "sealed proof is not current".into(),
                     ));
@@ -128,7 +129,7 @@ impl Registry {
                     sealed.caller.clone().into_relayed(),
                     sealed.harness,
                     sealed.native_call_id.clone(),
-                    sealed.expires_ms,
+                    source_expiry,
                     sealed.source_use_key.clone(),
                     ClaimSource::Sealed { digest },
                     sealed.tool_name.clone(),
@@ -243,12 +244,13 @@ impl Registry {
                 let sealed = self
                     .sealed
                     .get(&crate::server::sha256_hex(proof.as_str().as_bytes()))?;
-                (sealed.expires_ms > now_ms && self.sealed_current(sealed)).then(|| {
+                let source_expiry = sealed.source_expires_at_ms(self.config.max_call_age_ms);
+                (source_expiry > now_ms && self.sealed_current(sealed)).then(|| {
                     (
                         sealed.caller.clone().into_relayed(),
                         sealed.harness,
                         sealed.source_use_key.clone(),
-                        sealed.expires_ms,
+                        source_expiry,
                     )
                 })
             }

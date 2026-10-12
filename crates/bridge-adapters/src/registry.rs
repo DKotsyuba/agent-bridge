@@ -173,6 +173,16 @@ struct Sealed {
     tool_name: Option<String>,
 }
 
+impl Sealed {
+    /// Bounds v1 use to both the original protected observation lifetime and
+    /// the legacy transfer proof lifetime. Sealing never renews native evidence;
+    /// legacy redemption independently retains its established proof expiry.
+    fn source_expires_at_ms(&self, max_call_age_ms: u64) -> u64 {
+        self.expires_ms
+            .min(self.caller.observed_at_ms().saturating_add(max_call_age_ms))
+    }
+}
+
 /// Shells that may sit between a harness and its hook command.
 fn default_intermediates() -> Vec<PathBuf> {
     [

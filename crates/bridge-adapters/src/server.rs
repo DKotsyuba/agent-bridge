@@ -399,9 +399,11 @@ fn accept_loop(listener: UnixListener, state: Arc<ChannelState>) {
 }
 
 /// Reads one bounded strict UTF-8 line under one absolute timeout. Partial
-/// traffic never renews the budget; EOF/oversize/timeout/errors return None.
-fn read_line(reader: &mut BufReader<UnixStream>) -> Option<String> {
-    let deadline = Instant::now() + IO_TIMEOUT;
+/// traffic never renews the caller-supplied budget. Initial ingress uses five
+/// seconds; hook confirmation supplies its own configured handoff window.
+/// EOF/oversize/timeout/errors return None.
+fn read_line(reader: &mut BufReader<UnixStream>, budget: Duration) -> Option<String> {
+    let deadline = Instant::now() + budget;
     let mut bytes = Vec::new();
     loop {
         let remaining = deadline.checked_duration_since(Instant::now())?;
@@ -445,7 +447,7 @@ fn serve(stream: UnixStream, state: &ChannelState) {
         return;
     };
     let mut reader = BufReader::new(stream);
-    let Some(line) = read_line(&mut reader) else {
+    let Some(line) = read_line(&mut reader, IO_TIMEOUT) else {
         return;
     };
     if serde_json::from_str::<serde_json::Value>(&line)
@@ -591,14 +593,11 @@ fn serve_hook(
     // From here a hand-off may exist: only a matching flush confirmation is
     // positive evidence; everything else is a retained unknown outcome.
     let confirmation = match replied {
-        Ok(()) => {
-            let _ = reader
-                .get_ref()
-                .set_read_timeout(Some(Duration::from_millis(
-                    state.timing.handoff_ms.min(30_000),
-                )));
-            read_line(reader).and_then(|line| serde_json::from_str::<ChannelRequest>(&line).ok())
-        }
+        Ok(()) => read_line(
+            reader,
+            Duration::from_millis(state.timing.handoff_ms.min(30_000)),
+        )
+        .and_then(|line| serde_json::from_str::<ChannelRequest>(&line).ok()),
         Err(_) => None,
     };
     let outcome = match confirmation {
