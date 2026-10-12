@@ -1122,9 +1122,12 @@ fn desktop_child(channel: &str) {
     let _ = std::io::stdin().read(&mut byte);
 }
 
-/// Dispatches explicit owned fixture modes from argv; invalid arity/mode exits
-/// two with static usage. Credential-bearing modes load only private owned
-/// token files, never token values from argv. Modes perform the documented
+/// Dispatches owned fixture modes using each match arm's argument handling.
+/// Missing/unrecognized modes and rejected length-guarded arms reach static
+/// usage and exit two. Unguarded arms can ignore extra argv, default missing
+/// positions to empty strings, or panic when a required path is unwrapped
+/// (`desktop-child`). Credential-bearing modes load private owned token files,
+/// never token values from argv. Modes perform the documented
 /// stdio, socket, owned-file or child-process actions, terminate at input EOF
 /// where applicable, and panic on fixture setup failures; no global install,
 /// consumer configuration, authority inference from model arguments or network
