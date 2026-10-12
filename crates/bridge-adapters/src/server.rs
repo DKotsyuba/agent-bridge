@@ -278,6 +278,8 @@ impl ChannelServer {
     /// Binds `socket` (its directory must be private, see
     /// [`private_directory`]) and starts serving.
     ///
+    /// Revalidates the private sibling route journal and records renewed core
+    /// fences before accepting hooks. Call records are never recovered.
     /// An existing path at `socket` is refused, never removed: a stale
     /// endpoint must be cleared by its owner.
     pub fn start(
@@ -290,6 +292,25 @@ impl ChannelServer {
             .parent()
             .ok_or_else(|| std::io::Error::other("channel socket has no directory"))?;
         private_directory(directory)?;
+        let restored = lock_registry(&registry)
+            .attach_journal(
+                &socket.with_extension("bindings.json"),
+                current_unix_millis(),
+            )
+            .map_err(std::io::Error::other)?;
+        for attestation in restored {
+            let observed = with_custody(custody.as_ref(), |storage| {
+                storage.observe_binding(&attestation, current_unix_millis())
+            });
+            match observed {
+                Some(Ok(_)) => {}
+                _ => {
+                    return Err(std::io::Error::other(
+                        "restored recipient fence could not be recorded",
+                    ));
+                }
+            }
+        }
         let listener = UnixListener::bind(socket)?;
         let metadata = std::fs::symlink_metadata(socket)?;
         std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;

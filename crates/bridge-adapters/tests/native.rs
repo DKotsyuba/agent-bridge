@@ -2728,3 +2728,151 @@ fn signed_parent_private_channel_delivers_one_message() {
     stop.store(true, Ordering::Relaxed);
     drop(daemon.join().unwrap());
 }
+
+/// A fresh daemon registry restores only the same verified live session, without
+/// another recipient hook/MCP call; new fences reach core and caller proofs do not survive.
+#[test]
+fn recipient_routes_recover_after_restart_without_recipient_activity() {
+    use bridge_adapters::server::private_directory;
+    use bridge_adapters::{ChannelServer, Registry};
+    use std::os::unix::fs::PermissionsExt;
+    let mut lab = Lab::new("jr");
+    let address = lab.claude_address("live-idle");
+    let mut receiver = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    receiver.cmd(json!({"cmd":"inbox","session_id":"live-idle","behavior":"delivered"}));
+    receiver.hook(
+        &lab.socket,
+        Harness::ClaudeCode,
+        hook("SessionStart", "live-idle"),
+    );
+    receiver.hook(
+        &lab.socket,
+        Harness::ClaudeCode,
+        tool_hook("PreToolUse", "live-idle", "old-call", None),
+    );
+    receiver.hook(&lab.socket, Harness::ClaudeCode, hook("Stop", "live-idle"));
+    receiver.hook(
+        &lab.socket,
+        Harness::ClaudeCode,
+        hook("SessionStart", "waiting"),
+    );
+    receiver.hook(
+        &lab.socket,
+        Harness::ClaudeCode,
+        hook("PermissionRequest", "waiting"),
+    );
+    receiver.hook(
+        &lab.socket,
+        Harness::ClaudeCode,
+        hook("SessionStart", "ended"),
+    );
+    receiver.hook(
+        &lab.socket,
+        Harness::ClaudeCode,
+        hook("SessionEnd", "ended"),
+    );
+    let old_epoch = lab
+        .registry
+        .lock()
+        .unwrap()
+        .attest_recipient(&address)
+        .unwrap()
+        .1
+        .epoch;
+    lab.channel.take().unwrap().stop();
+    let owner = private_directory(lab.socket.parent().unwrap()).unwrap();
+    let restored = Arc::new(Mutex::new(
+        Registry::new(lab.config.clone(), owner).unwrap(),
+    ));
+    lab.channel = Some(
+        ChannelServer::start(
+            &lab.socket,
+            Arc::clone(&restored),
+            Arc::clone(&lab.storage) as Arc<dyn Custody>,
+            DispatchTiming::default(),
+        )
+        .unwrap(),
+    );
+    let attestation = restored.lock().unwrap().attest_recipient(&address).unwrap();
+    assert!(attestation.1.epoch > old_epoch);
+    assert_eq!(
+        attestation.0.lifecycle(),
+        bridge_core::dispatch::Lifecycle::Inactive
+    );
+    assert_eq!(
+        restored
+            .lock()
+            .unwrap()
+            .attest_recipient(&lab.claude_address("waiting"))
+            .unwrap()
+            .0
+            .lifecycle(),
+        bridge_core::dispatch::Lifecycle::AwaitingInput
+    );
+    assert!(
+        restored
+            .lock()
+            .unwrap()
+            .attest_recipient(&lab.claude_address("ended"))
+            .is_err()
+    );
+    // No hook or bridge_me was emitted by the receiver after the restart.
+    lab.publish("after-restart", &address, Mode::Message, "recovered route");
+    let mut carrier = ClaudeLaterCarrier::new(
+        Arc::clone(&restored),
+        Arc::clone(&lab.storage) as Arc<dyn Custody>,
+        ClaudeTiming::default(),
+    )
+    .unwrap();
+    let report = dispatch_message(
+        &lab.storage,
+        &mut carrier,
+        &address,
+        &now,
+        &DispatchTiming::default(),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            report,
+            DispatchReport::Sent {
+                state: AttemptState::NativeAccepted,
+                ..
+            }
+        ),
+        "{report:?}"
+    );
+    assert_eq!(
+        receiver.cmd(json!({"cmd":"frames"}))["frames"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        receiver.mcp(&lab.socket, claude_meta("old-call"))["err"],
+        "missing"
+    );
+    drop(carrier);
+    lab.channel.take().unwrap().stop();
+    // A changed qualification cannot be resurrected by private cached metadata.
+    let mut changed = lab.config.clone();
+    changed.profiles[0].executables[0].sha256 = "0".repeat(64);
+    let journal = lab.socket.with_extension("bindings.json");
+    let cached = std::fs::read(&journal).unwrap();
+    let mut unqualified = Registry::new(changed, owner).unwrap();
+    assert!(
+        unqualified
+            .attach_journal(&journal, now())
+            .unwrap()
+            .is_empty()
+    );
+    std::fs::write(&journal, &cached).unwrap();
+    receiver.stop();
+    let mut dead = Registry::new(lab.config.clone(), owner).unwrap();
+    assert!(dead.attach_journal(&journal, now()).unwrap().is_empty());
+    std::fs::write(&journal, &cached).unwrap();
+    std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let mut foreign = Registry::new(lab.config.clone(), owner).unwrap();
+    assert!(foreign.attach_journal(&journal, now()).is_err());
+}

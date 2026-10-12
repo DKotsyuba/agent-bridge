@@ -100,6 +100,8 @@ pub struct Lab {
     pub codex_store: PathBuf,
     /// Channel socket.
     pub socket: PathBuf,
+    /// Exact prepared fixture configuration for owned restart tests.
+    pub config: RegistryConfig,
     /// The registry.
     pub registry: Arc<Mutex<Registry>>,
     /// The custody store.
@@ -153,7 +155,7 @@ impl Lab {
                 sha256: sha.clone(),
             }],
         };
-        let registry = Arc::new(Mutex::new(Registry::new(config, owner).unwrap()));
+        let registry = Arc::new(Mutex::new(Registry::new(config.clone(), owner).unwrap()));
         let limits = serde_json::from_value(json!({"max_admitted_events": 1000})).unwrap();
         let mut storage = Storage::open_in_memory(limits).unwrap();
         storage.register_source_tag(PUBLISHER, PUBLISHER).unwrap();
@@ -171,6 +173,7 @@ impl Lab {
             codex_store,
             socket,
             registry,
+            config,
             storage,
             channel: Some(channel),
         }

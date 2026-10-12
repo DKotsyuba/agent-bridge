@@ -421,3 +421,23 @@ Still not established, retained honestly:
 - Q1's model-less `-32603 "no rollout found"` is classified unknown, not
   no-acceptance (a thread needs a persisted rollout). Linux has no
   confinement launcher, so Codex message is unsupported there.
+
+## Recipient recovery after daemon restart
+
+The adapter channel atomically persists only verified recipient bindings in its
+owner-only directory, with a bounded versioned mode-0600 snapshot. At restart it
+revalidates the same PID/start time, UID, executable bytes, native store and
+current profile, then renews the endpoint epoch and records the fence in core
+before serving. Lifecycle remains the last verified owner state: unknown and
+approval/input waits are never converted to idle. Retired, dead/reused-process,
+changed-store or unqualified-build routes cannot be restored. Caller records,
+sealed proofs, native inbox secrets and message payloads are never in the cache.
+
+An already observed live recipient can therefore receive an addressed message
+without any post-restart bridge_me or hook from the recipient. Recipient native
+endpoint/receipt checks still run before actual delivery. Earlier uncertain
+hand-offs remain retained and are never replayed by route recovery. The native
+boundary test covers delivery without recipient activity, larger renewed epochs,
+input-wait preservation, retired/dead routes, changed qualification and private
+file protection. This snapshot format is initialized by successful native hooks;
+installations predating it had no durable route metadata to restore.

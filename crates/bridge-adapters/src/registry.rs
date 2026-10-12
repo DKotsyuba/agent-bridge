@@ -40,6 +40,8 @@
 //! environment and PIDs alone are never evidence here.
 
 use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use bridge_core::dispatch::{Attestation, Capabilities, Lifecycle};
@@ -672,8 +674,10 @@ pub struct HookAdmission {
     pub drain: Option<Attestation>,
 }
 
-/// One binding of an address to a harness incarnation.
-#[derive(Debug, Clone)]
+/// One binding of an address to a harness incarnation. Only daemon-verified
+/// facts are persisted privately; fresh OS/build validation is required on load.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Binding {
     /// The bound address.
     address: NativeAddress,
@@ -787,8 +791,23 @@ pub struct RecipientBinding {
     pub transcript: Option<PathBuf>,
 }
 
-/// The in-memory protected registry. Not persisted: after a daemon restart
-/// every session is unknown until its next hook, never inactive.
+/// Versioned bounded route snapshot. It contains no publisher tokens, native
+/// inbox keys, message bodies, caller records or single-use proofs.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RouteSnapshot {
+    /// Snapshot format version; only version 1 is accepted.
+    schema: u32,
+    /// Last verified bindings, including retired tombstones and input-wait states.
+    bindings: Vec<Binding>,
+}
+
+/// Largest private route snapshot accepted before allocation/JSON parsing.
+const MAX_ROUTE_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Protected native registry. Verified recipient routes can be journaled in the
+/// private channel directory and recovered only for the same live, qualified
+/// harness/store. Call records and sealed proofs remain strictly memory-only.
 #[derive(Debug)]
 pub struct Registry {
     /// Configuration.
@@ -797,6 +816,8 @@ pub struct Registry {
     owner_uid: u32,
     /// Bindings by canonical address.
     bindings: HashMap<String, Binding>,
+    /// Optional private atomic snapshot of verified recipient routes, never calls or secrets.
+    journal: Option<PathBuf>,
     /// Call records by call id.
     calls: HashMap<String, Vec<CallRecord>>,
     /// Call ids in insertion order, for bounded eviction.
@@ -900,6 +921,7 @@ impl Registry {
             config,
             owner_uid,
             bindings: HashMap::new(),
+            journal: None,
             calls: HashMap::new(),
             call_order: VecDeque::new(),
             digests: HashMap::new(),
@@ -909,6 +931,166 @@ impl Registry {
         };
         registry.warm_digests();
         Ok(registry)
+    }
+
+    /// Attaches the private route journal and revalidates every saved route before
+    /// publishing a new endpoint epoch. `path` must lie in an existing owner-only
+    /// channel directory. Missing snapshots are initial setup; malformed, symlinked,
+    /// foreign, shared, oversized or unsupported files refuse startup. Dead/reused
+    /// processes, changed stores/builds/profiles and retired sessions are omitted.
+    /// Current profile capabilities bound recovery; unknown/input-wait lifecycle
+    /// stays such. No hook is manufactured and no caller/proof record is restored.
+    /// Returns fresh recipient attestations for core to fence before serving.
+    pub fn attach_journal(&mut self, path: &Path, now_ms: u64) -> Result<Vec<Attestation>, String> {
+        if self.journal.as_deref() == Some(path) {
+            return Ok(Vec::new());
+        }
+        crate::server::private_directory(path.parent().ok_or("route journal lacks parent")?)
+            .map_err(|_| "route journal directory refused".to_string())?;
+        let snapshot = match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err("route journal unreadable".into()),
+            Ok(meta) => {
+                if !meta.is_file()
+                    || meta.uid() != self.owner_uid
+                    || meta.mode() & 0o077 != 0
+                    || meta.nlink() != 1
+                    || meta.len() > MAX_ROUTE_SNAPSHOT_BYTES
+                {
+                    return Err("route journal is not a bounded private regular file".into());
+                }
+                let file = std::fs::File::open(path).map_err(|_| "route journal unreadable")?;
+                let opened = file
+                    .metadata()
+                    .map_err(|_| "route journal metadata unreadable")?;
+                if (opened.dev(), opened.ino()) != (meta.dev(), meta.ino()) {
+                    return Err("route journal changed while opening".into());
+                }
+                let mut bytes = Vec::new();
+                file.take(MAX_ROUTE_SNAPSHOT_BYTES + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|_| "route journal unreadable")?;
+                if bytes.len() as u64 > MAX_ROUTE_SNAPSHOT_BYTES {
+                    return Err("route journal oversized".into());
+                }
+                let snapshot: RouteSnapshot =
+                    serde_json::from_slice(&bytes).map_err(|_| "route journal malformed")?;
+                if snapshot.schema != 1 || snapshot.bindings.len() > DEFAULT_MAX_BINDINGS {
+                    return Err("route journal version or count refused".into());
+                }
+                Some(snapshot)
+            }
+        };
+        if let Some(snapshot) = snapshot {
+            for mut binding in snapshot.bindings {
+                if binding.retired
+                    || binding.address.host_id != self.config.host_id
+                    || binding.epoch == 0
+                    || binding.epoch == u64::MAX
+                    || NativeAddress::parse(&binding.address.to_canonical_string()).is_err()
+                {
+                    continue;
+                }
+                let Some(facts) = os::process_facts(binding.harness.0) else {
+                    continue;
+                };
+                if facts.uid != Some(self.owner_uid)
+                    || facts.start_time != binding.harness.1
+                    || facts.exe.as_ref() != Some(&binding.executable)
+                    || harness_store(&facts, binding.address.harness).as_ref()
+                        != Some(&binding.store)
+                {
+                    continue;
+                }
+                let qualified = self
+                    .config
+                    .profiles
+                    .iter()
+                    .find(|p| {
+                        p.harness == binding.address.harness
+                            && p.namespace == binding.address.native_store_namespace
+                            && p.store == binding.store
+                    })
+                    .and_then(|p| p.executables.iter().find(|e| e.path == binding.executable))
+                    .cloned();
+                let Some(qualified) = qualified else {
+                    continue;
+                };
+                if self
+                    .verify_loaded(&qualified.path, facts.start_time, &qualified.sha256)
+                    .is_err()
+                {
+                    continue;
+                }
+                binding.epoch = now_ms.max(binding.epoch + 1);
+                binding.qualified = Capabilities {
+                    inject: qualified.inject,
+                    message: qualified.message
+                        && !self.message_disabled.contains(&binding.address.harness),
+                };
+                binding.capabilities.inject &= binding.qualified.inject;
+                binding.capabilities.message &= binding.qualified.message;
+                binding.version = qualified.version;
+                if binding
+                    .transcript
+                    .as_ref()
+                    .is_some_and(|p| !p.starts_with(&binding.store))
+                {
+                    binding.transcript = None;
+                }
+                self.bindings
+                    .entry(binding.address.to_canonical_string())
+                    .or_insert(binding);
+            }
+        }
+        self.journal = Some(path.to_path_buf());
+        self.persist_routes()?;
+        Ok(self
+            .bindings
+            .values()
+            .filter(|b| !b.retired)
+            .filter_map(|b| self.attest_recipient(&b.address).ok().map(|(a, _)| a))
+            .collect())
+    }
+
+    /// Atomically fsyncs the bounded verified-route snapshot with mode 0600 and
+    /// an owner-only parent directory. Failure is reported without payload/path
+    /// diagnostics; a failed write leaves the previous snapshot intact. No-op
+    /// when persistence is disabled for an isolated registry.
+    fn persist_routes(&self) -> Result<(), String> {
+        let Some(path) = &self.journal else {
+            return Ok(());
+        };
+        let bytes = serde_json::to_vec(&RouteSnapshot {
+            schema: 1,
+            bindings: self.bindings.values().cloned().collect(),
+        })
+        .map_err(|_| "route snapshot encoding failed")?;
+        if bytes.len() as u64 > MAX_ROUTE_SNAPSHOT_BYTES {
+            return Err("route snapshot oversized".into());
+        }
+        let random = os::random_bytes().map_err(|_| "route snapshot entropy unavailable")?;
+        let temp = path.with_extension(format!(
+            "new-{:x}",
+            u64::from_le_bytes(random[..8].try_into().expect("eight entropy bytes"))
+        ));
+        // ponytail: one bounded snapshot per hook; use journaled rows if hook throughput warrants it.
+        let result = (|| -> std::io::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temp)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&temp, path)?;
+            std::fs::File::open(path.parent().expect("validated journal parent"))?.sync_all()
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+            return Err("route snapshot could not be committed".into());
+        }
+        Ok(())
     }
 
     /// Never grants the message capability for `harness` (the host cannot
@@ -1168,7 +1350,8 @@ impl Registry {
     /// the lifecycle transition, records `PreToolUse` calls and decides
     /// whether this event may drain inject. Refuses (and changes nothing)
     /// on a non-harness peer, a malformed payload, or an address held by
-    /// another live incarnation.
+    /// another live incarnation. A route-journal failure restores the previous
+    /// binding and records no caller/context evidence for the refused event.
     pub fn admit_hook(
         &mut self,
         peer: PeerIdentity,
@@ -1216,6 +1399,7 @@ impl Registry {
             .map(PathBuf::from)
             .filter(|path| path.is_absolute() && path.starts_with(&profile.store));
 
+        let previous_binding = self.bindings.get(&key).cloned();
         let (renewed, previous_epoch) = match self.bindings.get(&key) {
             Some(binding) if binding.harness != matched.incarnation => {
                 if !binding.retired && os::incarnation_alive(binding.harness.0, binding.harness.1) {
@@ -1235,6 +1419,11 @@ impl Registry {
             let epoch =
                 previous_epoch.map_or(now_ms.max(1), |old| now_ms.max(old.saturating_add(1)));
             self.evict_bindings();
+            if !self.bindings.contains_key(&key) && self.bindings.len() >= DEFAULT_MAX_BINDINGS {
+                return Err(CorrelationError::Unavailable(
+                    "verified route capacity exhausted".into(),
+                ));
+            }
             self.bindings.insert(
                 key.clone(),
                 Binding {
@@ -1261,6 +1450,17 @@ impl Registry {
             binding.retired = true;
         }
         let binding = binding.clone();
+        if let Err(error) = self.persist_routes() {
+            match previous_binding {
+                Some(old) => {
+                    self.bindings.insert(key.clone(), old);
+                }
+                None => {
+                    self.bindings.remove(&key);
+                }
+            }
+            return Err(CorrelationError::Unavailable(error));
+        }
 
         if kind == HookKind::PreToolUse
             && let Some(call) = payload.tool_use_id.as_deref()
@@ -1624,7 +1824,7 @@ impl Registry {
             })?;
         same_binding(binding, expected)?;
         binding.capabilities.message = message && binding.qualified.message;
-        Ok(())
+        self.persist_routes()
     }
 
     /// Addresses of live `harness` bindings whose message capability was
