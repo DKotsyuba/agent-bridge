@@ -290,7 +290,11 @@ mod tests {
         });
         let parent = &os::ancestry(std::process::id())[1];
         let incarnation = (parent.pid, parent.start_time);
-        let stale = dir.join(format!("ui2-{:010}.sock", std::process::id()));
+        let stale = dir.join(format!(
+            "{}{:010}.sock",
+            frontend_prefix(),
+            std::process::id()
+        ));
         drop(UnixListener::bind(&stale).unwrap());
         assert!(frontend_for(&dir, incarnation).is_none());
         let guard = start_frontend_with_pipe(&channel, pipe, node)
@@ -339,6 +343,17 @@ mod tests {
     }
 }
 
+/// Returns the compiled frontend build's private socket prefix. Rolling upgrades
+/// select only their own client implementation; unrelated older MCP processes
+/// remain running. Ordinary local tests use the fixed dev label, never runtime
+/// environment values supplied by a request or changed after compilation.
+fn frontend_prefix() -> String {
+    format!(
+        "ui2-{}-",
+        option_env!("BRIDGE_BUILD_LABEL").unwrap_or("dev")
+    )
+}
+
 /// Lifetime guard for the app-authorized MCP frontend's private delivery relay.
 /// Dropping it removes only its owned socket; the process exit ends its worker.
 /// The worker holds the host endpoint solely in memory and accepts only the
@@ -381,7 +396,7 @@ fn start_frontend_with_pipe(
     node: std::path::PathBuf,
 ) -> std::io::Result<Option<FrontendRelay>> {
     let parent = channel.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
-    let path = parent.join(format!("ui2-{}.sock", std::process::id()));
+    let path = parent.join(format!("{}{}.sock", frontend_prefix(), std::process::id()));
     let listener = UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     let channel = channel.to_path_buf();
@@ -463,17 +478,19 @@ struct FrontendRequest {
 /// incarnation. Only kernel PID/ancestry and the protected channel directory are
 /// used; filenames are not identity. A bounded, read-only connection probe skips
 /// dead sockets even when their filename PID was reused. Only signed-client
-/// protocol endpoints (ui2) are selected; older running frontends stay untouched.
+/// protocol endpoints from this exact compiled build are selected; older running
+/// frontends stay untouched and cannot mask a newly installed fixed client.
 /// The sending connection
 /// is independently rechecked below; probing never writes a request.
 pub fn frontend_for(directory: &Path, harness: (u32, u64)) -> Option<std::path::PathBuf> {
     let entries = std::fs::read_dir(directory).ok()?;
     let deadline = Instant::now() + HOST_TIMEOUT;
+    let prefix = frontend_prefix();
     for entry in entries.take(512).flatten() {
         let name = entry.file_name();
         let name = name.to_str()?;
         let Some(pid) = name
-            .strip_prefix("ui2-")
+            .strip_prefix(&prefix)
             .and_then(|n| n.strip_suffix(".sock"))
             .and_then(|n| n.parse::<u32>().ok())
         else {
