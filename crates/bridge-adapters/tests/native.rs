@@ -2707,6 +2707,19 @@ fn signed_parent_private_channel_delivers_one_message() {
     assert_eq!(ready.trim(), "ready");
     let me = bridge_adapters::os::process_facts(std::process::id()).unwrap();
     let path = bridge_adapters::desktop::frontend_for(&dir.0, (me.pid, me.start_time)).unwrap();
+    // Simulate a daemon upgrade while its signed primary MCP process stays open.
+    let pid = path
+        .file_stem()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .rsplit('-')
+        .next()
+        .unwrap();
+    let older = dir.0.join(format!("ui2-previous-{pid}.sock"));
+    std::fs::rename(&path, &older).unwrap();
+    let path = bridge_adapters::desktop::frontend_for(&dir.0, (me.pid, me.start_time)).unwrap();
+    assert_eq!(path, older);
     let result = bridge_adapters::desktop::via_frontend(
         &path,
         (me.pid, me.start_time),

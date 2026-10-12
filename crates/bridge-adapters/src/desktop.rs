@@ -349,8 +349,8 @@ mod tests {
 }
 
 /// Returns the compiled frontend build's private socket prefix. Rolling upgrades
-/// select only their own client implementation; unrelated older MCP processes
-/// remain running. Ordinary local tests use the fixed dev label, never runtime
+/// prefer their own client implementation; compatible signed primary clients
+/// survive daemon-only upgrades. Local tests use the fixed dev label, never runtime
 /// environment values supplied by a request or changed after compilation.
 fn frontend_prefix() -> String {
     format!(
@@ -596,28 +596,43 @@ struct FrontendRequest {
 /// incarnation. Only kernel PID/ancestry and the protected channel directory are
 /// used; filenames are not identity. A bounded, read-only connection probe skips
 /// dead sockets even when their filename PID was reused. Only signed-client
-/// protocol endpoints from this exact compiled build are selected; older running
-/// frontends stay untouched and cannot mask a newly installed fixed client.
+/// protocol endpoints are preferred from this build; older labelled endpoints
+/// remain eligible only under a primary Node process. The native application still
+/// enforces its signed-client authorization; a filename grants no authority.
 /// The sending connection
 /// is independently rechecked below; probing never writes a request.
 pub fn frontend_for(directory: &Path, harness: (u32, u64)) -> Option<std::path::PathBuf> {
-    let entries = std::fs::read_dir(directory).ok()?;
-    let deadline = Instant::now() + HOST_TIMEOUT;
     let prefix = frontend_prefix();
-    for entry in entries.take(512).flatten() {
+    // ponytail: bounded 512-entry scan; maintain a live index if this ceiling matters.
+    let mut entries: Vec<_> = std::fs::read_dir(directory)
+        .ok()?
+        .take(512)
+        .flatten()
+        .collect();
+    entries.sort_by_key(|entry| !entry.file_name().to_string_lossy().starts_with(&prefix));
+    let deadline = Instant::now() + HOST_TIMEOUT;
+    for entry in entries {
         let name = entry.file_name();
         let name = name.to_str()?;
         let Some(pid) = name
-            .strip_prefix(&prefix)
+            .strip_prefix("ui2-")
             .and_then(|n| n.strip_suffix(".sock"))
-            .and_then(|n| n.parse::<u32>().ok())
+            .and_then(|n| n.rsplit_once('-'))
+            .and_then(|(_, pid)| pid.parse::<u32>().ok())
         else {
             continue;
         };
-        if !os::ancestry(pid)
+        let chain = os::ancestry(pid);
+        if !chain
             .iter()
             .skip(1)
             .any(|p| (p.pid, p.start_time) == harness)
+            || (!name.starts_with(&prefix)
+                && !chain
+                    .get(1)
+                    .and_then(|p| p.exe.as_ref())
+                    .and_then(|exe| exe.file_name())
+                    .is_some_and(|name| name == "node"))
         {
             continue;
         }

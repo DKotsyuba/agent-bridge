@@ -446,3 +446,9 @@ Discovery rechecks the live process UID/start time, descriptor age, exact native
 store and qualified executable before persisting the route. Only native status
 supplies lifecycle; unknown/input waits stay held. Known and retired bindings
 are never overwritten, and discovery grants no MCP caller identity or proof.
+
+Codex application frontends use a versioned private protocol, independently of
+release build labels. A daemon update prefers its current build but can retain
+an older labelled frontend under a primary Node process; kernel PID/incarnation,
+protected channel and native signed-client checks still apply. An unavailable
+frontend holds before reservation, so reconnection consumes no delivery retries.

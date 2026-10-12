@@ -102,14 +102,23 @@ impl CodexQueueCarrier {
 
 impl DispatchCarrier for CodexQueueCarrier {
     /// Attests Codex recipients from the registry; anything else is not
-    /// this carrier's (an error, which core treats as a hold).
+    /// this carrier's (an error, which core treats as a hold). Application hosts
+    /// also require a live compatible frontend before consuming any send attempt.
     fn attest(&mut self, recipient: &NativeAddress) -> Result<Attestation, String> {
         if recipient.harness != Harness::Codex {
             return Err("not a Codex recipient".into());
         }
-        lock_registry(&self.registry)
-            .attest_recipient(recipient)
-            .map(|(attestation, _)| attestation)
+        let (attestation, binding) = lock_registry(&self.registry).attest_recipient(recipient)?;
+        if crate::os::process_env(binding.harness.0, "CODEX_APP_TOOLS_PIPE_PATH").is_some()
+            && !self.desktop_directory.as_ref().is_some_and(|directory| {
+                crate::desktop::frontend_for(directory, binding.harness).is_some()
+            })
+        {
+            return Err(
+                "registered Codex application frontend not available yet (transient hold)".into(),
+            );
+        }
+        Ok(attestation)
     }
 
     /// Hands the frozen manifest to the application's source-labelled native
