@@ -1,0 +1,9 @@
+[
+{"api_version":1,"request_id":"caps-1","credential":"fixture-secret","op":"capabilities","params":{}},
+{"api_version":1,"request_id":"register-1","credential":"fixture-secret","op":"register_call","params":{"operation_key":"opaque-op","evidence":{"type":"native","host":"codex","metadata":{"threadId":"native-thread","callId":"native-call","x-codex-turn-metadata":{}}}}},
+{"api_version":1,"request_id":"publish-1","credential":"fixture-secret","op":"publish","params":{"destination":{"type":"address","address":"local/codex/store/session"},"event_id":"opaque-event","kind":"opaque.kind","payload":"opaque content"}},
+{"api_version":1,"request_id":"status-1","credential":"fixture-secret","op":"status","params":{"selector":{"type":"event","event_id":"opaque-event"}}},
+{"api_version":1,"request_id":"close-1","credential":"fixture-secret","op":"close_route","params":{"route_key":"opaque-route"}},
+{"api_version":1,"request_id":"consume-1","credential":"fixture-secret","op":"consume_assertion","params":{"assertion_key":"fixture-assertion","invocation_key":"opaque-forwarded-rpc"}},
+{"api_version":1,"request_id":"retire-1","credential":"fixture-secret","op":"retire_delivery_scope","params":{"scope_key":"opaque-lifetime","action":"retire_unhanded"}}
+]
