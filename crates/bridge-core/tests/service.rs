@@ -675,3 +675,33 @@ fn socket_paths_are_unique_when_created_concurrently() {
         .collect();
     assert_eq!(paths.len(), 16 * 256);
 }
+
+/// An explicitly any-address publisher can admit a new session without changing
+/// configuration. Kind, mode, operator and malformed wildcard guards remain.
+#[test]
+fn wildcard_recipient_grants_admit_new_addresses_without_widening_other_rights() {
+    let dir = TempDir::new("svc-anyaddr");
+    let mut config = test_config(&dir);
+    config.grants[0].recipients = vec!["*".into()];
+    assert!(config.grants[0].validate().is_ok());
+    let mut invalid = config.grants[0].clone();
+    invalid.recipients = vec!["host-1/*".into()];
+    assert!(invalid.validate().is_err());
+    let mut admin = config.grants[1].clone();
+    admin.recipients = vec!["*".into()];
+    assert!(admin.validate().is_err());
+    let running = service::start(config).unwrap();
+    let mut client = bridge_client::BridgeClient::connect(running.socket_path()).unwrap();
+    let mut new = body("new-address");
+    new.recipient =
+        NativeAddress::new("host-1", Harness::ClaudeCode, "new-store", "new-session").unwrap();
+    assert!(!client.publish(GRANT_TOKEN, &new).unwrap().replayed);
+    new.event_id = "wrong-kind".into();
+    new.kind = "unlisted.kind".into();
+    assert_eq!(
+        client.publish(GRANT_TOKEN, &new).unwrap_err().class,
+        "forbidden"
+    );
+    running.shutdown();
+    running.join();
+}

@@ -1,5 +1,8 @@
 //! Codex `message` carrier: one `thread/queue/add` through an OS-confined,
-//! queue-only App Server helper.
+//! queue-only App Server helper for CLI hosts. Application hosts use their
+//! native message tool, preserving the application's cross-task source label.
+//! The native pipe is read only from the attested harness OS environment;
+//! after any native send begins no queue fallback or automatic replay occurs.
 //!
 //! The helper is the *qualified* Codex build of the recipient's binding,
 //! started for exactly one hand-off as
@@ -100,7 +103,10 @@ impl DispatchCarrier for CodexQueueCarrier {
             .map(|(attestation, _)| attestation)
     }
 
-    /// Hands the frozen manifest to the attested thread's native queue.
+    /// Hands the frozen manifest to the application's source-labelled native
+    /// message route when the attested harness exposes it; CLI recipients use
+    /// the confined queue helper. A selected application route never falls back
+    /// after a failed or ambiguous exchange, preventing duplicate delivery.
     fn send(&mut self, attempt: &AttemptRecord) -> Outcome {
         let (address, binding) = match self.binding_for(attempt) {
             Ok(found) => found,
@@ -115,6 +121,26 @@ impl DispatchCarrier for CodexQueueCarrier {
             attempt.fence.attempt_seq,
             prefix_within(&attempt.fence.manifest_hash, 16)
         );
+        if let Some(pipe) = crate::os::process_env(binding.harness.0, "CODEX_APP_TOOLS_PIPE_PATH") {
+            if !crate::os::incarnation_alive(binding.harness.0, binding.harness.1) {
+                return Outcome::KnownUnsent {
+                    evidence: "the recipient harness ended before application delivery".into(),
+                };
+            }
+            let Some(uid) = crate::os::process_facts(binding.harness.0).and_then(|facts| facts.uid)
+            else {
+                return Outcome::KnownUnsent {
+                    evidence: "the recipient harness user is unavailable".into(),
+                };
+            };
+            return crate::desktop::deliver(
+                &PathBuf::from(pipe),
+                &address.native_session_id,
+                &client_id,
+                &attempt.manifest,
+                uid,
+            );
+        }
         let helper = Helper {
             sandbox: &self.sandbox,
             executable: &binding.executable,

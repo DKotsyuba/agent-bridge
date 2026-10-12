@@ -23,6 +23,7 @@ use std::path::Path;
 
 use bridge_adapters::registry::{CorrelationError, PresentedMeta, SealedProof};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::root::{RelayRequest, RelayResponse, TOOLS, call_relay};
 
@@ -143,7 +144,7 @@ fn initialize(params: &Value) -> Value {
         "protocolVersion": version,
         "capabilities": {"tools": {"listChanged": false}},
         "serverInfo": {"name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION")},
-        "instructions": "Agent Bridge root tools. Your identity comes from the harness, never from arguments. Sends are keep_all to exact allowlisted recipients; status shows only your own requests. Uncertain delivery is never resent automatically.",
+        "instructions": "Agent Bridge root tools. Your identity comes from the harness, never from arguments. Sends are keep_all to valid native addresses within the configured policy (star allows new sessions without manual admission); status shows only your own requests. Uncertain delivery is never resent automatically.",
     })
 }
 
@@ -169,21 +170,23 @@ pub fn tool_list() -> Value {
         },
         {
             "name": TOOLS[1],
-            "description": "Send one keep_all notification to an exact allowlisted recipient. Repeating a request_id is an idempotent replay.",
+            "description": "Send with address and message. Native message delivery is the default. New sessions need no manual admission when policy is *. An omitted request_id is generated from this authenticated host call and returned. Reuse that id to reconcile uncertain delivery; never resend an uncertain message with a new id. Legacy recipient/body/kind/mode fields remain supported.",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["request_id", "recipient", "kind", "mode", "body"],
+                "anyOf": [{"required": ["address", "message"]}, {"required": ["recipient", "body"]}],
                 "properties": {
                     "request_id": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$"},
-                    "recipient": address,
+                    "address": {"type": "string", "description": "Canonical native address from bridge_me"},
+                    "message": {"type": "string"},
+                    "recipient": {"oneOf": [{"type": "string"}, address]},
                     "kind": {"type": "string"},
                     "mode": {"type": "string", "enum": ["inject", "message", "auto"]},
                     "body": {"type": "string"},
                     "expires_at_ms": {"type": "integer", "minimum": 1},
                 },
             },
-            "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+            "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false},
         },
         {
             "name": TOOLS[2],
@@ -199,7 +202,10 @@ pub fn tool_list() -> Value {
     ])
 }
 
-/// `tools/call`: closed params, attestation, relay.
+/// `tools/call`: closed params, attestation, and relay. For sends without
+/// `request_id`, derive a stable id from the authenticated native call id
+/// before any relay write. Kind/mode defaults and target validation remain
+/// relay-owned; unknown outcomes disclose the id for reconciliation.
 fn call_tool(
     params: &Value,
     seal: Sealer<'_>,
@@ -221,7 +227,7 @@ fn call_tool(
     if !TOOLS.contains(&name) {
         return Err((-32602, "unknown tool"));
     }
-    let arguments = params
+    let mut arguments = params
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
@@ -233,21 +239,53 @@ fn call_tool(
             "caller_not_evidence",
             "the request carries no harness _meta; arguments never identify a caller",
         ),
-        Some(meta) => match PresentedMeta::from_mcp_meta(meta)
-            .and_then(|meta| seal(&meta, bridge_core::service::current_unix_millis()))
-        {
+        Some(meta) => match PresentedMeta::from_mcp_meta(meta).and_then(|meta| {
+            seal(&meta, bridge_core::service::current_unix_millis()).map(|proof| (proof, meta))
+        }) {
             Err(refusal) => RelayResponse::error(
                 format!("caller_{}", refusal.class().trim_start_matches("caller_")),
                 refusal.detail().to_string(),
             ),
-            Ok(proof) => call_relay(
-                relay_socket,
-                &RelayRequest {
-                    proof,
-                    tool: name.to_string(),
-                    arguments,
-                },
-            ),
+            Ok((proof, native_meta)) => {
+                if name == TOOLS[1] && arguments.get("request_id").is_none() {
+                    let call_id = match &native_meta {
+                        PresentedMeta::Claude { tool_use_id } => tool_use_id,
+                        PresentedMeta::Codex { call_id, .. } => call_id,
+                        PresentedMeta::Sealed { .. } => {
+                            return Err((-32602, "native call identity missing"));
+                        }
+                    };
+                    arguments["request_id"] =
+                        Value::String(format!("call-{:x}", Sha256::digest(call_id.as_bytes())));
+                }
+                let request_id = arguments
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| {
+                        id.len() <= 128
+                            && id
+                                .bytes()
+                                .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+                    })
+                    .map(str::to_owned);
+                let mut answer = call_relay(
+                    relay_socket,
+                    &RelayRequest {
+                        proof,
+                        tool: name.to_string(),
+                        arguments,
+                    },
+                );
+                if let RelayResponse::Error { class, detail } = &mut answer
+                    && matches!(class.as_str(), "relay_outcome_unknown" | "custody_unknown")
+                    && let Some(id) = request_id
+                {
+                    detail.push_str(&format!(
+                        "; reconcile request_id={id}; never create a new id for this message"
+                    ));
+                }
+                answer
+            }
         },
     };
     Ok(tool_result(&answer))

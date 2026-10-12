@@ -17,7 +17,8 @@
 //!   first inject drain, caller attestation).
 //! - [`client`]: the hook command's client and the cross-process
 //!   [`client::RegistryAttestor`].
-//! - [`codex`]: the queue-only, OS-confined Codex message carrier.
+//! - [`codex`]: source-labelled application delivery or confined CLI queue.
+//! - [`desktop`]: bounded native application message-tool framing.
 //! - [`claude`]: the Claude `later` message carrier with a callback socket
 //!   unique to each attempt.
 //!
@@ -35,6 +36,7 @@
 pub mod claude;
 pub mod client;
 pub mod codex;
+pub mod desktop;
 pub mod os;
 pub mod registry;
 pub mod server;

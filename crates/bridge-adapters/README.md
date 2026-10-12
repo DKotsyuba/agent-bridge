@@ -108,7 +108,17 @@ at the end.
   hook stdout line, and records `hook_submitted` only after the hook confirms
   the flushed digest. Anything else after the reply is `outcome_unknown`
   (retained incident, never re-offered). A child never drains root data.
-- **Codex message**: `sandbox-exec -p '(version 1)(allow default)(deny
+- **Codex application message**: when the attested recipient harness exposes
+  `CODEX_APP_TOOLS_PIPE_PATH`, Bridge uses the application's native
+  `send_message_to_thread` tool with `callerSource = "codex"`, the same
+  host contract as agent-run. This preserves the application's cross-task source
+  label; XML inside the message is not used to manufacture a UI badge. The pipe
+  comes from the verified harness OS environment, never from sender arguments.
+  Only read-only tool discovery and that one exact message operation are sent,
+  under one eight-second connect/read/write deadline. A positive native success
+  is acceptance only. Any failure after the message request starts is unknown,
+  retained and never followed by a second ordinary-queue send.
+- **Codex CLI message**: `sandbox-exec -p '(version 1)(allow default)(deny
   network*)(deny process-fork)' <qualified codex> app-server --listen
   stdio://` with a scrubbed environment and `CODEX_HOME` = the attested store;
   only `initialize`, `initialized` and `thread/queue/add` are sent. One total

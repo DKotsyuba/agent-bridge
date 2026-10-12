@@ -332,6 +332,13 @@ fn scratch(tag: &str) -> PathBuf {
 /// Builds and starts the lab in a fresh scratch directory (removed, only
 /// it, when the lab drops).
 fn lab(tag: &str) -> Lab {
+    lab_with_addresses(tag, false)
+}
+
+/// Builds the existing process lab; `any` enables any canonical recipient and
+/// concise message defaults solely in the new policy test. Legacy labs retain
+/// their original exact grants and forbidden kind/mode cases.
+fn lab_with_addresses(tag: &str, any: bool) -> Lab {
     let dir = scratch(tag);
     let store = dir.join("cs");
     std::fs::create_dir_all(&store).unwrap();
@@ -342,12 +349,24 @@ fn lab(tag: &str) -> Lab {
         GrantConfig {
             token: ROOT_TOKEN.into(),
             publisher: "bridge-root".into(),
-            recipients: ["s1", "s2"]
-                .iter()
-                .map(|session| claude(session).to_canonical_string())
-                .collect(),
-            kinds: vec!["root.note".into()],
-            modes: vec!["inject".into(), "auto".into()],
+            recipients: if any {
+                vec!["*".into()]
+            } else {
+                ["s1", "s2"]
+                    .iter()
+                    .map(|session| claude(session).to_canonical_string())
+                    .collect()
+            },
+            kinds: if any {
+                vec!["root.note".into(), "bridge.message".into()]
+            } else {
+                vec!["root.note".into()]
+            },
+            modes: if any {
+                vec!["inject".into(), "auto".into(), "message".into()]
+            } else {
+                vec!["inject".into(), "auto".into()]
+            },
             policies: vec!["keep_all".into()],
             admin: false,
         },
@@ -465,6 +484,27 @@ kinds = ["root.note"]
         ),
     )
     .unwrap();
+    if any {
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        let text = text
+            .replace(
+                &format!(
+                    "recipients = [\"{}\", \"{}\"]",
+                    claude("s1").to_canonical_string(),
+                    claude("s2").to_canonical_string()
+                ),
+                "recipients = [\"*\"]",
+            )
+            .replace(
+                "modes = [\"inject\", \"auto\"]",
+                "modes = [\"inject\", \"auto\", \"message\"]",
+            )
+            .replace(
+                "kinds = [\"root.note\"]",
+                "kinds = [\"root.note\", \"bridge.message\"]",
+            );
+        std::fs::write(&config_path, text).unwrap();
+    }
     let relay = Command::new(&relay_exe)
         .arg(&config_path)
         .stdin(Stdio::null())
@@ -1169,4 +1209,63 @@ fn expired_replays_preserve_custody_without_admitting_new_expired_events() {
         json!({"request_id":"new-expired"}),
     );
     assert_eq!(status["structuredContent"]["custody"]["state"], "not_found");
+}
+
+/// The concise address/message API admits a previously unlisted session through
+/// the real frontend, sealed native identity, relay and core. The generated
+/// request id is returned, supports explicit replay, and altered data conflicts.
+#[test]
+fn address_message_send_needs_no_per_session_configuration() {
+    let lab = lab_with_addresses("ad", true);
+    let mut harness = Harnessed::start(&lab.store);
+    lab.hook(
+        &mut harness,
+        json!({"hook_event_name":"SessionStart","session_id":"s1","cwd":"/ignored"}),
+    );
+    let args =
+        json!({"address":claude("brand-new-session").to_canonical_string(),"message":"hello"});
+    let sent = lab.call(
+        &mut harness,
+        "s1",
+        "short-send",
+        None,
+        "bridge_send",
+        args.clone(),
+    );
+    assert_eq!(class(&sent), "ok", "{sent}");
+    let id = sent["structuredContent"]["request_id"].as_str().unwrap();
+    assert!(id.starts_with("call-") && id.len() <= 128);
+    let mut replay = args;
+    replay["request_id"] = json!(id);
+    let repeated = lab.call(
+        &mut harness,
+        "s1",
+        "short-replay",
+        None,
+        "bridge_send",
+        replay.clone(),
+    );
+    assert_eq!(class(&repeated), "ok", "{repeated}");
+    assert_eq!(repeated["structuredContent"]["custody"]["replayed"], true);
+    replay["message"] = json!("different");
+    assert_eq!(
+        class(&lab.call(
+            &mut harness,
+            "s1",
+            "short-conflict",
+            None,
+            "bridge_send",
+            replay
+        )),
+        "conflict"
+    );
+    let bad = lab.call(
+        &mut harness,
+        "s1",
+        "bad-address",
+        None,
+        "bridge_send",
+        json!({"address":"broken","message":"hi"}),
+    );
+    assert_eq!(class(&bad), "invalid");
 }

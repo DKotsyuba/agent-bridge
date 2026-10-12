@@ -91,7 +91,7 @@ pub struct RootConfig {
     pub callers: Vec<CallerPolicy>,
 }
 
-/// One root caller scope and its exact send allowlist.
+/// One root caller scope and its exact or any-address send policy.
 ///
 /// A caller matches when its attested address has these host, harness and
 /// store components and, when `native_session_id` is set, exactly that
@@ -109,7 +109,8 @@ pub struct CallerPolicy {
     /// Exact caller session; absent matches any root session of the store.
     #[serde(default)]
     pub native_session_id: Option<String>,
-    /// Exact canonical recipient addresses this caller may send to.
+    /// Canonical recipient addresses this caller may send to; `"*"` permits
+    /// every well-formed address, retaining native dispatch qualification.
     pub recipients: Vec<String>,
     /// Delivery modes this caller may request (`inject`, `message`, `auto`).
     pub modes: Vec<String>,
@@ -284,15 +285,20 @@ impl CallerPolicy {
                 .is_none_or(|session| *session == address.native_session_id)
     }
 
-    /// The recipient allowlist in canonical form (each entry parsed and
-    /// re-rendered, so a non-canonical spelling cannot slip past a match).
+    /// The recipient allowlist in canonical form. A literal `"*"` is kept as
+    /// the explicit any-address policy; every other entry is parsed and
+    /// re-rendered, and malformed addresses or wildcard patterns refuse.
     pub fn canonical_recipients(&self) -> Result<Vec<String>, String> {
         self.recipients
             .iter()
             .map(|recipient| {
-                NativeAddress::parse(recipient)
-                    .map(|address| address.to_canonical_string())
-                    .map_err(|_| "root.callers: invalid recipient address".to_string())
+                if recipient == "*" {
+                    Ok("*".to_string())
+                } else {
+                    NativeAddress::parse(recipient)
+                        .map(|address| address.to_canonical_string())
+                        .map_err(|_| "root.callers: invalid recipient address".to_string())
+                }
             })
             .collect()
     }

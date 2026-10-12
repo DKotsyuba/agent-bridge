@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-adapters"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bridge-core",
  "serde",
@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bridge-core",
  "serde_json",
@@ -41,7 +41,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bridge-client",
  "rusqlite",
@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-interfaces"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bridge-adapters",
  "bridge-client",
@@ -683,7 +683,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde_json",
 ]

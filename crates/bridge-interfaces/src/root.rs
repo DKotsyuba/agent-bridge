@@ -18,7 +18,7 @@
 //! refuses), require a *root* actor acting as its own address (a Claude
 //! subagent sharing its root's session, or any child, is refused), require
 //! a configured caller scope, then validate the closed arguments. `send`
-//! always publishes `keep_all` to an exact allowlisted recipient through the
+//! always publishes `keep_all` within the configured address policy through the
 //! relay's own core *publisher* grant; `status` reads only events this
 //! caller published. Event ids are derived from the caller address, actor
 //! and `request_id`, so callers cannot collide with, conflict with or read
@@ -165,23 +165,48 @@ struct MeArgs {}
 struct SendArgs {
     /// Caller-chosen stable request id (idempotency key).
     request_id: String,
-    /// Exact structured recipient.
+    /// Canonical address string or legacy structured recipient.
+    #[serde(alias = "address")]
     recipient: RecipientArg,
-    /// Allowlisted kind.
+    /// Allowlisted kind; defaults to the root message kind.
+    #[serde(default = "default_kind")]
     kind: String,
-    /// Requested delivery mode.
+    /// Requested delivery mode; defaults to visible native message delivery.
+    #[serde(default = "default_mode")]
     mode: String,
-    /// Plain-text body.
+    /// Plain-text body (`message` is the concise public spelling).
+    #[serde(alias = "message")]
     body: String,
     /// Optional absolute expiry (Unix epoch ms); must be in the future.
     #[serde(default)]
     expires_at_ms: Option<u64>,
 }
 
-/// Structured recipient argument (closed).
+/// A validated target address, accepting the concise native address or the
+/// original closed structured form. Neither variant identifies the sender.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RecipientArg {
+    /// Canonical `host/harness/store/session` address; parsed at admission.
+    Canonical(String),
+    /// Backward-compatible explicit components, still closed to extra fields.
+    Structured(StructuredRecipientArg),
+}
+
+/// Default root event kind when a concise send omits it.
+fn default_kind() -> String {
+    "bridge.message".to_string()
+}
+
+/// Default mode for visible application messages rather than quiet context injection.
+fn default_mode() -> String {
+    "message".to_string()
+}
+
+/// Original structured recipient argument (closed).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RecipientArg {
+struct StructuredRecipientArg {
     /// Host id.
     host_id: String,
     /// Harness wire name.
@@ -340,18 +365,21 @@ impl RootRelay {
         now_ms: u64,
     ) -> Result<RelayResponse, RelayResponse> {
         check_request_id(&args.request_id)?;
-        let harness = Harness::parse(&args.recipient.harness).map_err(invalid)?;
-        let recipient = NativeAddress::new(
-            args.recipient.host_id,
-            harness,
-            args.recipient.native_store_namespace,
-            args.recipient.native_session_id,
-        )
-        .map_err(invalid)?;
+        let recipient = match args.recipient {
+            RecipientArg::Canonical(address) => NativeAddress::parse(&address).map_err(invalid)?,
+            RecipientArg::Structured(args) => NativeAddress::new(
+                args.host_id,
+                Harness::parse(&args.harness).map_err(invalid)?,
+                args.native_store_namespace,
+                args.native_session_id,
+            )
+            .map_err(invalid)?,
+        };
         if !policy
             .canonical_recipients()
             .unwrap_or_default()
-            .contains(&recipient.to_canonical_string())
+            .iter()
+            .any(|entry| entry == "*" || entry == &recipient.to_canonical_string())
         {
             return Err(RelayResponse::error(
                 "forbidden",

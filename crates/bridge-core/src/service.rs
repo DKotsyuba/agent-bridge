@@ -8,7 +8,7 @@
 //!   kinds, modes and policies it may use; they can only `publish` and read
 //!   the `status` of their own events. The restricted root orchestrator
 //!   surface consumes this same protocol through its own backend grant whose
-//!   allowlist forces `keep_all` and its exact authorized recipients;
+//!   policy forces `keep_all` and its configured exact or any-address scope;
 //!   external root credentials are never core credentials.
 //! - **operator grants** (`admin = true`) carry empty allowlists, can never
 //!   publish or read publisher status, and alone can list incidents, record
@@ -101,7 +101,8 @@ pub struct GrantConfig {
     pub token: String,
     /// The single publisher (or operator) identity this grant authenticates.
     pub publisher: String,
-    /// Exact canonical recipient addresses this grant may publish to.
+    /// Canonical recipient addresses this grant may publish to; `"*"` permits
+    /// any well-formed address without a per-session admission change.
     pub recipients: Vec<String>,
     /// Event kinds this grant may publish.
     pub kinds: Vec<String>,
@@ -162,7 +163,9 @@ impl GrantConfig {
             crate::framing::validate_tag(&self.publisher)?;
         }
         for recipient in &self.recipients {
-            NativeAddress::parse(recipient)?;
+            if recipient != "*" {
+                NativeAddress::parse(recipient)?;
+            }
         }
         for kind in &self.kinds {
             Kind::new(kind.clone())?;
@@ -1439,7 +1442,13 @@ fn serve_publish(
             ))
         }
     };
-    authorize(grant.recipients.contains(&recipient_text), "this recipient")?;
+    authorize(
+        grant
+            .recipients
+            .iter()
+            .any(|entry| entry == "*" || entry == &recipient_text),
+        "this recipient",
+    )?;
     authorize(
         grant.kinds.iter().any(|allowed| allowed == &body.kind),
         "this kind",

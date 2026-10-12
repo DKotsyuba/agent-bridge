@@ -13,7 +13,7 @@ Qualification status: **not_verified**. See [Evidence levels](#evidence-levels).
 | Binary | Runs as | Holds |
 |---|---|---|
 | `bridge-root-mcp <channel> <relay>` | stdio MCP server launched by the harness | nothing secret |
-| `bridge-root-relay <interfaces.toml>` | resident daemon started by the operator | core *publisher* grant token (keep_all, exact recipients) |
+| `bridge-root-relay <interfaces.toml>` | resident daemon started by the operator | core *publisher* grant token (keep_all, configured recipient scope) |
 | `bridge` | operator CLI | reads the core *operator* grant token from its protected file |
 
 `bridge-native-daemon`, `bridge-hook` and `bridge-daemon` come from the core
@@ -41,6 +41,13 @@ while the caller's binding epoch is unchanged. Then the relay requires:
 2. a configured `[[root.callers]]` scope;
 3. valid closed arguments.
 
+For address-based personal messaging, set `recipients = ["*"]` in the root
+publisher grant and its root caller policies. This permits every well-formed
+native address without per-session edits or service restarts; exact lists
+remain supported. Sender attestation, root-only access, kinds, modes and
+body limits are unchanged. Delivery still requires a qualified native endpoint;
+an unknown address waits visibly rather than being rerouted or fabricated.
+
 Refusal classes: `caller_unattested` (no provider configured — the default
 without `[root].channel`), `caller_missing`, `caller_duplicate`,
 `caller_stale`, `caller_conflicting`, `caller_not_evidence`,
@@ -59,8 +66,14 @@ message).
 
 - `bridge_me` → the attested address, endpoint epoch, channel and the
   permitted recipients, modes, kinds, `keep_all` and body bound.
-- `bridge_send(request_id, recipient, kind, mode, body, expires_at_ms?)` →
-  publishes `keep_all` to an exact allowlisted recipient. The core event id
+- `bridge_send(address, message, request_id?, kind?, mode?, expires_at_ms?)` →
+  publishes `keep_all` within the configured address scope. Kind defaults to
+  `bridge.message`, mode to `message`. The canonical address string is sufficient;
+  legacy structured `recipient` and `body` spellings remain supported. If the
+  request id is omitted, the frontend derives it from the authenticated native
+  tool-call identity before writing to the relay and returns it in the receipt.
+  Use the returned id for status/reconciliation or an explicit idempotent retry;
+  after a lost/uncertain answer never create a fresh id for the same message. The core event id
   is derived from the caller address, actor and `request_id`: repeating a
   `request_id` replays (same receipt), a changed body under it conflicts,
   and callers never share events (equal native ids in different stores
