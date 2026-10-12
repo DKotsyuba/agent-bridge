@@ -1028,3 +1028,233 @@ fn publication_close_and_retirement_serialize_at_commit() {
         }
     }
 }
+
+/// Even a stale persisted reservation presented after retirement cannot cross
+/// the shared final invoking guard. Fixture restoration models an unsettled
+/// reservation; immutable manifest/hash/recipient/epoch remain untouched.
+#[test]
+fn committed_lifetime_fence_blocks_stale_reserved_manifest() {
+    let dir = TempDir::new("universal-invoke-fence");
+    let path = dir.path("state.db");
+    let mut storage = store(&path);
+    let route = storage
+        .register_call(
+            TOKEN,
+            "register",
+            &registration("job"),
+            Some(&origin("use", "root")),
+            &|| 1000,
+        )
+        .unwrap();
+    storage
+        .publish_v1(
+            TOKEN,
+            &publication(&route.route_key, "event", Some("generation")),
+            &|| 1001,
+        )
+        .unwrap();
+    let recipient = codex("caller");
+    let attestation = attest(&recipient, Lifecycle::Inactive, 1);
+    let Selection::Attempt(reserved) = storage
+        .reserve_next(
+            &attestation,
+            EffectiveMode::Message,
+            1002,
+            &DispatchTiming::default(),
+        )
+        .unwrap()
+    else {
+        panic!("expected reservation")
+    };
+    storage
+        .retire_delivery_scope(
+            TOKEN,
+            "retire",
+            &RetireDeliveryScopeParams {
+                scope_key: "generation".into(),
+                action: RetirementAction::RetireUnhanded,
+            },
+            &|| 1003,
+        )
+        .unwrap();
+    let sql = rusqlite::Connection::open(&path).unwrap();
+    sql.execute(
+        "UPDATE attempts SET state='reserved',lease_expires_ms=?1 WHERE attempt_seq=?2",
+        rusqlite::params![reserved.lease_expires_ms, reserved.fence.attempt_seq],
+    )
+    .unwrap();
+    sql.execute("UPDATE events SET delivery='reserved',attempt_seq=?1 WHERE publisher_id='report-maker' AND event_id='event'",rusqlite::params![reserved.fence.attempt_seq]).unwrap();
+    assert!(
+        storage
+            .mark_invoking(&reserved.fence, &attestation, 1004)
+            .is_err()
+    );
+    assert_eq!(
+        sql.query_row(
+            "SELECT state FROM attempts WHERE attempt_seq=?1",
+            rusqlite::params![reserved.fence.attempt_seq],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "reserved"
+    );
+}
+/// Same producer/group/destination batches cannot mix independent lifetimes;
+/// retired inject work cannot be returned at a natural hook context point.
+#[test]
+fn scoped_batch_and_inject_retirement_remain_isolated() {
+    let dir = TempDir::new("universal-batch");
+    let path = dir.path("state.db");
+    let mut storage = store(&path);
+    let mut intent = registration("job");
+    intent.allowed_modes = Some(vec![Mode::Message, Mode::Inject]);
+    let route = storage
+        .register_call(
+            TOKEN,
+            "register",
+            &intent,
+            Some(&origin("use", "root")),
+            &|| 1000,
+        )
+        .unwrap();
+    for (id, scope) in [("a1", "one"), ("a2", "one"), ("b1", "two")] {
+        let mut event = publication(&route.route_key, id, Some(scope));
+        event.policy = Policy::Batch {
+            group: "same-group".into(),
+        };
+        storage.publish_v1(TOKEN, &event, &|| 1001).unwrap();
+    }
+    let recipient = codex("caller");
+    let idle = attest(&recipient, Lifecycle::Inactive, 1);
+    let Selection::Attempt(reserved) = storage
+        .reserve_next(
+            &idle,
+            EffectiveMode::Message,
+            1002,
+            &DispatchTiming::default(),
+        )
+        .unwrap()
+    else {
+        panic!("expected batch")
+    };
+    assert_eq!(
+        reserved
+            .members
+            .iter()
+            .map(|m| m.event_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a1", "a2"]
+    );
+    storage
+        .retire_delivery_scope(
+            TOKEN,
+            "retire-one",
+            &RetireDeliveryScopeParams {
+                scope_key: "one".into(),
+                action: RetirementAction::RetireUnhanded,
+            },
+            &|| 1003,
+        )
+        .unwrap();
+    let mut inject = publication(&route.route_key, "inject", Some("injected-life"));
+    inject.mode = Mode::Inject;
+    storage.publish_v1(TOKEN, &inject, &|| 1004).unwrap();
+    storage
+        .retire_delivery_scope(
+            TOKEN,
+            "retire-inject",
+            &RetireDeliveryScopeParams {
+                scope_key: "injected-life".into(),
+                action: RetirementAction::RetireUnhanded,
+            },
+            &|| 1005,
+        )
+        .unwrap();
+    assert!(matches!(
+        storage
+            .drain_inject(
+                &attest(&recipient, Lifecycle::Active, 1),
+                1006,
+                &DispatchTiming::default()
+            )
+            .unwrap(),
+        Selection::Idle
+    ));
+    let Selection::Attempt(next) = storage
+        .reserve_next(
+            &idle,
+            EffectiveMode::Message,
+            1006,
+            &DispatchTiming::default(),
+        )
+        .unwrap()
+    else {
+        panic!("sibling batch missing")
+    };
+    assert_eq!(next.members[0].event_id, "b1");
+}
+
+/// Explicit route/event expiry fences new work but exact accepted intent recovers
+/// immutable custody; closing an expired route cannot extend or reopen it.
+#[test]
+fn accepted_retry_after_route_and_event_expiry_preserves_receipt() {
+    let dir = TempDir::new("universal-expiry");
+    let path = dir.path("state.db");
+    let mut storage = store(&path);
+    let mut intent = registration("job");
+    intent.route_expires_at_ms = Some(1050);
+    let route = storage
+        .register_call(
+            TOKEN,
+            "register",
+            &intent,
+            Some(&origin("use", "root")),
+            &|| 1000,
+        )
+        .unwrap();
+    let mut event = publication(&route.route_key, "event", None);
+    event.expires_at_ms = Some(1040);
+    let accepted = storage.publish_v1(TOKEN, &event, &|| 1010).unwrap();
+    storage.expire_due(1041).unwrap();
+    assert_eq!(
+        storage.publish_v1(TOKEN, &event, &|| 1060).unwrap().receipt,
+        accepted.receipt
+    );
+    assert_eq!(
+        storage
+            .publish_v1(TOKEN, &publication(&route.route_key, "new", None), &|| 1060)
+            .unwrap_err()
+            .reason,
+        "route_expired"
+    );
+    let closed = storage
+        .close_route(
+            TOKEN,
+            "close-expired",
+            &CloseRouteParams {
+                route_key: route.route_key.clone(),
+                reason: None,
+            },
+            &|| 1060,
+        )
+        .unwrap();
+    assert_eq!(closed.receipt.state, RouteState::Expired);
+    assert!(closed.receipt.closed_at_ms.is_none());
+    assert!(matches!(
+        storage
+            .status_v1(
+                TOKEN,
+                &StatusSelector::Route {
+                    route_key: route.route_key
+                },
+                1061
+            )
+            .unwrap(),
+        StatusResult::Route {
+            route: Some(RouteStatus {
+                state: RouteState::Expired,
+                ..
+            })
+        }
+    ));
+}

@@ -1138,6 +1138,11 @@ fn handle_connection(stream: UnixStream, state: &Arc<ServiceState>) {
         }
         // Additive v1 is strict and cannot fall through to legacy mutation.
         if let Some(bytes) = serve_v1_line(state, &line) {
+            // A failed response codec closes without falsely acknowledging a
+            // potentially committed mutation; the client reconciles its key.
+            if bytes.is_empty() {
+                break;
+            }
             if write_line(
                 &mut writer,
                 &bytes,
@@ -1251,7 +1256,7 @@ fn serve_v1_line(state: &ServiceState, line: &str) -> Option<Vec<u8>> {
             }
         }
     };
-    Some(serde_json::to_vec(&response).unwrap_or_default())
+    Some(bridge_protocol::encode_response(&response).unwrap_or_default())
 }
 
 /// The refusal returned for work that arrives after a stop.

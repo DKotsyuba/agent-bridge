@@ -545,6 +545,7 @@ impl Storage {
                     .map_err(storage_error)?,
             )
             .map_err(storage_error)?;
+            crate::framing::check_renderable(&envelope).map_err(storage_error)?;
             let custody = publish_in(&tx, &envelope, now, limits, lifetime)
                 .map_err(storage_error)?
                 .receipt;
@@ -1177,4 +1178,93 @@ fn delivery_status(delivery: Option<crate::DeliveryEvidence>) -> Result<Delivery
             .map(crate::recovery::bound_text),
         blocked_by: delivery.blocked_by,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    //! Actual SQLite commit-failure control on private in-memory fixture state.
+    use super::*;
+    use std::sync::Arc;
+    /// A deferred foreign-key failure happens at COMMIT after event/intent writes;
+    /// the API must report unknown with original event key, never safe no-effect.
+    /// Exact retry after removing the fault recovers without a replacement ID.
+    #[test]
+    fn commit_failure_reports_unknown_and_exact_retry_is_safe() {
+        let token = "fixture-commit-fault-token";
+        let mut storage = Storage::open_in_memory(crate::Limits::new(10)).unwrap();
+        let grant = crate::GrantConfig {
+            token: token.into(),
+            publisher: "opaque-producer".into(),
+            recipients: vec!["*".into()],
+            kinds: vec!["done".into()],
+            modes: vec!["message".into()],
+            policies: vec!["keep_all".into()],
+            admin: false,
+            producer_v1: Some(crate::ProducerPolicy {
+                direct_address: true,
+                ..crate::ProducerPolicy::default()
+            }),
+        };
+        storage
+            .install_producer_authorizer(Arc::new(
+                crate::ProducerAuthorizer::new(&[grant]).unwrap(),
+            ))
+            .unwrap();
+        storage
+            .register_source_tag("opaque-producer", "opaque-producer")
+            .unwrap();
+        storage.connection.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE fault_parent(id INTEGER PRIMARY KEY); CREATE TABLE fault_child(id INTEGER REFERENCES fault_parent(id) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER deferred_fault AFTER INSERT ON publication_intents BEGIN INSERT INTO fault_child VALUES(1); END;").unwrap();
+        let request = PublishParams {
+            destination: Destination::Address {
+                address: "fixture/codex/store/session".into(),
+            },
+            event_id: "event".into(),
+            kind: "done".into(),
+            payload: Payload::new("opaque result").unwrap(),
+            mode: Mode::Message,
+            policy: Policy::KeepAll,
+            metadata: Metadata::new(),
+            expires_at_ms: None,
+            delivery_scope_key: None,
+        };
+        let error = storage.publish_v1(token, &request, &|| 1000).unwrap_err();
+        assert_eq!(error.effect, Some(MutationEffect::Unknown));
+        assert_eq!(
+            error.reconciliation,
+            Some(ReconciliationKey::Event {
+                event_id: "event".into()
+            })
+        );
+        assert!(matches!(
+            storage
+                .status_v1(
+                    token,
+                    &StatusSelector::Event {
+                        event_id: "event".into()
+                    },
+                    1001
+                )
+                .unwrap(),
+            StatusResult::Event { event: None }
+        ));
+        storage
+            .connection
+            .execute_batch("DROP TRIGGER deferred_fault;")
+            .unwrap();
+        let accepted = storage.publish_v1(token, &request, &|| 1002).unwrap();
+        assert_eq!(accepted.receipt.acceptance_seq, 1);
+        assert!(
+            storage
+                .publish_v1(token, &request, &|| 1003)
+                .unwrap()
+                .replayed
+        );
+        assert_eq!(
+            storage
+                .connection
+                .query_row("SELECT COUNT(*) FROM events", [], |r| r.get::<_, u64>(0))
+                .unwrap(),
+            1
+        );
+    }
 }

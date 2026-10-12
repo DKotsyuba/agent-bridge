@@ -323,8 +323,9 @@ CREATE INDEX IF NOT EXISTS events_lifetime
 ///
 /// A database with no `schema_meta` table must also have no other table
 /// (anything else is a foreign file and is refused untouched). Version 2, 3
-/// and 4 databases are migrated forward (4 only gains the lineage column,
-/// table and backfill); the current version only has its idempotent DDL
+/// and 4 databases are migrated forward with lineage backfill; version 5
+/// gains only additive universal/lifetime tables and an empty lifetime column.
+/// The current version only has its idempotent DDL
 /// re-applied; every other version is refused with
 /// [`CoreError::Integrity`].
 pub fn ensure(tx: &Transaction<'_>) -> Result<(), CoreError> {

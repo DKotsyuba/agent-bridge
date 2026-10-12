@@ -526,6 +526,8 @@ impl Storage {
         envelope: &Envelope,
         now_ms: u64,
     ) -> Result<PublishOutcome, CoreError> {
+        envelope.validate()?;
+        check_renderable(envelope)?;
         let limits = self.limits;
         let tx = self.begin()?;
         let outcome = publish_in(&tx, envelope, now_ms, limits, "")?;
@@ -601,7 +603,8 @@ const MAX_CHAIN: usize = 1_000;
 /// Inserts or recovers canonical custody inside the caller's transaction.
 /// The caller owns commit/ack uncertainty. Empty lifetime preserves legacy
 /// keys; a validated producer lifetime isolates latest/batch and lineage keys.
-/// Validation/admission failure leaves this transaction uncommitted.
+/// The caller validates envelope and renderability before calling; this helper
+/// owns admission/state changes and never commits the caller's transaction.
 pub(crate) fn publish_in(
     tx: &Connection,
     envelope: &Envelope,
@@ -609,8 +612,6 @@ pub(crate) fn publish_in(
     limits: Limits,
     lifetime: &str,
 ) -> Result<PublishOutcome, CoreError> {
-    envelope.validate()?;
-    check_renderable(envelope)?;
     let now = to_sql(now_ms)?;
     let expiry = envelope
         .expires_at
@@ -963,6 +964,8 @@ fn snapshot_state(
 ///
 /// The lineage key is the coalescing scope *without* the publisher: exact
 /// recipient, kind, requested mode, declared project/task and stream. The
+/// unscoped legacy key stays exact; a producer-owned v1 lifetime additionally
+/// includes its producer and lifetime so independent lifetimes cannot merge.
 /// first authenticated publisher to publish into that lineage claims it
 /// durably; every other publisher's `latest` publication is declined
 /// before acceptance with [`CoreError::Fence`] naming the current owner —
