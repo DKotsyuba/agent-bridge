@@ -88,6 +88,8 @@ fn remaining(deadline: Instant) -> std::io::Result<Duration> {
 /// Delivers one message using the application-supplied signed `node` runtime.
 /// The native tools pipe rejects unsigned Rust clients on macOS; the installed
 /// host capability, rather than a caller-selected executable, supplies `node`.
+/// Its inherited host context is preserved: clearing the MCP environment causes
+/// the native pipe to close before tool discovery. No environment values are logged.
 /// `pipe` is the inherited native socket, `owner_uid` its required file owner,
 /// and remaining inputs are the adapter's frozen target, attempt id and manifest.
 /// One closed stdin request selects no methods; the embedded script owns fixed
@@ -119,7 +121,6 @@ pub fn deliver(
     command
         .arg("-e")
         .arg(include_str!("../assets/desktop-client.cjs"))
-        .env_clear()
         .env("CODEX_APP_TOOLS_PIPE_PATH", pipe);
     let mut child = match crate::codex::Running::start(command, deadline) {
         Ok(child) => child,

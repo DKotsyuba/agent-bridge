@@ -124,6 +124,9 @@ at the end.
   pipe closes unsigned-client connections before discovery. The typed Bridge
   frontend executes one embedded fixed-call client through that runtime with
   the existing bounded child watchdog, never a caller-supplied script or tool.
+  The signed client preserves its inherited MCP host environment; clearing it
+  closes native discovery even with the supplied signed executable. The separate
+  confined CLI queue helper retains its cleared environment and OS restrictions.
   Local native-client tests require an explicitly prepared `BRIDGE_TEST_NODE`;
   omission is reported as a skipped host-transport check, without downloading Node.
   Only read-only tool discovery and that one exact message operation are sent,
