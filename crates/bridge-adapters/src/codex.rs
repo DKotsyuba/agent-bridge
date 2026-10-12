@@ -221,11 +221,12 @@ pub struct Helper<'a> {
 
 /// A running helper with its line reader.
 ///
-/// One total budget bounds everything: a watchdog kills the helper at the
+/// Used by the confined CLI helper and the host-supplied signed Node client.
+/// One total budget bounds everything: a watchdog kills the child at the
 /// deadline, which also unblocks a write stuck on a full pipe and ends the
 /// reader. Dropping it (on every path, including a panic) closes stdin,
 /// gives the helper a short grace, then kills and reaps it.
-struct Running {
+pub(crate) struct Running {
     /// The confined helper process, shared with the watchdog.
     child: Arc<Mutex<Child>>,
     /// Its stdin (requests); taken on drop.
@@ -239,8 +240,54 @@ struct Running {
 }
 
 impl Running {
+    /// Starts one trusted command with piped protocol I/O and an absolute watchdog.
+    /// The command must already have its executable, arguments, environment and
+    /// confinement fixed by the carrier; no request-supplied command is accepted.
+    /// Spawn/pipe errors refuse before writing. Drop always kills and reaps.
+    pub(crate) fn start(mut command: Command, deadline: Instant) -> std::io::Result<Self> {
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = command.spawn()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("no stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("no stdout"))?;
+        let (sender, lines) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if line.len() > 1 << 20 || sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let child = Arc::new(Mutex::new(child));
+        let (watchdog, stop) = mpsc::channel::<()>();
+        let watched = Arc::clone(&child);
+        std::thread::spawn(move || {
+            let budget = deadline.saturating_duration_since(Instant::now());
+            if let Err(RecvTimeoutError::Timeout) = stop.recv_timeout(budget)
+                && let Ok(mut child) = watched.lock()
+            {
+                let _ = child.kill();
+            }
+        });
+        Ok(Running {
+            child,
+            stdin: Some(stdin),
+            lines,
+            next_id: 1,
+            _watchdog: watchdog,
+        })
+    }
     /// Writes one JSON-RPC message line.
-    fn write(&mut self, message: &Value) -> std::io::Result<()> {
+    pub(crate) fn write(&mut self, message: &Value) -> std::io::Result<()> {
         let mut line = serde_json::to_vec(message).map_err(std::io::Error::other)?;
         line.push(b'\n');
         let stdin = self
@@ -265,7 +312,7 @@ impl Running {
     /// Waits for the response to `id` until `deadline`, skipping
     /// notifications (which never extend the deadline); `None` on EOF or
     /// timeout.
-    fn response(&self, id: u64, deadline: Instant) -> Option<Value> {
+    pub(crate) fn response(&self, id: u64, deadline: Instant) -> Option<Value> {
         loop {
             let wait = deadline.saturating_duration_since(Instant::now());
             match self.lines.recv_timeout(wait) {
@@ -332,42 +379,7 @@ impl Helper<'_> {
         if let Some(home) = std::env::var_os("HOME") {
             command.env("HOME", home);
         }
-        let mut child = command.spawn()?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| std::io::Error::other("no stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| std::io::Error::other("no stdout"))?;
-        let (sender, lines) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                let Ok(line) = line else { break };
-                if line.len() > 1 << 20 || sender.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-        let child = Arc::new(Mutex::new(child));
-        let (watchdog, stop) = mpsc::channel::<()>();
-        let watched = Arc::clone(&child);
-        std::thread::spawn(move || {
-            let budget = deadline.saturating_duration_since(Instant::now());
-            if let Err(RecvTimeoutError::Timeout) = stop.recv_timeout(budget)
-                && let Ok(mut child) = watched.lock()
-            {
-                let _ = child.kill();
-            }
-        });
-        Ok(Running {
-            child,
-            stdin: Some(stdin),
-            lines,
-            next_id: 1,
-            _watchdog: watchdog,
-        })
+        Running::start(command, deadline)
     }
 
     /// Adds `text` to `thread_id`'s native queue with `client_id`.

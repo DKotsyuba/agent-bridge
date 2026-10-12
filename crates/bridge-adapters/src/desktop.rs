@@ -3,14 +3,15 @@
 //! The pipe is inherited only by the application-authorized MCP frontend.
 //! The daemon hands off through its protected typed frontend relay, whose
 //! kernel ancestry must match the attested recipient harness incarnation.
-//! This client sends `tools/list` and exactly `send_message_to_thread`, using
+//! The supplied signed Node runtime sends `tools/list` and exactly
+//! `send_message_to_thread`, using
 //! the same host contract as agent-run. It never accepts a pipe, tool name,
 //! namespace, or caller identity from message payloads. A single deadline
 //! bounds connect, every partial read/write and framing; failures after the
 //! message request starts are unknown and never fall back to a second route.
 
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -84,122 +85,62 @@ fn remaining(deadline: Instant) -> std::io::Result<Duration> {
     }
 }
 
-/// Exchanges one correlated native-host JSON-RPC frame with a four-byte
-/// little-endian length prefix. Bounds JSON bytes before allocation and checks
-/// version, response id and result shape. All failures return an I/O error;
-/// diagnostics contain no message, pipe, credentials or host error text.
-fn rpc(
-    stream: &mut UnixStream,
-    id: u64,
-    method: &str,
-    params: Value,
-    deadline: Instant,
-) -> std::io::Result<Value> {
-    let raw =
-        serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))?;
-    if raw.len() > MAX_FRAME_BYTES {
-        return Err(std::io::ErrorKind::InvalidData.into());
-    }
-    let mut frame = (raw.len() as u32).to_le_bytes().to_vec();
-    frame.extend(raw);
-    let mut bytes = frame.as_slice();
-    while !bytes.is_empty() {
-        stream.set_write_timeout(Some(remaining(deadline)?))?;
-        let n = stream.write(bytes)?;
-        if n == 0 {
-            return Err(std::io::ErrorKind::WriteZero.into());
-        }
-        bytes = &bytes[n..];
-    }
-    let mut header = [0; 4];
-    read_exact(stream, &mut header, deadline)?;
-    let size = u32::from_le_bytes(header) as usize;
-    if size == 0 || size > MAX_FRAME_BYTES {
-        return Err(std::io::ErrorKind::InvalidData.into());
-    }
-    let mut reply = vec![0; size];
-    read_exact(stream, &mut reply, deadline)?;
-    let value: Value = serde_json::from_slice(&reply)?;
-    if value["jsonrpc"] != "2.0"
-        || value["id"] != id
-        || value.get("error").is_some()
-        || !value["result"].is_object()
+/// Delivers one message using the application-supplied signed `node` runtime.
+/// The native tools pipe rejects unsigned Rust clients on macOS; the installed
+/// host capability, rather than a caller-selected executable, supplies `node`.
+/// `pipe` is the inherited native socket, `owner_uid` its required file owner,
+/// and remaining inputs are the adapter's frozen target, attempt id and manifest.
+/// One closed stdin request selects no methods; the embedded script owns fixed
+/// tools/list and send_message_to_thread calls. The existing child watchdog
+/// bounds every write/read and kills/reaps on all exits. Missing capabilities
+/// and pre-call failures are known-unsent; missing/negative post-call receipts
+/// are unknown. No raw host diagnostics, pipe paths or body enter evidence.
+pub fn deliver(
+    node: &Path,
+    pipe: &Path,
+    thread_id: &str,
+    call_id: &str,
+    text: &str,
+    owner_uid: u32,
+) -> Outcome {
+    if !node.is_absolute()
+        || !node.is_file()
+        || !pipe.is_absolute()
+        || !std::fs::symlink_metadata(pipe).is_ok_and(|m| {
+            m.uid() == owner_uid && std::os::unix::fs::FileTypeExt::is_socket(&m.file_type())
+        })
     {
-        return Err(std::io::ErrorKind::InvalidData.into());
-    }
-    Ok(value["result"].clone())
-}
-
-/// Delivers `text` once to the attested `thread_id` through `pipe`, with
-/// `call_id` as host correlation identity and `owner_uid` as the expected
-/// server user. Parameters are adapter-owned facts, never arbitrary passthrough.
-/// Read-only discovery failures are known-unsent. A positive host success is
-/// native acceptance, not context/processing evidence; any other outcome after
-/// starting tools/call is unknown. The pipe path and raw host diagnostics never
-/// appear in evidence, and there is no ordinary-queue fallback on failure.
-pub fn deliver(pipe: &Path, thread_id: &str, call_id: &str, text: &str, owner_uid: u32) -> Outcome {
-    if !pipe.is_absolute() {
         return Outcome::KnownUnsent {
-            evidence: "Codex application pipe path is not absolute; nothing sent".into(),
+            evidence: "Codex signed runtime or native socket is unqualified; nothing sent".into(),
         };
     }
     let deadline = Instant::now() + HOST_TIMEOUT;
-    let mut stream = match connect(pipe, deadline) {
-        Ok(stream) => stream,
+    let mut command = std::process::Command::new(node);
+    command
+        .arg("-e")
+        .arg(include_str!("../assets/desktop-client.cjs"))
+        .env_clear()
+        .env("CODEX_APP_TOOLS_PIPE_PATH", pipe);
+    let mut child = match crate::codex::Running::start(command, deadline) {
+        Ok(child) => child,
         Err(_) => {
             return Outcome::KnownUnsent {
-                evidence: "Codex application pipe unavailable before sending".into(),
+                evidence: "Codex signed client did not start; nothing sent".into(),
             };
         }
     };
-    if !os::peer_identity(&stream).is_ok_and(|peer| peer.uid == owner_uid) {
-        return Outcome::KnownUnsent {
-            evidence: "Codex application pipe has an unqualified owner".into(),
+    if child
+        .write(&json!({"thread_id":thread_id,"call_id":call_id,"text":text}))
+        .is_err()
+    {
+        return Outcome::OutcomeUnknown {
+            reason: "signed client request may have been written; no automatic resend".into(),
         };
     }
-    let namespace = rpc(
-        &mut stream,
-        1,
-        "tools/list",
-        json!({"threadStartKind":"all"}),
-        deadline,
-    )
-    .ok()
-    .and_then(|result| {
-        result["tools"]
-            .as_array()
-            .and_then(|tools| {
-                tools
-                    .iter()
-                    .find(|tool| tool["name"] == "send_message_to_thread")
-            })
-            .cloned()
-    })
-    .and_then(|tool| {
-        tool["namespace"]
-            .as_str()
-            .filter(|name| !name.is_empty() && name.len() <= 256)
-            .map(str::to_owned)
-    });
-    let Some(namespace) = namespace else {
-        return Outcome::KnownUnsent {
-            evidence: "Codex application message tool unavailable; nothing sent".into(),
-        };
-    };
-    let result = rpc(
-        &mut stream,
-        2,
-        "tools/call",
-        json!({
-            "arguments":{"threadId":thread_id,"prompt":text},
-            "callerSource":"codex","callId":call_id,"namespace":namespace,
-            "threadId":thread_id,"tool":"send_message_to_thread","turnId":call_id
-        }),
-        deadline,
-    );
-    match result {
-        Ok(value) if value["success"] == true => Outcome::NativeAccepted { evidence: format!("Codex application send_message_to_thread accepted {call_id}; source-labelled native route") },
-        _ => Outcome::OutcomeUnknown { reason: "Codex application message request may have been written without positive native acceptance; never resend or use a fallback".into() },
+    match child.response(1, deadline).map(|v| v["result"].clone()) {
+        Some(v) if v["state"] == "accepted" => Outcome::NativeAccepted { evidence: format!("Codex application send_message_to_thread accepted {call_id}; source-labelled native route") },
+        Some(v) if v["state"] == "known_unsent" => Outcome::KnownUnsent { evidence: "Codex application message tool unavailable; nothing sent".into() },
+        _ => Outcome::OutcomeUnknown { reason: "Codex signed client may have called the native message tool without positive acceptance; never resend or fall back".into() },
     }
 }
 
@@ -208,6 +149,16 @@ mod tests {
     //! Real Unix-socket native-host framing and conservative outcome controls.
     use super::*;
     use std::os::unix::net::UnixListener;
+
+    /// Returns the prepared absolute Node test runtime; missing provision is an
+    /// explicit skipped host-transport check, never an implicit install or PATH fallback.
+    fn test_node() -> Option<std::path::PathBuf> {
+        let node = std::env::var_os("BRIDGE_TEST_NODE").map(std::path::PathBuf::from);
+        if node.is_none() {
+            eprintln!("native client check skipped: BRIDGE_TEST_NODE is not provisioned");
+        }
+        node
+    }
 
     /// Reads one complete trusted mock request using the production framing bound.
     fn request(stream: &mut UnixStream) -> Value {
@@ -235,6 +186,9 @@ mod tests {
     /// miscorrelated answers after the call are unknown, never resent.
     #[test]
     fn native_delivery_has_one_scoped_call_and_conservative_receipts() {
+        let Some(node) = test_node() else {
+            return;
+        };
         let uid = os::process_facts(std::process::id()).unwrap().uid.unwrap();
         for case in ["accepted", "lost", "negative", "wrong_id", "missing"] {
             let entropy = os::random_bytes().unwrap();
@@ -282,7 +236,7 @@ mod tests {
                 let mut byte = [0];
                 assert_eq!(stream.read(&mut byte).unwrap(), 0);
             });
-            let result = deliver(&path, "owned-thread", "bridge-call", "marker", uid);
+            let result = deliver(&node, &path, "owned-thread", "bridge-call", "marker", uid);
             assert!(
                 match case {
                     "accepted" => matches!(result, Outcome::NativeAccepted { .. }),
@@ -300,6 +254,9 @@ mod tests {
     /// acceptance through real kernel-identified sockets, without environment edits.
     #[test]
     fn frontend_handoff_reaches_one_native_message_call() {
+        let Some(node) = test_node() else {
+            return;
+        };
         let entropy = os::random_bytes().unwrap();
         let dir = std::env::temp_dir().join(format!(
             "bf{:x}",
@@ -335,7 +292,9 @@ mod tests {
         let stale = dir.join(format!("ui-{:010}.sock", std::process::id()));
         drop(UnixListener::bind(&stale).unwrap());
         assert!(frontend_for(&dir, incarnation).is_none());
-        let guard = start_frontend_with_pipe(&channel, pipe).unwrap().unwrap();
+        let guard = start_frontend_with_pipe(&channel, pipe, node)
+            .unwrap()
+            .unwrap();
         let result = via_frontend(
             &guard.path,
             (parent.pid, parent.start_time),
@@ -398,21 +357,27 @@ impl Drop for FrontendRelay {
 /// Starts a typed message-only relay inside the harness-launched MCP frontend
 /// when it receives the application's native pipe capability. The native host
 /// sees the registered frontend as its caller, rather than the resident daemon.
-/// A missing capability returns None (ordinary CLI host); binding failure errors.
+/// A missing pipe returns None (ordinary CLI host); missing signed Node or binding failures error.
 /// The listener receives no arbitrary host methods, namespace or identity fields.
 pub fn start_frontend(channel: &Path) -> std::io::Result<Option<FrontendRelay>> {
     let Some(pipe) = std::env::var_os("CODEX_APP_TOOLS_PIPE_PATH") else {
         return Ok(None);
     };
-    start_frontend_with_pipe(channel, std::path::PathBuf::from(pipe))
+    let node = std::env::var_os("CODEX_MCP_NODE_PATH").ok_or(std::io::ErrorKind::NotFound)?;
+    start_frontend_with_pipe(
+        channel,
+        std::path::PathBuf::from(pipe),
+        std::path::PathBuf::from(node),
+    )
 }
 
-/// Binds the protected frontend relay to an already-authorized native host pipe.
+/// Binds the protected frontend relay to an authorized host pipe and signed runtime.
 /// This helper isolates endpoint injection in owned tests without mutating the
 /// process environment; production passes only its inherited capability.
 fn start_frontend_with_pipe(
     channel: &Path,
     pipe: std::path::PathBuf,
+    node: std::path::PathBuf,
 ) -> std::io::Result<Option<FrontendRelay>> {
     let parent = channel.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
     let path = parent.join(format!("ui-{}.sock", std::process::id()));
@@ -448,6 +413,7 @@ fn start_frontend_with_pipe(
                     return Err(std::io::ErrorKind::InvalidData.into());
                 }
                 Ok(deliver(
+                    &node,
                     &pipe,
                     &request.thread_id,
                     &request.call_id,

@@ -260,7 +260,8 @@ pub struct Harnessed {
 }
 
 impl Harnessed {
-    /// Starts a fixture harness whose own store variable names `store`.
+    /// Starts a CLI fixture harness whose store variable names `store`, stripping
+    /// real Desktop capabilities so owned stand-ins cannot select the GUI route.
     pub fn start(harness: Harness, store: &Path) -> Harnessed {
         let variable = match harness {
             Harness::Codex => "CODEX_HOME",
@@ -269,6 +270,8 @@ impl Harnessed {
         let mut child = Command::new(fixture_exe())
             .arg("harness")
             .env(variable, store)
+            .env_remove("CODEX_APP_TOOLS_PIPE_PATH")
+            .env_remove("CODEX_MCP_NODE_PATH")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()

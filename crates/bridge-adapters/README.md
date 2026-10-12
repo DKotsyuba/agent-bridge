@@ -119,7 +119,13 @@ at the end.
   the actual adapter daemon identified through the protected channel socket.
   This keeps native host calls in the registered frontend context, as agent-run
   does; the daemon cannot invoke arbitrary host tools. The Codex MCP entry
-  forwards only `CODEX_APP_TOOLS_PIPE_PATH` for this integration.
+  forwards `CODEX_APP_TOOLS_PIPE_PATH` and `CODEX_MCP_NODE_PATH` for this integration.
+  The latter names the host-supplied signed Node runtime: on macOS the native
+  pipe closes unsigned-client connections before discovery. The typed Bridge
+  frontend executes one embedded fixed-call client through that runtime with
+  the existing bounded child watchdog, never a caller-supplied script or tool.
+  Local native-client tests require an explicitly prepared `BRIDGE_TEST_NODE`;
+  omission is reported as a skipped host-transport check, without downloading Node.
   Only read-only tool discovery and that one exact message operation are sent,
   under one eight-second connect/read/write deadline. A positive native success
   is acceptance only. Any failure after the message request starts is unknown,
