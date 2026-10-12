@@ -1,6 +1,8 @@
 //! Source-labelled Codex application delivery through its native tools pipe.
 //!
-//! The pipe comes only from the attested recipient harness's OS environment.
+//! The pipe is inherited only by the application-authorized MCP frontend.
+//! The daemon hands off through its protected typed frontend relay, whose
+//! kernel ancestry must match the attested recipient harness incarnation.
 //! This client sends `tools/list` and exactly `send_message_to_thread`, using
 //! the same host contract as agent-run. It never accepts a pipe, tool name,
 //! namespace, or caller identity from message payloads. A single deadline
@@ -8,7 +10,8 @@
 //! message request starts are unknown and never fall back to a second route.
 
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -306,5 +309,197 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(100));
         drop(reader);
         send.join().unwrap();
+    }
+}
+
+/// Lifetime guard for the app-authorized MCP frontend's private delivery relay.
+/// Dropping it removes only its owned socket; the process exit ends its worker.
+/// The worker holds the host endpoint solely in memory and accepts only the
+/// actual current adapter daemon identified through the private channel socket.
+pub struct FrontendRelay {
+    /// Exclusively bound relay endpoint, under the protected adapter directory.
+    path: std::path::PathBuf,
+}
+
+impl Drop for FrontendRelay {
+    /// Unlinks only this instance's socket; never removes its parent directory.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Starts a typed message-only relay inside the harness-launched MCP frontend
+/// when it receives the application's native pipe capability. The native host
+/// sees the registered frontend as its caller, rather than the resident daemon.
+/// A missing capability returns None (ordinary CLI host); binding failure errors.
+/// The listener receives no arbitrary host methods, namespace or identity fields.
+pub fn start_frontend(channel: &Path) -> std::io::Result<Option<FrontendRelay>> {
+    let Some(pipe) = std::env::var_os("CODEX_APP_TOOLS_PIPE_PATH") else {
+        return Ok(None);
+    };
+    start_frontend_with_pipe(channel, std::path::PathBuf::from(pipe))
+}
+
+/// Binds the protected frontend relay to an already-authorized native host pipe.
+/// This helper isolates endpoint injection in owned tests without mutating the
+/// process environment; production passes only its inherited capability.
+fn start_frontend_with_pipe(
+    channel: &Path,
+    pipe: std::path::PathBuf,
+) -> std::io::Result<Option<FrontendRelay>> {
+    let parent = channel.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
+    let path = parent.join(format!("ui-{}.sock", std::process::id()));
+    let listener = UnixListener::bind(&path)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    let channel = channel.to_path_buf();
+    std::thread::spawn(move || {
+        for accepted in listener.incoming() {
+            let Ok(mut stream) = accepted else {
+                break;
+            };
+            let outcome = (|| -> std::io::Result<Outcome> {
+                let peer = os::peer_identity(&stream)?;
+                let daemon = UnixStream::connect(&channel)?;
+                let owner = os::peer_identity(&daemon)?;
+                if peer != owner {
+                    return Err(std::io::ErrorKind::PermissionDenied.into());
+                }
+                let deadline = Instant::now() + HOST_TIMEOUT;
+                let mut header = [0; 4];
+                read_exact(&mut stream, &mut header, deadline)?;
+                let n = u32::from_le_bytes(header) as usize;
+                if n == 0 || n > MAX_FRAME_BYTES {
+                    return Err(std::io::ErrorKind::InvalidData.into());
+                }
+                let mut body = vec![0; n];
+                read_exact(&mut stream, &mut body, deadline)?;
+                let request: FrontendRequest = serde_json::from_slice(&body)?;
+                if request.thread_id.is_empty()
+                    || request.call_id.is_empty()
+                    || request.text.len() > bridge_core::framing::MAX_FRAMED_BYTES
+                {
+                    return Err(std::io::ErrorKind::InvalidData.into());
+                }
+                Ok(deliver(
+                    &pipe,
+                    &request.thread_id,
+                    &request.call_id,
+                    &request.text,
+                    owner.uid,
+                ))
+            })();
+            let value = match outcome {
+                Ok(Outcome::NativeAccepted { evidence }) => {
+                    json!({"state":"accepted","detail":evidence})
+                }
+                Ok(Outcome::KnownUnsent { evidence }) => {
+                    json!({"state":"known_unsent","detail":evidence})
+                }
+                Ok(Outcome::OutcomeUnknown { reason }) => {
+                    json!({"state":"unknown","detail":reason})
+                }
+                _ => {
+                    json!({"state":"known_unsent","detail":"frontend caller or request refused before host send"})
+                }
+            };
+            if let Ok(bytes) = serde_json::to_vec(&value) {
+                let _ = stream.set_write_timeout(Some(HOST_TIMEOUT));
+                let _ = stream.write_all(&(bytes.len() as u32).to_le_bytes());
+                let _ = stream.write_all(&bytes);
+            }
+        }
+    });
+    Ok(Some(FrontendRelay { path }))
+}
+
+/// Closed daemon-to-frontend request. The daemon owns exact target and attempt
+/// identity; text is the already frozen source-framed manifest, never a tool call.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrontendRequest {
+    /// Attested recipient native session identifier.
+    thread_id: String,
+    /// Existing attempt correlation identifier; never a fresh retry id.
+    call_id: String,
+    /// Frozen escaped manifest with the external-data provenance statement.
+    text: String,
+}
+
+/// Finds a live Bridge frontend socket belonging to the exact recipient harness
+/// incarnation. Only kernel PID/ancestry and the protected channel directory are
+/// used; filenames are not identity. The connected socket is rechecked below.
+pub fn frontend_for(directory: &Path, harness: (u32, u64)) -> Option<std::path::PathBuf> {
+    let entries = std::fs::read_dir(directory).ok()?;
+    for entry in entries.take(512).flatten() {
+        let name = entry.file_name();
+        let name = name.to_str()?;
+        let Some(pid) = name
+            .strip_prefix("ui-")
+            .and_then(|n| n.strip_suffix(".sock"))
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if os::ancestry(pid)
+            .iter()
+            .skip(1)
+            .any(|p| (p.pid, p.start_time) == harness)
+        {
+            return Some(entry.path());
+        }
+    }
+    None
+}
+
+/// Delivers once through a registered frontend for `harness`. A connection or
+/// peer mismatch is known-unsent; after any request write the result is unknown
+/// unless a valid typed receipt says accepted/known-unsent. No host/queue fallback.
+pub fn via_frontend(
+    path: &Path,
+    harness: (u32, u64),
+    thread_id: &str,
+    call_id: &str,
+    text: &str,
+) -> Outcome {
+    let deadline = Instant::now() + HOST_TIMEOUT + Duration::from_secs(2);
+    let mut stream = match connect(path, deadline) {
+        Ok(s) => s,
+        Err(_) => {
+            return Outcome::KnownUnsent {
+                evidence: "registered Codex frontend unavailable before sending".into(),
+            };
+        }
+    };
+    let trusted = os::peer_identity(&stream).is_ok_and(|p| {
+        os::ancestry(p.pid)
+            .iter()
+            .skip(1)
+            .any(|a| (a.pid, a.start_time) == harness)
+    });
+    if !trusted {
+        return Outcome::KnownUnsent {
+            evidence: "Codex frontend is not owned by the attested recipient harness".into(),
+        };
+    }
+    let result = (|| -> std::io::Result<Value> {
+        let body =
+            serde_json::to_vec(&json!({"thread_id":thread_id,"call_id":call_id,"text":text}))?;
+        stream.set_write_timeout(Some(remaining(deadline)?))?;
+        stream.write_all(&(body.len() as u32).to_le_bytes())?;
+        stream.write_all(&body)?;
+        let mut head = [0; 4];
+        read_exact(&mut stream, &mut head, deadline)?;
+        let n = u32::from_le_bytes(head) as usize;
+        if n == 0 || n > MAX_FRAME_BYTES {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        let mut body = vec![0; n];
+        read_exact(&mut stream, &mut body, deadline)?;
+        Ok(serde_json::from_slice(&body)?)
+    })();
+    match result {
+        Ok(v) if v["state"]=="accepted" => Outcome::NativeAccepted{evidence:format!("Codex application frontend accepted {call_id}; source-labelled native route")},
+        Ok(v) if v["state"]=="known_unsent" => Outcome::KnownUnsent{evidence:v["detail"].as_str().unwrap_or("frontend refused before host send").to_string()},
+        _ => Outcome::OutcomeUnknown{reason:"Codex frontend hand-off may have reached the application; no fallback or automatic resend".into()},
     }
 }

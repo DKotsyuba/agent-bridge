@@ -72,6 +72,8 @@ message).
   legacy structured `recipient` and `body` spellings remain supported. If the
   request id is omitted, the frontend derives it from the authenticated native
   tool-call identity before writing to the relay and returns it in the receipt.
+  Already connected older frontends are compatible: the relay derives a
+  fallback id from their redeemed one-use proof if normalization is absent.
   Use the returned id for status/reconciliation or an explicit idempotent retry;
   after a lost/uncertain answer never create a fresh id for the same message. The core event id
   is derived from the caller address, actor and `request_id`: repeating a

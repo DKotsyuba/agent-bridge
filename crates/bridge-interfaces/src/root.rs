@@ -282,7 +282,11 @@ impl RootRelay {
     /// `core_unavailable` (no connection: nothing was sent); `custody_unknown`
     /// (the core may have accepted: repeat the same `request_id`); and the
     /// core's own classes (`conflict`, `capacity`, `unsupported`, …).
-    pub fn handle(&self, request: RelayRequest, now_ms: u64) -> RelayResponse {
+    pub fn handle(&self, mut request: RelayRequest, now_ms: u64) -> RelayResponse {
+        let compatibility_id = format!(
+            "call-{:x}",
+            Sha256::digest(request.proof.as_str().as_bytes())
+        );
         let caller = match self
             .attestor
             .attest(&PresentedMeta::sealed(request.proof), now_ms)
@@ -305,6 +309,15 @@ impl RootRelay {
         let Some(policy) = self.policy_for(caller.address()) else {
             return RelayResponse::error("forbidden", "caller is not a configured root");
         };
+        // Older live frontends do not normalize an omitted request id. The
+        // proof was redeemed above, so this fallback is an authenticated,
+        // one-call identity; it is never a claimed caller or a retry instruction.
+        if request.tool == "bridge_send"
+            && request.arguments.is_object()
+            && request.arguments.get("request_id").is_none()
+        {
+            request.arguments["request_id"] = Value::String(compatibility_id);
+        }
         let outcome = match request.tool.as_str() {
             "bridge_me" => parse::<MeArgs>(request.arguments).map(|_| self.me(&caller, policy)),
             "bridge_send" => parse::<SendArgs>(request.arguments)

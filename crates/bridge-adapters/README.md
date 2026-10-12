@@ -113,7 +113,13 @@ at the end.
   `send_message_to_thread` tool with `callerSource = "codex"`, the same
   host contract as agent-run. This preserves the application's cross-task source
   label; XML inside the message is not used to manufacture a UI badge. The pipe
-  comes from the verified harness OS environment, never from sender arguments.
+  is inherited by the app-authorized MCP frontend, never from sender arguments.
+  The resident daemon uses a message-only private relay: kernel ancestry ties
+  its frontend to the attested recipient harness, and the frontend accepts only
+  the actual adapter daemon identified through the protected channel socket.
+  This keeps native host calls in the registered frontend context, as agent-run
+  does; the daemon cannot invoke arbitrary host tools. The Codex MCP entry
+  forwards only `CODEX_APP_TOOLS_PIPE_PATH` for this integration.
   Only read-only tool discovery and that one exact message operation are sent,
   under one eight-second connect/read/write deadline. A positive native success
   is acceptance only. Any failure after the message request starts is unknown,

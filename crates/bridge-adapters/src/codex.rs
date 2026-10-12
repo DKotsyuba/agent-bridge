@@ -58,6 +58,8 @@ pub struct CodexQueueCarrier {
     sandbox: PathBuf,
     /// Bound for one helper exchange.
     timeout: Duration,
+    /// Protected adapter directory containing registered frontend sockets.
+    desktop_directory: Option<PathBuf>,
 }
 
 impl CodexQueueCarrier {
@@ -67,7 +69,14 @@ impl CodexQueueCarrier {
             registry,
             sandbox,
             timeout,
+            desktop_directory: None,
         }
+    }
+
+    /// Enables application frontend discovery under the protected channel directory.
+    pub fn with_desktop_directory(mut self, directory: PathBuf) -> Self {
+        self.desktop_directory = Some(directory);
+        self
     }
 
     /// Re-attests the attempt's recipient and checks it is still the same
@@ -121,25 +130,23 @@ impl DispatchCarrier for CodexQueueCarrier {
             attempt.fence.attempt_seq,
             prefix_within(&attempt.fence.manifest_hash, 16)
         );
-        if let Some(pipe) = crate::os::process_env(binding.harness.0, "CODEX_APP_TOOLS_PIPE_PATH") {
-            if !crate::os::incarnation_alive(binding.harness.0, binding.harness.1) {
-                return Outcome::KnownUnsent {
-                    evidence: "the recipient harness ended before application delivery".into(),
-                };
+        if crate::os::process_env(binding.harness.0, "CODEX_APP_TOOLS_PIPE_PATH").is_some() {
+            if let Some(directory) = &self.desktop_directory
+                && let Some(frontend) = crate::desktop::frontend_for(directory, binding.harness)
+            {
+                return crate::desktop::via_frontend(
+                    &frontend,
+                    binding.harness,
+                    &address.native_session_id,
+                    &client_id,
+                    &attempt.manifest,
+                );
             }
-            let Some(uid) = crate::os::process_facts(binding.harness.0).and_then(|facts| facts.uid)
-            else {
-                return Outcome::KnownUnsent {
-                    evidence: "the recipient harness user is unavailable".into(),
-                };
+            return Outcome::KnownUnsent {
+                evidence:
+                    "source-labelled application delivery needs its registered Bridge MCP frontend"
+                        .into(),
             };
-            return crate::desktop::deliver(
-                &PathBuf::from(pipe),
-                &address.native_session_id,
-                &client_id,
-                &attempt.manifest,
-                uid,
-            );
         }
         let helper = Helper {
             sandbox: &self.sandbox,

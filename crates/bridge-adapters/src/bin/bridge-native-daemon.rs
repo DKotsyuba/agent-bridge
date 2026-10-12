@@ -145,7 +145,8 @@ fn main() -> ExitCode {
         Arc::clone(&registry),
         config.adapters.sandbox.clone(),
         DEFAULT_HELPER_TIMEOUT,
-    );
+    )
+    .with_desktop_directory(config.adapters.channel.parent().unwrap().to_path_buf());
     let terminate = Arc::new(AtomicBool::new(false));
     for signal in [SIGTERM, SIGINT] {
         let registered =

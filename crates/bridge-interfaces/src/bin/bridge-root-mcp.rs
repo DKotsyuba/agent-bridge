@@ -22,6 +22,13 @@ fn main() -> ExitCode {
         eprintln!("usage: bridge-root-mcp <adapter-channel-socket> <root-relay-socket>");
         return ExitCode::FAILURE;
     };
+    let _desktop = match bridge_adapters::desktop::start_frontend(&PathBuf::from(channel)) {
+        Ok(relay) => relay,
+        Err(_) => {
+            eprintln!("Bridge application frontend relay unavailable");
+            None
+        }
+    };
     let attestor = RegistryAttestor::new(
         &PathBuf::from(channel),
         Duration::from_secs(5),
