@@ -122,11 +122,15 @@ at the end.
   forwards `CODEX_APP_TOOLS_PIPE_PATH` and `CODEX_MCP_NODE_PATH` for this integration.
   The latter names the host-supplied signed Node runtime: on macOS the native
   pipe closes unsigned-client connections before discovery. The typed Bridge
-  frontend executes one embedded fixed-call client through that runtime with
-  the existing bounded child watchdog, never a caller-supplied script or tool.
-  The signed client preserves its inherited MCP host environment; clearing it
-  closes native discovery even with the supplied signed executable. The separate
-  confined CLI queue helper retains its cleared environment and OS restrictions.
+  launcher replaces itself with that signed frontend, preserving the registered
+  MCP PID and inherited host context, as agent-run does. Node starts the Rust MCP
+  child with both native capability variables removed. Authenticated daemon
+  requests reach Node only over the child's inherited private descriptor; Rust
+  checks the kernel parent PID/UID and exact call correlation, and closes an
+  uncertain channel rather than replaying it. Only the supplied Node executable
+  is an allowed intermediate between the Rust child and qualified Codex harness.
+  Old frontend builds cannot mask the active build during rolling updates.
+  The confined CLI queue helper retains its cleared environment and restrictions.
   Local native-client tests require an explicitly prepared `BRIDGE_TEST_NODE`;
   omission is reported as a skipped host-transport check, without downloading Node.
   Only read-only tool discovery and that one exact message operation are sent,

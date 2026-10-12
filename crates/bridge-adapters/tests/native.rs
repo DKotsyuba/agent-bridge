@@ -2625,3 +2625,106 @@ fn native_refusal_after_the_write_is_unknown_and_never_repeats() {
     );
     harness.stop();
 }
+
+/// The production signed-parent layout authenticates its inherited descriptor,
+/// reaches one fixed host call, and returns its exact receipt without child auth inheritance.
+#[test]
+fn signed_parent_private_channel_delivers_one_message() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::process::{Command, Stdio};
+    let Some(node) = std::env::var_os("BRIDGE_TEST_NODE") else {
+        eprintln!("signed parent check skipped: BRIDGE_TEST_NODE missing");
+        return;
+    };
+    let dir = TempDir::new("sp");
+    let channel = dir.0.join("c.sock");
+    let listener = UnixListener::bind(&channel).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopping = Arc::clone(&stop);
+    let daemon = std::thread::spawn(move || {
+        let mut peers = Vec::new();
+        while !stopping.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((stream, _)) => peers.push(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+        peers
+    });
+    let pipe = dir.0.join("h.sock");
+    let host = UnixListener::bind(&pipe).unwrap();
+    let native = std::thread::spawn(move || {
+        let (mut stream, _) = host.accept().unwrap();
+        for id in [1, 2] {
+            let mut head = [0; 4];
+            stream.read_exact(&mut head).unwrap();
+            let n = u32::from_le_bytes(head) as usize;
+            assert!(n < 131072);
+            let mut body = vec![0; n];
+            stream.read_exact(&mut body).unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(request["id"], id);
+            if id == 2 {
+                assert_eq!(
+                    request["params"]["arguments"],
+                    json!({"threadId":"owned-thread","prompt":"marker"})
+                );
+            }
+            let result = if id == 1 {
+                json!({"tools":[{"name":"send_message_to_thread","namespace":"codex_app"}]})
+            } else {
+                json!({"success":true})
+            };
+            let bytes =
+                serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"result":result})).unwrap();
+            stream
+                .write_all(&(bytes.len() as u32).to_le_bytes())
+                .unwrap();
+            stream.write_all(&bytes).unwrap();
+        }
+    });
+    let mut child = Command::new(node)
+        .arg("-e")
+        .arg(include_str!("../assets/desktop-client.cjs"))
+        .arg("--")
+        .arg(fixture_exe())
+        .arg("desktop-child")
+        .arg(&channel)
+        .env("CODEX_APP_TOOLS_PIPE_PATH", &pipe)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut ready = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+    assert_eq!(ready.trim(), "ready");
+    let me = bridge_adapters::os::process_facts(std::process::id()).unwrap();
+    let path = bridge_adapters::desktop::frontend_for(&dir.0, (me.pid, me.start_time)).unwrap();
+    let result = bridge_adapters::desktop::via_frontend(
+        &path,
+        (me.pid, me.start_time),
+        "owned-thread",
+        "bridge-call",
+        "marker",
+    );
+    drop(child.stdin.take());
+    let status = child.wait().unwrap();
+    assert!(status.success());
+    assert!(
+        matches!(
+            result,
+            bridge_core::dispatch::Outcome::NativeAccepted { .. }
+        ),
+        "{result:?}"
+    );
+    native.join().unwrap();
+    stop.store(true, Ordering::Relaxed);
+    drop(daemon.join().unwrap());
+}

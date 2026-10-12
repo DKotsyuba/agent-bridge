@@ -11,9 +11,13 @@
 //! message request starts are unknown and never fall back to a second route.
 
 use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+#[cfg(test)]
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bridge_core::dispatch::Outcome;
@@ -97,7 +101,8 @@ fn remaining(deadline: Instant) -> std::io::Result<Duration> {
 /// bounds every write/read and kills/reaps on all exits. Missing capabilities
 /// and pre-call failures are known-unsent; missing/negative post-call receipts
 /// are unknown. No raw host diagnostics, pipe paths or body enter evidence.
-pub fn deliver(
+#[cfg(test)]
+fn deliver(
     node: &Path,
     pipe: &Path,
     thread_id: &str,
@@ -370,30 +375,150 @@ impl Drop for FrontendRelay {
     }
 }
 
+/// Replaces the app-launched MCP process with the supplied signed Node frontend,
+/// preserving its PID and inherited host context as agent-run does. The frontend
+/// starts the same Rust binary with capability variables removed and a private
+/// descriptor; missing app capabilities are ordinary CLI operation. Exec errors
+/// return a fixed error before opening a delivery relay, never an unsigned fallback.
+pub fn exec_frontend() -> std::io::Result<()> {
+    let (Some(pipe), Some(node)) = (
+        std::env::var_os("CODEX_APP_TOOLS_PIPE_PATH"),
+        std::env::var_os("CODEX_MCP_NODE_PATH"),
+    ) else {
+        return Ok(());
+    };
+    if !Path::new(&pipe).is_absolute()
+        || !Path::new(&node).is_absolute()
+        || !Path::new(&node).is_file()
+    {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    Err(std::process::Command::new(node)
+        .arg("-e")
+        .arg(include_str!("../assets/desktop-client.cjs"))
+        .arg("--")
+        .arg(std::env::current_exe()?)
+        .args(std::env::args_os().skip(1))
+        .exec())
+}
+
 /// Starts a typed message-only relay inside the harness-launched MCP frontend
 /// when it receives the application's native pipe capability. The native host
 /// sees the registered frontend as its caller, rather than the resident daemon.
 /// A missing pipe returns None (ordinary CLI host); missing signed Node or binding failures error.
 /// The listener receives no arbitrary host methods, namespace or identity fields.
 pub fn start_frontend(channel: &Path) -> std::io::Result<Option<FrontendRelay>> {
-    let Some(pipe) = std::env::var_os("CODEX_APP_TOOLS_PIPE_PATH") else {
+    let Some(parent) = std::env::var_os("BRIDGE_DESKTOP_PARENT_PID") else {
         return Ok(None);
     };
-    let node = std::env::var_os("CODEX_MCP_NODE_PATH").ok_or(std::io::ErrorKind::NotFound)?;
-    start_frontend_with_pipe(
-        channel,
-        std::path::PathBuf::from(pipe),
-        std::path::PathBuf::from(node),
-    )
+    let parent: u32 = parent
+        .to_str()
+        .and_then(|p| p.parse().ok())
+        .ok_or(std::io::ErrorKind::InvalidInput)?;
+    if os::process_facts(std::process::id()).and_then(|p| p.parent) != Some(parent) {
+        return Err(std::io::ErrorKind::PermissionDenied.into());
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/fd/3")?;
+    let fd: std::os::fd::OwnedFd = file.into();
+    let stream = UnixStream::from(fd);
+    let peer = os::peer_identity(&stream)?;
+    if peer.pid != parent
+        || os::process_facts(std::process::id()).and_then(|p| p.uid) != Some(peer.uid)
+    {
+        return Err(std::io::ErrorKind::PermissionDenied.into());
+    }
+    let parent = Arc::new(Mutex::new(Some(stream)));
+    start_frontend_with_delivery(channel, move |request, _owner| {
+        let mut guard = match parent.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return Outcome::OutcomeUnknown {
+                    reason: "signed frontend channel state unavailable; never resend".into(),
+                };
+            }
+        };
+        let Some(stream) = guard.as_mut() else {
+            return Outcome::KnownUnsent {
+                evidence: "signed frontend channel closed before sending".into(),
+            };
+        };
+        let deadline = Instant::now() + HOST_TIMEOUT;
+        let result = exchange(
+            stream,
+            &json!({"thread_id":request.thread_id,"call_id":request.call_id,"text":request.text}),
+            deadline,
+        );
+        match result {
+            Ok(v) if v["call_id"] == request.call_id && v["state"] == "accepted" => {
+                Outcome::NativeAccepted {
+                    evidence: format!("signed Codex frontend accepted {}", request.call_id),
+                }
+            }
+            Ok(v) if v["call_id"] == request.call_id && v["state"] == "known_unsent" => {
+                Outcome::KnownUnsent {
+                    evidence: "Codex application refused before message send".into(),
+                }
+            }
+            _ => {
+                guard.take();
+                Outcome::OutcomeUnknown { reason: "signed frontend request lacks a correlated receipt; channel closed, never resent".into() }
+            }
+        }
+    })
+}
+
+/// Exchanges one bounded typed frontend frame under one absolute deadline.
+/// Returns decoded JSON or an I/O/JSON error; callers conservatively retain any
+/// failure after write and check their own connection or explicit correlation.
+fn exchange(stream: &mut UnixStream, request: &Value, deadline: Instant) -> std::io::Result<Value> {
+    let body = serde_json::to_vec(request)?;
+    if body.len() > MAX_FRAME_BYTES {
+        return Err(std::io::ErrorKind::InvalidData.into());
+    }
+    stream.set_write_timeout(Some(remaining(deadline)?))?;
+    stream.write_all(&(body.len() as u32).to_le_bytes())?;
+    stream.write_all(&body)?;
+    let mut head = [0; 4];
+    read_exact(stream, &mut head, deadline)?;
+    let n = u32::from_le_bytes(head) as usize;
+    if n == 0 || n > MAX_FRAME_BYTES {
+        return Err(std::io::ErrorKind::InvalidData.into());
+    }
+    let mut body = vec![0; n];
+    read_exact(stream, &mut body, deadline)?;
+    Ok(serde_json::from_slice(&body)?)
 }
 
 /// Binds the protected frontend relay to an authorized host pipe and signed runtime.
 /// This helper isolates endpoint injection in owned tests without mutating the
 /// process environment; production passes only its inherited capability.
+#[cfg(test)]
 fn start_frontend_with_pipe(
     channel: &Path,
     pipe: std::path::PathBuf,
     node: std::path::PathBuf,
+) -> std::io::Result<Option<FrontendRelay>> {
+    start_frontend_with_delivery(channel, move |request, owner| {
+        deliver(
+            &node,
+            &pipe,
+            &request.thread_id,
+            &request.call_id,
+            &request.text,
+            owner,
+        )
+    })
+}
+
+/// Serves authenticated daemon requests through one fixed delivery callback.
+/// The callback receives only the closed frozen manifest and kernel owner uid;
+/// all peer checks and listener lifetime remain shared by production and tests.
+fn start_frontend_with_delivery(
+    channel: &Path,
+    delivery: impl Fn(&FrontendRequest, u32) -> Outcome + Send + 'static,
 ) -> std::io::Result<Option<FrontendRelay>> {
     let parent = channel.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
     let path = parent.join(format!("{}{}.sock", frontend_prefix(), std::process::id()));
@@ -428,14 +553,7 @@ fn start_frontend_with_pipe(
                 {
                     return Err(std::io::ErrorKind::InvalidData.into());
                 }
-                Ok(deliver(
-                    &node,
-                    &pipe,
-                    &request.thread_id,
-                    &request.call_id,
-                    &request.text,
-                    owner.uid,
-                ))
+                Ok(delivery(&request, owner.uid))
             })();
             let value = match outcome {
                 Ok(Outcome::NativeAccepted { evidence }) => {

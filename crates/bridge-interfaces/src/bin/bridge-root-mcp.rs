@@ -22,6 +22,10 @@ fn main() -> ExitCode {
         eprintln!("usage: bridge-root-mcp <adapter-channel-socket> <root-relay-socket>");
         return ExitCode::FAILURE;
     };
+    if bridge_adapters::desktop::exec_frontend().is_err() {
+        eprintln!("Bridge signed application frontend unavailable");
+        return ExitCode::FAILURE;
+    }
     let _desktop = match bridge_adapters::desktop::start_frontend(&PathBuf::from(channel)) {
         Ok(relay) => relay,
         Err(_) => {

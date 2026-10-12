@@ -802,10 +802,23 @@ fn queue_add(
 }
 
 /// Mode dispatch.
+/// Runs an owned Rust child of the signed frontend, publishing only its relay
+/// readiness and waiting for stdin EOF so the parent process has a bounded test lifetime.
+fn desktop_child(channel: &str) {
+    let _guard = bridge_adapters::desktop::start_frontend(Path::new(channel))
+        .unwrap()
+        .unwrap();
+    println!("ready");
+    std::io::stdout().flush().unwrap();
+    let mut byte = [0];
+    let _ = std::io::stdin().read(&mut byte);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("harness") => harness(),
+        Some("desktop-child") => desktop_child(args.get(2).unwrap()),
         Some("mcp") => mcp(args.get(2).map(String::as_str).unwrap_or_default(), false),
         Some("mcp-seal") => mcp(args.get(2).map(String::as_str).unwrap_or_default(), true),
         Some("relay") => relay(args.get(2).map(String::as_str).unwrap_or_default()),
