@@ -49,7 +49,7 @@ SDK config is immutable/shareable; each exchange owns a bounded Unix stream. One
 absolute deadline covers connect/write/read and optional one identical reconnect.
 No partial traffic renews it. A retry preserves request/event IDs and bytes. Lost,
 malformed or mismatched acknowledgement after any possible write is unknown;
-later failed connects do not erase earlier uncertainty. `ClientError` exposes
+later failed connects or retry-only preflight rejections do not erase earlier uncertainty. Only an authoritative same-identity committed result can resolve that uncertainty in this client. `ClientError` exposes
 structured service effect/hint/reconciliation without logging response bodies.
 
 `examples/producer.rs` is a tiny generic MCP stdin/stdout onboarding probe. Its

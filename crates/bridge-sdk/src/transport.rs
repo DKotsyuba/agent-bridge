@@ -30,7 +30,26 @@ pub(crate) fn exchange(
             break;
         }
         match once(path, request, &bytes, deadline) {
-            Ok(response) => return Ok(response),
+            Ok(response) => {
+                if uncertain
+                    && response.error.as_ref().is_some_and(|e| {
+                        !matches!(
+                            e.effect,
+                            Some(
+                                bridge_protocol::MutationEffect::Committed
+                                    | bridge_protocol::MutationEffect::CommittedReplay
+                            )
+                        )
+                    })
+                {
+                    return Err(failure(
+                        request,
+                        true,
+                        "earlier mutation outcome unresolved",
+                    ));
+                }
+                return Ok(response);
+            }
             Err(error) => {
                 uncertain |= matches!(
                     error,

@@ -135,6 +135,59 @@ fn public_sdk_boundary() {
     assert!(!diagnostic.contains("never-log-this-credential"));
     assert!(!diagnostic.contains("never-log-this-body"));
 
+    let socket = path("reject");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let worker = thread::spawn(move || {
+        let (first, _) = listener.accept().unwrap();
+        let mut frame = String::new();
+        BufReader::new(first).read_line(&mut frame).unwrap();
+        let (mut second, _) = listener.accept().unwrap();
+        let mut replay = String::new();
+        BufReader::new(second.try_clone().unwrap())
+            .read_line(&mut replay)
+            .unwrap();
+        assert_eq!(frame, replay);
+        let request = decode_request(replay.trim_end().as_bytes()).unwrap();
+        let response = Response::error(
+            &request.request_id,
+            ApiError {
+                class: ErrorClass::Auth,
+                reason: "revoked".into(),
+                retry_hint: RetryHint::Never,
+                effect: Some(MutationEffect::NotCommitted),
+                reconciliation: request.reconciliation(),
+                detail: "retry credential rejected before original lookup".into(),
+            },
+        );
+        let mut bytes = encode_response(&response).unwrap();
+        bytes.push(b'\n');
+        second.write_all(&bytes).unwrap();
+    });
+    let client = Client::new(
+        Config::new(
+            &socket,
+            &socket,
+            Secret::new("credential"),
+            Duration::from_secs(1),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let error = client.publish("stable-request", publication()).unwrap_err();
+    worker.join().unwrap();
+    fs::remove_file(&socket).unwrap();
+    assert!(
+        matches!(
+            error,
+            ClientError::Transport {
+                outcome: TransportOutcome::OutcomeUnknown,
+                reconciliation: Some(ReconciliationKey::Event { .. }),
+                ..
+            }
+        ),
+        "later request refusal erased earlier mutation uncertainty"
+    );
+
     let socket = path("slow");
     let listener = UnixListener::bind(&socket).unwrap();
     let worker = thread::spawn(move || {
