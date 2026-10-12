@@ -337,7 +337,11 @@ fn lab(tag: &str) -> Lab {
 
 /// Builds the existing process lab; `any` enables any canonical recipient and
 /// concise message defaults solely in the new policy test. Legacy labs retain
-/// their original exact grants and forbidden kind/mode cases.
+/// their original exact grants and forbidden kind/mode cases. When the inherited
+/// Desktop capabilities select the signed Node frontend, only its exact canonical
+/// executable is admitted as an intermediate; the stand-in harness still must
+/// match its qualified executable digest and owned store. A different selected
+/// frontend or unavailable executable panics before starting the registry.
 fn lab_with_addresses(tag: &str, any: bool) -> Lab {
     let dir = scratch(tag);
     let store = dir.join("cs");
@@ -369,6 +373,7 @@ fn lab_with_addresses(tag: &str, any: bool) -> Lab {
             },
             policies: vec!["keep_all".into()],
             admin: false,
+            producer_v1: None,
         },
         GrantConfig {
             token: OPERATOR_TOKEN.into(),
@@ -378,6 +383,7 @@ fn lab_with_addresses(tag: &str, any: bool) -> Lab {
             modes: vec![],
             policies: vec![],
             admin: true,
+            producer_v1: None,
         },
     ];
     let core = Arc::new(
@@ -386,6 +392,7 @@ fn lab_with_addresses(tag: &str, any: bool) -> Lab {
                 database: dir.join("bridge.db"),
                 socket: core_socket.clone(),
                 limits: serde_json::from_value(json!({"max_admitted_events": 1000})).unwrap(),
+                universal_limits: Default::default(),
                 grants,
             },
             Vec::new(),
@@ -399,6 +406,21 @@ fn lab_with_addresses(tag: &str, any: bool) -> Lab {
     let relay_exe = PathBuf::from(env!("CARGO_BIN_EXE_bridge-root-relay"))
         .canonicalize()
         .unwrap();
+    let mut intermediates: Vec<_> = ["/bin/sh", "/bin/bash", "/bin/zsh", "/bin/dash"]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    if let Some(node) = std::env::var_os("CODEX_APP_TOOLS_PIPE_PATH")
+        .and_then(|_| std::env::var_os("CODEX_MCP_NODE_PATH"))
+    {
+        let node = PathBuf::from(node).canonicalize().unwrap();
+        let signed =
+            PathBuf::from("/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node")
+                .canonicalize()
+                .unwrap();
+        assert_eq!(node, signed, "unexpected Desktop frontend executable");
+        intermediates.push(node);
+    }
     let registry = Registry::new(
         RegistryConfig {
             host_id: HOST.into(),
@@ -417,15 +439,13 @@ fn lab_with_addresses(tag: &str, any: bool) -> Lab {
                     }],
                 })
                 .collect(),
-            intermediates: ["/bin/sh", "/bin/bash", "/bin/zsh", "/bin/dash"]
-                .iter()
-                .map(PathBuf::from)
-                .collect(),
+            intermediates,
             max_call_age_ms: 600_000,
             relays: vec![RelayExecutable {
                 sha256: file_sha256(&relay_exe).unwrap(),
                 path: relay_exe.clone(),
             }],
+            audiences: Vec::new(),
         },
         owner,
     )

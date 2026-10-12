@@ -1,5 +1,5 @@
 //! Operator counts, lineage transfer and the doctor recovery summary over a
-//! real core service (schema 5) and the real `bridge` CLI.
+//! real core service with its current schema and the real `bridge` CLI.
 //!
 //! Synthetic publishers and recipients only; every socket, database and
 //! token is a fresh file in an exclusively created scratch tree under the
@@ -126,12 +126,14 @@ fn lab() -> Lab {
         modes: vec!["inject".into(), "message".into()],
         policies: vec!["latest".into(), "keep_all".into()],
         admin: false,
+        producer_v1: None,
     };
     let core = start_with_carriers(
         Config {
             database: dir.join("bridge.db"),
             socket: socket.clone(),
             limits: serde_json::from_value(json!({"max_admitted_events": 1000})).unwrap(),
+            universal_limits: Default::default(),
             grants: vec![
                 producer(PRODUCER_A, "producer-a"),
                 producer(PRODUCER_B, "producer-b"),
@@ -143,6 +145,7 @@ fn lab() -> Lab {
                     modes: vec![],
                     policies: vec![],
                     admin: true,
+                    producer_v1: None,
                 },
             ],
         },
