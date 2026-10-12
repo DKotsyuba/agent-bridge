@@ -48,14 +48,24 @@ fn connect(pipe: &Path, deadline: Instant) -> std::io::Result<UnixStream> {
 
 /// Reads exactly `bytes.len()` bytes without renewing the absolute deadline.
 /// EOF, socket failure or expiration refuses the frame; partial bytes are not used.
+/// macOS can reject SO_RCVTIMEO after a peer closes despite buffered reply bytes;
+/// in that case only a nonblocking drain is attempted, never an unbounded read.
 fn read_exact(
     stream: &mut UnixStream,
     mut bytes: &mut [u8],
     deadline: Instant,
 ) -> std::io::Result<()> {
     while !bytes.is_empty() {
-        stream.set_read_timeout(Some(remaining(deadline)?))?;
-        let n = stream.read(bytes)?;
+        let n = match stream.set_read_timeout(Some(remaining(deadline)?)) {
+            Ok(()) => stream.read(bytes)?,
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+                stream.set_nonblocking(true)?;
+                let read = stream.read(bytes);
+                stream.set_nonblocking(false)?;
+                read?
+            }
+            Err(error) => return Err(error),
+        };
         if n == 0 {
             return Err(std::io::ErrorKind::UnexpectedEof.into());
         }
@@ -286,6 +296,63 @@ mod tests {
         }
     }
 
+    /// The typed frontend relay preserves exact host arguments and returns native
+    /// acceptance through real kernel-identified sockets, without environment edits.
+    #[test]
+    fn frontend_handoff_reaches_one_native_message_call() {
+        let entropy = os::random_bytes().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "bf{:x}",
+            u64::from_le_bytes(entropy[..8].try_into().unwrap())
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let channel = dir.join("c.sock");
+        let daemon = UnixListener::bind(&channel).unwrap();
+        let channel_peer = std::thread::spawn(move || daemon.accept().unwrap().0);
+        let pipe = dir.join("h.sock");
+        let host = UnixListener::bind(&pipe).unwrap();
+        let native = std::thread::spawn(move || {
+            let (mut stream, _) = host.accept().unwrap();
+            assert_eq!(request(&mut stream)["method"], "tools/list");
+            reply(
+                &mut stream,
+                json!({"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"send_message_to_thread","namespace":"codex_app"}]}}),
+            );
+            let call = request(&mut stream);
+            assert_eq!(
+                call["params"]["arguments"],
+                json!({"threadId":"owned-thread","prompt":"marker"})
+            );
+            assert_eq!(call["params"]["callerSource"], "codex");
+            reply(
+                &mut stream,
+                json!({"jsonrpc":"2.0","id":2,"result":{"success":true}}),
+            );
+        });
+        let parent = &os::ancestry(std::process::id())[1];
+        let incarnation = (parent.pid, parent.start_time);
+        let stale = dir.join(format!("ui-{:010}.sock", std::process::id()));
+        drop(UnixListener::bind(&stale).unwrap());
+        assert!(frontend_for(&dir, incarnation).is_none());
+        let guard = start_frontend_with_pipe(&channel, pipe).unwrap().unwrap();
+        let result = via_frontend(
+            &guard.path,
+            (parent.pid, parent.start_time),
+            "owned-thread",
+            "bridge-call",
+            "marker",
+        );
+        assert!(
+            matches!(result, Outcome::NativeAccepted { .. }),
+            "{result:?}"
+        );
+        native.join().unwrap();
+        drop(channel_peer.join().unwrap());
+        drop(guard);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// Partial reads cannot renew the shared timeout, preventing slow frames
     /// from keeping a hand-off alive beyond its absolute deadline.
     #[test]
@@ -427,9 +494,12 @@ struct FrontendRequest {
 
 /// Finds a live Bridge frontend socket belonging to the exact recipient harness
 /// incarnation. Only kernel PID/ancestry and the protected channel directory are
-/// used; filenames are not identity. The connected socket is rechecked below.
+/// used; filenames are not identity. A bounded, read-only connection probe skips
+/// dead sockets even when their filename PID was reused. The sending connection
+/// is independently rechecked below; probing never writes a request.
 pub fn frontend_for(directory: &Path, harness: (u32, u64)) -> Option<std::path::PathBuf> {
     let entries = std::fs::read_dir(directory).ok()?;
+    let deadline = Instant::now() + HOST_TIMEOUT;
     for entry in entries.take(512).flatten() {
         let name = entry.file_name();
         let name = name.to_str()?;
@@ -440,10 +510,17 @@ pub fn frontend_for(directory: &Path, harness: (u32, u64)) -> Option<std::path::
         else {
             continue;
         };
-        if os::ancestry(pid)
+        if !os::ancestry(pid)
             .iter()
             .skip(1)
             .any(|p| (p.pid, p.start_time) == harness)
+        {
+            continue;
+        }
+        // A dead socket can share a reused PID with a current harness child.
+        // Probe without writing; EOF cannot initiate a native message.
+        if let Ok(stream) = connect(&entry.path(), deadline)
+            && os::peer_identity(&stream).is_ok_and(|peer| peer.pid == pid)
         {
             return Some(entry.path());
         }
