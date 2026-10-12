@@ -362,16 +362,18 @@ else run('m2xp', 20 * 60_000, REQUIRED, async probe => {
 });
 
 /** Whether the kept own server subtree is exactly the per-launch approval
- * config: both tools enabled, only `bridge_me` with `ME_APPROVAL`, no
- * server-wide default.
+ * config: exactly the supplied tools enabled, only the first with
+ * `ME_APPROVAL`, no server-wide default. Defaults preserve the legacy probe.
  * @param {object|null} effective The kept `bridge_probe` subtree.
+ * @param {string[]} [tools] Nonempty owned tool names; first is approved.
  * @returns {boolean}
  */
-function ownApprovalParsed(effective) {
+function ownApprovalParsed(effective, tools = ['bridge_me', 'bridge_unlisted']) {
   return Boolean(effective
-    && JSON.stringify(effective.enabled_tools) === JSON.stringify(['bridge_me', 'bridge_unlisted'])
-    && effective.tools && effective.tools.bridge_me && effective.tools.bridge_me.approval_mode === ME_APPROVAL
-    && !(effective.tools.bridge_unlisted && effective.tools.bridge_unlisted.approval_mode)
+    && tools.length > 0 && new Set(tools).size === tools.length
+    && JSON.stringify(effective.enabled_tools) === JSON.stringify(tools)
+    && effective.tools && effective.tools[tools[0]] && effective.tools[tools[0]].approval_mode === ME_APPROVAL
+    && tools.slice(1).every(name => !(effective.tools[name] && effective.tools[name].approval_mode))
     && !effective.default_tools_approval_mode);
 }
 
@@ -396,7 +398,8 @@ function stateOverride(hooks) {
  * Every stdout line is projected by `keep` before it is logged or parsed,
  * so no other part of it is written or retained: the `hooks/list` answer
  * (request id 1) to the minimal hook fields plus `own`, the `config/read`
- * answer (id 2) to `result.config.mcp_servers.bridge_probe`, any other
+ * answer (id 2) to `result.config.mcp_servers.bridge_probe` plus server-name
+ * enablement and instruction-presence booleans (no foreign values), any other
  * answer to its id (or error code), a notification or server request to
  * its method name; an unparsable line is dropped. Stderr is never written:
  * it is reduced in memory while it streams (`Probe.spawn` `stderrMatch`),
@@ -410,8 +413,9 @@ function stateOverride(hooks) {
  * @param {string} label Log label.
  * @param {string[]} flags App Server flags.
  * @param {string} ownCommand The exact command of this probe's own hooks; a `sessionFlags` hook with exactly this command is `own`.
- * @returns {Promise<{hooks: {key: string|null, source: string|null, eventName: string|null, enabled: boolean|null, trustStatus: string|null, currentHash: string|null, own: boolean}[]|null, effective: object|null, overrideRejected: boolean}>}
- *   Projected hooks (null when not answered), the own server subtree (null when absent) and the stderr verdict.
+ * @returns {Promise<{hooks: {key: string|null, source: string|null, eventName: string|null, enabled: boolean|null, trustStatus: string|null, currentHash: string|null, own: boolean}[]|null, effective: object|null, configFacts: {servers: Record<string,boolean|null>, instructions: boolean, developer_instructions: boolean}|null, overrideRejected: boolean}>}
+ *   Projected hooks, own server subtree, safe configuration facts (null when
+ *   unanswered), and stderr verdict. Foreign credentials/commands are omitted.
  */
 async function gateRead(probe, codex, store, label, flags, ownCommand) {
   /** A JSON scalar or null (no object or array survives).
@@ -443,7 +447,13 @@ async function gateRead(probe, codex, store, label, flags, ownCommand) {
     }
     if (id === 2) {
       const servers = result.config && result.config.mcp_servers;
-      return JSON.stringify({ id, result: { config: { mcp_servers: { bridge_probe: (servers && servers.bridge_probe) || null } } } });
+      const config = result.config;
+      return JSON.stringify({ id, result: { config: { mcp_servers: { bridge_probe: (servers && servers.bridge_probe) || null } },
+        facts: config && servers && typeof servers === 'object' && !Array.isArray(servers) ? {
+          servers: Object.fromEntries(Object.entries(servers).map(([name, value]) => [name, value && typeof value.enabled === 'boolean' ? value.enabled : null])),
+          instructions: typeof config.instructions === 'string' && config.instructions.length > 0,
+          developer_instructions: typeof config.developer_instructions === 'string' && config.developer_instructions.length > 0,
+        } : null } });
     }
     return JSON.stringify({ id, result: {} });
   };
@@ -460,6 +470,7 @@ async function gateRead(probe, codex, store, label, flags, ownCommand) {
   return {
     hooks: answer && answer.result ? answer.result.data[0].hooks : null,
     effective: config && config.result ? config.result.config.mcp_servers.bridge_probe : null,
+    configFacts: config && config.result ? config.result.facts : null,
     overrideRejected,
   };
 }
@@ -473,8 +484,9 @@ async function gateRead(probe, codex, store, label, flags, ownCommand) {
  * - `normal`: requires the own config subtree, own-hook recognition (and
  *   only it), the state override and the detected stderr override warning;
  *   after `finish` also checks that the kept `hooks/list` entries carry only
- *   the minimal fields, the kept `config/read` line is the own subtree and
- *   notifications keep only their method.
+ *   the minimal fields, the kept `config/read` line is the own subtree plus
+ *   exact server-name enablement/instruction-presence booleans, and notifications
+ *   keep only their method. No foreign configuration values survive.
  * - `signal`: the server writes its stderr and never answers; the probe
  *   sends itself SIGTERM mid-gate, so cleanup runs before any gate result.
  * - `late`: the server answers, ignores SIGTERM and keeps writing stderr
@@ -485,7 +497,7 @@ async function gateRead(probe, codex, store, label, flags, ownCommand) {
  * @returns {void}
  */
 function configControl(mode) {
-  const required = { normal: ['config_own_survives', 'config_hooks_classified', 'config_state_override', 'config_override_rejection_detected'],
+  const required = { normal: ['config_own_survives', 'config_facts_minimal', 'config_hooks_classified', 'config_state_override', 'config_override_rejection_detected'],
     signal: ['config_gate_completed'], late: ['config_late_rejected'] }[mode];
   if (!required) throw new Error(`unknown control case ${mode}`);
   run('m2xc', 60_000, required, async probe => {
@@ -504,9 +516,12 @@ function configControl(mode) {
       await new Promise(r => setTimeout(r, 30_000));
       return;
     }
-    const { hooks, effective, overrideRejected } = await gateRead(probe, fake, store, 'hooks-gate-c', [], CONTROL_OWN_COMMAND);
+    const { hooks, effective, configFacts, overrideRejected } = await gateRead(probe, fake, store, 'hooks-gate-c', [], CONTROL_OWN_COMMAND);
     if (mode === 'late') { probe.checks.config_late_rejected = overrideRejected === true; return; }
     probe.checks.config_own_survives = ownApprovalParsed(effective);
+    probe.checks.config_facts_minimal = JSON.stringify(configFacts) === JSON.stringify({
+      servers: { foreign: null, bridge_probe: null }, instructions: false, developer_instructions: false,
+    });
     probe.checks.config_hooks_classified = Boolean(hooks && hooks.length === 2
       && hooks.some(h => h.key === 'own-key' && h.own === true && h.currentHash === 'own-hash')
       && hooks.some(h => h.key === 'foreign-key' && h.own === false)
@@ -522,7 +537,10 @@ function configControl(mode) {
       === JSON.stringify(['key', 'source', 'eventName', 'enabled', 'trustStatus', 'currentHash', 'own']));
     const configKept = log.filter(l => l.id === 2).map(l => JSON.stringify(l));
     const configOwnOnly = configKept.length === 1
-      && configKept[0] === JSON.stringify({ id: 2, result: { config: { mcp_servers: { bridge_probe: { enabled_tools: ['bridge_me', 'bridge_unlisted'], tools: { bridge_me: { approval_mode: ME_APPROVAL } } } } } } });
+      && configKept[0] === JSON.stringify({ id: 2, result: {
+        config: { mcp_servers: { bridge_probe: { enabled_tools: ['bridge_me', 'bridge_unlisted'], tools: { bridge_me: { approval_mode: ME_APPROVAL } } } } },
+        facts: { servers: { foreign: null, bridge_probe: null }, instructions: false, developer_instructions: false },
+      } });
     const notificationsMethodOnly = log.filter(l => l.method !== undefined).every(l => JSON.stringify(Object.keys(l)) === '["method"]');
     const pass = probe.failures.length === 0 && hooksMinimal && configOwnOnly && notificationsMethodOnly;
     console.log(JSON.stringify({ config_case: 'normal', pass, hooksMinimal, configOwnOnly, notificationsMethodOnly }));
@@ -629,7 +647,8 @@ async function appServer(probe, codex, store, label, flags, requests, cleanup = 
   return responses;
 }
 
-/** The proven Q3 isolation/config building blocks, reused unchanged by
- * `codex-lifecycle-probe.cjs` (loading this file runs nothing).
- * @type {{MODEL: string, EFFORT: string, POLICY: string, DISABLED: string[], EVENTS: string[], ME_APPROVAL: string, gateRead: (probe: import('./probe-lib.cjs').Probe, codex: string, store: string, label: string, flags: string[], ownCommand: string) => Promise<{hooks: {key: string|null, source: string|null, eventName: string|null, enabled: boolean|null, trustStatus: string|null, currentHash: string|null, own: boolean}[]|null, effective: {enabled_tools?: string[], tools?: {[tool: string]: {approval_mode?: string}}, default_tools_approval_mode?: string}|null, overrideRejected: boolean}>, stateOverride: (hooks: {key: string, own: boolean, currentHash: string|null}[]) => string[], ownApprovalParsed: (effective: {enabled_tools?: string[], tools?: {[tool: string]: {approval_mode?: string}}, default_tools_approval_mode?: string}|null) => boolean, appServer: (probe: import('./probe-lib.cjs').Probe, codex: string, store: string, label: string, flags: string[], requests: [string, {[param: string]: unknown}][], cleanup?: boolean, keep?: (line: string) => string|null, stderrMatch?: RegExp) => Promise<({id: number, result?: {[field: string]: unknown}, error?: {code?: number, message?: string}}|undefined)[]>}} */
+/** Shared Q3 isolation/config building blocks; importing runs nothing.
+ * Legacy tool defaults remain; universal qualification supplies its own tool.
+ * @type {{MODEL:string,EFFORT:string,POLICY:string,DISABLED:string[],EVENTS:string[],ME_APPROVAL:string,
+ * gateRead:typeof gateRead,stateOverride:typeof stateOverride,ownApprovalParsed:typeof ownApprovalParsed,appServer:typeof appServer}} */
 module.exports = { MODEL, EFFORT, POLICY, DISABLED, EVENTS, ME_APPROVAL, gateRead, stateOverride, ownApprovalParsed, appServer };

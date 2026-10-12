@@ -136,7 +136,7 @@ const { MODEL, EFFORT, POLICY, DISABLED, EVENTS, ME_APPROVAL, gateRead, stateOve
  * @typedef {{method: string, params?: {threadId?: string, turnId?: string, turn?: {id?: string, status?: string}, run?: {eventName?: string, status?: string, source?: string}, item?: {type?: string, text?: string, tool?: string, status?: string, error?: JsonValue}, tokenUsage?: TokenUsage}}} Notification */
 /** One `mcpServerStatus/list` request and the response it got (null when none arrived in time), kept together so the exact parameters sent can be checked.
  * @typedef {{params: RpcParams, response: RpcResponse|null}} McpExchange */
-/** Verdict of one MCP inventory read: whether the own server is connected on the own thread with both own tools, why not, whether the state is terminal (no waiting can fix it), and ONLY the own fields observed.
+/** Verdict of one MCP inventory read: whether the own server is connected on the own thread with all expected tools, why not, whether the state is terminal (no waiting can fix it), and ONLY the own fields observed.
  * @typedef {{ready: boolean, terminal: boolean, reason: string, runtime_status: string|null, tools: string[], pages: number}} McpVerdict */
 /** A hook run the frontend reported (`hook/completed`): camelCase event name, run status and hook source (`sessionFlags` is this probe's own per-launch hook).
  * @typedef {{event: string, status: string, source: string}} HookRun */
@@ -308,15 +308,18 @@ function approvalRefusal(call) {
  * never retained), whose `runtimeStatus` is `connected` (the thread-runtime
  * connection state; `starting`/`notStarted`/explicit null are waited for,
  * while missing, malformed, unsupported or unusable values are terminal), whose
- * `toolsError` is null or absent, and whose `tools` catalog holds both
- * `bridge_me` and `bridge_unlisted` (by catalog key or tool name). Every
+ * `toolsError` is null or absent, and whose `tools` catalog holds all
+ * expected owned tools (default `bridge_me` and `bridge_unlisted`, by
+ * catalog key or tool name). Every
  * catalog value must be a non-null, non-array object; null, scalar and array
  * definitions make the inventory malformed and terminal.
  * @param {string} thread The own native thread id.
  * @param {McpExchange[]} exchanges The exchanges of one read, in order.
- * @returns {McpVerdict} The verdict; `tools` lists only the two own tool names found.
+ * @param {string[]} [tools] Nonempty unique owned tool names; defaults preserve
+ * the legacy probe. Names come from the frozen run's private configuration.
+ * @returns {McpVerdict} The verdict; `tools` lists only expected own names found.
  */
-function mcpInventoryVerdict(thread, exchanges) {
+function mcpInventoryVerdict(thread, exchanges, tools = ['bridge_me', 'bridge_unlisted']) {
   /** Builds a verdict with the page count of this read.
    * @param {boolean} ready Whether the gate may open.
    * @param {boolean} terminal Whether waiting cannot fix the state.
@@ -326,6 +329,7 @@ function mcpInventoryVerdict(thread, exchanges) {
    * @returns {McpVerdict}
    */
   const verdict = (ready, terminal, reason, status = null, tools = []) => ({ ready, terminal, reason, runtime_status: status, tools, pages: exchanges.length });
+  if (tools.length === 0 || new Set(tools).size !== tools.length) return verdict(false, true, 'invalid owned tool set');
   if (exchanges.length === 0 || exchanges.length > MAX_MCP_PAGES) return verdict(false, true, 'no or too many pages');
   const rows = [];
   let cursor = null;
@@ -353,9 +357,9 @@ function mcpInventoryVerdict(thread, exchanges) {
   const entries = Object.entries(catalog);
   if (entries.some(([, tool]) => !tool || typeof tool !== 'object' || Array.isArray(tool))) return verdict(false, true, 'malformed tool catalog entry', status);
   const names = new Set(entries.flatMap(([key, tool]) => [key, tool && tool.name]));
-  const found = ['bridge_me', 'bridge_unlisted'].filter(name => names.has(name));
-  if (found.length !== 2) return verdict(false, true, 'own tools not both advertised', status, found);
-  return verdict(true, false, 'connected with both own tools', status, found);
+  const found = tools.filter(name => names.has(name));
+  if (found.length !== tools.length) return verdict(false, true, 'own tools not all advertised', status, found);
+  return verdict(true, false, 'connected with all own tools', status, found);
 }
 
 /** Remaining time available for one inventory request or for accepting its result.
@@ -573,7 +577,7 @@ function selfTest() {
    * @returns {McpExchange[]}
    */
   const one = row => [{ params: askFor(), response: page([row]) }];
-  assert.deepEqual(mcpInventoryVerdict(T, one(goodRow)), { ready: true, terminal: false, reason: 'connected with both own tools', runtime_status: 'connected', tools: ['bridge_me', 'bridge_unlisted'], pages: 1 });
+  assert.deepEqual(mcpInventoryVerdict(T, one(goodRow)), { ready: true, terminal: false, reason: 'connected with all own tools', runtime_status: 'connected', tools: ['bridge_me', 'bridge_unlisted'], pages: 1 });
   assert.equal(mcpInventoryVerdict(T, [{ params: askFor(), response: page([{ name: 'other', runtimeStatus: 'connected' }], 'c1') }, { params: askFor('c1'), response: page([goodRow]) }]).ready, true); // follows a complete chain, ignores other servers
   const keyed = { ...goodRow, tools: { bridge_me: tool('bridge_me'), x: tool('bridge_unlisted') } };
   assert.equal(mcpInventoryVerdict(T, one(keyed)).ready, true); // advertised by tool name as well as by catalog key
