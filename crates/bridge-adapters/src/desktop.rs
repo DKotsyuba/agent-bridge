@@ -289,7 +289,7 @@ mod tests {
         });
         let parent = &os::ancestry(std::process::id())[1];
         let incarnation = (parent.pid, parent.start_time);
-        let stale = dir.join(format!("ui-{:010}.sock", std::process::id()));
+        let stale = dir.join(format!("ui2-{:010}.sock", std::process::id()));
         drop(UnixListener::bind(&stale).unwrap());
         assert!(frontend_for(&dir, incarnation).is_none());
         let guard = start_frontend_with_pipe(&channel, pipe, node)
@@ -380,7 +380,7 @@ fn start_frontend_with_pipe(
     node: std::path::PathBuf,
 ) -> std::io::Result<Option<FrontendRelay>> {
     let parent = channel.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
-    let path = parent.join(format!("ui-{}.sock", std::process::id()));
+    let path = parent.join(format!("ui2-{}.sock", std::process::id()));
     let listener = UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     let channel = channel.to_path_buf();
@@ -461,7 +461,9 @@ struct FrontendRequest {
 /// Finds a live Bridge frontend socket belonging to the exact recipient harness
 /// incarnation. Only kernel PID/ancestry and the protected channel directory are
 /// used; filenames are not identity. A bounded, read-only connection probe skips
-/// dead sockets even when their filename PID was reused. The sending connection
+/// dead sockets even when their filename PID was reused. Only signed-client
+/// protocol endpoints (ui2) are selected; older running frontends stay untouched.
+/// The sending connection
 /// is independently rechecked below; probing never writes a request.
 pub fn frontend_for(directory: &Path, harness: (u32, u64)) -> Option<std::path::PathBuf> {
     let entries = std::fs::read_dir(directory).ok()?;
@@ -470,7 +472,7 @@ pub fn frontend_for(directory: &Path, harness: (u32, u64)) -> Option<std::path::
         let name = entry.file_name();
         let name = name.to_str()?;
         let Some(pid) = name
-            .strip_prefix("ui-")
+            .strip_prefix("ui2-")
             .and_then(|n| n.strip_suffix(".sock"))
             .and_then(|n| n.parse::<u32>().ok())
         else {
