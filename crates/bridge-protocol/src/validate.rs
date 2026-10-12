@@ -489,6 +489,7 @@ impl OperationResult {
                 r.receipt.request_id == request.request_id
                     && r.receipt.operation_key == p.operation_key
                     && r.receipt.reply_policy == p.reply_policy
+                    && registration_constraints_match(p, &r.receipt.constraints)
                     && r.receipt.route_expires_at_ms == p.route_expires_at_ms
                     && r.assertion.as_ref().is_none_or(|a| {
                         Some(&a.audience) == p.assertion_audience.as_ref()
@@ -542,4 +543,28 @@ impl OperationResult {
         }
         Ok(())
     }
+}
+
+/// Rejects a returned route broader than explicit constraints/default message mode.
+/// Inherited kinds/size cannot be independently resolved without service policy.
+fn registration_constraints_match(
+    request: &RegisterCallParams,
+    returned: &RouteConstraints,
+) -> bool {
+    let default = [Mode::Message];
+    let modes = request.allowed_modes.as_deref().unwrap_or(&default);
+    returned
+        .allowed_modes
+        .iter()
+        .all(|mode| modes.contains(mode))
+        && request
+            .max_payload_bytes
+            .is_none_or(|max| returned.max_payload_bytes <= max)
+        && request.allowed_kinds.as_ref().is_none_or(|kinds| {
+            kinds.iter().any(|kind| kind == "*")
+                || returned
+                    .allowed_kinds
+                    .iter()
+                    .all(|kind| kinds.contains(kind))
+        })
 }

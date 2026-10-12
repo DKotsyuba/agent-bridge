@@ -4,8 +4,10 @@ use serde_json::{Value, json};
 
 /// Reusable accepted fixture set; contains only intentionally synthetic credentials.
 fn fixtures() -> Vec<Request> {
-    serde_json::from_str::<Vec<Value>>(include_str!("wire-v1.json"))
+    serde_json::from_str::<Value>(include_str!("wire-v1.json")).unwrap()["requests"]
+        .as_array()
         .unwrap()
+        .clone()
         .into_iter()
         .map(|v| decode_request(&serde_json::to_vec(&v).unwrap()).unwrap())
         .collect()
@@ -35,6 +37,21 @@ fn receipt(p: &PublishParams) -> EventReceipt {
 #[test]
 fn public_wire_boundary() {
     let all = fixtures();
+    let fixture: Value = serde_json::from_str(include_str!("wire-v1.json")).unwrap();
+    for (request, response) in all.iter().zip(fixture["responses"].as_array().unwrap()) {
+        let bytes = serde_json::to_vec(response).unwrap();
+        decode_response(&bytes, request).unwrap();
+    }
+    let mut bounded = all[1].clone();
+    if let Operation::RegisterCall(p) = &mut bounded.operation {
+        p.max_payload_bytes = Some(100);
+        p.allowed_kinds = Some(vec!["only.kind".into()]);
+    }
+    let forged = serde_json::to_vec(&fixture["responses"][1]).unwrap();
+    assert!(
+        decode_response(&forged, &bounded).is_err(),
+        "broader registration constraints accepted"
+    );
     for request in &all {
         let bytes = encode_request(request).unwrap();
         assert_eq!(decode_request(&bytes).unwrap(), *request);
