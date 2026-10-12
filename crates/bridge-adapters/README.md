@@ -439,5 +439,10 @@ endpoint/receipt checks still run before actual delivery. Earlier uncertain
 hand-offs remain retained and are never replayed by route recovery. The native
 boundary test covers delivery without recipient activity, larger renewed epochs,
 input-wait preservation, retired/dead routes, changed qualification and private
-file protection. This snapshot format is initialized by successful native hooks;
-installations predating it had no durable route metadata to restore.
+file protection. Successful native hooks initialize this snapshot. A missing
+interactive Claude recipient, including a session opened before this format,
+can also be discovered from its bounded owner-owned native session descriptor.
+Discovery rechecks the live process UID/start time, descriptor age, exact native
+store and qualified executable before persisting the route. Only native status
+supplies lifecycle; unknown/input waits stay held. Known and retired bindings
+are never overwritten, and discovery grants no MCP caller identity or proof.

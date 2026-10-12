@@ -937,7 +937,8 @@ impl Registry {
     /// publishing a new endpoint epoch. `path` must lie in an existing owner-only
     /// channel directory. Missing snapshots are initial setup; malformed, symlinked,
     /// foreign, shared, oversized or unsupported files refuse startup. Dead/reused
-    /// processes, changed stores/builds/profiles and retired sessions are omitted.
+    /// processes and changed stores/builds/profiles are omitted. Retired
+    /// tombstones remain refusal fences, never restored live routes.
     /// Current profile capabilities bound recovery; unknown/input-wait lifecycle
     /// stays such. No hook is manufactured and no caller/proof record is restored.
     /// Returns fresh recipient attestations for core to fence before serving.
@@ -983,12 +984,17 @@ impl Registry {
         };
         if let Some(snapshot) = snapshot {
             for mut binding in snapshot.bindings {
-                if binding.retired
-                    || binding.address.host_id != self.config.host_id
+                if binding.address.host_id != self.config.host_id
                     || binding.epoch == 0
                     || binding.epoch == u64::MAX
                     || NativeAddress::parse(&binding.address.to_canonical_string()).is_err()
                 {
+                    continue;
+                }
+                if binding.retired {
+                    self.bindings
+                        .entry(binding.address.to_canonical_string())
+                        .or_insert(binding);
                     continue;
                 }
                 let Some(facts) = os::process_facts(binding.harness.0) else {
@@ -1089,6 +1095,93 @@ impl Registry {
         if result.is_err() {
             let _ = std::fs::remove_file(&temp);
             return Err("route snapshot could not be committed".into());
+        }
+        Ok(())
+    }
+
+    /// Bootstraps a missing interactive Claude recipient from fresh native session
+    /// metadata, including clients opened before route journals existed. Addresses
+    /// already known (including ended/held tombstones) are never overwritten. A
+    /// descriptor supplies only session/PID/status; current OS UID/start/executable,
+    /// process-owned store, descriptor age and qualified loaded bytes are rechecked.
+    /// Persistence precedes delivery and caller records remain absent. Returns
+    /// no-op on absent/unknown native evidence; normal attestation then holds it.
+    pub(crate) fn discover_claude_recipient(
+        &mut self,
+        address: &NativeAddress,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        let key = address.to_canonical_string();
+        if self.bindings.contains_key(&key)
+            || address.host_id != self.config.host_id
+            || address.harness != Harness::ClaudeCode
+        {
+            return Ok(());
+        }
+        let Some(profile) = self
+            .config
+            .profiles
+            .iter()
+            .find(|p| p.harness == address.harness && p.namespace == address.native_store_namespace)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let Some(hint) =
+            crate::claude::session_hint(&profile.store, &address.native_session_id, self.owner_uid)
+        else {
+            return Ok(());
+        };
+        let Some(facts) = os::process_facts(hint.pid) else {
+            return Ok(());
+        };
+        if facts.uid != Some(self.owner_uid)
+            || i128::from(hint.written_at) < i128::from(facts.start_time)
+            || harness_store(&facts, Harness::ClaudeCode).as_ref() != Some(&profile.store)
+        {
+            return Ok(());
+        }
+        let Some(exe) = profile
+            .executables
+            .iter()
+            .find(|e| facts.exe.as_ref() == Some(&e.path))
+            .cloned()
+        else {
+            return Ok(());
+        };
+        if self
+            .verify_loaded(&exe.path, facts.start_time, &exe.sha256)
+            .is_err()
+        {
+            return Ok(());
+        }
+        self.evict_bindings();
+        if self.bindings.len() >= DEFAULT_MAX_BINDINGS {
+            return Err("verified route capacity exhausted".into());
+        }
+        let qualified = Capabilities {
+            inject: exe.inject,
+            message: exe.message && !self.message_disabled.contains(&Harness::ClaudeCode),
+        };
+        self.bindings.insert(
+            key.clone(),
+            Binding {
+                address: address.clone(),
+                harness: (facts.pid, facts.start_time),
+                epoch: now_ms.max(1),
+                capabilities: qualified,
+                qualified,
+                version: exe.version,
+                lifecycle: hint.lifecycle,
+                transcript: None,
+                store: profile.store,
+                executable: exe.path,
+                retired: false,
+            },
+        );
+        if let Err(error) = self.persist_routes() {
+            self.bindings.remove(&key);
+            return Err(error);
         }
         Ok(())
     }
@@ -1549,14 +1642,14 @@ impl Registry {
         }
     }
 
-    /// Drops retired or dead bindings when the bound is reached.
+    /// Drops only dead process bindings at capacity; live retired tombstones must
+    /// remain refusal fences against automatic native descriptor rediscovery.
     fn evict_bindings(&mut self) {
         if self.bindings.len() < DEFAULT_MAX_BINDINGS {
             return;
         }
-        self.bindings.retain(|_, binding| {
-            !binding.retired && os::incarnation_alive(binding.harness.0, binding.harness.1)
-        });
+        self.bindings
+            .retain(|_, binding| os::incarnation_alive(binding.harness.0, binding.harness.1));
     }
 
     /// Attests the actual caller of one MCP request.

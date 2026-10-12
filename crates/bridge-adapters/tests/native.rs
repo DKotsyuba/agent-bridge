@@ -2876,3 +2876,92 @@ fn recipient_routes_recover_after_restart_without_recipient_activity() {
     let mut foreign = Registry::new(lab.config.clone(), owner).unwrap();
     assert!(foreign.attach_journal(&journal, now()).is_err());
 }
+
+/// An interactive native descriptor bootstraps a missing legacy route with no
+/// recipient hook or bridge_me; unknown native states remain held and no caller
+/// records or inject context are fabricated by descriptor discovery.
+#[test]
+fn legacy_native_claude_descriptor_delivers_without_any_recipient_hook() {
+    let lab = Lab::new("legacy");
+    let address = lab.claude_address("legacy-open");
+    let mut receiver = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    receiver.cmd(json!({"cmd":"inbox","session_id":"legacy-open","behavior":"delivered"}));
+    let file = lab
+        .claude_store
+        .join("sessions")
+        .join(format!("{}.json", receiver.child.id()));
+    let mut descriptor: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    descriptor["kind"] = json!("interactive");
+    descriptor["status"] = json!("idle");
+    std::fs::write(&file, serde_json::to_vec(&descriptor).unwrap()).unwrap();
+    assert!(
+        lab.registry
+            .lock()
+            .unwrap()
+            .attest_recipient(&address)
+            .is_err()
+    );
+    lab.publish(
+        "legacy-send",
+        &address,
+        Mode::Message,
+        "legacy delivered without hooks",
+    );
+    let mut carrier = ClaudeLaterCarrier::new(
+        Arc::clone(&lab.registry),
+        Arc::clone(&lab.storage) as Arc<dyn Custody>,
+        ClaudeTiming::default(),
+    )
+    .unwrap();
+    // A native approval wait is a visible hold, never an inferred idle session.
+    descriptor["status"] = json!("waiting");
+    std::fs::write(&file, serde_json::to_vec(&descriptor).unwrap()).unwrap();
+    let held = dispatch_message(
+        &lab.storage,
+        &mut carrier,
+        &address,
+        &now,
+        &DispatchTiming::default(),
+    )
+    .unwrap();
+    assert!(matches!(held, DispatchReport::Held(_)), "{held:?}");
+    assert!(lab.attempt("legacy-send").is_none());
+    assert_eq!(receiver.cmd(json!({"cmd":"frames"}))["frames"], json!([]));
+
+    // A fresh process registry may discover a positive native idle descriptor.
+    *lab.registry.lock().unwrap() = bridge_adapters::registry::Registry::new(
+        lab.config.clone(),
+        bridge_adapters::server::private_directory(lab.socket.parent().unwrap()).unwrap(),
+    )
+    .unwrap();
+    descriptor["status"] = json!("idle");
+    std::fs::write(&file, serde_json::to_vec(&descriptor).unwrap()).unwrap();
+    let report = dispatch_message(
+        &lab.storage,
+        &mut carrier,
+        &address,
+        &now,
+        &DispatchTiming::default(),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            report,
+            DispatchReport::Sent {
+                state: AttemptState::NativeAccepted,
+                ..
+            }
+        ),
+        "{report:?}"
+    );
+    assert_eq!(
+        receiver.cmd(json!({"cmd":"frames"}))["frames"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(carrier);
+    receiver.stop();
+}

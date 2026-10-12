@@ -285,6 +285,50 @@ fn registry_entries(store: &Path, keep: impl Fn(&Path) -> bool) -> Vec<PathBuf> 
     paths
 }
 
+/// Current native Claude session facts used only for recipient discovery.
+/// No token, socket or caller authority is imported from this view.
+#[derive(Debug)]
+pub(crate) struct SessionHint {
+    /// Native descriptor process id, still independently checked against the OS.
+    pub pid: u32,
+    /// Positive native idle/busy status; unknown or waiting descriptors cannot bootstrap.
+    pub lifecycle: bridge_core::dispatch::Lifecycle,
+    /// Descriptor modification time in Unix seconds; predating a process refuses PID reuse.
+    pub written_at: i64,
+}
+
+/// Finds an owner-owned bounded native descriptor naming exactly `session` in
+/// `store`. Only current interactive Claude sessions can bootstrap a recipient.
+/// Returns no caller identity or credentials; registry must check UID, process
+/// incarnation, executable qualification and native store before trusting it.
+/// Unknown/approval statuses remain held, and files cannot make a PID live.
+pub(crate) fn session_hint(store: &Path, session: &str, uid: u32) -> Option<SessionHint> {
+    registry_entries(store, |p| p.extension().is_some_and(|x| x == "json"))
+        .into_iter()
+        .find_map(|path| {
+            let map = owned_json(&path, uid)?;
+            if map.get("sessionId")?.as_str()? != session
+                || map.get("kind")?.as_str()? != "interactive"
+            {
+                return None;
+            }
+            let pid = u32::try_from(map.get("pid")?.as_u64()?)
+                .ok()
+                .filter(|p| *p > 0)?;
+            let lifecycle = match map.get("status").and_then(Value::as_str) {
+                Some("idle") => bridge_core::dispatch::Lifecycle::Inactive,
+                Some("busy") => bridge_core::dispatch::Lifecycle::Active,
+                _ => return None,
+            };
+            let written_at = std::fs::symlink_metadata(&path).ok()?.mtime();
+            Some(SessionHint {
+                pid,
+                lifecycle,
+                written_at,
+            })
+        })
+}
+
 /// What the session descriptor of the attested harness process says about
 /// its native inbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1114,7 +1158,11 @@ impl DispatchCarrier for ClaudeLaterCarrier {
         if recipient.harness != Harness::ClaudeCode {
             return Err("not a Claude recipient".into());
         }
-        let (attestation, binding) = lock_registry(&self.registry).attest_recipient(recipient)?;
+        let (attestation, binding) = {
+            let mut registry = lock_registry(&self.registry);
+            registry.discover_claude_recipient(recipient, current_unix_millis())?;
+            registry.attest_recipient(recipient)?
+        };
         let changed = self.hub.sync_message(&self.registry, recipient, &binding)?;
         self.hub.callback_capacity()?;
         Ok(changed.unwrap_or(attestation))
