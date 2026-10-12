@@ -1,0 +1,755 @@
+//! Real isolated SQLite/socket controls for generic unknown producers. No
+//! consumer source, installed daemon or real native session is touched.
+mod common;
+use bridge_core::dispatch::{DispatchTiming, EffectiveMode, Lifecycle, Outcome, Selection};
+use bridge_core::service::GrantConfig;
+use bridge_core::{
+    ProducerAuthorizer, ProducerPolicy, Storage, UniversalLimits, VerifiedRegistration,
+};
+use bridge_protocol::*;
+use common::{TempDir, attest, codex};
+use std::sync::Arc;
+
+/// Synthetic configured credentials; these are not installed or actual secrets.
+const TOKEN: &str = "fixture-report-maker-token";
+/// A second independent unknown producer credential used for privacy controls.
+const OTHER: &str = "fixture-second-producer-token";
+/// Arbitrary unknown producer config; opt-in policy is fully declarative.
+fn grant(token: &str, producer: &str) -> GrantConfig {
+    GrantConfig {
+        token: token.into(),
+        publisher: producer.into(),
+        recipients: vec!["*".into()],
+        kinds: vec!["done".into(), "progress".into()],
+        modes: vec!["message".into(), "inject".into(), "auto".into()],
+        policies: vec!["keep_all".into(), "latest".into(), "batch".into()],
+        admin: false,
+        producer_v1: Some(ProducerPolicy {
+            registration: true,
+            native_scopes: vec!["*".into()],
+            reply_policies: vec!["self".into(), "shared_session".into()],
+            direct_address: true,
+            delivery_scopes: true,
+            ..ProducerPolicy::default()
+        }),
+    }
+}
+/// Opens a fresh isolated fixture store with the same immutable authority for
+/// arbitrary producers. Reopening reinstalls credentials without losing IDs.
+fn store(path: &std::path::Path) -> Storage {
+    let mut storage = Storage::open(path, bridge_core::Limits::new(100)).unwrap();
+    storage
+        .install_producer_authorizer(Arc::new(
+            ProducerAuthorizer::new(&[
+                grant(TOKEN, "report-maker"),
+                grant(OTHER, "unknown-next-tool"),
+            ])
+            .unwrap(),
+        ))
+        .unwrap();
+    storage
+        .register_source_tag("report-maker", "report-maker")
+        .unwrap();
+    storage
+        .register_source_tag("unknown-next-tool", "unknown-next-tool")
+        .unwrap();
+    storage
+}
+/// A genuine-looking fixture fact; only synthetic trusted test code creates it.
+fn origin(use_key: &str, actor: &str) -> VerifiedRegistration {
+    VerifiedRegistration {
+        caller_address: codex("caller"),
+        native_actor_id: actor.into(),
+        actor_role: ActorRole::Root,
+        destination: codex("caller"),
+        observed_at_ms: 990,
+        endpoint_epoch: 1,
+        harness_pid: 42,
+        harness_start_time: 900,
+        evidence_use_key: use_key.into(),
+        evidence_expires_at_ms: 5000,
+    }
+}
+/// Product-independent registration intention; no native evidence is a wire
+/// argument in this trusted core fixture.
+fn registration(operation: &str) -> RegisterCallParams {
+    RegisterCallParams {
+        operation_key: operation.into(),
+        evidence: None,
+        reply_policy: ReplyPolicy::SelfActor,
+        allowed_modes: None,
+        allowed_kinds: None,
+        max_payload_bytes: None,
+        route_expires_at_ms: None,
+        assertion_audience: None,
+        invocation_key: None,
+    }
+}
+/// Opaque generic publication into a route, with optional producer lifetime.
+fn publication(route: &str, event: &str, lifetime: Option<&str>) -> PublishParams {
+    PublishParams {
+        destination: Destination::Route {
+            route_key: route.into(),
+        },
+        event_id: event.into(),
+        kind: "done".into(),
+        payload: Payload::new("opaque producer result").unwrap(),
+        mode: Mode::Message,
+        policy: Policy::KeepAll,
+        metadata: Metadata::new(),
+        expires_at_ms: None,
+        delivery_scope_key: lifetime.map(str::to_owned),
+    }
+}
+/// Checks atomic claims/route/request commit, loss of receipt recovery, no
+/// cross-producer evidence reuse and logical scopes surviving renewal/restart.
+#[test]
+fn registration_atomicity_replay_identity_and_restart() {
+    let dir = TempDir::new("universal-registration");
+    let path = dir.path("state.db");
+    let mut storage = store(&path);
+    let sql = rusqlite::Connection::open(&path).unwrap();
+    sql.execute_batch("CREATE TRIGGER fail_request BEFORE INSERT ON registration_requests BEGIN SELECT RAISE(ABORT,'fixture rollback'); END;").unwrap();
+    let err = storage
+        .register_call(
+            TOKEN,
+            "req-1",
+            &registration("job-1"),
+            Some(&origin("use-1", "root")),
+            &|| 1000,
+        )
+        .unwrap_err();
+    assert_eq!(err.effect, Some(MutationEffect::NotCommitted));
+    for table in [
+        "return_routes",
+        "registration_requests",
+        "evidence_uses",
+        "producer_scopes",
+    ] {
+        assert_eq!(
+            sql.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+    }
+    sql.execute_batch("DROP TRIGGER fail_request;").unwrap();
+    let first = storage
+        .register_call(
+            TOKEN,
+            "req-1",
+            &registration("job-1"),
+            Some(&origin("use-1", "root")),
+            &|| 1000,
+        )
+        .unwrap();
+    assert!(
+        storage
+            .register_call(
+                OTHER,
+                "foreign",
+                &registration("other-job"),
+                Some(&origin("use-1", "root")),
+                &|| 1001
+            )
+            .is_err()
+    );
+    assert!(
+        storage
+            .register_call(
+                TOKEN,
+                "req-2",
+                &registration("job-1"),
+                Some(&origin("use-2", "other-actor")),
+                &|| 1001
+            )
+            .is_err()
+    );
+    let mut renewed = origin("use-2", "root");
+    renewed.endpoint_epoch = 9;
+    renewed.harness_pid = 100;
+    renewed.harness_start_time = 999;
+    let again = storage
+        .register_call(
+            TOKEN,
+            "req-2",
+            &registration("job-1"),
+            Some(&renewed),
+            &|| 1002,
+        )
+        .unwrap();
+    assert_eq!(again.route_key, first.route_key);
+    assert_eq!(again.caller_scope, first.caller_scope);
+    let committed = storage
+        .registration_evidence_committed(TOKEN, "req-1", "use-1")
+        .unwrap();
+    assert_eq!(
+        committed.claim,
+        bridge_core::RegistrationClaimState::CommittedToRequest
+    );
+    drop(storage);
+    let mut storage = store(&path);
+    assert_eq!(
+        storage
+            .register_call(TOKEN, "req-1", &registration("job-1"), None, &|| 2000)
+            .unwrap(),
+        first
+    );
+    assert!(
+        storage
+            .register_call(TOKEN, "req-new", &registration("job-1"), None, &|| 2000)
+            .is_err()
+    );
+    assert!(
+        storage
+            .registration_replay(TOKEN, "req-1", &registration("changed-job"))
+            .is_err()
+    );
+}
+/// Publication intent/envelope rollback is one transaction; close never changes
+/// original custody and tagged address/route identities cannot be substituted.
+#[test]
+fn publication_intent_atomicity_close_and_cross_owner_privacy() {
+    let dir = TempDir::new("universal-publish");
+    let path = dir.path("state.db");
+    let mut storage = store(&path);
+    let route = storage
+        .register_call(
+            TOKEN,
+            "register",
+            &registration("job"),
+            Some(&origin("use", "root")),
+            &|| 1000,
+        )
+        .unwrap();
+    let sql = rusqlite::Connection::open(&path).unwrap();
+    sql.execute_batch("CREATE TRIGGER fail_intent BEFORE INSERT ON publication_intents BEGIN SELECT RAISE(ABORT,'fixture rollback'); END;").unwrap();
+    let request = publication(&route.route_key, "event", None);
+    assert_eq!(
+        storage
+            .publish_v1(TOKEN, &request, &|| 1001)
+            .unwrap_err()
+            .effect,
+        Some(MutationEffect::NotCommitted)
+    );
+    assert_eq!(
+        sql.query_row("SELECT COUNT(*) FROM events", [], |r| r.get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
+    sql.execute_batch("DROP TRIGGER fail_intent;").unwrap();
+    let first = storage.publish_v1(TOKEN, &request, &|| 1002).unwrap();
+    storage
+        .close_route(
+            TOKEN,
+            "close",
+            &CloseRouteParams {
+                route_key: route.route_key.clone(),
+                reason: None,
+            },
+            &|| 1003,
+        )
+        .unwrap();
+    assert!(
+        storage
+            .publish_v1(
+                TOKEN,
+                &publication(&route.route_key, "new-event", None),
+                &|| 1004
+            )
+            .is_err()
+    );
+    assert_eq!(
+        storage
+            .publish_v1(TOKEN, &request, &|| 1004)
+            .unwrap()
+            .receipt,
+        first.receipt
+    );
+    let mut changed = request.clone();
+    changed.destination = Destination::Address {
+        address: codex("caller").to_canonical_string(),
+    };
+    assert!(storage.publish_v1(TOKEN, &changed, &|| 1004).is_err());
+    assert!(
+        storage
+            .publish_v1(
+                OTHER,
+                &publication(&route.route_key, "other", None),
+                &|| 1004
+            )
+            .is_err()
+    );
+    assert!(matches!(
+        storage
+            .status_v1(
+                OTHER,
+                &StatusSelector::Route {
+                    route_key: route.route_key
+                },
+                1004
+            )
+            .unwrap(),
+        StatusResult::Route { route: None }
+    ));
+}
+/// Retiring before publication installs a permanent tombstone; exact event
+/// replay and sibling scopes retain immutable facts across restart.
+#[test]
+fn retirement_tombstone_replay_and_scoped_coalescing() {
+    let dir = TempDir::new("universal-retire");
+    let path = dir.path("state.db");
+    let mut storage = store(&path);
+    let route = storage
+        .register_call(
+            TOKEN,
+            "register",
+            &registration("job"),
+            Some(&origin("use", "root")),
+            &|| 1000,
+        )
+        .unwrap();
+    let retired = storage
+        .retire_delivery_scope(
+            TOKEN,
+            "retire-first",
+            &RetireDeliveryScopeParams {
+                scope_key: "old-life".into(),
+                action: RetirementAction::RetireUnhanded,
+            },
+            &|| 1001,
+        )
+        .unwrap();
+    assert_eq!(retired.receipt.disposed, 0);
+    assert!(
+        storage
+            .publish_v1(
+                TOKEN,
+                &publication(&route.route_key, "late", "old-life".into()),
+                &|| 1002
+            )
+            .is_err()
+    );
+    let mut a = publication(&route.route_key, "a", Some("new-life"));
+    a.policy = Policy::Latest {
+        stream: "progress".into(),
+        revision: 1,
+    };
+    let accepted = storage.publish_v1(TOKEN, &a, &|| 1003).unwrap();
+    let mut b = a.clone();
+    b.event_id = "b".into();
+    b.delivery_scope_key = Some("sibling-life".into());
+    storage.publish_v1(TOKEN, &b, &|| 1003).unwrap();
+    let receipt = storage
+        .retire_delivery_scope(
+            TOKEN,
+            "retire-new",
+            &RetireDeliveryScopeParams {
+                scope_key: "new-life".into(),
+                action: RetirementAction::RetireUnhanded,
+            },
+            &|| 1004,
+        )
+        .unwrap();
+    assert_eq!(receipt.receipt.disposed, 1);
+    assert_eq!(
+        storage.publish_v1(TOKEN, &a, &|| 1005).unwrap().receipt,
+        accepted.receipt
+    );
+    assert!(matches!(
+        storage
+            .status_v1(
+                TOKEN,
+                &StatusSelector::Event {
+                    event_id: "b".into()
+                },
+                1005
+            )
+            .unwrap(),
+        StatusResult::Event {
+            event: Some(EventStatus {
+                delivery: DeliveryStatus {
+                    delivery: DeliveryState::Unhanded,
+                    ..
+                },
+                ..
+            })
+        }
+    ));
+    drop(storage);
+    let mut storage = store(&path);
+    assert!(
+        storage
+            .retire_delivery_scope(
+                TOKEN,
+                "retire-new",
+                &RetireDeliveryScopeParams {
+                    scope_key: "new-life".into(),
+                    action: RetirementAction::RetireUnhanded
+                },
+                &|| 2000
+            )
+            .unwrap()
+            .replayed
+    );
+    assert!(
+        storage
+            .publish_v1(
+                TOKEN,
+                &publication(&route.route_key, "late-again", Some("old-life")),
+                &|| 2000
+            )
+            .is_err()
+    );
+}
+/// A reservation is safely revoked; an already invoking unknown effect remains
+/// retained, receives no second native attempt and keeps late evidence allowed.
+#[test]
+fn reserved_retirement_fences_invoking_and_preserves_unknown() {
+    let dir = TempDir::new("universal-attempt");
+    let path = dir.path("state.db");
+    let mut storage = store(&path);
+    let route = storage
+        .register_call(
+            TOKEN,
+            "register",
+            &registration("job"),
+            Some(&origin("use", "root")),
+            &|| 1000,
+        )
+        .unwrap();
+    storage
+        .publish_v1(
+            TOKEN,
+            &publication(&route.route_key, "reserved", Some("reserved-life")),
+            &|| 1001,
+        )
+        .unwrap();
+    let recipient = codex("caller");
+    let attestation = attest(&recipient, Lifecycle::Inactive, 1);
+    let Selection::Attempt(reserved) = storage
+        .reserve_next(
+            &attestation,
+            EffectiveMode::Message,
+            1002,
+            &DispatchTiming::default(),
+        )
+        .unwrap()
+    else {
+        panic!("expected reservation")
+    };
+    let receipt = storage
+        .retire_delivery_scope(
+            TOKEN,
+            "retire-reserved",
+            &RetireDeliveryScopeParams {
+                scope_key: "reserved-life".into(),
+                action: RetirementAction::RetireUnhanded,
+            },
+            &|| 1003,
+        )
+        .unwrap();
+    assert_eq!(receipt.receipt.disposed, 1);
+    assert!(
+        storage
+            .mark_invoking(&reserved.fence, &attestation, 1004)
+            .is_err()
+    );
+    storage
+        .publish_v1(
+            TOKEN,
+            &publication(&route.route_key, "unknown", Some("unknown-life")),
+            &|| 1004,
+        )
+        .unwrap();
+    let Selection::Attempt(reserved) = storage
+        .reserve_next(
+            &attestation,
+            EffectiveMode::Message,
+            1005,
+            &DispatchTiming::default(),
+        )
+        .unwrap()
+    else {
+        panic!("expected reservation")
+    };
+    storage
+        .mark_invoking(&reserved.fence, &attestation, 1006)
+        .unwrap();
+    storage
+        .record_outcome(
+            &reserved.fence,
+            Outcome::OutcomeUnknown {
+                reason: "fixture uncertain handoff".into(),
+            },
+            1007,
+        )
+        .unwrap();
+    let receipt = storage
+        .retire_delivery_scope(
+            TOKEN,
+            "retire-unknown",
+            &RetireDeliveryScopeParams {
+                scope_key: "unknown-life".into(),
+                action: RetirementAction::RetireUnhanded,
+            },
+            &|| 1008,
+        )
+        .unwrap();
+    assert_eq!(receipt.receipt.preserved_possible_effect, 1);
+    assert_eq!(receipt.receipt.disposed, 0);
+    assert!(matches!(
+        storage
+            .reserve_next(
+                &attestation,
+                EffectiveMode::Message,
+                1009,
+                &DispatchTiming::default()
+            )
+            .unwrap(),
+        Selection::Idle
+    ));
+}
+/// Hard tombstone capacity and immutable authority installation never evict or
+/// reopen prior identities, and expiry is sampled under the transaction lock.
+#[test]
+fn authority_capacity_and_commit_clock_are_explicit() {
+    let dir = TempDir::new("universal-caps");
+    let path = dir.path("state.db");
+    let mut storage = store(&path);
+    let auth = storage.producer_authorizer().unwrap();
+    storage.install_producer_authorizer(auth).unwrap();
+    assert!(
+        storage
+            .install_producer_authorizer(Arc::new(
+                ProducerAuthorizer::new(&[grant(TOKEN, "report-maker")]).unwrap()
+            ))
+            .is_err()
+    );
+    storage
+        .configure_universal_limits(UniversalLimits {
+            max_open_routes: 1,
+            max_retained_routes: 1,
+            ..UniversalLimits::default()
+        })
+        .unwrap();
+    assert!(
+        storage
+            .register_call(
+                TOKEN,
+                "expired",
+                &registration("expired"),
+                Some(&origin("expired-use", "root")),
+                &|| 6000
+            )
+            .is_err()
+    );
+    let first = storage
+        .register_call(
+            TOKEN,
+            "first",
+            &registration("one"),
+            Some(&origin("one-use", "root")),
+            &|| 1000,
+        )
+        .unwrap();
+    storage
+        .close_route(
+            TOKEN,
+            "close-one",
+            &CloseRouteParams {
+                route_key: first.route_key,
+                reason: None,
+            },
+            &|| 1001,
+        )
+        .unwrap();
+    assert_eq!(
+        storage
+            .register_call(
+                TOKEN,
+                "second",
+                &registration("two"),
+                Some(&origin("two-use", "root")),
+                &|| 1002
+            )
+            .unwrap_err()
+            .class,
+        ErrorClass::Capacity
+    );
+}
+
+/// Current token/policy changes after restart do not rewrite accepted identity;
+/// revoked credentials disclose nothing and narrower grants fence only new work.
+#[test]
+fn rotated_credential_and_tightened_policy_recover_only_history() {
+    let dir = TempDir::new("universal-rotation");
+    let path = dir.path("state.db");
+    let mut storage = store(&path);
+    let receipt = storage
+        .register_call(
+            TOKEN,
+            "registration",
+            &registration("job"),
+            Some(&origin("use", "root")),
+            &|| 1000,
+        )
+        .unwrap();
+    let request = publication(&receipt.route_key, "event", None);
+    let accepted = storage.publish_v1(TOKEN, &request, &|| 1001).unwrap();
+    drop(storage);
+    let rotated = "fixture-rotated-producer-token";
+    let mut next = grant(rotated, "report-maker");
+    next.kinds = vec!["progress".into()];
+    next.producer_v1.as_mut().unwrap().registration = false;
+    let mut storage = Storage::open(&path, bridge_core::Limits::new(100)).unwrap();
+    storage
+        .install_producer_authorizer(Arc::new(ProducerAuthorizer::new(&[next]).unwrap()))
+        .unwrap();
+    assert_eq!(
+        storage
+            .registration_replay(rotated, "registration", &registration("job"))
+            .unwrap(),
+        Some(receipt.clone())
+    );
+    assert_eq!(
+        storage
+            .publish_v1(rotated, &request, &|| 2000)
+            .unwrap()
+            .receipt,
+        accepted.receipt
+    );
+    assert_eq!(
+        storage
+            .publish_v1(
+                rotated,
+                &publication(&receipt.route_key, "new-event", None),
+                &|| 2000
+            )
+            .unwrap_err()
+            .class,
+        ErrorClass::Forbidden
+    );
+    assert_eq!(
+        storage
+            .registration_replay(TOKEN, "registration", &registration("job"))
+            .unwrap_err()
+            .class,
+        ErrorClass::Auth
+    );
+}
+/// Real protected-core Unix exchanges validate the public wire/correlation and
+/// policy-only capabilities; native call verification remains adapter-owned.
+#[test]
+fn core_socket_v1_roundtrip_and_unknown_version_refusal() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    let dir = TempDir::new("universal-socket");
+    let socket = common::short_socket("v1");
+    let service = bridge_core::start_service(bridge_core::Config {
+        database: dir.path("state.db"),
+        socket: socket.clone(),
+        limits: bridge_core::Limits::new(100),
+        grants: vec![grant(TOKEN, "report-maker")],
+        universal_limits: UniversalLimits::default(),
+    })
+    .unwrap();
+    let request = Request::new(
+        "publish-1",
+        Secret::new(TOKEN),
+        Operation::Publish(PublishParams {
+            destination: Destination::Address {
+                address: codex("socket-caller").to_canonical_string(),
+            },
+            ..publication("unused", "socket-event", None)
+        }),
+    )
+    .unwrap();
+    let mut stream = UnixStream::connect(&socket).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    stream
+        .write_all(&encode_request(&request).unwrap())
+        .unwrap();
+    stream.write_all(b"\n").unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let response = decode_response(line.trim_end().as_bytes(), &request).unwrap();
+    assert!(response.success);
+    let caps = Request::new(
+        "caps",
+        Secret::new(TOKEN),
+        Operation::Capabilities(CapabilitiesParams {}),
+    )
+    .unwrap();
+    stream.write_all(&encode_request(&caps).unwrap()).unwrap();
+    stream.write_all(b"\n").unwrap();
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    let response = decode_response(line.trim_end().as_bytes(), &caps).unwrap();
+    assert!(matches!(
+        response.result,
+        Some(OperationResult::Capabilities(Capabilities {
+            features: Features {
+                host_observations: false,
+                ..
+            },
+            ..
+        }))
+    ));
+    let mut unsupported = serde_json::to_value(&request).unwrap();
+    unsupported["api_version"] = serde_json::json!(2);
+    unsupported["request_id"] = serde_json::json!("unsupported");
+    unsupported["params"]["event_id"] = serde_json::json!("must-not-exist");
+    stream
+        .write_all(serde_json::to_string(&unsupported).unwrap().as_bytes())
+        .unwrap();
+    stream.write_all(b"\n").unwrap();
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    let response: Response = serde_json::from_str(line.trim_end()).unwrap();
+    assert_eq!(response.error.unwrap().class, ErrorClass::Unsupported);
+    assert!(matches!(
+        service
+            .with_storage(|s| s.status_v1(
+                TOKEN,
+                &StatusSelector::Event {
+                    event_id: "must-not-exist".into()
+                },
+                2000
+            ))
+            .unwrap(),
+        StatusResult::Event { event: None }
+    ));
+    drop(reader);
+    drop(stream);
+    service.shutdown();
+    service.join();
+}
+/// Shared destination never merges actual native root/child actor scopes.
+#[test]
+fn root_and_child_scopes_remain_distinct_with_same_destination() {
+    let dir = TempDir::new("universal-child");
+    let path = dir.path("state.db");
+    let mut storage = store(&path);
+    let root = storage
+        .register_call(
+            TOKEN,
+            "root",
+            &registration("root-job"),
+            Some(&origin("root-use", "root")),
+            &|| 1000,
+        )
+        .unwrap();
+    let mut child = origin("child-use", "child-1");
+    child.actor_role = ActorRole::Child;
+    let mut intent = registration("child-job");
+    intent.reply_policy = ReplyPolicy::SharedSession;
+    let child = storage
+        .register_call(TOKEN, "child", &intent, Some(&child), &|| 1001)
+        .unwrap();
+    assert_ne!(root.caller_scope, child.caller_scope);
+    assert_eq!(root.destination_scope, child.destination_scope);
+}

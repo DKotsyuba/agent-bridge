@@ -34,11 +34,13 @@ fn recipient_text() -> String {
 /// A minimal daemon config with a publisher grant and an admin grant.
 fn test_config(dir: &TempDir) -> Config {
     Config {
+        universal_limits: bridge_core::UniversalLimits::default(),
         database: dir.path("bridge.db"),
         socket: short_socket("t"),
         limits: Limits::new(100),
         grants: vec![
             GrantConfig {
+                producer_v1: None,
                 token: GRANT_TOKEN.to_string(),
                 publisher: "agent-run".to_string(),
                 recipients: vec![recipient_text()],
@@ -48,6 +50,7 @@ fn test_config(dir: &TempDir) -> Config {
                 admin: false,
             },
             GrantConfig {
+                producer_v1: None,
                 token: ADMIN_TOKEN.to_string(),
                 publisher: "bridge-ops".to_string(),
                 recipients: vec![],
@@ -57,6 +60,7 @@ fn test_config(dir: &TempDir) -> Config {
                 admin: true,
             },
             GrantConfig {
+                producer_v1: None,
                 token: SECOND_TOKEN.to_string(),
                 publisher: "agent-ide".to_string(),
                 recipients: vec![recipient_text()],

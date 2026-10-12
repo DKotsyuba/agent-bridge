@@ -26,12 +26,17 @@
 
 pub mod dispatch;
 pub mod framing;
+pub mod producer;
 pub mod recovery;
 pub mod schema;
 pub mod service;
 pub mod storage;
 pub mod types;
+pub mod universal;
 pub mod wire;
+
+pub use producer::{ProducerAuthorizer, ProducerPolicy, ProducerPolicyGrant, UniversalLimits};
+pub use universal::{RegistrationClaimState, RegistrationReconciliation, VerifiedRegistration};
 
 pub use recovery::DeliveryEvidence;
 pub use service::{

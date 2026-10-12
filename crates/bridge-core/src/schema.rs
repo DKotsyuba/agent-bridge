@@ -22,8 +22,10 @@ use crate::types::{CoreError, Envelope};
 /// predecessor ordering, evidence, bindings, holds, source tags and the
 /// operator audit log. Version 5 adds the per-event stream `lineage_key` and
 /// the `stream_lineages` authority table (one producer owns each `latest`
-/// lineage).
-pub const SCHEMA_VERSION: u32 = 5;
+/// lineage). Version 6 adds durable producer routes/request receipts, global
+/// evidence-use claims, lifetime fences and scoped snapshot watermarks;
+/// accepted legacy envelope bytes/hashes and possible effects stay unchanged.
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// Backfills each migrated `latest` event's lineage key.
 ///
@@ -143,6 +145,7 @@ CREATE TABLE IF NOT EXISTS events (
     not_before_ms INTEGER NOT NULL DEFAULT 0,
     duplicate_risk INTEGER NOT NULL DEFAULT 0,
     lineage_key TEXT NOT NULL DEFAULT '',
+    delivery_scope_key TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (publisher_id, event_id)
 );
 CREATE TABLE IF NOT EXISTS watermarks (
@@ -267,6 +270,53 @@ CREATE UNIQUE INDEX IF NOT EXISTS incidents_one_open
     ON incidents (publisher_id, event_id, kind) WHERE state = 'open';
 CREATE INDEX IF NOT EXISTS incidents_by_state
     ON incidents (state, next_check_ms);
+CREATE TABLE IF NOT EXISTS producer_scopes (
+    producer TEXT NOT NULL, kind TEXT NOT NULL, identity_key TEXT NOT NULL,
+    scope_key TEXT NOT NULL UNIQUE,
+    PRIMARY KEY (producer, kind, identity_key)
+);
+CREATE TABLE IF NOT EXISTS return_routes (
+    producer TEXT NOT NULL, operation_key TEXT NOT NULL,
+    route_key TEXT NOT NULL UNIQUE, binding_hash TEXT NOT NULL,
+    requested_json TEXT NOT NULL, caller_json TEXT NOT NULL,
+    destination TEXT NOT NULL, constraints_json TEXT NOT NULL,
+    caller_scope TEXT NOT NULL, destination_scope TEXT NOT NULL,
+    created_ms INTEGER NOT NULL, expires_ms INTEGER, closed_ms INTEGER,
+    PRIMARY KEY (producer, operation_key)
+);
+CREATE TABLE IF NOT EXISTS registration_requests (
+    producer TEXT NOT NULL, request_id TEXT NOT NULL, request_hash TEXT NOT NULL,
+    operation_key TEXT NOT NULL, receipt_json TEXT NOT NULL, use_key TEXT NOT NULL,
+    PRIMARY KEY (producer, request_id)
+);
+CREATE TABLE IF NOT EXISTS evidence_uses (
+    use_key TEXT PRIMARY KEY, producer TEXT NOT NULL, request_id TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS publication_intents (
+    producer TEXT NOT NULL, event_id TEXT NOT NULL, intent_hash TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    PRIMARY KEY (producer, event_id)
+);
+CREATE TABLE IF NOT EXISTS close_requests (
+    producer TEXT NOT NULL, request_id TEXT NOT NULL, request_hash TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    PRIMARY KEY (producer, request_id)
+);
+CREATE TABLE IF NOT EXISTS delivery_scopes (
+    producer TEXT NOT NULL, scope_key TEXT NOT NULL,
+    closed_ms INTEGER, action TEXT, receipt_json TEXT,
+    PRIMARY KEY (producer, scope_key)
+);
+CREATE TABLE IF NOT EXISTS retire_requests (
+    producer TEXT NOT NULL, request_id TEXT NOT NULL, request_hash TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    PRIMARY KEY (producer, request_id)
+);
+CREATE TABLE IF NOT EXISTS scoped_watermarks (
+    scope_key TEXT PRIMARY KEY, revision INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS events_lifetime
+    ON events (publisher_id, delivery_scope_key, delivery);
 ";
 
 /// Creates or migrates the schema inside the caller's transaction.
@@ -313,12 +363,22 @@ pub fn ensure(tx: &Transaction<'_>) -> Result<(), CoreError> {
             tx.execute_batch(CURRENT_DDL)?;
             Ok(())
         }
+        Some(Ok(5)) => {
+            add_delivery_scope(tx)?;
+            tx.execute_batch(CURRENT_DDL)?;
+            tx.execute(
+                "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
+                params![SCHEMA_VERSION.to_string()],
+            )?;
+            Ok(())
+        }
         // Version 4 databases lack the additive `events.lineage_key` column
         // and the stream_lineages table. The column is added before the
         // idempotent DDL (whose index references it); no stored row is
         // rewritten except the new key column, which is backfilled from
         // retained evidence.
         Some(Ok(4)) => {
+            add_delivery_scope(tx)?;
             let has_key: bool = tx.query_row(
                 "SELECT COUNT(*) > 0 FROM pragma_table_info('events') WHERE name = 'lineage_key'",
                 [],
@@ -391,6 +451,7 @@ fn migrate(tx: &Transaction<'_>, from: u32) -> Result<(), CoreError> {
         ("not_before_ms", "INTEGER NOT NULL DEFAULT 0"),
         ("duplicate_risk", "INTEGER NOT NULL DEFAULT 0"),
         ("lineage_key", "TEXT NOT NULL DEFAULT ''"),
+        ("delivery_scope_key", "TEXT NOT NULL DEFAULT ''"),
     ] {
         tx.execute_batch(&format!(
             "ALTER TABLE events ADD COLUMN {column} {definition};"
@@ -413,6 +474,22 @@ fn migrate(tx: &Transaction<'_>, from: u32) -> Result<(), CoreError> {
         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
         params![SCHEMA_VERSION.to_string()],
     )?;
+    Ok(())
+}
+
+/// Adds only the schema-six lifetime column to existing version-four/five
+/// events; accepted envelope bytes and delivery evidence are untouched.
+fn add_delivery_scope(tx: &Transaction<'_>) -> Result<(), CoreError> {
+    let present: bool = tx.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('events') WHERE name = 'delivery_scope_key'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !present {
+        tx.execute_batch(
+            "ALTER TABLE events ADD COLUMN delivery_scope_key TEXT NOT NULL DEFAULT '';",
+        )?;
+    }
     Ok(())
 }
 

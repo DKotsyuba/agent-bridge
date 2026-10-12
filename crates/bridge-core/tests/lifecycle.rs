@@ -40,11 +40,13 @@ fn recipient() -> NativeAddress {
 fn config(dir: &TempDir, tag: &str) -> Config {
     let allowed = vec![recipient().to_canonical_string()];
     Config {
+        universal_limits: bridge_core::UniversalLimits::default(),
         database: dir.path("bridge.db"),
         socket: short_socket(tag),
         limits: Limits::new(1_000),
         grants: vec![
             GrantConfig {
+                producer_v1: None,
                 token: RUN_TOKEN.to_string(),
                 publisher: "agent-run".to_string(),
                 recipients: allowed.clone(),
@@ -54,6 +56,7 @@ fn config(dir: &TempDir, tag: &str) -> Config {
                 admin: false,
             },
             GrantConfig {
+                producer_v1: None,
                 token: IDE_TOKEN.to_string(),
                 publisher: "agent-ide".to_string(),
                 recipients: allowed,
@@ -63,6 +66,7 @@ fn config(dir: &TempDir, tag: &str) -> Config {
                 admin: false,
             },
             GrantConfig {
+                producer_v1: None,
                 token: OPS_TOKEN.to_string(),
                 publisher: "bridge-ops".to_string(),
                 recipients: vec![],
@@ -1158,6 +1162,7 @@ fn credentials_never_appear_in_debug_output_or_error_details() {
     };
     assert!(!format!("{request:?}").contains(secret));
     let grant = GrantConfig {
+        producer_v1: None,
         token: secret.to_string(),
         publisher: "agent-run".into(),
         recipients: vec![],

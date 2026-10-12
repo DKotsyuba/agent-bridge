@@ -162,7 +162,7 @@ fn version_two_databases_migrate_without_touching_accepted_bytes_or_identity() {
         .collect();
 
     let mut storage = Storage::open(&path, Limits::new(100)).unwrap();
-    assert_eq!(version(&path), "5");
+    assert_eq!(version(&path), "6");
     let after: Vec<(String, Vec<u8>, String)> = Connection::open(&path)
         .unwrap()
         .prepare("SELECT event_id, envelope_json, envelope_hash FROM events ORDER BY event_id")
@@ -318,7 +318,7 @@ fn version_three_attempts_that_may_have_reached_a_carrier_are_never_redispatched
 #[test]
 fn unknown_versions_and_foreign_files_are_refused_untouched() {
     let dir = TempDir::new("migrate-refuse");
-    for stored in ["1", "6", "garbage"] {
+    for stored in ["1", "7", "garbage"] {
         let path = dir.path(&format!("v{stored}.db"));
         {
             let connection = Connection::open(&path).unwrap();
@@ -489,7 +489,7 @@ fn version_four_databases_gain_lineages_additively() {
             .unwrap();
     }
     let mut storage = Storage::open(&path, Limits::new(10)).unwrap();
-    assert_eq!(version(&path), "5");
+    assert_eq!(version(&path), "6");
     // Lineage fencing is live on the migrated database.
     let event = Envelope::new(
         PublisherId::new("agent-run").unwrap(),

@@ -382,6 +382,10 @@ pub struct Storage {
     pub(crate) connection: Connection,
     /// Admission limits applied by [`Storage::publish`].
     limits: Limits,
+    /// One immutable shared in-memory producer authority for this boot.
+    pub(crate) producer_authorizer: Option<std::sync::Arc<crate::ProducerAuthorizer>>,
+    /// Durable v1 identity admission capacities, never a product job TTL.
+    pub(crate) universal_limits: crate::UniversalLimits,
 }
 
 impl Storage {
@@ -403,7 +407,13 @@ impl Storage {
             return Err(corrupt(format!("database refused WAL journaling ({mode})")));
         }
         connection.pragma_update(None, "synchronous", "FULL")?;
-        Storage { connection, limits }.init_schema()
+        Storage {
+            connection,
+            limits,
+            producer_authorizer: None,
+            universal_limits: crate::UniversalLimits::default(),
+        }
+        .init_schema()
     }
 
     /// Opens an in-memory database; for tests and in-process tools.
@@ -413,7 +423,13 @@ impl Storage {
     pub fn open_in_memory(limits: Limits) -> Result<Self, CoreError> {
         limits.validate()?;
         let connection = Connection::open_in_memory()?;
-        Storage { connection, limits }.init_schema()
+        Storage {
+            connection,
+            limits,
+            producer_authorizer: None,
+            universal_limits: crate::UniversalLimits::default(),
+        }
+        .init_schema()
     }
 
     /// The admission limits this store enforces.
@@ -510,149 +526,11 @@ impl Storage {
         envelope: &Envelope,
         now_ms: u64,
     ) -> Result<PublishOutcome, CoreError> {
-        envelope.validate()?;
-        check_renderable(envelope)?;
-        let now = to_sql(now_ms)?;
-        let expiry = envelope
-            .expires_at
-            .map(|expiry| to_sql(expiry.unix_millis()))
-            .transpose()?;
-        let revision = match &envelope.policy {
-            Policy::Latest { revision, .. } => Some(to_sql(*revision)?),
-            _ => None,
-        };
-        let predecessor = envelope.metadata.get("predecessor");
-        if let Some(predecessor) = predecessor {
-            EventId::new(predecessor.clone())?;
-            if predecessor == envelope.event_id.as_str() {
-                return Err(CoreError::InvalidEnvelope(
-                    "an event cannot be its own predecessor".into(),
-                ));
-            }
-        }
-        let hash = envelope.envelope_hash();
         let limits = self.limits;
         let tx = self.begin()?;
-
-        if let Some(existing) =
-            load_row(&tx, envelope.publisher.as_str(), envelope.event_id.as_str())?
-        {
-            if existing.hash == hash {
-                return Ok(PublishOutcome {
-                    receipt: existing.receipt(
-                        envelope.publisher.as_str(),
-                        envelope.event_id.as_str(),
-                        true,
-                    ),
-                });
-            }
-            return Err(CoreError::Conflict {
-                event_id: envelope.event_id.as_str().to_string(),
-                stored_hash: existing.hash.as_str().to_string(),
-                submitted_hash: hash.as_str().to_string(),
-            });
-        }
-
-        if let Some(predecessor) = predecessor
-            && creates_cycle(
-                &tx,
-                envelope.publisher.as_str(),
-                envelope.event_id.as_str(),
-                predecessor,
-            )?
-        {
-            return Err(CoreError::InvalidEnvelope(format!(
-                "predecessor {predecessor:?} would create a dependency cycle"
-            )));
-        }
-        check_supported(&tx, envelope)?;
-        let lineage_key = lineage_gate(&tx, envelope, now_ms)?;
-
-        let state = snapshot_state(&tx, envelope, &hash)?;
-        if count(
-            &tx,
-            "SELECT value FROM counters WHERE name = 'retained_events'",
-            [],
-        )? >= limits.max_retained_events as u64
-        {
-            return Err(CoreError::Capacity {
-                limit: format!("max_retained_events {}", limits.max_retained_events),
-            });
-        }
-        if state == EventState::Pending {
-            check_admission(&tx, envelope, &limits)?;
-        }
-
-        let acceptance_seq = bump_counter(&tx, "acceptance_seq")?;
-        bump_counter(&tx, "retained_events")?;
-        let scope = scope_key(envelope);
-        tx.execute(
-            "INSERT INTO events
-                 (publisher_id, event_id, envelope_hash, envelope_json, state,
-                  acceptance_seq, accepted_at_ms, expires_at_ms, recipient, policy_class,
-                  mode, scope_key, revision, predecessor, lineage_key)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-            params![
-                envelope.publisher.as_str(),
-                envelope.event_id.as_str(),
-                hash.as_str(),
-                envelope.canonical_bytes(),
-                state.as_str(),
-                to_sql(acceptance_seq)?,
-                now,
-                expiry,
-                envelope.recipient.to_canonical_string(),
-                envelope.policy.as_str(),
-                envelope.mode.as_str(),
-                scope,
-                revision,
-                predecessor,
-                lineage_key,
-            ],
-        )?;
-
-        if let (Policy::Latest { stream, .. }, Some(revision)) = (&envelope.policy, revision) {
-            tx.execute(
-                "INSERT INTO watermarks
-                     (publisher_id, recipient, kind, mode, project, task, stream_id, revision)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                 ON CONFLICT (publisher_id, recipient, kind, mode, project, task, stream_id)
-                 DO UPDATE SET revision = MAX(revision, excluded.revision)",
-                params![
-                    envelope.publisher.as_str(),
-                    envelope.recipient.to_canonical_string(),
-                    envelope.kind.as_str(),
-                    envelope.mode.as_str(),
-                    envelope.metadata.get("project").map_or("", String::as_str),
-                    envelope.metadata.get("task").map_or("", String::as_str),
-                    stream.as_str(),
-                    revision,
-                ],
-            )?;
-            if state == EventState::Pending {
-                // Only never-handed-off older snapshots are replaced; an
-                // attempt already reserved or beyond keeps its manifest.
-                tx.execute(
-                    "UPDATE events SET state = 'superseded'
-                     WHERE scope_key = ?1 AND state = 'pending' AND delivery = 'unhanded'
-                       AND revision < ?2",
-                    params![scope, revision],
-                )?;
-            }
-        }
-
+        let outcome = publish_in(&tx, envelope, now_ms, limits, "")?;
         tx.commit()?;
-        Ok(PublishOutcome {
-            receipt: CustodyReceipt {
-                publisher: envelope.publisher.as_str().to_string(),
-                event_id: envelope.event_id.as_str().to_string(),
-                envelope_hash: hash,
-                acceptance_seq,
-                accepted_at_ms: now_ms,
-                state,
-                replayed: false,
-            },
-        })
+        Ok(outcome)
     }
 
     /// Looks up the current custody record for an event.
@@ -720,13 +598,169 @@ impl Storage {
 /// Longest predecessor chain followed when checking for cycles.
 const MAX_CHAIN: usize = 1_000;
 
+/// Inserts or recovers canonical custody inside the caller's transaction.
+/// The caller owns commit/ack uncertainty. Empty lifetime preserves legacy
+/// keys; a validated producer lifetime isolates latest/batch and lineage keys.
+/// Validation/admission failure leaves this transaction uncommitted.
+pub(crate) fn publish_in(
+    tx: &Connection,
+    envelope: &Envelope,
+    now_ms: u64,
+    limits: Limits,
+    lifetime: &str,
+) -> Result<PublishOutcome, CoreError> {
+    envelope.validate()?;
+    check_renderable(envelope)?;
+    let now = to_sql(now_ms)?;
+    let expiry = envelope
+        .expires_at
+        .map(|expiry| to_sql(expiry.unix_millis()))
+        .transpose()?;
+    let revision = match &envelope.policy {
+        Policy::Latest { revision, .. } => Some(to_sql(*revision)?),
+        _ => None,
+    };
+    let predecessor = envelope.metadata.get("predecessor");
+    if let Some(predecessor) = predecessor {
+        EventId::new(predecessor.clone())?;
+        if predecessor == envelope.event_id.as_str() {
+            return Err(CoreError::InvalidEnvelope(
+                "an event cannot be its own predecessor".into(),
+            ));
+        }
+    }
+    let hash = envelope.envelope_hash();
+
+    if let Some(existing) = load_row(tx, envelope.publisher.as_str(), envelope.event_id.as_str())? {
+        if existing.hash == hash {
+            return Ok(PublishOutcome {
+                receipt: existing.receipt(
+                    envelope.publisher.as_str(),
+                    envelope.event_id.as_str(),
+                    true,
+                ),
+            });
+        }
+        return Err(CoreError::Conflict {
+            event_id: envelope.event_id.as_str().to_string(),
+            stored_hash: existing.hash.as_str().to_string(),
+            submitted_hash: hash.as_str().to_string(),
+        });
+    }
+
+    if let Some(predecessor) = predecessor
+        && creates_cycle(
+            tx,
+            envelope.publisher.as_str(),
+            envelope.event_id.as_str(),
+            predecessor,
+        )?
+    {
+        return Err(CoreError::InvalidEnvelope(format!(
+            "predecessor {predecessor:?} would create a dependency cycle"
+        )));
+    }
+    check_supported(tx, envelope)?;
+    let lineage_key = lineage_gate(tx, envelope, now_ms, lifetime)?;
+
+    let state = snapshot_state(tx, envelope, &hash, lifetime)?;
+    if count(
+        tx,
+        "SELECT value FROM counters WHERE name = 'retained_events'",
+        [],
+    )? >= limits.max_retained_events as u64
+    {
+        return Err(CoreError::Capacity {
+            limit: format!("max_retained_events {}", limits.max_retained_events),
+        });
+    }
+    if state == EventState::Pending {
+        check_admission(tx, envelope, &limits)?;
+    }
+
+    let acceptance_seq = bump_counter(tx, "acceptance_seq")?;
+    bump_counter(tx, "retained_events")?;
+    let scope = scoped_scope_key(envelope, lifetime);
+    tx.execute(
+        "INSERT INTO events
+                 (publisher_id, event_id, envelope_hash, envelope_json, state,
+                  acceptance_seq, accepted_at_ms, expires_at_ms, recipient, policy_class,
+                  mode, scope_key, revision, predecessor, lineage_key, delivery_scope_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        params![
+            envelope.publisher.as_str(),
+            envelope.event_id.as_str(),
+            hash.as_str(),
+            envelope.canonical_bytes(),
+            state.as_str(),
+            to_sql(acceptance_seq)?,
+            now,
+            expiry,
+            envelope.recipient.to_canonical_string(),
+            envelope.policy.as_str(),
+            envelope.mode.as_str(),
+            scope,
+            revision,
+            predecessor,
+            lineage_key,
+            lifetime,
+        ],
+    )?;
+
+    if let (Policy::Latest { stream, .. }, Some(revision)) = (&envelope.policy, revision) {
+        if lifetime.is_empty() {
+            tx.execute(
+                "INSERT INTO watermarks
+                     (publisher_id, recipient, kind, mode, project, task, stream_id, revision)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT (publisher_id, recipient, kind, mode, project, task, stream_id)
+                 DO UPDATE SET revision = MAX(revision, excluded.revision)",
+                params![
+                    envelope.publisher.as_str(),
+                    envelope.recipient.to_canonical_string(),
+                    envelope.kind.as_str(),
+                    envelope.mode.as_str(),
+                    envelope.metadata.get("project").map_or("", String::as_str),
+                    envelope.metadata.get("task").map_or("", String::as_str),
+                    stream.as_str(),
+                    revision,
+                ],
+            )?;
+        } else {
+            tx.execute(
+                    "INSERT INTO scoped_watermarks (scope_key, revision) VALUES (?1, ?2)
+                     ON CONFLICT (scope_key) DO UPDATE SET revision = MAX(revision, excluded.revision)",
+                    params![scope, revision],
+                )?;
+        }
+        if state == EventState::Pending {
+            // Only never-handed-off older snapshots are replaced; an
+            // attempt already reserved or beyond keeps its manifest.
+            tx.execute(
+                "UPDATE events SET state = 'superseded'
+                     WHERE scope_key = ?1 AND state = 'pending' AND delivery = 'unhanded'
+                       AND revision < ?2",
+                params![scope, revision],
+            )?;
+        }
+    }
+
+    Ok(PublishOutcome {
+        receipt: CustodyReceipt {
+            publisher: envelope.publisher.as_str().to_string(),
+            event_id: envelope.event_id.as_str().to_string(),
+            envelope_hash: hash,
+            acceptance_seq,
+            accepted_at_ms: now_ms,
+            state,
+            replayed: false,
+        },
+    })
+}
+
 /// Whether making `predecessor` the predecessor of `event_id` would close a
-/// dependency cycle through already accepted events.
-///
-/// Follows the chain of declared predecessors from `predecessor`; reaching
-/// `event_id` is a cycle, a missing or independent link ends the walk. A
-/// chain longer than [`MAX_CHAIN`] is refused as a cycle-equivalent
-/// anomaly, so the walk is bounded.
+/// dependency cycle through already accepted events. The walk ends on a
+/// missing/independent link; more than MAX_CHAIN links refuses as an anomaly.
 fn creates_cycle(
     tx: &Connection,
     publisher: &str,
@@ -883,13 +917,14 @@ fn snapshot_state(
     tx: &Connection,
     envelope: &Envelope,
     hash: &EnvelopeHash,
+    lifetime: &str,
 ) -> Result<EventState, CoreError> {
     let Policy::Latest { stream, revision } = &envelope.policy else {
         return Ok(EventState::Pending);
     };
     let revision = to_sql(*revision)?;
-    let watermark: Option<i64> = tx
-        .query_row(
+    let watermark: Option<i64> = if lifetime.is_empty() {
+        tx.query_row(
             "SELECT revision FROM watermarks
              WHERE publisher_id = ?1 AND recipient = ?2 AND kind = ?3
                AND mode = ?4 AND project = ?5 AND task = ?6 AND stream_id = ?7",
@@ -904,7 +939,15 @@ fn snapshot_state(
             ],
             |row| row.get(0),
         )
-        .optional()?;
+        .optional()?
+    } else {
+        tx.query_row(
+            "SELECT revision FROM scoped_watermarks WHERE scope_key = ?1",
+            params![scoped_scope_key(envelope, lifetime)],
+            |row| row.get(0),
+        )
+        .optional()?
+    };
     match watermark {
         Some(stored) if stored == revision => Err(CoreError::Conflict {
             event_id: envelope.event_id.as_str().to_string(),
@@ -933,7 +976,12 @@ fn snapshot_state(
 /// `keep_all` and `batch` events never claim or check lineage; publisher
 /// identity itself is always the Bridge-stamped grant identity, never
 /// caller metadata.
-fn lineage_gate(tx: &Connection, envelope: &Envelope, now_ms: u64) -> Result<String, CoreError> {
+fn lineage_gate(
+    tx: &Connection,
+    envelope: &Envelope,
+    now_ms: u64,
+    lifetime: &str,
+) -> Result<String, CoreError> {
     let Policy::Latest { stream, .. } = &envelope.policy else {
         return Ok(String::new());
     };
@@ -945,6 +993,11 @@ fn lineage_gate(tx: &Connection, envelope: &Envelope, now_ms: u64) -> Result<Str
         envelope.metadata.get("task").map_or("", String::as_str),
         stream.as_str(),
     );
+    let lineage_key = if lifetime.is_empty() {
+        lineage_key
+    } else {
+        [lineage_key.as_str(), envelope.publisher.as_str(), lifetime].join("\u{1f}")
+    };
     let owner: Option<String> = tx
         .query_row(
             "SELECT owner FROM stream_lineages WHERE lineage_key = ?1",
@@ -1100,6 +1153,17 @@ pub(crate) fn scope_key(envelope: &Envelope) -> String {
         discriminator,
     ]
     .join("\u{1f}")
+}
+
+/// Adds a validated producer-owned lifetime to a coalescing key.
+/// Empty lifetime is byte-for-byte legacy behavior; keep_all never coalesces.
+pub(crate) fn scoped_scope_key(envelope: &Envelope, lifetime: &str) -> String {
+    let scope = scope_key(envelope);
+    if scope.is_empty() || lifetime.is_empty() {
+        scope
+    } else {
+        [scope.as_str(), lifetime].join("\u{1f}")
+    }
 }
 
 /// A stored event row as read back for dedup and status.

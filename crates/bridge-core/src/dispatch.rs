@@ -578,7 +578,10 @@ const ELIGIBLE: &str = "e.state = 'pending' AND e.delivery = 'unhanded' AND e.re
         SELECT 1 FROM events p
         WHERE p.publisher_id = e.publisher_id AND p.event_id = e.predecessor
           AND (p.state = 'superseded'
-               OR p.delivery IN ('accepted', 'hook_submitted', 'disposed'))))";
+               OR p.delivery IN ('accepted', 'hook_submitted', 'disposed'))))
+    AND NOT EXISTS (SELECT 1 FROM delivery_scopes s
+        WHERE s.producer = e.publisher_id AND s.scope_key = e.delivery_scope_key
+          AND s.closed_ms IS NOT NULL AND s.action = 'retire_unhanded')";
 
 /// The requested modes a path may take for the observed lifecycle.
 ///
@@ -1218,6 +1221,23 @@ fn reserve_in(
 /// Flips a validated reservation to `invoking` inside the caller's
 /// transaction.
 fn invoke_in(tx: &Connection, attempt_seq: u64, now_ms: u64) -> Result<(), CoreError> {
+    // A reservation is not a handoff. Both paths enforce the same durable
+    // retirement fence immediately before committing possible native effect.
+    let retired: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM attempt_members m JOIN events e
+           ON e.publisher_id = m.publisher_id AND e.event_id = m.event_id
+         JOIN delivery_scopes s ON s.producer = e.publisher_id
+           AND s.scope_key = e.delivery_scope_key
+         WHERE m.attempt_seq = ?1 AND s.closed_ms IS NOT NULL
+           AND s.action = 'retire_unhanded')",
+        params![to_sql(attempt_seq)?],
+        |row| row.get(0),
+    )?;
+    if retired {
+        return Err(CoreError::Fence(
+            "producer delivery scope retired before invoking".into(),
+        ));
+    }
     tx.execute(
         "UPDATE attempts SET state = 'invoking', lease_expires_ms = NULL, updated_ms = ?1
          WHERE attempt_seq = ?2 AND state = 'reserved'",

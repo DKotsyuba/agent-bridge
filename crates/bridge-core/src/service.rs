@@ -85,6 +85,9 @@ pub struct Config {
     /// Integration grants; at least one is required to serve anything.
     #[serde(default, alias = "grant")]
     pub grants: Vec<GrantConfig>,
+    /// Separate bounded v1 identities; never an implicit producer job timeout.
+    #[serde(default)]
+    pub universal_limits: crate::UniversalLimits,
 }
 
 /// One authenticated grant.
@@ -114,6 +117,9 @@ pub struct GrantConfig {
     /// operations, never publishing.
     #[serde(default)]
     pub admin: bool,
+    /// Opt-in v1 permissions; absence preserves all legacy grant behavior.
+    #[serde(default)]
+    pub producer_v1: Option<crate::ProducerPolicy>,
 }
 
 impl std::fmt::Debug for GrantConfig {
@@ -127,6 +133,7 @@ impl std::fmt::Debug for GrantConfig {
             .field("modes", &self.modes)
             .field("policies", &self.policies)
             .field("admin", &self.admin)
+            .field("producer_v1", &self.producer_v1)
             .finish()
     }
 }
@@ -141,6 +148,28 @@ impl GrantConfig {
     /// operator grant must have empty allowlists. Returns the first
     /// problem as [`CoreError::InvalidEnvelope`].
     pub fn validate(&self) -> Result<(), CoreError> {
+        if let Some(policy) = &self.producer_v1 {
+            if self.admin {
+                return Err(CoreError::InvalidEnvelope(
+                    "operator grants cannot enable producer v1".into(),
+                ));
+            }
+            policy
+                .validate()
+                .map_err(|_| CoreError::InvalidEnvelope("invalid producer v1 policy".into()))?;
+            for values in [&self.kinds, &self.modes, &self.policies] {
+                if values.len() > 64
+                    || values
+                        .iter()
+                        .enumerate()
+                        .any(|(index, value)| values[..index].contains(value))
+                {
+                    return Err(CoreError::InvalidEnvelope(
+                        "producer v1 allowlists must be bounded unique sets".into(),
+                    ));
+                }
+            }
+        }
         PublisherId::new(self.publisher.clone())?;
         if self.token.len() < MIN_TOKEN_BYTES {
             return Err(CoreError::InvalidEnvelope(format!(
@@ -593,7 +622,7 @@ struct ServiceState {
     /// The custody store; its lock also fences shutdown against publishes.
     storage: Mutex<Storage>,
     /// Validated grants.
-    grants: Vec<GrantConfig>,
+    authorizer: Arc<crate::ProducerAuthorizer>,
     /// Connection and timeout bounds (see [`Limits`]).
     limits: Limits,
     /// `false` once a stop was requested; new work is refused under the
@@ -667,6 +696,14 @@ pub fn start_with_carriers(
         tokens.push(&grant.token);
     }
     config.limits.validate()?;
+    config
+        .universal_limits
+        .validate()
+        .map_err(|_| CoreError::InvalidEnvelope("invalid universal limits".into()))?;
+    let authorizer = Arc::new(
+        crate::ProducerAuthorizer::new(&config.grants)
+            .map_err(|_| CoreError::InvalidEnvelope("invalid boot producer authority".into()))?,
+    );
     if let Some(parent) = config.socket.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| io_failure(format!("cannot create socket directory: {error}")))?;
@@ -675,6 +712,10 @@ pub fn start_with_carriers(
     // is touched: a loser changes nothing.
     let endpoint_lock = acquire_endpoint_lock(&config.socket)?;
     let mut storage = Storage::open(&config.database, config.limits)?;
+    storage.universal_limits = config.universal_limits;
+    storage
+        .install_producer_authorizer(Arc::clone(&authorizer))
+        .map_err(|_| CoreError::InvalidEnvelope("cannot install producer authority".into()))?;
     for grant in config.grants.iter().filter(|grant| !grant.admin) {
         storage.register_source_tag(&grant.publisher, &grant.publisher)?;
     }
@@ -693,7 +734,7 @@ pub fn start_with_carriers(
         .map_err(|error| io_failure(format!("cannot set socket non-blocking: {error}")))?;
     let state = Arc::new(ServiceState {
         storage: Mutex::new(storage),
-        grants: config.grants,
+        authorizer,
         limits: config.limits,
         running: AtomicBool::new(true),
         socket_path: config.socket.clone(),
@@ -710,7 +751,7 @@ pub fn start_with_carriers(
         "service_starting",
         &[
             ("socket", &state.socket_path.display().to_string()),
-            ("grants", &state.grants.len().to_string()),
+            ("grants", &config.grants.len().to_string()),
         ],
     );
     let accept_state = Arc::clone(&state);
@@ -1095,6 +1136,19 @@ fn handle_connection(stream: UnixStream, state: &Arc<ServiceState>) {
             let _ = respond(state, &mut writer, &stopping().into());
             break;
         }
+        // Additive v1 is strict and cannot fall through to legacy mutation.
+        if let Some(bytes) = serve_v1_line(state, &line) {
+            if write_line(
+                &mut writer,
+                &bytes,
+                Duration::from_millis(state.limits.write_timeout_ms),
+            )
+            .is_err()
+            {
+                break;
+            }
+            continue;
+        }
         let response = match serde_json::from_str::<Request>(&line) {
             Ok(request) => serve(state, request).unwrap_or_else(Response::from),
             Err(error) => {
@@ -1115,6 +1169,89 @@ fn handle_connection(stream: UnixStream, state: &Arc<ServiceState>) {
             break;
         }
     }
+}
+
+/// Dispatches only additive versioned producer frames on the existing socket.
+/// Protocol owns strict decoding/correlation; this function never echoes a
+/// request/credential/body and native registration/consumption stay on adapter
+/// ingress. All mutations share the custody/shutdown critical section.
+fn serve_v1_line(state: &ServiceState, line: &str) -> Option<Vec<u8>> {
+    use bridge_protocol::{Operation as Op, OperationResult as Out};
+    let candidate: serde_json::Value = serde_json::from_str(line).ok()?;
+    candidate.get("api_version")?;
+    let request_id = candidate
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| crate::producer::opaque(v))
+        .unwrap_or("invalid-request");
+    let response = match bridge_protocol::decode_request(line.as_bytes()) {
+        Err(error) => bridge_protocol::Response::error(
+            request_id,
+            crate::producer::failure(
+                if error.field == "api_version" {
+                    bridge_protocol::ErrorClass::Unsupported
+                } else {
+                    bridge_protocol::ErrorClass::Invalid
+                },
+                "invalid_v1_request",
+            ),
+        ),
+        Ok(request) => {
+            let mut storage = lock_storage(&state.storage);
+            let result = if !state.running.load(Ordering::SeqCst) {
+                Err(crate::producer::failure(
+                    bridge_protocol::ErrorClass::Unavailable,
+                    "service_stopping",
+                ))
+            } else {
+                let credential = request.credential.expose();
+                match &request.operation {
+                    Op::Capabilities(_) => {
+                        storage.capabilities_v1(credential).map(Out::Capabilities)
+                    }
+                    Op::Publish(body) => storage
+                        .publish_v1(credential, body, &current_unix_millis)
+                        .map(Out::Publish),
+                    Op::Status(body) => storage
+                        .status_v1(credential, &body.selector, current_unix_millis())
+                        .map(Out::Status),
+                    Op::CloseRoute(body) => storage
+                        .close_route(credential, &request.request_id, body, &current_unix_millis)
+                        .map(Out::CloseRoute),
+                    Op::RetireDeliveryScope(body) => storage
+                        .retire_delivery_scope(
+                            credential,
+                            &request.request_id,
+                            body,
+                            &current_unix_millis,
+                        )
+                        .map(Out::RetireDeliveryScope),
+                    _ => storage
+                        .producer_authorizer()
+                        .and_then(|auth| auth.authenticate(credential).map(|_| ()))
+                        .and_then(|_| {
+                            Err(crate::producer::failure(
+                                bridge_protocol::ErrorClass::Unsupported,
+                                "native_ingress_required",
+                            ))
+                        }),
+                }
+            };
+            match result {
+                Ok(value) => bridge_protocol::Response::ok(&request.request_id, value),
+                Err(mut error) => {
+                    if let Some(key) = request.reconciliation() {
+                        if error.effect.is_none() {
+                            error.effect = Some(bridge_protocol::MutationEffect::NotCommitted);
+                        }
+                        error.reconciliation = Some(key);
+                    }
+                    bridge_protocol::Response::error(&request.request_id, error)
+                }
+            }
+        }
+    };
+    Some(serde_json::to_vec(&response).unwrap_or_default())
 }
 
 /// The refusal returned for work that arrives after a stop.
@@ -1385,13 +1522,7 @@ fn mutate(
 /// match), so timing reveals neither which grant matched nor how much of a
 /// token was right.
 fn authenticate<'a>(state: &'a ServiceState, token: &str) -> Result<&'a GrantConfig, Refusal> {
-    let mut matched: Option<&GrantConfig> = None;
-    for grant in &state.grants {
-        if constant_time_eq(token.as_bytes(), grant.token.as_bytes()) {
-            matched = Some(grant);
-        }
-    }
-    matched.ok_or_else(|| {
+    state.authorizer.authenticate_legacy(token).ok_or_else(|| {
         log_event("warn", "auth_failed", &[]);
         Refusal::new("auth", "unknown or invalid grant token")
     })
@@ -1674,7 +1805,7 @@ fn dispatch_pass(state: &ServiceState) {
 ///
 /// Compares every byte of both slices regardless of where they differ, so
 /// timing does not leak how much of a token matched.
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
     }

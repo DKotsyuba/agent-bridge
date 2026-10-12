@@ -38,11 +38,13 @@ fn recipient() -> NativeAddress {
 /// Neither non-operator realm may read operator pages or retained foreign facts.
 fn config(dir: &TempDir) -> Config {
     Config {
+        universal_limits: bridge_core::UniversalLimits::default(),
         database: dir.path("bridge.db"),
         socket: short_socket("peer"),
         limits: Limits::new(1_000),
         grants: vec![
             GrantConfig {
+                producer_v1: None,
                 token: RUN_TOKEN.to_string(),
                 publisher: "agent-run".to_string(),
                 recipients: vec![recipient().to_canonical_string()],
@@ -52,6 +54,7 @@ fn config(dir: &TempDir) -> Config {
                 admin: false,
             },
             GrantConfig {
+                producer_v1: None,
                 token: ROOT_TOKEN.to_string(),
                 publisher: "bridge-root".into(),
                 recipients: vec![recipient().to_canonical_string()],
@@ -61,6 +64,7 @@ fn config(dir: &TempDir) -> Config {
                 admin: false,
             },
             GrantConfig {
+                producer_v1: None,
                 token: OPS_TOKEN.to_string(),
                 publisher: "bridge-ops".to_string(),
                 recipients: vec![],
