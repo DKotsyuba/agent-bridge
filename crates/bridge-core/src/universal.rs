@@ -194,11 +194,28 @@ impl Storage {
         let grant = auth.authenticate(credential)?;
         replay_registration(&self.connection, grant.producer(), request_id, &hash)
     }
-    /// Atomically commits route/request/global-use facts from genuinely reserved
-    /// native input. Exact request replay is historical and consumes no new use.
-    /// Clock sampling occurs after BEGIN IMMEDIATE, including lock contention.
-    /// A shared-address child requires explicit SharedSession policy; SelfActor
-    /// is admitted only for a root or a child with its independently addressed ID.
+    /// Commits an immutable producer return route, request receipt and global
+    /// native-use claim together. Credential identifies the configured producer;
+    /// request_id is its stable nonempty, control-free <=256-byte retry identity.
+    /// Changed request/operation semantics conflict rather than replacing origin.
+    ///
+    /// Params are validated protocol intentions, not native authority. Missing
+    /// modes means message; missing kinds inherit the first grant snapshot;
+    /// missing payload ceiling means 64 KiB; missing route expiry imposes no TTL.
+    /// Verified must be genuinely reserved provider facts for a new request.
+    /// None is allowed only to recover an already committed exact request;
+    /// Some on replay compares origin without spending a new proof or granting
+    /// freshness. Shared-address children require explicit SharedSession policy.
+    ///
+    /// Clock returns absolute Unix milliseconds in 1..=MAX_SQLITE_INT and is
+    /// sampled after acquiring BEGIN IMMEDIATE, so queued time cannot renew
+    /// evidence. A new registration checks the original observation/expiry.
+    /// Success is durable or historical receipt only, never job permission or
+    /// fresh assertion. Validation/auth/capacity/conflict errors report
+    /// NotCommitted; COMMIT failure is conservatively Unknown with the original
+    /// registration reconciliation key, even if no receipt is visible yet.
+    /// Reconcile that request/use before releasing an uncertain native claim;
+    /// retry only the same identity and never synthesize a replacement operation.
     pub fn register_call(
         &mut self,
         credential: &str,
@@ -417,9 +434,25 @@ impl Storage {
         }
         Ok(RegistrationReconciliation { receipt, claim })
     }
-    /// Authenticated normalized v1 intent plus canonical legacy custody commit.
-    /// Accepted exact replay precedes new policy/route/lifetime checks; no new
-    /// handoff is caused. A route key is only an owner-scoped reference.
+    /// Commits authenticated normalized event intent and canonical custody in
+    /// one immediate transaction. Credential determines producer; params contain
+    /// immutable event_id, tagged own route/authorized address, opaque content,
+    /// mode/policy/metadata, absolute expiry and optional producer lifetime.
+    /// Message/keep_all/empty metadata/no expiry are protocol defaults.
+    ///
+    /// Existing exact intent recovers its original receipt before new
+    /// route/expiry/current-policy admission. Changed intent or legacy-only
+    /// identity conflicts; a route key is a scoped reference, never authority.
+    /// Clock returns Unix milliseconds in 1..=MAX_SQLITE_INT, sampled after
+    /// BEGIN IMMEDIATE acquisition. Current grants, route and lifetime fences
+    /// serialize with new custody; success proves custody only and never
+    /// requests another native handoff on replay.
+    ///
+    /// Precommit validation/auth/admission errors report NotCommitted. Failure
+    /// at COMMIT reports Unknown with the original event reconciliation key;
+    /// absent status is not proof that another same-key commit cannot exist.
+    /// Preserve/reconcile the immutable event intent and exact-retry that ID,
+    /// never replace it or directly resend an uncertain native effect.
     pub fn publish_v1(
         &mut self,
         credential: &str,
@@ -853,9 +886,20 @@ impl Storage {
             }
         })
     }
-    /// Closes only new route custody with an immutable request receipt. Accepted
-    /// publications still replay/deliver; expired routes stay expired. Current
-    /// owner authentication and close/publication serialization precede commit.
+    /// Fences only new custody against an authenticated own return route.
+    /// Request_id is the producer's stable <=256-byte close retry identity;
+    /// params bind its route_key and optional bounded reason (default None).
+    /// Changed same-request semantics conflict. Existing events retain ordinary
+    /// delivery/expiry, accepted intent retry and their frozen destination.
+    ///
+    /// Clock returns Unix milliseconds in 1..=MAX_SQLITE_INT, sampled after
+    /// BEGIN IMMEDIATE; closure and new publication serialize at commit.
+    /// Success returns an immutable close receipt or exact replay. First close
+    /// time stays fixed; already-expired routes stay expired and never reopen.
+    /// Precommit failures report NotCommitted, while COMMIT failure is Unknown
+    /// with this original close reconciliation key. Query/reconcile or retry
+    /// the same request and route; absence does not cancel an in-flight commit.
+    /// Closing neither recalls a native effect nor authorizes delivery replay.
     pub fn close_route(
         &mut self,
         credential: &str,
@@ -914,10 +958,25 @@ impl Storage {
         };
         action().map_err(|e| mutation_error(e, reconciliation))
     }
-    /// Permanently retires an opaque producer lifetime, including before first
-    /// publication. RetireUnhanded prevents every new invoking commit, closes
-    /// reserved attempts and disposes only proved zero-effect members. Possible
-    /// invoking/held/written/unknown/accepted history remains retained, not recalled.
+    /// Permanently fences an authenticated producer-owned opaque lifetime,
+    /// including before first publication. Request_id is a stable <=256-byte
+    /// retry identity; params fix scope_key and explicit immutable action.
+    /// Preserve fences new custody only and keeps existing dispatch eligible.
+    /// RetireUnhanded also fences every new invoking transition and safely
+    /// disposes only proved zero-effect work, including uninvoked reservations.
+    /// Invoking/held/written/unknown/accepted history remains retained.
+    ///
+    /// Clock returns Unix milliseconds in 1..=MAX_SQLITE_INT after acquiring
+    /// BEGIN IMMEDIATE. Custody, retirement and invoking permission serialize
+    /// durably; no accepted native effect is recalled. Success returns the
+    /// original four disjoint first-snapshot counts/time/action. Exact retry
+    /// returns its original receipt; a later same-action request changes only
+    /// request_id, and changed action conflicts. No retired scope key reopens.
+    ///
+    /// Precommit auth/validation/capacity/conflict failures report NotCommitted.
+    /// COMMIT failure reports Unknown with the original retirement key;
+    /// reconcile or exact-retry that request/scope without replacing identity.
+    /// Missing visible status is not cancellation or definite noncommit.
     pub fn retire_delivery_scope(
         &mut self,
         credential: &str,
@@ -1016,21 +1075,27 @@ impl Storage {
     pub fn capabilities_v1(&self, credential: &str) -> Result<Capabilities, ApiError> {
         let auth = self.producer_authorizer()?;
         let grant = auth.authenticate(credential)?;
-        let modes = grant
-            .modes()
-            .iter()
-            .map(|m| decode(&encode(m)?))
-            .collect::<Result<Vec<Mode>, _>>()?;
-        let policies = grant
-            .policies()
-            .iter()
-            .map(|p| decode(&encode(p)?))
-            .collect::<Result<Vec<PolicyKind>, _>>()?;
-        let replies = grant
-            .reply_policies()
-            .iter()
-            .map(|p| decode(&encode(p)?))
-            .collect::<Result<Vec<ReplyPolicy>, _>>()?;
+        let modes = public_set(
+            grant
+                .modes()
+                .iter()
+                .map(|m| decode(&encode(m)?))
+                .collect::<Result<Vec<Mode>, _>>()?,
+        );
+        let policies = public_set(
+            grant
+                .policies()
+                .iter()
+                .map(|p| decode(&encode(p)?))
+                .collect::<Result<Vec<PolicyKind>, _>>()?,
+        );
+        let replies = public_set(
+            grant
+                .reply_policies()
+                .iter()
+                .map(|p| decode(&encode(p)?))
+                .collect::<Result<Vec<ReplyPolicy>, _>>()?,
+        );
         let scope = grant.policy().is_some_and(|p| p.delivery_scopes);
         let mut operations = vec!["capabilities".into(), "status".into()];
         if let Some(policy) = grant.policy() {
@@ -1064,10 +1129,10 @@ impl Storage {
             grant: ProducerConstraints {
                 allowed_modes: modes,
                 allowed_policies: policies,
-                allowed_kinds: grant.kinds().to_vec(),
+                allowed_kinds: public_set(grant.kinds().to_vec()),
                 reply_policies: replies,
                 direct_address: grant.policy().is_some_and(|p| p.direct_address),
-                native_scopes: grant.native_scopes().to_vec(),
+                native_scopes: public_set(grant.native_scopes().to_vec()),
             },
             features: Features {
                 consume_assertion: false,
@@ -1164,7 +1229,7 @@ fn delivery_status(delivery: Option<crate::DeliveryEvidence>) -> Result<Delivery
             .as_ref()
             .map(|a| decode(&encode(&a.effective_mode)?))
             .transpose()?,
-        note: delivery.note.as_deref().map(crate::recovery::bound_text),
+        note: delivery.note.as_deref().map(public_diagnostic),
         attempts_made: u64::from(delivery.attempts_made),
         attempt: delivery.attempt.as_ref().map(|a| a.attempt_seq),
         tiers,
@@ -1172,12 +1237,35 @@ fn delivery_status(delivery: Option<crate::DeliveryEvidence>) -> Result<Delivery
             .incident
             .as_ref()
             .map(|i| format!("incident-{}", i.incident_seq)),
-        hold_reason: delivery
-            .hold_reason
-            .as_deref()
-            .map(crate::recovery::bound_text),
+        hold_reason: delivery.hold_reason.as_deref().map(public_diagnostic),
         blocked_by: delivery.blocked_by,
     })
+}
+
+/// Projects stored diagnostics to the public no-controls, 512-byte domain.
+/// Replaces each control code point with one space, then bounds UTF-8 at a
+/// character boundary. Stored/legacy evidence and semantic states are untouched.
+fn public_diagnostic(text: &str) -> String {
+    crate::recovery::bound_text(
+        &text
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect::<String>(),
+    )
+}
+
+/// Projects configured declaration lists into unique public sets, preserving
+/// first occurrence order without mutating legacy configuration acceptance.
+fn public_set<T: Eq>(values: Vec<T>) -> Vec<T> {
+    // ponytail: small configured sets use linear dedup; use a keyed set only
+    // if measured legacy configuration sizes make this projection expensive.
+    let mut unique = Vec::new();
+    for value in values {
+        if !unique.contains(&value) {
+            unique.push(value);
+        }
+    }
+    unique
 }
 
 #[cfg(test)]

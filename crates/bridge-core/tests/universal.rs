@@ -1258,3 +1258,310 @@ fn accepted_retry_after_route_and_event_expiry_preserves_receipt() {
         }
     ));
 }
+
+/// Exchanges one actual v1 frame with a private fixture service under two-second
+/// I/O bounds. Missing/invalid response is an error; no mutation retry is hidden.
+fn fixture_exchange(socket: &std::path::Path, request: &Request) -> Result<Response, String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    let mut stream = UnixStream::connect(socket).map_err(|_| "connect".to_string())?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    stream
+        .write_all(&encode_request(request).unwrap())
+        .map_err(|_| "write".to_string())?;
+    stream.write_all(b"\n").map_err(|_| "write".to_string())?;
+    let mut line = String::new();
+    if BufReader::new(stream)
+        .read_line(&mut line)
+        .map_err(|_| "read".to_string())?
+        == 0
+    {
+        return Err("empty response".into());
+    }
+    decode_response(line.trim_end().as_bytes(), request).map_err(|_| "invalid response".into())
+}
+/// Status diagnostics sanitize all control code points only at the public
+/// projection. Actual socket response remains encodable and stored legacy note,
+/// unknown evidence and recipient hold bytes are not rewritten.
+#[test]
+fn public_status_diagnostics_normalize_controls_without_rewriting_history() {
+    let dir = TempDir::new("universal-diagnostics");
+    let path = dir.path("state.db");
+    let socket = common::short_socket("diag-v1");
+    let service = bridge_core::start_service(bridge_core::Config {
+        database: path.clone(),
+        socket: socket.clone(),
+        limits: bridge_core::Limits::new(100),
+        grants: vec![grant(TOKEN, "report-maker")],
+        universal_limits: UniversalLimits::default(),
+    })
+    .unwrap();
+    let reason = "native\nuncertain\t\u{0000}\u{007f}\u{0085}";
+    let hold = "waiting\r\n\u{0001}\u{009f}control";
+    service.with_storage(|s| {
+        let route = s
+            .register_call(
+                TOKEN,
+                "register",
+                &registration("job"),
+                Some(&origin("use", "root")),
+                &|| 1000,
+            )
+            .unwrap();
+        s.publish_v1(
+            TOKEN,
+            &publication(&route.route_key, "event", None),
+            &|| 1001,
+        )
+        .unwrap();
+        let recipient = codex("caller");
+        let a = attest(&recipient, Lifecycle::Inactive, 1);
+        let Selection::Attempt(r) = s
+            .reserve_next(&a, EffectiveMode::Message, 1002, &DispatchTiming::default())
+            .unwrap()
+        else {
+            panic!("reservation")
+        };
+        s.mark_invoking(&r.fence, &a, 1003).unwrap();
+        s.record_outcome(
+            &r.fence,
+            Outcome::OutcomeUnknown {
+                reason: reason.into(),
+            },
+            1004,
+        )
+        .unwrap();
+        s.publish_v1(
+            TOKEN,
+            &publication(&route.route_key, "hold-event", None),
+            &|| 1005,
+        )
+        .unwrap();
+        s.record_hold(&recipient, hold, 1005).unwrap();
+    });
+    let request = Request::new(
+        "status",
+        Secret::new(TOKEN),
+        Operation::Status(StatusParams {
+            selector: StatusSelector::Event {
+                event_id: "event".into(),
+            },
+        }),
+    )
+    .unwrap();
+    let response = fixture_exchange(&socket, &request);
+    service.shutdown();
+    service.join();
+    let response =
+        response.expect("control-containing legacy diagnostics must remain valid public responses");
+    let Some(OperationResult::Status(StatusResult::Event { event: Some(event) })) = response.result
+    else {
+        panic!("event status")
+    };
+    assert_eq!(event.delivery.delivery, DeliveryState::Review);
+    assert!(event.delivery.tiers.contains(&EvidenceTier::Unknown));
+    for value in [event.delivery.note, event.delivery.hold_reason]
+        .into_iter()
+        .flatten()
+    {
+        assert!(!value.chars().any(char::is_control));
+        assert!(value.len() <= 512);
+    }
+    let sql = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        sql.query_row(
+            "SELECT detail FROM evidence WHERE tier='unknown'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        reason
+    );
+    assert_eq!(
+        sql.query_row("SELECT reason FROM recipient_holds", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        hold
+    );
+    assert!(
+        sql.query_row("SELECT note FROM attempts", [], |r| r.get::<_, String>(0))
+            .unwrap()
+            .contains(reason)
+    );
+}
+/// Valid legacy grant duplicate declarations remain accepted, while both outer
+/// and nested public capability sets are unique and valid on the actual socket.
+#[test]
+fn public_capabilities_normalize_valid_legacy_duplicate_grants() {
+    let dir = TempDir::new("universal-legacy-caps");
+    let socket = common::short_socket("dup-v1");
+    let mut legacy = grant(TOKEN, "legacy-opaque-producer");
+    legacy.producer_v1 = None;
+    legacy.modes = vec!["message".into(), "message".into(), "inject".into()];
+    legacy.policies = vec!["keep_all".into(), "keep_all".into(), "batch".into()];
+    legacy.kinds = vec!["done".into(), "done".into(), "progress".into()];
+    assert!(legacy.validate().is_ok());
+    let original = legacy.clone();
+    let service = bridge_core::start_service(bridge_core::Config {
+        database: dir.path("state.db"),
+        socket: socket.clone(),
+        limits: bridge_core::Limits::new(100),
+        grants: vec![legacy],
+        universal_limits: UniversalLimits::default(),
+    })
+    .unwrap();
+    let request = Request::new(
+        "caps",
+        Secret::new(TOKEN),
+        Operation::Capabilities(CapabilitiesParams {}),
+    )
+    .unwrap();
+    let response = fixture_exchange(&socket, &request);
+    service.shutdown();
+    service.join();
+    let response =
+        response.expect("valid legacy duplicate grants must remain readable as capabilities");
+    let Some(OperationResult::Capabilities(caps)) = response.result else {
+        panic!("capabilities")
+    };
+    caps.validate().unwrap();
+    assert_eq!(caps.modes, vec![Mode::Message, Mode::Inject]);
+    assert_eq!(caps.grant.allowed_modes, caps.modes);
+    assert_eq!(caps.policies, vec![PolicyKind::KeepAll, PolicyKind::Batch]);
+    assert_eq!(caps.grant.allowed_policies, caps.policies);
+    assert_eq!(caps.grant.allowed_kinds, vec!["done", "progress"]);
+    assert_eq!(original.modes.len(), 3);
+    assert_eq!(original.kinds.len(), 3);
+}
+/// Preserve fences only new custody, keeps existing dispatch eligible, freezes
+/// all four disjoint first-snapshot counts across later same-action requests and
+/// restart, and cannot be upgraded to RetireUnhanded by another request.
+#[test]
+fn preserve_lifetime_keeps_dispatch_and_freezes_disjoint_snapshot() {
+    let dir = TempDir::new("universal-preserve");
+    let path = dir.path("state.db");
+    let mut storage = store(&path);
+    let route = storage
+        .register_call(
+            TOKEN,
+            "register",
+            &registration("job"),
+            Some(&origin("use", "root")),
+            &|| 1000,
+        )
+        .unwrap();
+    for id in ["unknown", "safe", "terminal"] {
+        let mut event = publication(&route.route_key, id, Some("generation"));
+        if id == "terminal" {
+            event.expires_at_ms = Some(1003);
+        }
+        storage.publish_v1(TOKEN, &event, &|| 1001).unwrap();
+    }
+    let recipient = codex("caller");
+    let a = attest(&recipient, Lifecycle::Inactive, 1);
+    let Selection::Attempt(r) = storage
+        .reserve_next(&a, EffectiveMode::Message, 1002, &DispatchTiming::default())
+        .unwrap()
+    else {
+        panic!("unknown reservation")
+    };
+    assert_eq!(r.members[0].event_id, "unknown");
+    storage.mark_invoking(&r.fence, &a, 1002).unwrap();
+    storage
+        .record_outcome(
+            &r.fence,
+            Outcome::OutcomeUnknown {
+                reason: "fixture unknown".into(),
+            },
+            1002,
+        )
+        .unwrap();
+    storage.expire_due(1004).unwrap();
+    let params = RetireDeliveryScopeParams {
+        scope_key: "generation".into(),
+        action: RetirementAction::Preserve,
+    };
+    let first = storage
+        .retire_delivery_scope(TOKEN, "preserve-first", &params, &|| 1005)
+        .unwrap();
+    assert_eq!(
+        (
+            first.receipt.disposed,
+            first.receipt.already_terminal,
+            first.receipt.preserved_possible_effect,
+            first.receipt.preserved_unhanded
+        ),
+        (0, 1, 1, 1)
+    );
+    assert!(
+        storage
+            .publish_v1(
+                TOKEN,
+                &publication(&route.route_key, "late", Some("generation")),
+                &|| 1006
+            )
+            .is_err()
+    );
+    let Selection::Attempt(safe) = storage
+        .reserve_next(&a, EffectiveMode::Message, 1006, &DispatchTiming::default())
+        .unwrap()
+    else {
+        panic!("preserve must keep accepted dispatch")
+    };
+    assert_eq!(safe.members[0].event_id, "safe");
+    storage.mark_invoking(&safe.fence, &a, 1007).unwrap();
+    storage
+        .record_outcome(
+            &safe.fence,
+            Outcome::NativeAccepted {
+                evidence: "fixture native acceptance".into(),
+            },
+            1008,
+        )
+        .unwrap();
+    let later = storage
+        .retire_delivery_scope(TOKEN, "preserve-later", &params, &|| 1009)
+        .unwrap();
+    assert_eq!(
+        later.receipt,
+        RetireReceipt {
+            request_id: "preserve-later".into(),
+            ..first.receipt.clone()
+        }
+    );
+    assert!(
+        storage
+            .retire_delivery_scope(
+                TOKEN,
+                "changed-action",
+                &RetireDeliveryScopeParams {
+                    scope_key: "generation".into(),
+                    action: RetirementAction::RetireUnhanded
+                },
+                &|| 1010
+            )
+            .is_err()
+    );
+    drop(storage);
+    let mut storage = store(&path);
+    let replay = storage
+        .retire_delivery_scope(TOKEN, "preserve-first", &params, &|| 2000)
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.receipt, first.receipt);
+    let again = storage
+        .retire_delivery_scope(TOKEN, "after-restart", &params, &|| 2000)
+        .unwrap();
+    assert_eq!(
+        again.receipt,
+        RetireReceipt {
+            request_id: "after-restart".into(),
+            ..first.receipt
+        }
+    );
+}
