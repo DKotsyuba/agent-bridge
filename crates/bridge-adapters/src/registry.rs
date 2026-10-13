@@ -713,7 +713,7 @@ pub struct HookAdmission {
 
 /// One binding of an address to a harness incarnation. Only daemon-verified
 /// facts are persisted privately; fresh OS/build validation is required on load.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Binding {
     /// The bound address.
@@ -741,8 +741,25 @@ struct Binding {
     store: PathBuf,
     /// Qualified harness executable of the binding.
     executable: PathBuf,
-    /// Set by `SessionEnd`; a retired binding never attests.
+    /// Set by root `SessionEnd`; normal recipient and caller authority stays refused.
     retired: bool,
+    /// Positive pre-end Desktop owner idleness, granting only native MESSAGE
+    /// candidate eligibility. Missing legacy facts keep tombstones held. Old
+    /// binaries reject this field when true rather than restore authority;
+    /// false is omitted so ineligible rows retain their prior journal shape.
+    #[serde(default, skip_serializing_if = "is_false")]
+    desktop_idle_message: bool,
+    /// Retained transcript device/inode at the positive end observation;
+    /// replacement or movement out of sessions revokes message eligibility.
+    /// Missing values read as None and are omitted when writing old-shaped rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    desktop_idle_transcript: Option<(u64, u64)>,
+}
+
+/// Serde omission predicate for the private idle fact: false carries no new
+/// authority and need not change legacy journal rows; true must persist.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// A verified native observation tuple: caller, actual harness incarnation,
@@ -834,6 +851,106 @@ pub struct RecipientBinding {
     pub executable: PathBuf,
     /// Session transcript inside the store, when reported by hooks.
     pub transcript: Option<PathBuf>,
+    /// This MESSAGE snapshot requires the native Desktop route even if its
+    /// capability disappears after validation; never fall back to a CLI helper.
+    pub(crate) desktop_message_only: bool,
+}
+
+/// Owned Codex MESSAGE validation snapshot; performs OS/file validation after
+/// releasing the registry lock. Ordinary bindings retain their capabilities;
+/// retired Desktop exceptions supply no inject, caller or call authority.
+pub(crate) struct CodexMessageCandidate {
+    /// Exact private binding, including its unchanged tombstone epoch.
+    binding: Binding,
+    /// Current configured executable qualification, never journal authority.
+    qualified: QualifiedExecutable,
+    /// Owner required for both process and retained transcript.
+    owner_uid: u32,
+    /// Startup-warmed identities of this qualified executable; no runtime hashing.
+    keys: Vec<FileKey>,
+}
+
+impl CodexMessageCandidate {
+    /// Revalidates exact PID/start, owner, executable, current profile/store and
+    /// startup-warmed loaded bytes. Retired candidates additionally require the
+    /// app capability and the same owned regular transcript under sessions,
+    /// with no symlink/path traversal. Returns Inactive only for that private
+    /// positive fact; all missing or changed evidence refuses before sending.
+    /// Ordinary live bindings retain their owner lifecycle and capabilities.
+    /// Current store aliases use the same canonical equivalence as admission;
+    /// retired transcript checks still require the literal configured sessions
+    /// prefix and a canonical path without symlink components, plus exact inode.
+    /// The caller must perform the final locked stamp check after frontend I/O.
+    pub(crate) fn validate(&self) -> Result<(Attestation, RecipientBinding), String> {
+        let binding = &self.binding;
+        let facts = os::process_facts(binding.harness.0).ok_or("harness is gone")?;
+        let key = file_key(&binding.executable).ok_or("executable unreadable")?;
+        if facts.uid != Some(self.owner_uid)
+            || facts.start_time != binding.harness.1
+            || facts.exe.as_ref() != Some(&binding.executable)
+            || !harness_store(&facts, Harness::Codex)
+                .is_some_and(|store| same_path(&store, &binding.store))
+            || !self.keys.contains(&key)
+            || i128::from(key.mtime.0.max(key.ctime.0)) >= i128::from(facts.start_time)
+        {
+            return Err("Codex message harness/store/loaded build changed".into());
+        }
+        let lifecycle = if binding.retired {
+            if !binding.desktop_idle_message
+                || binding.address.harness != Harness::Codex
+                || os::process_env(facts.pid, "CODEX_APP_TOOLS_PIPE_PATH").is_none()
+                || retained_transcript(binding, self.owner_uid) != binding.desktop_idle_transcript
+                || binding.desktop_idle_transcript.is_none()
+            {
+                return Err("retired Desktop message evidence unavailable".into());
+            }
+            Lifecycle::Inactive
+        } else {
+            binding.lifecycle
+        };
+        let attestation = Attestation::verified(
+            binding.address.clone(),
+            binding.address.native_session_id.clone(),
+            binding.epoch,
+            lifecycle,
+            Capabilities {
+                inject: !binding.retired && binding.capabilities.inject,
+                message: binding.capabilities.message && self.qualified.message,
+            },
+            proof(format!(
+                "codex-message:{}@{}:epoch{}",
+                binding.harness.0, binding.harness.1, binding.epoch
+            )),
+        )
+        .map_err(|error| error.to_string())?;
+        Ok((
+            attestation,
+            RecipientBinding {
+                harness: binding.harness,
+                epoch: binding.epoch,
+                store: binding.store.clone(),
+                executable: binding.executable.clone(),
+                transcript: binding.transcript.clone(),
+                desktop_message_only: binding.retired,
+            },
+        ))
+    }
+}
+
+/// Returns device/inode only for the exact owned regular transcript inside the
+/// configured store/sessions. Canonical equality rejects symlink components,
+/// traversal and moved/archive/foreign files; absence is never positive evidence.
+fn retained_transcript(binding: &Binding, owner_uid: u32) -> Option<(u64, u64)> {
+    let path = binding.transcript.as_ref()?;
+    if !path.is_absolute()
+        || !path.starts_with(binding.store.join("sessions"))
+        || path.canonicalize().ok()?.as_path() != path.as_path()
+    {
+        return None;
+    }
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    (meta.is_file() && meta.uid() == owner_uid && meta.nlink() == 1)
+        .then_some((meta.dev(), meta.ino()))
 }
 
 /// Versioned bounded route snapshot. It contains no publisher tokens, native
@@ -1019,7 +1136,12 @@ impl Registry {
     /// channel directory. Missing snapshots are initial setup; malformed, symlinked,
     /// foreign, shared, oversized or unsupported files refuse startup. Dead/reused
     /// processes and changed stores/builds/profiles are omitted. Retired
-    /// tombstones remain refusal fences, never restored live routes.
+    /// tombstones retain their exact epoch and refusal fences; their optional
+    /// Desktop MESSAGE fact is revalidated on every carrier use, never promoted
+    /// into normal live authority by recovery. Missing new fields default false/
+    /// None and false/None values are omitted, preserving old row shape. Older
+    /// binaries reject eligible rows with new fields (`deny_unknown_fields`),
+    /// so rollback with those rows requires a compatible journal or fresh setup.
     /// Current profile capabilities bound recovery; unknown/input-wait lifecycle
     /// stays such. No hook is manufactured and no caller/proof record is restored.
     /// Returns fresh recipient attestations for core to fence before serving.
@@ -1258,6 +1380,8 @@ impl Registry {
                 store: profile.store,
                 executable: exe.path,
                 retired: false,
+                desktop_idle_message: false,
+                desktop_idle_transcript: None,
             },
         );
         if let Err(error) = self.persist_routes() {
@@ -1532,6 +1656,9 @@ impl Registry {
     /// on a non-harness peer, a malformed payload, or an address held by
     /// another live incarnation. A route-journal failure restores the previous
     /// binding and records no caller/context evidence for the refused event.
+    /// Root Desktop SessionEnd can retain only prior positive owner Inactive
+    /// message eligibility and the exact owned regular sessions transcript inode;
+    /// retirement and Unknown lifecycle remain, and renewal clears both facts.
     pub fn admit_hook(
         &mut self,
         peer: PeerIdentity,
@@ -1621,17 +1748,32 @@ impl Registry {
                     store: profile.store.clone(),
                     executable: qualified.path.clone(),
                     retired: false,
+                    desktop_idle_message: false,
+                    desktop_idle_transcript: None,
                 },
             );
         }
         let binding = self.bindings.get_mut(&key).expect("binding inserted above");
+        let retained_path = transcript
+            .as_ref()
+            .is_none_or(|path| binding.transcript.as_ref() == Some(path));
         if transcript.is_some() {
             binding.transcript = transcript;
         }
-        binding.lifecycle = next_lifecycle(binding.lifecycle, kind, role, harness, payload);
         if kind == HookKind::SessionEnd && role == ActorRole::Root {
+            binding.desktop_idle_transcript = if harness == Harness::Codex
+                && binding.lifecycle == Lifecycle::Inactive
+                && retained_path
+                && os::process_env(binding.harness.0, "CODEX_APP_TOOLS_PIPE_PATH").is_some()
+            {
+                retained_transcript(binding, self.owner_uid)
+            } else {
+                None
+            };
+            binding.desktop_idle_message = binding.desktop_idle_transcript.is_some();
             binding.retired = true;
         }
+        binding.lifecycle = next_lifecycle(binding.lifecycle, kind, role, harness, payload);
         let binding = binding.clone();
         if let Err(error) = self.persist_routes() {
             match previous_binding {
@@ -2103,7 +2245,73 @@ impl Registry {
             .collect()
     }
 
-    /// Attests a recipient endpoint for a message carrier right now.
+    /// Copies current Codex MESSAGE qualification and private binding under the
+    /// lock, without OS/file/native I/O. The owned candidate MUST be validated
+    /// outside the lock on every attest/send, and app frontends separately checked.
+    /// Missing profiles, disabled message capability and legacy tombstones refuse.
+    pub(crate) fn codex_message_candidate(
+        &self,
+        address: &NativeAddress,
+    ) -> Result<CodexMessageCandidate, String> {
+        let binding = self
+            .bindings
+            .get(&address.to_canonical_string())
+            .ok_or("no Codex message binding")?;
+        if address.harness != Harness::Codex
+            || self.message_disabled.contains(&Harness::Codex)
+            || (binding.retired && !binding.desktop_idle_message)
+        {
+            return Err("Codex message binding unavailable".into());
+        }
+        let qualified = self
+            .config
+            .profiles
+            .iter()
+            .find(|p| {
+                p.harness == Harness::Codex
+                    && p.namespace == address.native_store_namespace
+                    && p.store == binding.store
+            })
+            .and_then(|p| p.executables.iter().find(|e| e.path == binding.executable))
+            .ok_or("Codex message profile changed")?
+            .clone();
+        let keys = self
+            .digests
+            .iter()
+            .filter(|(key, digest)| {
+                key.path == qualified.path && digest.eq_ignore_ascii_case(&qualified.sha256)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        Ok(CodexMessageCandidate {
+            binding: binding.clone(),
+            qualified,
+            owner_uid: self.owner_uid,
+            keys,
+        })
+    }
+
+    /// Refuses a MESSAGE snapshot changed during unlocked OS/frontend validation.
+    /// Compares the entire binding including same-epoch lifecycle/capabilities,
+    /// retirement and private transcript evidence, and current host disablement.
+    /// Pure in-memory check; callers run it under the registry lock last, on both
+    /// attest and send. It grants no caller or ordinary recipient authority.
+    pub(crate) fn codex_message_current(
+        &self,
+        candidate: &CodexMessageCandidate,
+    ) -> Result<(), String> {
+        if self.message_disabled.contains(&Harness::Codex)
+            || self
+                .bindings
+                .get(&candidate.binding.address.to_canonical_string())
+                != Some(&candidate.binding)
+        {
+            return Err("Codex message binding changed during validation".into());
+        }
+        Ok(())
+    }
+
+    /// Attests a recipient endpoint for ordinary recipient authority right now.
     ///
     /// Errors (core holds visibly, never treats as inactive) when no
     /// binding exists, it is retired, or its harness incarnation is gone.
@@ -2147,6 +2355,7 @@ impl Registry {
                 store: binding.store.clone(),
                 executable: binding.executable.clone(),
                 transcript: binding.transcript.clone(),
+                desktop_message_only: false,
             },
         ))
     }
@@ -2269,6 +2478,121 @@ mod tests {
     //! The executable digest cache: warmed before serving, never trusted.
 
     use super::*;
+
+    /// Controlled permission/renewal during the production frontend picker
+    /// refuses before returning a route. Same-epoch changes invalidate the entire
+    /// snapshot, including permission/input state, capabilities and idle inode;
+    /// default-reading old journal rows cannot mint the private Desktop fact.
+    #[test]
+    fn codex_message_stamp_rejects_same_epoch_changes_and_legacy_facts() {
+        let mut registry = registry_with(&[]);
+        let address = NativeAddress::new("h", Harness::Codex, "ns", "idle").unwrap();
+        let binding = Binding {
+            address: address.clone(),
+            harness: (1, 2),
+            epoch: 3,
+            capabilities: Capabilities {
+                inject: true,
+                message: true,
+            },
+            qualified: Capabilities {
+                inject: true,
+                message: true,
+            },
+            version: "qualified".into(),
+            lifecycle: Lifecycle::Unknown,
+            transcript: Some("/tmp/store/sessions/idle.jsonl".into()),
+            store: "/tmp/store".into(),
+            executable: "/tmp/executable".into(),
+            retired: true,
+            desktop_idle_message: true,
+            desktop_idle_transcript: Some((4, 5)),
+        };
+        let candidate = CodexMessageCandidate {
+            binding: binding.clone(),
+            owner_uid: 0,
+            keys: Vec::new(),
+            qualified: QualifiedExecutable {
+                path: binding.executable.clone(),
+                sha256: "0".repeat(64),
+                version: "qualified".into(),
+                inject: true,
+                message: true,
+            },
+        };
+        let key = address.to_canonical_string();
+        registry.bindings.insert(key.clone(), binding.clone());
+        assert!(registry.codex_message_current(&candidate).is_ok());
+        {
+            let shared = std::cell::RefCell::new(&mut registry);
+            let selected = PathBuf::from("/owned/frontend.sock");
+            assert_eq!(
+                crate::codex::checked_frontend(
+                    || Ok(Some(selected.clone())),
+                    || shared.borrow().codex_message_current(&candidate),
+                )
+                .unwrap(),
+                Some(selected.clone())
+            );
+            for renewed in [false, true] {
+                shared
+                    .borrow_mut()
+                    .bindings
+                    .insert(key.clone(), binding.clone());
+                let result = crate::codex::checked_frontend(
+                    || {
+                        let mut registry = shared.borrow_mut();
+                        let current = registry.bindings.get_mut(&key).unwrap();
+                        if renewed {
+                            current.epoch += 1;
+                        } else {
+                            current.lifecycle = Lifecycle::AwaitingInput;
+                        }
+                        Ok(Some(selected.clone()))
+                    },
+                    || shared.borrow().codex_message_current(&candidate),
+                );
+                assert!(
+                    result.is_err(),
+                    "frontend chosen during permission/renewal must not escape final fence"
+                );
+            }
+        }
+        for change in 0..8 {
+            let mut changed = binding.clone();
+            match change {
+                0 => changed.lifecycle = Lifecycle::AwaitingInput,
+                1 => changed.capabilities.message = false,
+                2 => changed.retired = false,
+                3 => changed.desktop_idle_message = false,
+                4 => changed.desktop_idle_transcript = Some((4, 6)),
+                5 => changed.harness.0 = 7,
+                6 => changed.epoch += 1,
+                _ => changed.capabilities.inject = false,
+            }
+            registry.bindings.insert(key.clone(), changed);
+            assert!(registry.codex_message_current(&candidate).is_err());
+        }
+        registry.bindings.insert(key, binding.clone());
+        registry.message_disabled.push(Harness::Codex);
+        assert!(registry.codex_message_current(&candidate).is_err());
+        let mut legacy = serde_json::to_value(binding).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("desktop_idle_message");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("desktop_idle_transcript");
+        let restored: Binding = serde_json::from_value(legacy).unwrap();
+        assert!(restored.retired);
+        assert!(!restored.desktop_idle_message);
+        assert!(restored.desktop_idle_transcript.is_none());
+        let old_shape = serde_json::to_value(restored).unwrap();
+        assert!(old_shape.get("desktop_idle_message").is_none());
+        assert!(old_shape.get("desktop_idle_transcript").is_none());
+    }
 
     /// A registry whose one Claude profile qualifies `executables` (path,
     /// configured digest) and whose relays are empty.

@@ -33,8 +33,8 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use bridge_core::dispatch::{AttemptRecord, Attestation, DispatchCarrier, Outcome};
-use bridge_core::{Harness, NativeAddress};
+use bridge_core::dispatch::{AttemptRecord, Attestation, DispatchCarrier, Lifecycle, Outcome};
+use bridge_core::{Harness, Mode, NativeAddress};
 use serde_json::{Value, json};
 
 use crate::registry::{RecipientBinding, Registry, prefix_within};
@@ -79,45 +79,75 @@ impl CodexQueueCarrier {
         self
     }
 
-    /// Re-attests the attempt's recipient and checks it is still the same
-    /// endpoint epoch, returning the binding to hand off to.
+    /// Revalidates the MESSAGE-only recipient outside the registry lock, then
+    /// checks the unchanged attempt epoch. Retired Desktop routes require their
+    /// exact live frontend on both attest and send and never select a CLI helper.
     fn binding_for(
         &self,
         attempt: &AttemptRecord,
-    ) -> Result<(NativeAddress, RecipientBinding), String> {
+    ) -> Result<(NativeAddress, RecipientBinding, Option<PathBuf>), String> {
         let address = NativeAddress::parse(&attempt.fence.recipient).map_err(|e| e.to_string())?;
         if address.harness != Harness::Codex {
             return Err("not a Codex recipient".into());
         }
-        let (_, binding) = lock_registry(&self.registry).attest_recipient(&address)?;
+        let (attestation, binding, frontend) = self.message_recipient(&address)?;
         if binding.epoch != attempt.fence.endpoint_epoch {
             return Err("the endpoint epoch changed since the reservation".into());
         }
-        if !lock_registry(&self.registry).executable_qualified(&binding.executable) {
-            return Err("the Codex build on disk is no longer the qualified build".into());
+        if !matches!(
+            attestation.lifecycle(),
+            Lifecycle::Active | Lifecycle::Inactive
+        ) || (attempt.requested_mode == Mode::Auto
+            && attestation.lifecycle() != Lifecycle::Inactive)
+        {
+            return Err("recipient lifecycle changed before message hand-off".into());
         }
-        Ok((address, binding))
+        Ok((address, binding, frontend))
+    }
+
+    /// Takes an owned registry snapshot, releases its lock, revalidates current
+    /// OS/store/build/transcript facts and requires an exact-harness frontend
+    /// for application recipients. Failure holds before reservation or sending;
+    /// no native/history/status request or caller evidence is manufactured.
+    /// A final locked equality check rejects even same-epoch lifecycle changes
+    /// during validation/probing before returning to either attest or send.
+    /// Returns the selected frontend path with the snapshot, so send performs
+    /// no further discovery after that check; invocation still verifies peers.
+    fn message_recipient(
+        &self,
+        address: &NativeAddress,
+    ) -> Result<(Attestation, RecipientBinding, Option<PathBuf>), String> {
+        let candidate = { lock_registry(&self.registry).codex_message_candidate(address)? };
+        let result = candidate.validate()?;
+        let frontend = checked_frontend(
+            || {
+                if result.1.desktop_message_only
+                    || crate::os::process_env(result.1.harness.0, "CODEX_APP_TOOLS_PIPE_PATH")
+                        .is_some()
+                {
+                    self.desktop_directory.as_ref()
+                        .and_then(|directory| crate::desktop::frontend_for(directory, result.1.harness))
+                        .map(Some)
+                        .ok_or_else(|| "registered Codex application frontend not available yet (transient hold)".into())
+                } else {
+                    Ok(None)
+                }
+            },
+            || lock_registry(&self.registry).codex_message_current(&candidate),
+        )?;
+        Ok((result.0, result.1, frontend))
     }
 }
 
 impl DispatchCarrier for CodexQueueCarrier {
-    /// Attests Codex recipients from the registry; anything else is not
+    /// Attests Codex MESSAGE recipients from fresh snapshot validation; anything else is not
     /// this carrier's (an error, which core treats as a hold). Application hosts
     /// also require a live compatible frontend before consuming any send attempt.
     fn attest(&mut self, recipient: &NativeAddress) -> Result<Attestation, String> {
         if recipient.harness != Harness::Codex {
             return Err("not a Codex recipient".into());
         }
-        let (attestation, binding) = lock_registry(&self.registry).attest_recipient(recipient)?;
-        if crate::os::process_env(binding.harness.0, "CODEX_APP_TOOLS_PIPE_PATH").is_some()
-            && !self.desktop_directory.as_ref().is_some_and(|directory| {
-                crate::desktop::frontend_for(directory, binding.harness).is_some()
-            })
-        {
-            return Err(
-                "registered Codex application frontend not available yet (transient hold)".into(),
-            );
-        }
+        let (attestation, _, _) = self.message_recipient(recipient)?;
         Ok(attestation)
     }
 
@@ -126,7 +156,7 @@ impl DispatchCarrier for CodexQueueCarrier {
     /// the confined queue helper. A selected application route never falls back
     /// after a failed or ambiguous exchange, preventing duplicate delivery.
     fn send(&mut self, attempt: &AttemptRecord) -> Outcome {
-        let (address, binding) = match self.binding_for(attempt) {
+        let (address, binding, frontend) = match self.binding_for(attempt) {
             Ok(found) => found,
             Err(reason) => {
                 return Outcome::KnownUnsent {
@@ -139,23 +169,14 @@ impl DispatchCarrier for CodexQueueCarrier {
             attempt.fence.attempt_seq,
             prefix_within(&attempt.fence.manifest_hash, 16)
         );
-        if crate::os::process_env(binding.harness.0, "CODEX_APP_TOOLS_PIPE_PATH").is_some() {
-            if let Some(directory) = &self.desktop_directory
-                && let Some(frontend) = crate::desktop::frontend_for(directory, binding.harness)
-            {
-                return crate::desktop::via_frontend(
-                    &frontend,
-                    binding.harness,
-                    &address.native_session_id,
-                    &client_id,
-                    &attempt.manifest,
-                );
-            }
-            return Outcome::KnownUnsent {
-                evidence:
-                    "source-labelled application delivery needs its registered Bridge MCP frontend"
-                        .into(),
-            };
+        if let Some(frontend) = frontend {
+            return crate::desktop::via_frontend(
+                &frontend,
+                binding.harness,
+                &address.native_session_id,
+                &client_id,
+                &attempt.manifest,
+            );
         }
         let helper = Helper {
             sandbox: &self.sandbox,
@@ -165,6 +186,20 @@ impl DispatchCarrier for CodexQueueCarrier {
         };
         helper.queue_add(&address.native_session_id, &client_id, &attempt.manifest)
     }
+}
+
+/// Runs all frontend discovery/probing in `pick` before the final in-memory
+/// binding confirmation in `confirm`. Returns the selected Desktop path or
+/// None for a positively selected CLI route; either error refuses the hand-off.
+/// Callbacks must preserve that ordering and perform no native message writes.
+/// This fence detects changes during selection, not cancellation after invocation.
+pub(crate) fn checked_frontend(
+    pick: impl FnOnce() -> Result<Option<PathBuf>, String>,
+    confirm: impl FnOnce() -> Result<(), String>,
+) -> Result<Option<PathBuf>, String> {
+    let frontend = pick()?;
+    confirm()?;
+    Ok(frontend)
 }
 
 /// Classifies the native answer to a written `thread/queue/add`.

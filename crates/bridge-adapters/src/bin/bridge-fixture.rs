@@ -15,6 +15,12 @@
 //!   - `{"cmd":"mcp","socket":..,"meta":{..}}` runs `bridge-fixture mcp`
 //!     as its child (a harness-launched MCP server) and answers its
 //!     attestation result.
+//!   - `{"cmd":"desktop_frontend","node":..,"channel":..}` starts one
+//!     test-provisioned Node primary and its Rust typed relay under this exact
+//!     harness. Both inputs are UTF-8 paths; the native mock pipe is inherited
+//!     from this harness, never supplied by the command. Answers `ok` only
+//!     after reading `ready`. Missing inputs, spawn/read errors or wrong
+//!     readiness panic. Call once; stdin EOF or exit closes/reaps the child.
 //!   - `{"cmd":"inbox","behavior":..,"session_id":..}` starts a fake
 //!     Claude inbox owned by this process and writes its descriptor and
 //!     key into `$CLAUDE_CONFIG_DIR/sessions`. Behaviors: `held`,
@@ -28,7 +34,7 @@
 //!   - `{"cmd":"mcp_server","args":[channel,core,token,evidence],"requests":[..]}`
 //!     runs `bridge-fixture mcp-server` as its child, sends the JSON-RPC
 //!     requests and answers the responses of those with an id.
-//!   - `{"cmd":"exit"}` exits.
+//!   - `{"cmd":"exit"}` closes/reaps an owned Desktop child, then exits.
 //! - `bridge-fixture mcp <socket>` (or `mcp-seal`) with `_meta` JSON on
 //!   stdin: attests through `RegistryAttestor` (sealing a proof) and prints
 //!   the result. The harness `mcp` command takes `"seal": true`.
@@ -60,7 +66,7 @@
 //!   `$CODEX_HOME/probe_port`, spawning `/usr/bin/true`) and records the
 //!   results in `$CODEX_HOME/probe.json`.
 
-use std::io::{BufRead, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -181,9 +187,17 @@ fn start_inbox(state: Arc<Mutex<Inbox>>, session: &str, behavior: String) -> Val
     json!({"ok": true, "socket": socket})
 }
 
-/// Runs the harness command loop.
+/// Serves line-delimited fixture commands from stdin and replies on stdout.
+/// Malformed JSON is skipped; unknown commands return an error. The optional
+/// desktop_frontend command requires UTF-8 node/channel paths, inherits this
+/// harness's mock pipe, and replies only after child readiness; missing inputs,
+/// spawn/read failure or unexpected readiness panic. Tests call it at most once.
+/// The harness owns the child stdin until EOF/exit, then closes it and waits for
+/// reaping. Other commands and their inputs are listed in the module inventory.
 fn harness() {
     let inbox = Arc::new(Mutex::new(Inbox::default()));
+    // Owned independent Desktop frontend lives under this exact harness.
+    let mut frontend = None;
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -192,6 +206,10 @@ fn harness() {
             continue;
         };
         let reply = match command["cmd"].as_str().unwrap_or_default() {
+            "desktop_frontend" => {
+                frontend = Some(start_desktop_frontend(&command));
+                json!({"ok": true})
+            }
             "hook" => run_hook(&command),
             "delayed_hook" => run_delayed_hook(&command),
             "mcp" => run_mcp(&command),
@@ -235,12 +253,40 @@ fn harness() {
                     .unwrap_or_default();
                 json!({"sent": send_receipt(&from, msg_id, command["status"].as_str().unwrap_or_default(), command["close"].as_bool() == Some(true))})
             }
-            "exit" => return,
+            "exit" => break,
             _ => json!({"error": "unknown command"}),
         };
         let _ = writeln!(stdout, "{reply}");
         let _ = stdout.flush();
     }
+    if let Some(mut child) = frontend {
+        drop(child.stdin.take());
+        let _ = child.wait();
+    }
+}
+
+/// Starts an owned Node primary and Rust typed relay under this fixture harness,
+/// inheriting only the fixture's native mock pipe. `node` and `channel` name
+/// test-provisioned resources; readiness is required before returning the child.
+/// The harness retains stdin and closes/reaps the child on its own shutdown.
+fn start_desktop_frontend(command: &Value) -> std::process::Child {
+    let mut child = Command::new(command["node"].as_str().expect("node"))
+        .arg("-e")
+        .arg(include_str!("../../assets/desktop-client.cjs"))
+        .arg("--")
+        .arg(std::env::current_exe().expect("fixture"))
+        .arg("desktop-child")
+        .arg(command["channel"].as_str().expect("channel"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("frontend");
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().expect("ready pipe"))
+        .read_line(&mut line)
+        .expect("read readiness");
+    assert_eq!(line.trim(), "ready");
+    child
 }
 
 /// Runs an owned qualified hook peer with controlled confirmation latency.

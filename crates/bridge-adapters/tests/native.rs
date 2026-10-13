@@ -2979,3 +2979,450 @@ fn legacy_native_claude_descriptor_delivers_without_any_recipient_hook() {
     drop(carrier);
     receiver.stop();
 }
+/// A root end after positive Desktop idleness delivers exactly once through an
+/// independent same-harness typed frontend, including private journal recovery.
+/// Normal caller/recipient authority remains retired; lost acknowledgement is
+/// Unknown and never replayed or sent through the deliberately absent CLI helper.
+#[test]
+fn desktop_idle_end_retains_message_only_wake_fact() {
+    use bridge_adapters::server::private_directory;
+    use bridge_adapters::{ChannelServer, Registry};
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+    let Some(node) = std::env::var("BRIDGE_TEST_NODE").ok() else {
+        panic!("BRIDGE_TEST_NODE is required for this deterministic Desktop regression");
+    };
+    for case in ["accepted", "restart", "lost"] {
+        let mut lab = Lab::new("idleend");
+        let pipe = lab.dir.0.join("native.sock");
+        let host = UnixListener::bind(&pipe).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let lost = case == "lost";
+        let native = std::thread::spawn(move || {
+            let (mut stream, _) = host.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            for id in [1, 2] {
+                let mut head = [0; 4];
+                stream.read_exact(&mut head).unwrap();
+                let size = u32::from_le_bytes(head) as usize;
+                assert!(size < 131072);
+                let mut bytes = vec![0; size];
+                stream.read_exact(&mut bytes).unwrap();
+                let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(request["id"], id);
+                let result = if id == 1 {
+                    assert_eq!(request["method"], "tools/list");
+                    json!({"tools":[{"name":"send_message_to_thread","namespace":"codex_app"}]})
+                } else {
+                    assert_eq!(request["method"], "tools/call");
+                    assert_eq!(request["params"]["arguments"]["threadId"], "idle-end");
+                    assert_eq!(request["params"]["callerSource"], "codex");
+                    assert!(
+                        request["params"]["arguments"]["prompt"]
+                            .as_str()
+                            .unwrap()
+                            .contains("idle wake marker")
+                    );
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    if lost {
+                        return;
+                    }
+                    json!({"success":true})
+                };
+                let bytes =
+                    serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"result":result})).unwrap();
+                stream
+                    .write_all(&(bytes.len() as u32).to_le_bytes())
+                    .unwrap();
+                stream.write_all(&bytes).unwrap();
+            }
+        });
+        let transcript = lab.codex_store.join("sessions").join("idle.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, "").unwrap();
+        let mut receiver = Harnessed::start_desktop(&lab.codex_store, &pipe);
+        receiver.cmd(json!({"cmd":"desktop_frontend","node":node,"channel":lab.socket}));
+        let address = lab.codex_address("idle-end");
+        let mut start = hook("SessionStart", "idle-end");
+        start["transcript_path"] = json!(transcript);
+        receiver.hook(&lab.socket, Harness::Codex, start);
+        receiver.hook(
+            &lab.socket,
+            Harness::Codex,
+            tool_hook("PreToolUse", "idle-end", "valid-control-call", None),
+        );
+        let control = receiver.mcp(
+            &lab.socket,
+            json!({"threadId":"idle-end","callId":"valid-control-call","x-codex-turn-metadata":{}}),
+        );
+        assert_eq!(control["ok"]["address"], address.to_canonical_string());
+        receiver.hook(
+            &lab.socket,
+            Harness::Codex,
+            tool_hook("PreToolUse", "idle-end", "old-idle-call", None),
+        );
+        receiver.hook(&lab.socket, Harness::Codex, hook("Stop", "idle-end"));
+        receiver.hook(&lab.socket, Harness::Codex, hook("SessionEnd", "idle-end"));
+        assert!(
+            lab.registry
+                .lock()
+                .unwrap()
+                .attest_recipient(&address)
+                .is_err()
+        );
+        assert_eq!(
+            receiver.mcp(
+                &lab.socket,
+                json!({"threadId":"idle-end","callId":"old-idle-call","x-codex-turn-metadata":{}}),
+            )["err"],
+            "stale",
+            "unconsumed valid call must reach the retired binding gate"
+        );
+        if case == "restart" {
+            lab.channel.take().unwrap().stop();
+            let owner = private_directory(lab.socket.parent().unwrap()).unwrap();
+            lab.registry = Arc::new(Mutex::new(
+                Registry::new(lab.config.clone(), owner).unwrap(),
+            ));
+            lab.channel = Some(
+                ChannelServer::start(
+                    &lab.socket,
+                    Arc::clone(&lab.registry),
+                    Arc::clone(&lab.storage) as Arc<dyn Custody>,
+                    DispatchTiming::default(),
+                )
+                .unwrap(),
+            );
+            assert!(
+                lab.registry
+                    .lock()
+                    .unwrap()
+                    .attest_recipient(&address)
+                    .is_err()
+            );
+        }
+        let mut carrier = CodexQueueCarrier::new(
+            Arc::clone(&lab.registry),
+            "/absent-helper".into(),
+            Duration::from_secs(1),
+        )
+        .with_desktop_directory(lab.socket.parent().unwrap().into());
+        lab.publish(
+            "idle-end-message",
+            &address,
+            Mode::Message,
+            "idle wake marker",
+        );
+        let timing = DispatchTiming::default();
+        let report = dispatch_message(&lab.storage, &mut carrier, &address, &now, &timing).unwrap();
+        let expected = if lost {
+            AttemptState::OutcomeUnknown
+        } else {
+            AttemptState::NativeAccepted
+        };
+        assert!(
+            matches!(report, DispatchReport::Sent { state, .. } if state == expected),
+            "{case}: {report:?}"
+        );
+        native.join().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        for _ in 0..2 {
+            assert!(!matches!(
+                dispatch_message(&lab.storage, &mut carrier, &address, &now, &timing).unwrap(),
+                DispatchReport::Sent { .. }
+            ));
+        }
+        assert_eq!(lab.attempt("idle-end-message").unwrap().state, expected);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let snapshot: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(lab.socket.with_extension("bindings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(snapshot["bindings"][0]["desktop_idle_message"], true);
+        receiver.stop();
+    }
+}
+
+/// Root-end eligibility never overrides input/unknown/active state, CLI/Claude
+/// retirement, missing/changed/archived/symlink transcripts, current profile/build,
+/// exact harness frontend or operator no-wake. Every refused dispatch has zero
+/// attempts and zero native connections, including legacy journal recovery.
+#[test]
+fn desktop_idle_end_negative_evidence_never_sends() {
+    use bridge_adapters::server::private_directory;
+    use bridge_adapters::{ChannelServer, Registry};
+    use std::os::unix::{fs::symlink, net::UnixListener};
+    let node = std::env::var("BRIDGE_TEST_NODE").expect("BRIDGE_TEST_NODE required");
+    for case in [
+        "active",
+        "permission",
+        "unknown",
+        "cli",
+        "claude",
+        "missing",
+        "moved",
+        "archived",
+        "symlink",
+        "foreign",
+        "swapped",
+        "invalid_path",
+        "missing_at_end",
+        "build",
+        "store",
+        "harness",
+        "other_harness",
+        "absent_frontend",
+        "legacy",
+        "renewed",
+        "no_wake",
+    ] {
+        let mut lab = Lab::new("idlehold");
+        let harness = if case == "claude" {
+            Harness::ClaudeCode
+        } else {
+            Harness::Codex
+        };
+        let store = if harness == Harness::Codex {
+            &lab.codex_store
+        } else {
+            &lab.claude_store
+        };
+        let transcript = store.join("sessions").join("held.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, "").unwrap();
+        let pipe = lab.dir.0.join("native.sock");
+        let host = UnixListener::bind(&pipe).unwrap();
+        host.set_nonblocking(true).unwrap();
+        let mut receiver = if matches!(case, "cli" | "claude") {
+            Harnessed::start(harness, store)
+        } else {
+            Harnessed::start_desktop(store, &pipe)
+        };
+        if !matches!(case, "cli" | "claude" | "absent_frontend" | "other_harness") {
+            receiver.cmd(json!({"cmd":"desktop_frontend","node":node,"channel":lab.socket}));
+        }
+        let mut sibling = if case == "other_harness" {
+            let mut sibling = Harnessed::start_desktop(store, &pipe);
+            sibling.cmd(json!({"cmd":"desktop_frontend","node":node,"channel":lab.socket}));
+            Some(sibling)
+        } else {
+            None
+        };
+        let address = if harness == Harness::Codex {
+            lab.codex_address("held")
+        } else {
+            lab.claude_address("held")
+        };
+        let mut start = hook(
+            if case == "unknown" {
+                "SubagentStop"
+            } else {
+                "SessionStart"
+            },
+            "held",
+        );
+        start["transcript_path"] = json!(transcript);
+        if case == "invalid_path" {
+            start["transcript_path"] = json!(lab.dir.0.join("outside.jsonl"));
+        }
+        receiver.hook(&lab.socket, harness, start);
+        if case != "unknown" {
+            receiver.hook(
+                &lab.socket,
+                harness,
+                hook(
+                    match case {
+                        "active" => "UserPromptSubmit",
+                        "permission" => "PermissionRequest",
+                        _ => "Stop",
+                    },
+                    "held",
+                ),
+            );
+        }
+        if case == "missing_at_end" {
+            std::fs::remove_file(&transcript).unwrap();
+        }
+        receiver.hook(&lab.socket, harness, hook("SessionEnd", "held"));
+        assert!(
+            lab.registry
+                .lock()
+                .unwrap()
+                .attest_recipient(&address)
+                .is_err()
+        );
+        match case {
+            "missing_at_end" => std::fs::write(&transcript, "").unwrap(),
+            "swapped" => {
+                let replacement = transcript.with_extension("replacement");
+                std::fs::write(&replacement, "").unwrap();
+                std::fs::rename(replacement, &transcript).unwrap();
+            }
+            "renewed" => {
+                receiver.hook(&lab.socket, harness, hook("SessionStart", "held"));
+                receiver.hook(&lab.socket, harness, hook("PermissionRequest", "held"));
+                let snapshot: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(lab.socket.with_extension("bindings.json")).unwrap(),
+                )
+                .unwrap();
+                assert!(
+                    snapshot["bindings"][0]
+                        .get("desktop_idle_message")
+                        .is_none()
+                );
+            }
+            "missing" => std::fs::remove_file(&transcript).unwrap(),
+            "moved" | "archived" => {
+                let destination = lab.codex_store.join("archived_sessions");
+                std::fs::create_dir_all(&destination).unwrap();
+                std::fs::rename(&transcript, destination.join("held.jsonl")).unwrap();
+            }
+            "symlink" => {
+                let retained = lab.codex_store.join("sessions").join("other.jsonl");
+                std::fs::rename(&transcript, &retained).unwrap();
+                symlink(&retained, &transcript).unwrap();
+            }
+            "foreign" => {
+                let outside = lab.dir.0.join("foreign.jsonl");
+                std::fs::rename(&transcript, &outside).unwrap();
+                symlink(&outside, &transcript).unwrap();
+            }
+            "no_wake" => {
+                lab.storage
+                    .lock()
+                    .unwrap()
+                    .set_no_wake(
+                        &address.to_canonical_string(),
+                        true,
+                        Some("owner pause"),
+                        "operator",
+                        now(),
+                    )
+                    .unwrap();
+            }
+            _ => {}
+        }
+        if matches!(case, "build" | "store" | "harness" | "legacy") {
+            lab.channel.take().unwrap().stop();
+            let journal = lab.socket.with_extension("bindings.json");
+            let mut snapshot: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+            if case == "legacy" {
+                snapshot["bindings"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("desktop_idle_message");
+                snapshot["bindings"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("desktop_idle_transcript");
+            } else if case == "harness" {
+                snapshot["bindings"][0]["harness"][1] = json!(0);
+            }
+            std::fs::write(&journal, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+            let mut config = lab.config.clone();
+            if case == "build" {
+                config.profiles[1].executables[0].sha256 = "0".repeat(64);
+            }
+            if case == "store" {
+                config.profiles[1].store = lab.claude_store.clone();
+            }
+            let owner = private_directory(lab.socket.parent().unwrap()).unwrap();
+            lab.registry = Arc::new(Mutex::new(Registry::new(config, owner).unwrap()));
+            lab.channel = Some(
+                ChannelServer::start(
+                    &lab.socket,
+                    Arc::clone(&lab.registry),
+                    Arc::clone(&lab.storage) as Arc<dyn Custody>,
+                    DispatchTiming::default(),
+                )
+                .unwrap(),
+            );
+        }
+        let mut carrier = CodexQueueCarrier::new(
+            Arc::clone(&lab.registry),
+            "/absent-helper".into(),
+            Duration::from_secs(1),
+        )
+        .with_desktop_directory(lab.socket.parent().unwrap().into());
+        lab.publish("held-event", &address, Mode::Message, "must remain held");
+        let report = dispatch_message(
+            &lab.storage,
+            &mut carrier,
+            &address,
+            &now,
+            &DispatchTiming::default(),
+        )
+        .unwrap();
+        assert!(
+            !matches!(report, DispatchReport::Sent { .. }),
+            "{case}: {report:?}"
+        );
+        assert!(
+            lab.attempt("held-event").is_none(),
+            "{case}: consumed attempt"
+        );
+        assert!(
+            matches!(host.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "{case}: native connection"
+        );
+        receiver.stop();
+        if let Some(sibling) = sibling.take() {
+            sibling.stop();
+        }
+    }
+}
+
+/// A live Codex route admitted through a canonical store alias remains eligible
+/// for ordinary MESSAGE attestation with its original inject capability. This
+/// exercises fresh carrier validation; retired transcript path rules are separate.
+#[test]
+fn codex_live_store_alias_preserves_message_and_inject_capabilities() {
+    use bridge_core::dispatch::{DispatchCarrier, Lifecycle, Selection};
+    use std::os::unix::fs::symlink;
+    let lab = Lab::new("storealias");
+    let alias = lab.dir.0.join("codex-alias");
+    symlink(&lab.codex_store, &alias).unwrap();
+    let mut receiver = Harnessed::start(Harness::Codex, &alias);
+    let address = lab.codex_address("aliased-live");
+    let admitted = receiver.hook(
+        &lab.socket,
+        Harness::Codex,
+        hook("SessionStart", "aliased-live"),
+    );
+    assert_eq!(admitted["status"], 0);
+    let mut carrier = CodexQueueCarrier::new(
+        Arc::clone(&lab.registry),
+        "/absent-helper".into(),
+        Duration::from_secs(1),
+    );
+    let attestation = carrier.attest(&address).unwrap();
+    assert_eq!(attestation.lifecycle(), Lifecycle::Inactive);
+    receiver.hook(
+        &lab.socket,
+        Harness::Codex,
+        hook("UserPromptSubmit", "aliased-live"),
+    );
+    lab.publish(
+        "alias-auto",
+        &address,
+        Mode::Auto,
+        "aliased inject capability",
+    );
+    let active = carrier.attest(&address).unwrap();
+    assert_eq!(active.lifecycle(), Lifecycle::Active);
+    let inject = lab
+        .storage
+        .lock()
+        .unwrap()
+        .drain_inject(&active, now(), &DispatchTiming::default())
+        .unwrap();
+    match inject {
+        Selection::Attempt(record) => assert_eq!(record.granted, "inject,message"),
+        other => panic!("active auto must retain inject capability: {other:?}"),
+    }
+    receiver.stop();
+}

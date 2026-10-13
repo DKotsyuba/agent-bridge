@@ -268,19 +268,34 @@ impl Harnessed {
     /// Starts a CLI fixture harness whose store variable names `store`, stripping
     /// real Desktop capabilities so owned stand-ins cannot select the GUI route.
     pub fn start(harness: Harness, store: &Path) -> Harnessed {
+        Self::start_with_app(harness, store, None)
+    }
+
+    /// Starts an owned Codex Desktop stand-in with its own native pipe capability;
+    /// no installed application, frontend, or caller evidence is fabricated.
+    pub fn start_desktop(store: &Path, pipe: &Path) -> Harnessed {
+        Self::start_with_app(Harness::Codex, store, Some(pipe))
+    }
+
+    /// Starts the fixture with the specified store and optional owned Desktop pipe;
+    /// inherited application capabilities are removed for CLI stand-ins.
+    fn start_with_app(harness: Harness, store: &Path, pipe: Option<&Path>) -> Harnessed {
         let variable = match harness {
             Harness::Codex => "CODEX_HOME",
             Harness::ClaudeCode => "CLAUDE_CONFIG_DIR",
         };
-        let mut child = Command::new(fixture_exe())
+        let mut command = Command::new(fixture_exe());
+        command
             .arg("harness")
             .env(variable, store)
             .env_remove("CODEX_APP_TOOLS_PIPE_PATH")
             .env_remove("CODEX_MCP_NODE_PATH")
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stdout(Stdio::piped());
+        if let Some(pipe) = pipe {
+            command.env("CODEX_APP_TOOLS_PIPE_PATH", pipe);
+        }
+        let mut child = command.spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         Harnessed {
