@@ -52,8 +52,9 @@ automatically repeated after a possible handoff.
     revisions is indistinguishable from stale input and stays superseded;
     the supported declared signals are a new stream id or an audited
     transfer to a different publisher identity — cross-publisher isolation
-    does not cover this case. The schema is versioned (current: 5); versions
-    2, 3 and 4 migrate forward in one transaction without touching accepted
+    does not cover this case. The schema is versioned (current: 6); the additive
+    5-to-6 migration preserves accepted bytes, hashes, identifiers and uncertain
+    attempt history. Versions 2, 3 and 4 migrate forward in one transaction without touching accepted
     bytes, hashes or identifiers (lineage owners are backfilled from the
     retained events and watermarks; a lineage with several historical
     producers migrates as *ambiguous* and fences publication and dispatch
