@@ -1,0 +1,29 @@
+[package]
+name = "bridge-adapters"
+description = "Agent Bridge native adapters: protected caller registry, root hooks and qualified Codex/Claude message carriers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bridge-protocol.workspace = true
+bridge-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+signal-hook = { workspace = true }
+sysinfo = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+
+[features]
+# Exposes explicit fixture constructors for consumer tests (never for
+# production builds): a test of the root-caller consumer can build a
+# VerifiedCaller without a live harness.
+test-fixtures = []
+
+[lints]
+workspace = true

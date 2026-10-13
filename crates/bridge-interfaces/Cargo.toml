@@ -1,0 +1,22 @@
+[package]
+name = "bridge-interfaces"
+description = "Agent Bridge interfaces: restricted root MCP and relay, operator recovery, outbound owner channel and product packaging."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bridge-adapters = { path = "../bridge-adapters" }
+bridge-client = { path = "../bridge-client" }
+bridge-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+signal-hook = { workspace = true }
+toml = { workspace = true }
+
+[lints]
+workspace = true

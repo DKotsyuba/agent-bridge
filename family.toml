@@ -1,0 +1,31 @@
+schema_version = 1
+product = "agent-bridge"
+repository = "https://github.com/DKotsyuba/agent-bridge"
+env_prefix = "AGENT_BRIDGE_"
+standard_version = "1.0.0-rc.2"
+devkit_version = "0.2.0"
+baseline = "rust-macos-2026-09-candidate1"
+# Local diagnostics and isolated package/lifecycle evidence exist; native
+# host, installed-host and Telegram qualification do not.
+qualification = "not_verified"
+
+[profiles]
+# Resident daemons (core + adapters, root relay) plus a harness-launched
+# stdio MCP frontend; not the in-process single-binary profile.
+process = "resident"
+state = "local"
+transports = ["stdio", "unix-socket"]
+host_adapter = true
+
+[compatibility]
+supported_protocol_revisions = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]
+candidate_targets = ["aarch64-apple-darwin"]
+qualified_targets = []
+qualified_hosts = []
+
+[release]
+enabled = false
+# Local bundle: release-manifest.json + SHA256SUMS + bin/ (six executables),
+# installed by install.sh with an out-of-band SHA256SUMS digest.
+delivery_profile = "bridge-bundle-v1"
+trust_profile = "local-build-digest"
