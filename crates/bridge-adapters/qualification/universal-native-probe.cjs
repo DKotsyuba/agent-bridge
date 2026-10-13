@@ -10,11 +10,14 @@
  * text; queue/custody acceptance alone fails this gate. Message observations
  * that the stock build cannot positively expose remain failures, never passes.
  * `--self-test` checks pure gates without processes, files or model effects.
+ * `--cleanup-existing <settings.json> <old-checks.json>` is a root-only,
+ * model-free queue/archive supplement; it never rewrites the failed run.
  */
 'use strict';
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { pathToFileURL } = require('node:url');
 const { isDeepStrictEqual } = require('node:util');
 const { run } = require('./probe-lib.cjs');
 const { networkFenceWitness, dbRows } = require('./lifecycle-lib.cjs');
@@ -209,17 +212,38 @@ function registrationProblem(calls, receipt, config) {
   return null;
 }
 
-/** Reads only attempt IDs/hashes/actors from this own database during an actual
- * registered cleanup. Reuses Probe.spawn's cleanup flag and bounded exit/stdio
- * collection; SQL failure is unproven, never an invented empty attempt set.
+/** Allows immutable SQLite only for a closed owned Bridge database: all tracked
+ * Bridge children positively exited zero and no WAL/SHM exists. Absence of an
+ * observed daemon is not exit proof. Live evidence queries never use this URI.
+ * @param {string} database Absolute owned database path.
+ * @param {{exitCode:number|null,signalCode:string|null}[]} daemons Actual tracked children.
+ * @param {boolean} wal Whether the database has a WAL sibling.
+ * @param {boolean} shm Whether the database has an SHM sibling.
+ * @returns {string} Properly escaped immutable SQLite URI.
+ * @throws {Error} Live/unverified processes, journal siblings or relative path.
+ */
+function immutableCleanupURI(database, daemons, wal, shm) {
+  if (!path.isAbsolute(database) || daemons.length === 0 || daemons.some(child => child.exitCode !== 0 || child.signalCode !== null) || wal || shm) {
+    throw new Error('immutable cleanup requires positively closed Bridge without WAL/SHM');
+  }
+  return `file:${pathToFileURL(database).pathname}?immutable=1`;
+}
+
+/** Reads only attempt IDs/hashes/actors from the positively closed own database
+ * during registered cleanup. Apple SQLite needs immutable mode after shutdown;
+ * the guard forbids applying it to live queries or ignoring uncheckpointed WAL.
+ * Reuses Probe.spawn's cleanup flag and bounded exit/stdio collection; SQL
+ * failure is unproven, never an invented empty attempt set.
  * @param {import('./probe-lib.cjs').Probe} probe Active registered cleanup owner.
  * @param {string} database Exact owned database path.
  * @returns {Promise<import('./lifecycle-lib.cjs').DbRow[]>} Actual readonly rows.
  * @throws {Error} Readonly process/output could not be verified.
  */
 async function cleanupAttempts(probe, database) {
+  const uri = immutableCleanupURI(database, probe.children.filter(entry => entry.name.startsWith('daemon-')).map(entry => entry.child),
+    fs.existsSync(`${database}-wal`), fs.existsSync(`${database}-shm`));
   const lines = [];
-  const child = probe.spawn('cleanup-attempts', '/usr/bin/sqlite3', ['-readonly', '-json', database,
+  const child = probe.spawn('cleanup-attempts', '/usr/bin/sqlite3', ['-readonly', '-json', uri,
     'SELECT attempt_seq,manifest_hash,actor FROM attempts'], { cleanup: true }, line => lines.push(line));
   const exit = await probe.exited(child, 10000);
   const entry = probe.children.find(entry => entry.child === child);
@@ -262,7 +286,8 @@ function messageContext(events, thread, clientId, marker) {
  * @param {Settings} settings Native executable/store.
  * @param {string[]} flags Already verified isolation flags.
  * @param {string} thread Exact owned recipient thread.
- * @param {string} marker Private expected marker, never logged as a request.
+ * @param {string|null} marker Private expected marker, never logged as a request;
+ * null selects metadata-only cleanup using exact previously observed client IDs.
  * @param {boolean} [cleanup] Whether called inside registered cleanup.
  * @returns {Promise<{id:string,clientUserMessageId:string,marker_present:boolean}[]|null>} Safe native readback or null when unproven.
  */
@@ -275,13 +300,73 @@ async function queueReadback(probe, settings, flags, thread, marker, cleanup = f
     let value;
     try { value = JSON.parse(line); } catch { return null; }
     if (value.id === 1 && value.result && Array.isArray(value.result.data)) return JSON.stringify({ id: 1, result: { data: value.result.data.map(item => ({
-      id: item.id, clientUserMessageId: item.clientUserMessageId, marker_present: JSON.stringify(item.input || []).includes(marker),
+      id: item.id, clientUserMessageId: item.clientUserMessageId, marker_present: marker !== null && JSON.stringify(item.input || []).includes(marker),
     })) } });
     return JSON.stringify({ id: value.id, result: value.result ? {} : null, error: value.error ? { code: value.error.code } : null });
   };
   const [reply] = await appServer(probe, settings.codex_executable, settings.codex_store,
     `queue-${cleanup ? 'cleanup' : 'observe'}-${thread}-${probe.children.length}`, flags, [['thread/queue/list', { threadId: thread }]], cleanup, keep);
   return reply && reply.result && Array.isArray(reply.result.data) ? reply.result.data : null;
+}
+
+/** Supplements cleanup of an already-completed owned run without replaying any
+ * producer operation or model turn. Root supplies its original settings and
+ * exact proof JSON. Only the old proof's actor/client pairs may be deleted or
+ * archived. Every helper is network/fork denied; configuration readback disables
+ * all MCP servers/hooks and clears per-launch instructions before cleanup RPCs.
+ * Original failures/proof are never rewritten; a fresh Probe writes its own
+ * cleanup supplement, scope and exits. No credentials are read/copied or sent.
+ * @param {Settings} settings Original root-native executable/store selection.
+ * @param {{dir:string,checks:object}} previous Explicit old owned proof.
+ * @returns {Promise<import('./probe-lib.cjs').Probe>} Supplement lifecycle result.
+ * @throws {Error} Proof scope/identity or original Bridge exit facts are invalid.
+ */
+function cleanupExisting(settings, previous) {
+  const facts = previous.checks, pairs = facts && facts.message_native_readback;
+  if (!previous.dir || !previous.dir.startsWith(`${TEMP_ROOT}/`) || path.resolve(previous.dir) !== previous.dir
+      || !facts || !facts.freeze || facts.freeze.candidate !== settings.frozen.candidate
+      || !Array.isArray(pairs) || pairs.length !== 2 || new Set(pairs.map(item => item.thread)).size !== 2
+      || pairs.some(item => !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(item.thread)
+        || !/^agent-bridge-[1-9][0-9]*-[a-f0-9]{16}$/.test(item.client_id)
+        || !(facts.receipts || []).some(receipt => receipt && receipt.publication.destination.address.endsWith(`/${item.thread}`)))) {
+    throw new Error('existing cleanup proof scope refused');
+  }
+  for (const name of ['daemon-before', 'daemon-after']) {
+    if (!facts.exits || !facts.exits[name] || facts.exits[name].code !== 0 || facts.exits[name].signal !== null) throw new Error('existing Bridge shutdown unverified');
+  }
+  return run('m2uc', 5 * 60000, ['cleanup_only_isolated', 'own_queue_removed', 'threads_archived_cleanup'], async probe => {
+    if (probe.sha256(settings.codex_executable) !== settings.frozen.sha256[settings.codex_executable]) throw new Error('existing native build changed');
+    probe.checks.original_scope = { dir: previous.dir, candidate: facts.freeze.candidate, pairs };
+    const base = [...DISABLED, '--enable', 'hooks', '-c', 'notify=[]', '-c', 'project_doc_max_bytes=0',
+      '-c', 'instructions=""', '-c', 'developer_instructions=""'];
+    const first = await gateRead(probe, settings.codex_executable, settings.codex_store, 'cleanup-isolation-first', base, '');
+    const servers = first.configFacts && first.configFacts.servers;
+    if (!first.hooks || first.overrideRejected || !servers || !Object.keys(servers).every(name => /^[A-Za-z0-9_-]+$/.test(name))
+        || first.hooks.some(hook => hook.own)) throw new Error('cleanup configuration unavailable');
+    const flags = [...base, ...stateOverride(first.hooks), ...Object.keys(servers).flatMap(name => ['-c', `mcp_servers.${name}.enabled=false`])];
+    const second = await gateRead(probe, settings.codex_executable, settings.codex_store, 'cleanup-isolation-confirm', flags, '');
+    probe.checks.cleanup_only_isolated = Boolean(!second.overrideRejected && second.hooks && second.hooks.every(hook => hook.enabled === false)
+      && second.configFacts && instructionsClosed(second.configFacts) && Object.keys(servers).every(name => second.configFacts.servers[name] === false));
+    if (!probe.checks.cleanup_only_isolated) throw new Error('cleanup isolation refused');
+    let queueRemoved = true, archived = true;
+    for (const item of pairs) {
+      const before = await queueReadback(probe, settings, flags, item.thread, null);
+      if (!before) queueRemoved = false;
+      for (const entry of (before || []).filter(entry => entry.clientUserMessageId === item.client_id)) {
+        const [deleted] = await appServer(probe, settings.codex_executable, settings.codex_store,
+          `cleanup-delete-${item.thread}-${entry.id}`, flags, [['thread/queue/delete', { threadId: item.thread, queuedSubmissionId: entry.id }]]);
+        queueRemoved = queueRemoved && Boolean(deleted && deleted.result);
+      }
+      const after = await queueReadback(probe, settings, flags, item.thread, null);
+      queueRemoved = queueRemoved && Boolean(after && after.every(entry => entry.clientUserMessageId !== item.client_id));
+      const [reply] = await appServer(probe, settings.codex_executable, settings.codex_store,
+        `cleanup-archive-${item.thread}`, flags, [['thread/archive', { threadId: item.thread }]]);
+      archived = archived && Boolean(reply && reply.result);
+    }
+    probe.checks.own_queue_removed = queueRemoved;
+    probe.checks.threads_archived_cleanup = archived;
+    probe.checks.model_requests = 0;
+  });
 }
 
 /** Observes a message after registration turns: accepts an already-consumed
@@ -611,11 +696,28 @@ function selfTest() {
   assert.equal(messageContext(consumed, 'foreign', 'client', 'hidden'), null);
   assert.equal(messageContext(consumed, 'thread', 'other-client', 'hidden'), null);
   assert.equal(messageContext(consumed.slice(0, -1), 'thread', 'client', 'hidden'), null);
+  const closed = [{ exitCode: 0, signalCode: null }, { exitCode: 0, signalCode: null }];
+  assert.equal(immutableCleanupURI('/owned/db with space', closed, false, false), 'file:/owned/db%20with%20space?immutable=1');
+  assert.throws(() => immutableCleanupURI('/owned/db', [], false, false));
+  assert.throws(() => immutableCleanupURI('/owned/db', [{ exitCode: null, signalCode: null }], false, false));
+  assert.throws(() => immutableCleanupURI('/owned/db', [{ exitCode: 1, signalCode: null }], false, false));
+  assert.throws(() => immutableCleanupURI('/owned/db', [{ exitCode: 0, signalCode: 'SIGTERM' }], false, false));
+  assert.throws(() => immutableCleanupURI('/owned/db', closed, true, false));
+  assert.throws(() => immutableCleanupURI('/owned/db', closed, false, true));
   console.log(JSON.stringify({ self_test: 'PASS' }));
 }
 
 if (require.main === module) {
   if (process.argv[2] === '--self-test') selfTest();
+  else if (process.argv[2] === '--cleanup-existing') {
+    if ([process.env.TMPDIR, process.env.TMP, process.env.TEMP].some(value => value !== TEMP_ROOT)) {
+      console.error('approved project temporary root required'); process.exitCode = 2;
+    } else {
+      const settings = JSON.parse(privateText(process.argv[3], 1024 * 1024));
+      const previous = JSON.parse(fs.readFileSync(process.argv[4], 'utf8'));
+      cleanupExisting(settings, previous).catch(() => { console.error('existing cleanup supplement failed'); process.exitCode = 1; });
+    }
+  }
   else if (process.env.BRIDGE_UNIVERSAL_PAID !== '1') { console.error('root model authorization required'); process.exitCode = 2; }
   else if ([process.env.TMPDIR, process.env.TMP, process.env.TEMP].some(value => value !== TEMP_ROOT)) {
     console.error('approved project temporary root required'); process.exitCode = 2;
@@ -624,3 +726,8 @@ if (require.main === module) {
     run('m2u', 15 * 60000, REQUIRED, probe => main(probe, settings));
   }
 }
+
+/** Root-only cleanup entry and pure immutable guard; importing has no effects.
+ * @type {{cleanupExisting:typeof cleanupExisting,immutableCleanupURI:typeof immutableCleanupURI}}
+ */
+module.exports = { cleanupExisting, immutableCleanupURI };
