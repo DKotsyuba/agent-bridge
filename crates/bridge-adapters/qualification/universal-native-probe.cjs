@@ -334,9 +334,10 @@ function cleanupExisting(settings, previous) {
   for (const name of ['daemon-before', 'daemon-after']) {
     if (!facts.exits || !facts.exits[name] || facts.exits[name].code !== 0 || facts.exits[name].signal !== null) throw new Error('existing Bridge shutdown unverified');
   }
-  return run('m2uc', 5 * 60000, ['cleanup_only_isolated', 'own_queue_removed', 'threads_archived_cleanup'], async probe => {
+  return run('m2uc', 5 * 60000, ['cleanup_only_isolated', 'own_queue_removed', 'threads_archived_cleanup', 'original_proof_unchanged'], async probe => {
     if (probe.sha256(settings.codex_executable) !== settings.frozen.sha256[settings.codex_executable]) throw new Error('existing native build changed');
-    probe.checks.original_scope = { dir: previous.dir, candidate: facts.freeze.candidate, pairs };
+    const proofPath = path.join(previous.dir, 'checks.json'), proofHash = probe.sha256(proofPath);
+    probe.checks.original_scope = { dir: previous.dir, proof_path: proofPath, proof_sha256: proofHash, candidate: facts.freeze.candidate, pairs };
     const base = [...DISABLED, '--enable', 'hooks', '-c', 'notify=[]', '-c', 'project_doc_max_bytes=0',
       '-c', 'instructions=""', '-c', 'developer_instructions=""'];
     const first = await gateRead(probe, settings.codex_executable, settings.codex_store, 'cleanup-isolation-first', base, '');
@@ -366,6 +367,7 @@ function cleanupExisting(settings, previous) {
     probe.checks.own_queue_removed = queueRemoved;
     probe.checks.threads_archived_cleanup = archived;
     probe.checks.model_requests = 0;
+    probe.checks.original_proof_unchanged = probe.sha256(proofPath) === proofHash;
   });
 }
 
