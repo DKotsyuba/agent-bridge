@@ -19,7 +19,7 @@ const { isDeepStrictEqual } = require('node:util');
 const { run } = require('./probe-lib.cjs');
 const { networkFenceWitness, dbRows } = require('./lifecycle-lib.cjs');
 const { MODEL, EFFORT, POLICY, DISABLED, EVENTS, ME_APPROVAL, gateRead, stateOverride, ownApprovalParsed, appServer } = require('./codex-native-probe.cjs');
-const { agentText, usageIncrement, hookRuns, hookFailures, ownHooksOnly, mcpInventoryVerdict, supportsFlag, instructionsClosed, keepLive } = require('./codex-lifecycle-probe.cjs');
+const { agentText, toolCalls, usageIncrement, hookRuns, hookFailures, ownHooksOnly, mcpInventoryVerdict, supportsFlag, instructionsClosed, keepLive } = require('./codex-lifecycle-probe.cjs');
 const { exchange, privateText, registrationParams, receiptsBound } = require('./raw-producer.cjs');
 
 /** Safe JSON data used by owned RPC/configuration fixtures.
@@ -76,9 +76,11 @@ function frozenMatches(probe, settings) {
  * @param {Settings} settings Explicit native executable/store paths.
  * @param {string} label Owned backend log label.
  * @param {string[]} flags Verified per-launch configuration.
+ * @param {() => void} observed Updates already-observed usage/evidence only;
+ * cannot start a model or native request, including during failure cleanup.
  * @returns {Backend} Process, native notifications and bounded RPC sender.
  */
-function backend(probe, settings, label, flags) {
+function backend(probe, settings, label, flags, observed) {
   const events = [], responses = new Map();
   let nextId = 0;
   const child = probe.spawn(label, settings.codex_executable, ['app-server', '--listen', 'stdio://', ...flags],
@@ -89,7 +91,7 @@ function backend(probe, settings, label, flags) {
       else if (message.id !== undefined) {
         probe.fail('unexpected_native_server_request');
         child.stdin.write(JSON.stringify({ id: message.id, error: { code: -32601, message: 'unsupported by owned probe' } }) + '\n');
-      } else events.push(message);
+      } else { events.push(message); observed(); }
     });
   child.stdin.on('error', () => {});
   return { child, events, request: async (method, params, ms = 30000) => {
@@ -146,7 +148,7 @@ async function inventory(probe, owner, thread, tool) {
  * @returns {Promise<{thread:string,turn_id:string,status:string,usage:object|null,text:string}>} Actual completed turn observations.
  */
 async function turn(probe, owner, thread, tool) {
-  const instruction = tool ? `Call ${tool} exactly once with {}. Then` : 'Do not call any tools. Only';
+  const instruction = tool ? `Call the MCP tool ${tool} on server bridge_probe (qualified name mcp__bridge_probe__${tool}) exactly once with {}. Then` : 'Do not call any tools. Only';
   const reply = await owner.request('turn/start', { threadId: thread,
     input: [{ type: 'text', text: `Owned Bridge qualification. ${instruction} quote every U_CTX_ marker actually visible in your context, or NONE. Do not read files, execute commands, browse, call other tools or delegate. Keep the reply short.`, text_elements: [] }],
     model: MODEL, effort: EFFORT, approvalPolicy: 'never', sandboxPolicy: { type: 'readOnly' } });
@@ -190,6 +192,68 @@ function usageLedger(owners, threads) {
     complete: turns.length > 0 && turns.every(item => item.status === 'completed' && item.usage && item.usage.increment > 0) };
 }
 
+/** Classifies actual native invocation/receipt evidence before delivery waits.
+ * Inventory alone is never an executed call. A missing receipt after execution
+ * is unresolved, not proof that no mutation committed; original IDs stay fixed.
+ * @param {{status:string,error:Json}[]} calls Completed native items of this tool.
+ * @param {{[key:string]:Json}|null} receipt Parsed safe journal, null when unavailable.
+ * @param {import('./raw-producer.cjs').Fixture} config Original actor intent.
+ * @returns {string|null} Static failure category, or null for qualified custody.
+ */
+function registrationProblem(calls, receipt, config) {
+  if (calls.length === 0) return 'fail_missing_native_call';
+  if (calls.length !== 1 || calls[0].status !== 'completed' || calls[0].error) return 'fail_native_call_not_completed_once';
+  if (!receipt) return 'fail_native_receipt_missing_unresolved';
+  if (receipt.evidence_state !== 'verified_at_registration' || receipt.assertion_present !== false
+      || !receiptsBound(config, receipt.registration, receipt.publication)) return 'fail_native_receipt_binding';
+  return null;
+}
+
+/** Reads only attempt IDs/hashes/actors from this own database during an actual
+ * registered cleanup. Reuses Probe.spawn's cleanup flag and bounded exit/stdio
+ * collection; SQL failure is unproven, never an invented empty attempt set.
+ * @param {import('./probe-lib.cjs').Probe} probe Active registered cleanup owner.
+ * @param {string} database Exact owned database path.
+ * @returns {Promise<import('./lifecycle-lib.cjs').DbRow[]>} Actual readonly rows.
+ * @throws {Error} Readonly process/output could not be verified.
+ */
+async function cleanupAttempts(probe, database) {
+  const lines = [];
+  const child = probe.spawn('cleanup-attempts', '/usr/bin/sqlite3', ['-readonly', '-json', database,
+    'SELECT attempt_seq,manifest_hash,actor FROM attempts'], { cleanup: true }, line => lines.push(line));
+  const exit = await probe.exited(child, 10000);
+  const entry = probe.children.find(entry => entry.child === child);
+  let timer;
+  const closed = await Promise.race([entry.closed, new Promise(resolve => { timer = setTimeout(() => resolve(false), 2000); })]);
+  clearTimeout(timer);
+  if (!exit || exit.code !== 0 || closed !== true) throw new Error('cleanup readonly attempts unavailable');
+  const rows = lines.length ? JSON.parse(lines.join('\n')) : [];
+  if (!Array.isArray(rows)) throw new Error('cleanup readonly attempts malformed');
+  return rows;
+}
+
+/** Recognizes an already-consumed native queue message on the exact owner:
+ * one user item binds actual client ID, thread, turn and hidden input marker;
+ * that same completed, measured turn must independently quote the marker.
+ * @param {{method:string,params:object}[]} events Actual owner notifications.
+ * @param {string} thread Frozen recipient thread.
+ * @param {string} clientId Actual attempt-derived native queue client ID.
+ * @param {string} marker Hidden fixture marker, never supplied in a prompt.
+ * @returns {{turn_id:string,text:string}|null} Positive context observation;
+ * null means incomplete/unmatched/duplicate evidence, never no-effect certainty.
+ */
+function messageContext(events, thread, clientId, marker) {
+  const users = events.filter(event => event.method === 'item/completed' && event.params && event.params.threadId === thread
+    && event.params.item && event.params.item.type === 'userMessage' && event.params.item.clientId === clientId
+    && JSON.stringify(event.params.item.content || []).includes(marker));
+  if (users.length !== 1 || !users[0].params.turnId) return null;
+  const id = users[0].params.turnId;
+  const done = events.find(event => event.method === 'turn/completed' && event.params && event.params.threadId === thread
+    && event.params.turn && event.params.turn.id === id && event.params.turn.status === 'completed');
+  const text = agentText(events, thread, id), usage = usageIncrement(events, thread, id);
+  return done && usage && usage.increment > 0 && text.includes(marker) ? { turn_id: id, text } : null;
+}
+
 /** Reads the native queue of an exact owned recipient through the existing
  * network/fork-denied App Server reader. The pre-write projection retains only
  * submission/client IDs and a hidden-marker match boolean, never queue payload.
@@ -216,13 +280,14 @@ async function queueReadback(probe, settings, flags, thread, marker, cleanup = f
     return JSON.stringify({ id: value.id, result: value.result ? {} : null, error: value.error ? { code: value.error.code } : null });
   };
   const [reply] = await appServer(probe, settings.codex_executable, settings.codex_store,
-    `queue-${cleanup ? 'cleanup' : 'observe'}-${thread.slice(0, 8)}`, flags, [['thread/queue/list', { threadId: thread }]], cleanup, keep);
+    `queue-${cleanup ? 'cleanup' : 'observe'}-${thread}-${probe.children.length}`, flags, [['thread/queue/list', { threadId: thread }]], cleanup, keep);
   return reply && reply.result && Array.isArray(reply.result.data) ? reply.result.data : null;
 }
 
-/** Observes a message after registration turns: first requires exact native
- * queue/client/hidden-input readback, then resumes the same owned thread and
- * observes an unsolicited reply or one short natural context-only turn. Before
+/** Observes a message after registration turns: accepts an already-consumed
+ * exact native user/client/turn/context join, or requires pending queue/client/
+ * hidden-input readback before resuming the same owned thread and observing
+ * an unsolicited reply or one short natural context-only turn. Before
  * any additional paid request, ALL prior observed turns must have completed,
  * measured usage below the shared ceiling; missing usage fails closed.
  * @param {import('./probe-lib.cjs').Probe} probe Root lifecycle.
@@ -252,10 +317,21 @@ async function messageObservation(probe, settings, owners, threads, cases, flags
     const attempt = dbRows(probe, database, `SELECT manifest_hash, actor FROM attempts WHERE attempt_seq=${seq}`)[0];
     if (!attempt || !/^[a-f0-9]{64}$/.test(attempt.manifest_hash) || attempt.actor !== threads[index]) throw new Error('message recipient attempt mismatch');
     const client = `agent-bridge-${seq}-${attempt.manifest_hash.slice(0, 16)}`;
+    await probe.until(() => messageContext(owners[index].events, threads[index], client, item.marker) !== null, 5000);
+    const consumed = messageContext(owners[index].events, threads[index], client, item.marker);
+    if (consumed) {
+      probe.checks.message_native_readback.push({ thread: threads[index], client_id: client, turn_id: consumed.turn_id, consumed_context: true });
+      texts.push(consumed.text); continue;
+    }
     const queue = await queueReadback(probe, settings, flags, threads[index], item.marker);
     const matching = queue && queue.filter(entry => entry.clientUserMessageId === client && entry.marker_present);
     probe.checks.message_native_readback.push({ thread: threads[index], client_id: client, matched: Boolean(matching && matching.length === 1) });
-    if (!matching || matching.length !== 1) throw new Error('message queue readback unavailable; custody is not context');
+    const raced = messageContext(owners[index].events, threads[index], client, item.marker);
+    if (raced) {
+      Object.assign(probe.checks.message_native_readback.at(-1), { turn_id: raced.turn_id, consumed_context: true });
+      texts.push(raced.text); continue;
+    }
+    if (!matching || matching.length !== 1) throw new Error('message pending/consumed evidence unavailable; custody is not context');
     const prior = usageLedger(owners, threads);
     probe.checks.model_usage = prior;
     if (!prior.complete || prior.tokens >= 150000 || prior.turns.length >= 4) throw new Error('prior model usage unavailable or exhausted');
@@ -343,6 +419,19 @@ async function main(probe, settings) {
     && ownedHooks.every(hook => hook.enabled && hook.trustStatus === 'trusted') && hooks.filter(hook => !hook.own).every(hook => !hook.enabled));
   if (!probe.checks.isolation_verified || !probe.checks.network_fence_witnessed) throw new Error('native isolation refused');
   const owners = [], threads = [];
+  /** Snapshots all already-observed native model effects and context arrival.
+   * Called on every notification and cleanup; never submits a native/model call.
+   * @returns {void}
+   */
+  const observed = () => {
+    const measured = usageLedger(owners, threads);
+    probe.checks.model_usage = measured;
+    probe.checks.usage_measured = measured.complete && measured.tokens <= 150000 && measured.turns.length <= (settings.mode === 'message' ? 4 : 2);
+    probe.checks.native_arrival_by_actor = cases.map((item, index) => Boolean(owners[index] && owners[index].events.some(event =>
+      event.method === 'item/completed' && event.params && event.params.threadId === threads[index]
+      && event.params.item && event.params.item.type === 'agentMessage' && String(event.params.item.text || '').includes(item.marker))));
+    if (measured.tokens > 150000 || measured.turns.length > (settings.mode === 'message' ? 4 : 2)) probe.fail('observed_all_turn_budget_exhausted');
+  };
   let nativeStarted = false;
   probe.onCleanup('owned-native-threads', async () => {
     for (const entry of probe.children.filter(entry => entry.name.startsWith('daemon-'))) {
@@ -350,9 +439,11 @@ async function main(probe, settings) {
       await probe.exited(entry.child, 10000);
     }
     for (const owner of owners) { try { process.kill(-owner.child.pid, 'SIGTERM'); } catch {} await probe.exited(owner.child, 10000); }
+    observed();
+    probe.checks.frozen_after_probe = frozenMatches(probe, settings);
     let queueRemoved = true;
     if (settings.mode === 'message' && nativeStarted) {
-      const attempts = dbRows(probe, database, 'SELECT attempt_seq,manifest_hash,actor FROM attempts');
+      const attempts = await cleanupAttempts(probe, database);
       const clients = attempts.filter(item => Number.isSafeInteger(item.attempt_seq) && /^[a-f0-9]{64}$/.test(item.manifest_hash)
         && threads.includes(item.actor)).map(item => `agent-bridge-${item.attempt_seq}-${item.manifest_hash.slice(0, 16)}`);
       for (const [index, thread] of threads.entries()) {
@@ -360,7 +451,7 @@ async function main(probe, settings) {
         if (!before) { queueRemoved = false; continue; }
         for (const item of before.filter(item => clients.includes(item.clientUserMessageId))) {
           const [deleted] = await appServer(probe, settings.codex_executable, settings.codex_store,
-            `delete-own-${thread.slice(0, 8)}`, flags, [['thread/queue/delete', { threadId: thread, queuedSubmissionId: item.id }]], true);
+            `delete-own-${thread}-${item.id}`, flags, [['thread/queue/delete', { threadId: thread, queuedSubmissionId: item.id }]], true);
           queueRemoved = queueRemoved && Boolean(deleted && deleted.result);
         }
         const after = await queueReadback(probe, settings, flags, thread, cases[index].marker, true);
@@ -370,13 +461,13 @@ async function main(probe, settings) {
     probe.checks.own_queue_removed = queueRemoved;
     let archived = true;
     for (const thread of threads) {
-      const [reply] = await appServer(probe, settings.codex_executable, settings.codex_store, `archive-${thread.slice(0, 8)}`, flags, [['thread/archive', { threadId: thread }]], true);
+      const [reply] = await appServer(probe, settings.codex_executable, settings.codex_store, `archive-${thread}`, flags, [['thread/archive', { threadId: thread }]], true);
       archived = archived && Boolean(reply && reply.result);
     }
     probe.checks.threads_archived_cleanup = archived;
   });
   for (const [index, item] of cases.entries()) {
-    const owner = backend(probe, settings, `backend-${index}`, [...flags, '-c', `mcp_servers.bridge_probe.args=${JSON.stringify(args(item.config))}`]);
+    const owner = backend(probe, settings, `backend-${index}`, [...flags, '-c', `mcp_servers.bridge_probe.args=${JSON.stringify(args(item.config))}`], observed);
     owners.push(owner);
     const init = await owner.request('initialize', { clientInfo: { name: 'bridge_universal_qualification', version: '1' }, capabilities: { experimentalApi: true } });
     if (!init || !init.result) throw new Error('native initialization refused');
@@ -415,6 +506,24 @@ async function main(probe, settings) {
   nativeStarted = true;
   const turns = await Promise.all(owners.map((owner, index) => turn(probe, owner, threads[index], tool)));
   probe.checks.turns = turns.map(({ text, ...facts }) => facts);
+  observed();
+  const receipts = cases.map(item => {
+    try {
+      const lines = privateText(item.value.receipt_file, 1024 * 1024).trim().split('\n').map(line => JSON.parse(line));
+      return lines.length === 1 ? lines[0] : null;
+    } catch { return null; }
+  });
+  probe.checks.receipts = receipts;
+  const problems = cases.map((item, index) => registrationProblem(toolCalls(owners[index].events, threads[index], tool), receipts[index], item.value));
+  probe.checks.registration_phase = problems.map((failure, index) => ({ actor: threads[index], failure }));
+  probe.checks.native_calls_registered = problems.every(failure => failure === null);
+  for (const [index, problem] of problems.entries()) if (problem) probe.fail(`${problem}:actor-${index}`);
+  if (!probe.checks.native_calls_registered) throw new Error('native registration phase failed before delivery observation');
+  probe.checks.actor_scopes_distinct = receipts[0].registration.caller_scope !== receipts[1].registration.caller_scope
+    && receipts[0].registration.destination_scope !== receipts[1].registration.destination_scope;
+  probe.checks.custody_bound = receipts.every((item, index) => receiptsBound(cases[index].value, item.registration, item.publication)
+    && item.publication.destination.address === `${host}/codex/${namespace}/${threads[index]}`);
+  if (!probe.checks.actor_scopes_distinct || !probe.checks.custody_bound) throw new Error('native receipt scope phase failed before delivery observation');
   const arrivalTexts = settings.mode === 'message'
     ? await messageObservation(probe, settings, owners, threads, cases, flags, core, token.token, database)
     : turns.map(item => item.text);
@@ -425,17 +534,6 @@ async function main(probe, settings) {
   probe.checks.no_unexpected_tools = owners.every(owner => !owner.events.some(event => event.method === 'item/completed'
     && event.params && event.params.item && (['commandExecution', 'fileChange', 'webSearch', 'collabAgentSpawn', 'imageView'].includes(event.params.item.type)
       || (event.params.item.type === 'mcpToolCall' && event.params.item.tool !== tool))));
-  const receipts = cases.map(item => {
-    const lines = privateText(item.value.receipt_file, 1024 * 1024).trim().split('\n').map(line => JSON.parse(line));
-    if (lines.length !== 1) throw new Error('one native registration expected');
-    return lines[0];
-  });
-  probe.checks.receipts = receipts;
-  probe.checks.native_calls_registered = receipts.every(item => item.evidence_state === 'verified_at_registration' && item.assertion_present === false);
-  probe.checks.actor_scopes_distinct = receipts[0].registration.caller_scope !== receipts[1].registration.caller_scope
-    && receipts[0].registration.destination_scope !== receipts[1].registration.destination_scope;
-  probe.checks.custody_bound = receipts.every((item, index) => receiptsBound(cases[index].value, item.registration, item.publication)
-    && item.publication.destination.address === `${host}/codex/${namespace}/${threads[index]}`);
   probe.checks.native_arrival = arrivalTexts.every((text, index) => text.includes(cases[index].marker));
   probe.checks.no_cross_talk = arrivalTexts.every((text, index) => !text.includes(cases[1 - index].marker));
   const beforeRestart = await Promise.all(cases.map((item, index) => exchange(core, token.token, `before-restart-${index}`, 'status',
@@ -494,6 +592,25 @@ function selfTest() {
     { method: 'thread/tokenUsage/updated', params: { threadId: 'thread', turnId: 'one', tokenUsage: { total: { totalTokens: 20 }, last: { totalTokens: 20 } } } }];
   assert.equal(usageLedger([{ events }], ['thread']).tokens, 20);
   assert.equal(usageLedger([{ events: [...events, { method: 'turn/started', params: { threadId: 'thread', turn: { id: 'unsolicited' } } }] }], ['thread']).complete, false);
+  const unsolicited = [{ method: 'turn/completed', params: { threadId: 'thread', turn: { id: 'two', status: 'completed' } } },
+    { method: 'thread/tokenUsage/updated', params: { threadId: 'thread', turnId: 'two', tokenUsage: { total: { totalTokens: 35 }, last: { totalTokens: 15 } } } }];
+  assert.equal(usageLedger([{ events: [...events, ...unsolicited] }], ['thread']).tokens, 35);
+  assert.equal(usageLedger([{ events: [...events, ...unsolicited] }], ['thread']).turns.length, 2);
+  const config = { request_id: 'req', operation_key: 'op', event_id: 'event' };
+  const registration = { producer: 'opaque', request_id: 'req', operation_key: 'op', route_key: 'route', caller_scope: 'actor', destination_scope: 'target' };
+  const publication = { producer: 'opaque', event_id: 'event', intent_hash: 'a'.repeat(64), envelope_hash: 'b'.repeat(64),
+    destination: { route_key: 'route', caller_scope: 'actor', destination_scope: 'target' } };
+  const receipt = { registration, publication, evidence_state: 'verified_at_registration', assertion_present: false };
+  assert.equal(registrationProblem([], receipt, config), 'fail_missing_native_call');
+  assert.equal(registrationProblem([{ status: 'completed', error: null }], null, config), 'fail_native_receipt_missing_unresolved');
+  assert.equal(registrationProblem([{ status: 'completed', error: null }], receipt, config), null);
+  const consumed = [...events, { method: 'item/completed', params: { threadId: 'thread', turnId: 'one',
+    item: { type: 'userMessage', clientId: 'client', content: [{ type: 'text', text: 'hidden' }] } } },
+    { method: 'item/completed', params: { threadId: 'thread', turnId: 'one', item: { type: 'agentMessage', text: 'hidden' } } }];
+  assert.equal(messageContext(consumed, 'thread', 'client', 'hidden').turn_id, 'one');
+  assert.equal(messageContext(consumed, 'foreign', 'client', 'hidden'), null);
+  assert.equal(messageContext(consumed, 'thread', 'other-client', 'hidden'), null);
+  assert.equal(messageContext(consumed.slice(0, -1), 'thread', 'client', 'hidden'), null);
   console.log(JSON.stringify({ self_test: 'PASS' }));
 }
 
