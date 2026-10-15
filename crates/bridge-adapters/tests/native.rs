@@ -112,9 +112,11 @@ fn claude_root_and_child_callers_join_single_use_records() {
     harness.stop();
 }
 
-/// Callers outside a qualified harness, harnesses with a foreign store and builds with a wrong digest are refused.
+/// Callers outside a marked harness process and a relabeled harness are refused,
+/// while a harness in an unlisted store and one beside a relay with a wrong digest
+/// register (neither a store path nor a relay digest is a recipient trust input).
 #[test]
-fn non_harness_callers_wrong_store_and_unqualified_builds_refuse() {
+fn non_harness_callers_and_relabeled_harnesses_refuse_while_unlisted_stores_register() {
     let lab = Lab::new("nh");
     let mut harness = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
     harness.hook(
@@ -149,7 +151,7 @@ fn non_harness_callers_wrong_store_and_unqualified_builds_refuse() {
         "root"
     );
     // The hook command's harness label (an argv value) cannot relabel a
-    // Claude harness as Codex: its own store is not the Codex profile's.
+    // Claude harness as Codex: the process carries no Codex product marker.
     let relabeled = harness.hook(&lab.socket, Harness::Codex, hook("SessionStart", "sess-2"));
     assert!(
         relabeled["stderr"]
@@ -160,7 +162,8 @@ fn non_harness_callers_wrong_store_and_unqualified_builds_refuse() {
     );
     harness.stop();
 
-    // A harness whose own store is not a configured profile is refused.
+    // A harness in a store no configuration names registers from its own hook:
+    // no store path or executable is predeclared.
     let foreign = lab.dir.0.join("foreign-store");
     std::fs::create_dir_all(&foreign).unwrap();
     let mut stranger = Harnessed::start(Harness::ClaudeCode, &foreign);
@@ -169,24 +172,27 @@ fn non_harness_callers_wrong_store_and_unqualified_builds_refuse() {
         Harness::ClaudeCode,
         hook("SessionStart", "sess-3"),
     );
+    assert_eq!(reply["status"], 0, "{reply}");
     assert!(
-        reply["stderr"].as_str().unwrap().contains("not_evidence"),
-        "{reply}"
+        lab.registry
+            .lock()
+            .unwrap()
+            .attest_recipient(&lab.claude_address("sess-3"))
+            .is_ok(),
+        "the dynamic store's session is a bound recipient"
     );
     stranger.stop();
 
-    // A build whose digest is not the qualified digest is refused.
-    let unqualified = Lab::with_digest("uq", Some("0".repeat(64)));
-    let mut harness = Harnessed::start(Harness::ClaudeCode, &unqualified.claude_store);
+    // The digests configured for Bridge's own relay are irrelevant to a native
+    // recipient: a wrong relay digest does not refuse a harness.
+    let mismatched = Lab::with_digest("uq", Some("0".repeat(64)));
+    let mut harness = Harnessed::start(Harness::ClaudeCode, &mismatched.claude_store);
     let reply = harness.hook(
-        &unqualified.socket,
+        &mismatched.socket,
         Harness::ClaudeCode,
         hook("SessionStart", "sess-4"),
     );
-    assert!(
-        reply["stderr"].as_str().unwrap().contains("not_evidence"),
-        "{reply}"
-    );
+    assert_eq!(reply["status"], 0, "{reply}");
     harness.stop();
 }
 
@@ -644,10 +650,11 @@ fn disabled_inbox_refuses_before_acceptance_and_absent_inbox_only_holds() {
     harness.stop();
 }
 
-/// A build not qualified for message stays without it even when its inbox
-/// is advertised: a late inbox never promotes beyond the qualified profile.
+/// A harness whose message carrier the host disabled stays without message even
+/// when its inbox is advertised: a late inbox never promotes beyond what the
+/// policy and host allow.
 #[test]
-fn late_inbox_never_promotes_an_unqualified_message_capability() {
+fn late_inbox_never_promotes_a_disabled_message_capability() {
     let lab = Lab::new("np");
     lab.registry
         .lock()
@@ -826,7 +833,7 @@ fn withdrawn_message_recovers_from_a_late_inbox_without_pending_work() {
 
 /// An observation taken under an old incarnation's snapshot never changes
 /// the renewed binding of the same session: the old process's disabled
-/// inbox cannot withdraw message from the new, qualified incarnation,
+/// inbox cannot withdraw message from the new, verified incarnation,
 /// which keeps receiving.
 #[test]
 fn an_old_incarnation_snapshot_never_changes_a_renewed_binding() {
@@ -1799,7 +1806,6 @@ fn daemon_composition_hands_probe_context_to_the_root_hook() {
     .unwrap();
     let address =
         bridge_core::NativeAddress::new(HOST, Harness::ClaudeCode, "claude-lab", "sess-d").unwrap();
-    let sha = bridge_adapters::registry::file_sha256(&fixture_exe()).unwrap();
     let config = format!(
         r#"database = "{db}"
 socket = "{core}"
@@ -1815,23 +1821,17 @@ policies = ["keep_all"]
 [adapters]
 channel = "{channel}"
 host_id = "{HOST}"
-[[adapters.profiles]]
-namespace = "claude-lab"
+[[adapters.harnesses]]
 harness = "ClaudeCode"
-store = "{store}"
-[[adapters.profiles.executables]]
-path = "{exe}"
-sha256 = "{sha}"
-version = "fixture"
+namespace = "claude-lab"
 inject = true
 message = true
+executable_markers = ["bridge-fixture"]
 "#,
         db = dir.0.join("b.db").display(),
         core = core.display(),
         recipient = address.to_canonical_string(),
         channel = channel.display(),
-        store = store.display(),
-        exe = fixture_exe().display(),
     );
     let config_path = dir.0.join("bridge.toml");
     std::fs::write(&config_path, config).unwrap();
@@ -2009,98 +2009,6 @@ message = true
         .status()
         .unwrap();
     assert!(daemon.wait().unwrap().success());
-}
-
-/// Runs one root drain under a profile whose version label is `label` and
-/// returns the drained attempt's frozen proof reference. Panics (fails the
-/// test) if the registry panics: the hook then gets no answer.
-fn drain_proof_with_label(label: &str) -> String {
-    let dir = TempDir::new("vl");
-    let store = dir.0.join("s");
-    std::fs::create_dir(&store).unwrap();
-    let channel_dir = dir.0.join("ch");
-    let owner = bridge_adapters::server::private_directory(&channel_dir).unwrap();
-    let socket = channel_dir.join("c.sock");
-    let sha = bridge_adapters::registry::file_sha256(&fixture_exe()).unwrap();
-    let mut profile = profile("claude-lab", Harness::ClaudeCode, &store, &sha);
-    profile.executables[0].version = label.to_string();
-    let config = bridge_adapters::registry::RegistryConfig {
-        host_id: HOST.into(),
-        profiles: vec![profile],
-        intermediates: ["/bin/sh", "/bin/bash", "/bin/zsh", "/bin/dash"]
-            .iter()
-            .map(std::path::PathBuf::from)
-            .collect(),
-        max_call_age_ms: 600_000,
-        relays: Vec::new(),
-        audiences: Vec::new(),
-    };
-    let registry = Arc::new(std::sync::Mutex::new(
-        bridge_adapters::Registry::new(config, owner).unwrap(),
-    ));
-    let limits = serde_json::from_value(json!({"max_admitted_events": 10})).unwrap();
-    let mut storage = bridge_core::Storage::open_in_memory(limits).unwrap();
-    storage.register_source_tag(PUBLISHER, PUBLISHER).unwrap();
-    let storage = Arc::new(std::sync::Mutex::new(storage));
-    let _channel = bridge_adapters::ChannelServer::start(
-        &socket,
-        Arc::clone(&registry),
-        Arc::clone(&storage) as Arc<dyn Custody>,
-        DispatchTiming::default(),
-    )
-    .unwrap();
-    let mut harness = Harnessed::start(Harness::ClaudeCode, &store);
-    let start = harness.hook(&socket, Harness::ClaudeCode, hook("SessionStart", "sess-v"));
-    assert_eq!(start["stderr"], "", "{start}");
-    let address =
-        bridge_core::NativeAddress::new(HOST, Harness::ClaudeCode, "claude-lab", "sess-v").unwrap();
-    let envelope = bridge_core::Envelope::new(
-        bridge_core::PublisherId::new(PUBLISHER).unwrap(),
-        bridge_core::EventId::new("evt-label").unwrap(),
-        address,
-        bridge_core::Kind::new("worker.completed").unwrap(),
-        Mode::Inject,
-        bridge_core::Policy::KeepAll,
-        bridge_core::Payload::new("label payload").unwrap(),
-        bridge_core::Metadata::new(),
-        None,
-    )
-    .unwrap();
-    storage.lock().unwrap().publish(&envelope, now()).unwrap();
-    let post = harness.hook(
-        &socket,
-        Harness::ClaudeCode,
-        tool_hook("PostToolUse", "sess-v", "tu-v", None),
-    );
-    harness.stop();
-    assert!(
-        post["stdout"].as_str().unwrap().contains("label payload"),
-        "{post}"
-    );
-    storage
-        .lock()
-        .unwrap()
-        .latest_attempt(PUBLISHER, "evt-label")
-        .unwrap()
-        .unwrap()
-        .proof_ref
-}
-
-/// A configured version label of any UTF-8 never panics the registry: an
-/// emoji-only label longer than the 256-byte proof bound, at four
-/// paddings, puts byte 256 inside a 4-byte character for at least one of
-/// them whatever the PID/start-time digits; every hook is admitted, the
-/// root drain hands the manifest, and the frozen proof reference stays
-/// within core's bound, cut on a character boundary.
-#[test]
-fn multibyte_version_label_is_bounded_in_proof_references() {
-    for pad in 0..4 {
-        let label = format!("{}{}", "x".repeat(pad), "🙂".repeat(80));
-        assert!(label.len() > 256);
-        let proof = drain_proof_with_label(&label);
-        assert!(proof.len() <= 256, "{}", proof.len());
-        assert!(proof.contains("🙂"), "{proof}");
-    }
 }
 
 /// Lifecycle of a recipient as the message carrier would see it.
@@ -2869,9 +2777,12 @@ fn recipient_routes_recover_after_restart_without_recipient_activity() {
     );
     drop(carrier);
     lab.channel.take().unwrap().stop();
-    // A changed qualification cannot be resurrected by private cached metadata.
+    // A harness the policy no longer serves cannot be resurrected by private
+    // cached metadata.
     let mut changed = lab.config.clone();
-    changed.profiles[0].executables[0].sha256 = "0".repeat(64);
+    changed
+        .harnesses
+        .retain(|policy| policy.harness != Harness::ClaudeCode);
     let journal = lab.socket.with_extension("bindings.json");
     let cached = std::fs::read(&journal).unwrap();
     let mut unqualified = Registry::new(changed, owner).unwrap();
@@ -2891,263 +2802,9 @@ fn recipient_routes_recover_after_restart_without_recipient_activity() {
     assert!(foreign.attach_journal(&journal, now()).is_err());
 }
 
-/// An interactive native descriptor bootstraps a missing legacy route with no
-/// recipient hook or bridge_me; unknown native states remain held and no caller
-/// records or inject context are fabricated by descriptor discovery.
-#[test]
-fn legacy_native_claude_descriptor_delivers_without_any_recipient_hook() {
-    let lab = Lab::new("legacy");
-    let address = lab.claude_address("legacy-open");
-    let mut receiver = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
-    receiver.cmd(json!({"cmd":"inbox","session_id":"legacy-open","behavior":"delivered"}));
-    let file = lab
-        .claude_store
-        .join("sessions")
-        .join(format!("{}.json", receiver.child.id()));
-    let mut descriptor: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
-    descriptor["kind"] = json!("interactive");
-    descriptor["status"] = json!("idle");
-    std::fs::write(&file, serde_json::to_vec(&descriptor).unwrap()).unwrap();
-    assert!(
-        lab.registry
-            .lock()
-            .unwrap()
-            .attest_recipient(&address)
-            .is_err()
-    );
-    lab.publish(
-        "legacy-send",
-        &address,
-        Mode::Message,
-        "legacy delivered without hooks",
-    );
-    let mut carrier = ClaudeLaterCarrier::new(
-        Arc::clone(&lab.registry),
-        Arc::clone(&lab.storage) as Arc<dyn Custody>,
-        ClaudeTiming::default(),
-    )
-    .unwrap();
-    // A native approval wait is a visible hold, never an inferred idle session.
-    descriptor["status"] = json!("waiting");
-    std::fs::write(&file, serde_json::to_vec(&descriptor).unwrap()).unwrap();
-    let held = dispatch_message(
-        &lab.storage,
-        &mut carrier,
-        &address,
-        &now,
-        &DispatchTiming::default(),
-    )
-    .unwrap();
-    assert!(matches!(held, DispatchReport::Held(_)), "{held:?}");
-    assert!(lab.attempt("legacy-send").is_none());
-    assert_eq!(receiver.cmd(json!({"cmd":"frames"}))["frames"], json!([]));
-
-    // A fresh process registry may discover a positive native idle descriptor.
-    *lab.registry.lock().unwrap() = bridge_adapters::registry::Registry::new(
-        lab.config.clone(),
-        bridge_adapters::server::private_directory(lab.socket.parent().unwrap()).unwrap(),
-    )
-    .unwrap();
-    descriptor["status"] = json!("idle");
-    std::fs::write(&file, serde_json::to_vec(&descriptor).unwrap()).unwrap();
-    let report = dispatch_message(
-        &lab.storage,
-        &mut carrier,
-        &address,
-        &now,
-        &DispatchTiming::default(),
-    )
-    .unwrap();
-    assert!(
-        matches!(
-            report,
-            DispatchReport::Sent {
-                state: AttemptState::NativeAccepted,
-                ..
-            }
-        ),
-        "{report:?}"
-    );
-    assert_eq!(
-        receiver.cmd(json!({"cmd":"frames"}))["frames"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    drop(carrier);
-    receiver.stop();
-}
-/// A root end after positive Desktop idleness delivers exactly once through an
-/// independent same-harness typed frontend, including private journal recovery.
-/// Normal caller/recipient authority remains retired; lost acknowledgement is
-/// Unknown and never replayed or sent through the deliberately absent CLI helper.
-#[test]
-fn desktop_idle_end_retains_message_only_wake_fact() {
-    use bridge_adapters::server::private_directory;
-    use bridge_adapters::{ChannelServer, Registry};
-    use std::io::{Read, Write};
-    use std::os::unix::net::UnixListener;
-    let Some(node) = std::env::var("BRIDGE_TEST_NODE").ok() else {
-        panic!("BRIDGE_TEST_NODE is required for this deterministic Desktop regression");
-    };
-    for case in ["accepted", "restart", "lost"] {
-        let mut lab = Lab::new("idleend");
-        let pipe = lab.dir.0.join("native.sock");
-        let host = UnixListener::bind(&pipe).unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let observed = Arc::clone(&calls);
-        let lost = case == "lost";
-        let native = std::thread::spawn(move || {
-            let (mut stream, _) = host.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            for id in [1, 2] {
-                let mut head = [0; 4];
-                stream.read_exact(&mut head).unwrap();
-                let size = u32::from_le_bytes(head) as usize;
-                assert!(size < 131072);
-                let mut bytes = vec![0; size];
-                stream.read_exact(&mut bytes).unwrap();
-                let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                assert_eq!(request["id"], id);
-                let result = if id == 1 {
-                    assert_eq!(request["method"], "tools/list");
-                    json!({"tools":[{"name":"send_message_to_thread","namespace":"codex_app"}]})
-                } else {
-                    assert_eq!(request["method"], "tools/call");
-                    assert_eq!(request["params"]["arguments"]["threadId"], "idle-end");
-                    assert_eq!(request["params"]["callerSource"], "codex");
-                    assert!(
-                        request["params"]["arguments"]["prompt"]
-                            .as_str()
-                            .unwrap()
-                            .contains("idle wake marker")
-                    );
-                    observed.fetch_add(1, Ordering::SeqCst);
-                    if lost {
-                        return;
-                    }
-                    json!({"success":true})
-                };
-                let bytes =
-                    serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"result":result})).unwrap();
-                stream
-                    .write_all(&(bytes.len() as u32).to_le_bytes())
-                    .unwrap();
-                stream.write_all(&bytes).unwrap();
-            }
-        });
-        let transcript = lab.codex_store.join("sessions").join("idle.jsonl");
-        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
-        std::fs::write(&transcript, "").unwrap();
-        let mut receiver = Harnessed::start_desktop(&lab.codex_store, &pipe);
-        receiver.cmd(json!({"cmd":"desktop_frontend","node":node,"channel":lab.socket}));
-        let address = lab.codex_address("idle-end");
-        let mut start = hook("SessionStart", "idle-end");
-        start["transcript_path"] = json!(transcript);
-        receiver.hook(&lab.socket, Harness::Codex, start);
-        receiver.hook(
-            &lab.socket,
-            Harness::Codex,
-            tool_hook("PreToolUse", "idle-end", "valid-control-call", None),
-        );
-        let control = receiver.mcp(
-            &lab.socket,
-            json!({"threadId":"idle-end","callId":"valid-control-call","x-codex-turn-metadata":{}}),
-        );
-        assert_eq!(control["ok"]["address"], address.to_canonical_string());
-        receiver.hook(
-            &lab.socket,
-            Harness::Codex,
-            tool_hook("PreToolUse", "idle-end", "old-idle-call", None),
-        );
-        receiver.hook(&lab.socket, Harness::Codex, hook("Stop", "idle-end"));
-        receiver.hook(&lab.socket, Harness::Codex, hook("SessionEnd", "idle-end"));
-        assert!(
-            lab.registry
-                .lock()
-                .unwrap()
-                .attest_recipient(&address)
-                .is_err()
-        );
-        assert_eq!(
-            receiver.mcp(
-                &lab.socket,
-                json!({"threadId":"idle-end","callId":"old-idle-call","x-codex-turn-metadata":{}}),
-            )["err"],
-            "stale",
-            "unconsumed valid call must reach the retired binding gate"
-        );
-        if case == "restart" {
-            lab.channel.take().unwrap().stop();
-            let owner = private_directory(lab.socket.parent().unwrap()).unwrap();
-            lab.registry = Arc::new(Mutex::new(
-                Registry::new(lab.config.clone(), owner).unwrap(),
-            ));
-            lab.channel = Some(
-                ChannelServer::start(
-                    &lab.socket,
-                    Arc::clone(&lab.registry),
-                    Arc::clone(&lab.storage) as Arc<dyn Custody>,
-                    DispatchTiming::default(),
-                )
-                .unwrap(),
-            );
-            assert!(
-                lab.registry
-                    .lock()
-                    .unwrap()
-                    .attest_recipient(&address)
-                    .is_err()
-            );
-        }
-        let mut carrier = CodexQueueCarrier::new(
-            Arc::clone(&lab.registry),
-            "/absent-helper".into(),
-            Duration::from_secs(1),
-        )
-        .with_desktop_directory(lab.socket.parent().unwrap().into());
-        lab.publish(
-            "idle-end-message",
-            &address,
-            Mode::Message,
-            "idle wake marker",
-        );
-        let timing = DispatchTiming::default();
-        let report = dispatch_message(&lab.storage, &mut carrier, &address, &now, &timing).unwrap();
-        let expected = if lost {
-            AttemptState::OutcomeUnknown
-        } else {
-            AttemptState::NativeAccepted
-        };
-        assert!(
-            matches!(report, DispatchReport::Sent { state, .. } if state == expected),
-            "{case}: {report:?}"
-        );
-        native.join().unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        for _ in 0..2 {
-            assert!(!matches!(
-                dispatch_message(&lab.storage, &mut carrier, &address, &now, &timing).unwrap(),
-                DispatchReport::Sent { .. }
-            ));
-        }
-        assert_eq!(lab.attempt("idle-end-message").unwrap().state, expected);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        let snapshot: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(lab.socket.with_extension("bindings.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(snapshot["bindings"][0]["desktop_idle_message"], true);
-        receiver.stop();
-    }
-}
-
 /// Root-end eligibility never overrides input/unknown/active state, CLI/Claude
-/// retirement, missing/changed/archived/symlink transcripts, current profile/build,
+/// retirement, missing/changed/archived/symlink transcripts, the current harness
+/// process and policy,
 /// exact harness frontend or operator no-wake. Every refused dispatch has zero
 /// attempts and zero native connections, including legacy journal recovery.
 #[test]
@@ -3321,14 +2978,15 @@ fn desktop_idle_end_negative_evidence_never_sends() {
                     .remove("desktop_idle_transcript");
             } else if case == "harness" {
                 snapshot["bindings"][0]["harness"][1] = json!(0);
+            } else if case == "store" {
+                snapshot["bindings"][0]["store"] = json!(lab.claude_store);
             }
             std::fs::write(&journal, serde_json::to_vec(&snapshot).unwrap()).unwrap();
             let mut config = lab.config.clone();
             if case == "build" {
-                config.profiles[1].executables[0].sha256 = "0".repeat(64);
-            }
-            if case == "store" {
-                config.profiles[1].store = lab.claude_store.clone();
+                config
+                    .harnesses
+                    .retain(|policy| policy.harness != Harness::Codex);
             }
             let owner = private_directory(lab.socket.parent().unwrap()).unwrap();
             lab.registry = Arc::new(Mutex::new(Registry::new(config, owner).unwrap()));
@@ -3376,17 +3034,29 @@ fn desktop_idle_end_negative_evidence_never_sends() {
     }
 }
 
-/// A live Codex route admitted through a canonical store alias remains eligible
-/// for ordinary MESSAGE attestation with its original inject capability. This
-/// exercises fresh carrier validation; retired transcript path rules are separate.
+/// A symlink alias of a store is never a bindable store (only a canonical path
+/// is), while the same store under its canonical path binds, stays eligible for
+/// ordinary MESSAGE attestation and keeps its inject capability. This exercises
+/// fresh carrier validation; retired transcript path rules are separate.
 #[test]
-fn codex_live_store_alias_preserves_message_and_inject_capabilities() {
+fn codex_live_store_alias_is_refused_and_the_canonical_store_keeps_capabilities() {
     use bridge_core::dispatch::{DispatchCarrier, Lifecycle, Selection};
     use std::os::unix::fs::symlink;
     let lab = Lab::new("storealias");
     let alias = lab.dir.0.join("codex-alias");
     symlink(&lab.codex_store, &alias).unwrap();
-    let mut receiver = Harnessed::start(Harness::Codex, &alias);
+    let mut aliased = Harnessed::start(Harness::Codex, &alias);
+    let refused = aliased.hook(
+        &lab.socket,
+        Harness::Codex,
+        hook("SessionStart", "aliased-live"),
+    );
+    assert!(
+        refused["stderr"].as_str().unwrap().contains("not_evidence"),
+        "{refused}"
+    );
+    aliased.stop();
+    let mut receiver = Harnessed::start(Harness::Codex, &lab.codex_store);
     let address = lab.codex_address("aliased-live");
     let admitted = receiver.hook(
         &lab.socket,
@@ -3425,4 +3095,1103 @@ fn codex_live_store_alias_preserves_message_and_inject_capabilities() {
         other => panic!("active auto must retain inject capability: {other:?}"),
     }
     receiver.stop();
+}
+
+/// How the mock Codex application host answers the one `send_message_to_thread`.
+#[derive(Clone, Copy, PartialEq)]
+enum GatewayHost {
+    /// Positive success receipt.
+    Accept,
+    /// Read the call, then drop the connection without any receipt.
+    Lose,
+    /// Offer no message tool at all: the frontend answers known-unsent before any
+    /// message call exists.
+    Missing,
+}
+
+/// Serves one mock native host connection (inventory, then exactly one message
+/// call for `thread`) and counts calls; panics on an unexpected shape. With
+/// `lock`, that directory is made read-only the moment the call is read, so the
+/// daemon cannot journal anything after the hand-off began.
+fn gateway_host(
+    host: std::os::unix::net::UnixListener,
+    thread: &'static str,
+    calls: Arc<AtomicUsize>,
+    answer: GatewayHost,
+    lock: Option<std::path::PathBuf>,
+) -> std::thread::JoinHandle<()> {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    std::thread::spawn(move || {
+        let (mut stream, _) = host.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        for id in [1, 2] {
+            let mut head = [0; 4];
+            stream.read_exact(&mut head).unwrap();
+            let mut bytes = vec![0; u32::from_le_bytes(head) as usize];
+            stream.read_exact(&mut bytes).unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(request["id"], id);
+            let result = if id == 1 {
+                if answer == GatewayHost::Missing {
+                    json!({"tools":[]})
+                } else {
+                    json!({"tools":[{"name":"send_message_to_thread","namespace":"codex_app"}]})
+                }
+            } else {
+                assert_eq!(request["params"]["arguments"]["threadId"], thread);
+                assert_eq!(request["params"]["callerSource"], "codex");
+                calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(directory) = &lock {
+                    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o500))
+                        .unwrap();
+                }
+                if answer == GatewayHost::Lose {
+                    return;
+                }
+                json!({"success":true})
+            };
+            let bytes =
+                serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"result":result})).unwrap();
+            stream
+                .write_all(&(bytes.len() as u32).to_le_bytes())
+                .unwrap();
+            stream.write_all(&bytes).unwrap();
+            if answer == GatewayHost::Missing {
+                return;
+            }
+        }
+    })
+}
+
+/// Writes a native-shaped rollout for `thread` (a `session_meta` header naming
+/// it, then two events) inside the Codex test store and returns its path.
+fn gateway_rollout(lab: &Lab, thread: &str) -> std::path::PathBuf {
+    let path = lab
+        .codex_store
+        .join("sessions")
+        .join(format!("rollout-{thread}.jsonl"));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        format!(
+            "{}\n{}\n{}\n",
+            json!({"type":"session_meta","payload":{"id":thread}}),
+            json!({"type":"event_msg","payload":{"type":"user_message"}}),
+            json!({"type":"event_msg","payload":{"type":"task_complete"}}),
+        ),
+    )
+    .unwrap();
+    path
+}
+
+/// Drives one owned Desktop stand-in through a session start and a positive owner
+/// `Stop` for `thread`, the state an idle thread is left in.
+fn gateway_idle(harness: &mut Harnessed, lab: &Lab, thread: &str, transcript: &std::path::Path) {
+    let mut start = hook("SessionStart", thread);
+    start["transcript_path"] = json!(transcript);
+    harness.hook(&lab.socket, Harness::Codex, start);
+    harness.hook(&lab.socket, Harness::Codex, hook("Stop", thread));
+}
+
+/// The first binding row of the private route journal.
+fn gateway_journal(lab: &Lab) -> serde_json::Value {
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(lab.socket.with_extension("bindings.json")).unwrap())
+            .unwrap();
+    snapshot["bindings"][0].clone()
+}
+
+/// A queued message to a positively idle Desktop thread is delivered exactly once
+/// through the current Desktop frontend after the application restarted (a new
+/// harness incarnation with no hook), without any receiver `bridge_me`, hook or
+/// new source event: the old incarnation is dead, the binding gets a fresh epoch,
+/// the route stays MESSAGE-only without caller authority, and the one-shot proof is
+/// spent so a second event holds. It holds both for a binding that was never ended
+/// and for one retired by `SessionEnd` after the same positive idle (the existing
+/// narrow Desktop exception). Synthetic native-owner input only.
+#[test]
+fn idle_codex_thread_is_woken_through_the_new_gateway_after_restart() {
+    use std::os::unix::net::UnixListener;
+    let node = std::env::var("BRIDGE_TEST_NODE").expect("BRIDGE_TEST_NODE required");
+    for ended in [false, true] {
+        let lab = Lab::new("gw");
+        let pipe = lab.dir.0.join("native.sock");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let native = gateway_host(
+            UnixListener::bind(&pipe).unwrap(),
+            "gw",
+            Arc::clone(&calls),
+            GatewayHost::Accept,
+            None,
+        );
+        let transcript = gateway_rollout(&lab, "gw");
+        let address = lab.codex_address("gw");
+        let mut first = Harnessed::start_desktop(&lab.codex_store, &pipe);
+        gateway_idle(&mut first, &lab, "gw", &transcript);
+        if ended {
+            first.hook(&lab.socket, Harness::Codex, hook("SessionEnd", "gw"));
+        }
+        let before = gateway_journal(&lab);
+        assert!(before.get("wake").is_some(), "positive idle was stamped");
+        first.stop();
+        // Process start times have whole-second resolution: the new harness must
+        // be born in a later second than the one it replaces.
+        std::thread::sleep(Duration::from_millis(1100));
+        let mut second = Harnessed::start_desktop(&lab.codex_store, &pipe);
+        second.cmd(json!({"cmd":"desktop_frontend","node":node,"channel":lab.socket}));
+        assert!(
+            lab.registry
+                .lock()
+                .unwrap()
+                .attest_recipient(&address)
+                .is_err(),
+            "the ordinary route stays closed: the recorded incarnation is gone"
+        );
+        lab.publish("gw-msg", &address, Mode::Message, "gateway wake marker");
+        let mut carrier = CodexQueueCarrier::new(
+            Arc::clone(&lab.registry),
+            "/absent-helper".into(),
+            Duration::from_secs(1),
+        )
+        .with_desktop_directory(lab.socket.parent().unwrap().into());
+        let timing = DispatchTiming::default();
+        let report = dispatch_message(&lab.storage, &mut carrier, &address, &now, &timing).unwrap();
+        assert!(
+            matches!(report, DispatchReport::Sent { state, .. } if state == AttemptState::NativeAccepted),
+            "ended={ended}: {report:?}"
+        );
+        native.join().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let after = gateway_journal(&lab);
+        assert!(after["epoch"].as_u64() > before["epoch"].as_u64());
+        assert!(after.get("wake").is_none(), "the proof is spent");
+        let attempt = lab.attempt("gw-msg").unwrap();
+        assert_eq!(
+            attempt.fence.endpoint_epoch,
+            after["epoch"].as_u64().unwrap()
+        );
+        assert!(
+            second.mcp(
+                &lab.socket,
+                json!({"threadId":"gw","callId":"none","x-codex-turn-metadata":{}})
+            )["err"]
+                .is_string(),
+            "the gateway grants no caller evidence"
+        );
+        lab.publish("gw-msg-2", &address, Mode::Message, "second marker");
+        for _ in 0..2 {
+            assert!(!matches!(
+                dispatch_message(&lab.storage, &mut carrier, &address, &now, &timing).unwrap(),
+                DispatchReport::Sent { .. }
+            ));
+        }
+        assert!(lab.attempt("gw-msg-2").is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        second.stop();
+    }
+}
+
+/// Every state that is not exactly "idle, same unchanged thread, one qualified
+/// live gateway" holds with no attempt and no native connection: grown, replaced,
+/// rewritten, unnamed or other-thread transcripts, active, awaiting-input and ended-while-active
+/// sessions, a missing, duplicate or other-store gateway, a still-live old
+/// incarnation and an operator no-wake.
+#[test]
+fn idle_gateway_holds_every_unproven_state_without_a_native_connection() {
+    use std::os::unix::net::UnixListener;
+    let node = std::env::var("BRIDGE_TEST_NODE").expect("BRIDGE_TEST_NODE required");
+    for case in [
+        "grown",
+        "replaced",
+        "rewritten",
+        "no_header",
+        "other_thread",
+        "active",
+        "permission",
+        "ended_active",
+        "no_frontend",
+        "older_gateway",
+        "duplicate",
+        "other_store",
+        "live_old",
+        "no_wake",
+    ] {
+        let lab = Lab::new("gwneg");
+        let pipe = lab.dir.0.join("native.sock");
+        let host = UnixListener::bind(&pipe).unwrap();
+        host.set_nonblocking(true).unwrap();
+        let transcript = gateway_rollout(&lab, "gw");
+        match case {
+            "no_header" => std::fs::write(&transcript, "").unwrap(),
+            "other_thread" => {
+                std::fs::write(
+                    &transcript,
+                    format!(
+                        "{}\n",
+                        json!({"type":"session_meta","payload":{"id":"other"}})
+                    ),
+                )
+                .unwrap();
+            }
+            _ => {}
+        }
+        let address = lab.codex_address("gw");
+        // A live Desktop harness (with its frontend) that started BEFORE the one that
+        // held the address: a gateway must be strictly newer, so it never qualifies.
+        let older = (case == "older_gateway").then(|| {
+            let mut older = Harnessed::start_desktop(&lab.codex_store, &pipe);
+            older.cmd(json!({"cmd":"desktop_frontend","node":node,"channel":lab.socket}));
+            std::thread::sleep(Duration::from_millis(1100));
+            older
+        });
+        let mut first = Harnessed::start_desktop(&lab.codex_store, &pipe);
+        gateway_idle(&mut first, &lab, "gw", &transcript);
+        match case {
+            "active" => {
+                first.hook(&lab.socket, Harness::Codex, hook("UserPromptSubmit", "gw"));
+            }
+            "permission" => {
+                first.hook(&lab.socket, Harness::Codex, hook("PermissionRequest", "gw"));
+            }
+            "ended_active" => {
+                first.hook(&lab.socket, Harness::Codex, hook("UserPromptSubmit", "gw"));
+                first.hook(&lab.socket, Harness::Codex, hook("SessionEnd", "gw"));
+            }
+            "no_wake" => lab
+                .storage
+                .lock()
+                .unwrap()
+                .set_no_wake(
+                    &address.to_canonical_string(),
+                    true,
+                    Some("owner pause"),
+                    "operator",
+                    now(),
+                )
+                .unwrap(),
+            _ => {}
+        }
+        let mut first = Some(first);
+        if case != "live_old" {
+            first.take().unwrap().stop();
+        }
+        match case {
+            "grown" => {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&transcript)
+                    .unwrap();
+                writeln!(
+                    file,
+                    "{}",
+                    json!({"type":"event_msg","payload":{"type":"x"}})
+                )
+                .unwrap();
+            }
+            "replaced" => {
+                let copy = transcript.with_extension("copy");
+                std::fs::copy(&transcript, &copy).unwrap();
+                std::fs::rename(&copy, &transcript).unwrap();
+            }
+            "rewritten" => {
+                let mut bytes = std::fs::read(&transcript).unwrap();
+                let last = bytes.len() - 3;
+                bytes[last] = b'Z';
+                std::fs::write(&transcript, bytes).unwrap();
+            }
+            _ => {}
+        }
+        // Whole-second process start times: later-born gateways, so a hold below
+        // is never an artifact of the same-second birth fence.
+        std::thread::sleep(Duration::from_millis(1100));
+        let mut gateways = Vec::new();
+        let (count, store) = match case {
+            "no_frontend" | "live_old" | "older_gateway" => (0, &lab.codex_store),
+            "duplicate" => (2, &lab.codex_store),
+            "other_store" => (1, &lab.claude_store),
+            _ => (1, &lab.codex_store),
+        };
+        for _ in 0..count {
+            let mut gateway = Harnessed::start_desktop(store, &pipe);
+            gateway.cmd(json!({"cmd":"desktop_frontend","node":node,"channel":lab.socket}));
+            gateways.push(gateway);
+        }
+        let mut carrier = CodexQueueCarrier::new(
+            Arc::clone(&lab.registry),
+            "/absent-helper".into(),
+            Duration::from_secs(1),
+        )
+        .with_desktop_directory(lab.socket.parent().unwrap().into());
+        lab.publish("gw-held", &address, Mode::Message, "must not send");
+        let timing = DispatchTiming::default();
+        for _ in 0..2 {
+            let report =
+                dispatch_message(&lab.storage, &mut carrier, &address, &now, &timing).unwrap();
+            assert!(
+                !matches!(report, DispatchReport::Sent { .. }),
+                "{case}: {report:?}"
+            );
+        }
+        assert!(lab.attempt("gw-held").is_none(), "{case}: no attempt");
+        assert!(
+            matches!(host.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "{case}: no native connection"
+        );
+        for gateway in gateways {
+            gateway.stop();
+        }
+        if let Some(first) = first {
+            first.stop();
+        }
+        drop(older);
+    }
+}
+
+/// A hand-off lost after the request was written is an unknown outcome that is
+/// retained and never resent; the one-shot proof was journaled as spent before the
+/// write, so a daemon restart cannot revive it for a different queued message;
+/// and a failed epoch commit never leaves a usable route (the first attempt
+/// holds, the next one after the journal works succeeds).
+#[test]
+fn gateway_commit_failure_holds_and_unknown_hand_off_spends_the_proof() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    let node = std::env::var("BRIDGE_TEST_NODE").expect("BRIDGE_TEST_NODE required");
+    let mut lab = Lab::new("gwlost");
+    let pipe = lab.dir.0.join("native.sock");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let native = gateway_host(
+        UnixListener::bind(&pipe).unwrap(),
+        "gw",
+        Arc::clone(&calls),
+        GatewayHost::Lose,
+        Some(lab.socket.parent().unwrap().to_path_buf()),
+    );
+    let transcript = gateway_rollout(&lab, "gw");
+    let address = lab.codex_address("gw");
+    let mut first = Harnessed::start_desktop(&lab.codex_store, &pipe);
+    gateway_idle(&mut first, &lab, "gw", &transcript);
+    first.stop();
+    std::thread::sleep(Duration::from_millis(1100));
+    let mut second = Harnessed::start_desktop(&lab.codex_store, &pipe);
+    second.cmd(json!({"cmd":"desktop_frontend","node":node,"channel":lab.socket}));
+    let mut carrier = CodexQueueCarrier::new(
+        Arc::clone(&lab.registry),
+        "/absent-helper".into(),
+        Duration::from_secs(1),
+    )
+    .with_desktop_directory(lab.socket.parent().unwrap().into());
+    lab.publish("gw-lost", &address, Mode::Message, "lost marker");
+    let timing = DispatchTiming::default();
+    let directory = lab.socket.parent().unwrap().to_path_buf();
+    let epoch = gateway_journal(&lab)["epoch"].as_u64().unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let held = dispatch_message(&lab.storage, &mut carrier, &address, &now, &timing).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(matches!(held, DispatchReport::Held(_)), "{held:?}");
+    assert_eq!(gateway_journal(&lab)["epoch"].as_u64().unwrap(), epoch);
+    assert!(lab.attempt("gw-lost").is_none());
+    let report = dispatch_message(&lab.storage, &mut carrier, &address, &now, &timing).unwrap();
+    assert!(
+        matches!(report, DispatchReport::Sent { state, .. } if state == AttemptState::OutcomeUnknown),
+        "{report:?}"
+    );
+    native.join().unwrap();
+    // The spend was journaled before the write; the directory went read-only when
+    // the call was read, so nothing could have been written afterwards.
+    lab.publish("gw-next", &address, Mode::Message, "next marker");
+    for _ in 0..2 {
+        assert!(!matches!(
+            dispatch_message(&lab.storage, &mut carrier, &address, &now, &timing).unwrap(),
+            DispatchReport::Sent { .. }
+        ));
+    }
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        gateway_journal(&lab).get("wake").is_none(),
+        "the spend reached the journal before the hand-off"
+    );
+    // A restart drops the gone incarnation with its proof: nothing resurrects.
+    lab.channel.take().unwrap().stop();
+    let owner = bridge_adapters::server::private_directory(&directory).unwrap();
+    lab.registry = Arc::new(Mutex::new(
+        bridge_adapters::Registry::new(lab.config.clone(), owner).unwrap(),
+    ));
+    lab.channel = Some(
+        bridge_adapters::ChannelServer::start(
+            &lab.socket,
+            Arc::clone(&lab.registry),
+            Arc::clone(&lab.storage) as Arc<dyn Custody>,
+            DispatchTiming::default(),
+        )
+        .unwrap(),
+    );
+    let mut carrier = CodexQueueCarrier::new(
+        Arc::clone(&lab.registry),
+        "/absent-helper".into(),
+        Duration::from_secs(1),
+    )
+    .with_desktop_directory(directory.clone());
+    for _ in 0..2 {
+        assert!(!matches!(
+            dispatch_message(&lab.storage, &mut carrier, &address, &now, &timing).unwrap(),
+            DispatchReport::Sent { .. }
+        ));
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        lab.attempt("gw-lost").unwrap().state,
+        AttemptState::OutcomeUnknown
+    );
+    assert!(lab.attempt("gw-next").is_none());
+    second.stop();
+}
+
+/// A hand-off lost after the request was written, with the journal fully writable
+/// (the read-only-directory variant above is separate coverage): the native host
+/// observes exactly one effect, the outcome is unknown and retained, and the
+/// durable journal holds NO wake proof afterwards (an unknown outcome never gives
+/// the one-shot proof back). A different queued event is then neither handed off
+/// nor re-homed, before and after a daemon restart; the host's listener stays open
+/// so a wrongly resurrected route would be seen as a second connection. The journal
+/// assertion is the essential one: it does not depend on core withholding a second
+/// event.
+#[test]
+fn lost_ack_with_a_writable_journal_leaves_no_wake_proof_and_never_rehomes() {
+    use std::os::unix::net::UnixListener;
+    let node = std::env::var("BRIDGE_TEST_NODE").expect("BRIDGE_TEST_NODE required");
+    let mut lab = Lab::new("gwack");
+    let pipe = lab.dir.0.join("native.sock");
+    let listener = UnixListener::bind(&pipe).unwrap();
+    let probe = listener.try_clone().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let native = gateway_host(listener, "gw", Arc::clone(&calls), GatewayHost::Lose, None);
+    let transcript = gateway_rollout(&lab, "gw");
+    let address = lab.codex_address("gw");
+    let mut first = Harnessed::start_desktop(&lab.codex_store, &pipe);
+    gateway_idle(&mut first, &lab, "gw", &transcript);
+    first.stop();
+    std::thread::sleep(Duration::from_millis(1100));
+    let mut second = Harnessed::start_desktop(&lab.codex_store, &pipe);
+    second.cmd(json!({"cmd":"desktop_frontend","node":node,"channel":lab.socket}));
+    let directory = lab.socket.parent().unwrap().to_path_buf();
+    let mut carrier = CodexQueueCarrier::new(
+        Arc::clone(&lab.registry),
+        "/absent-helper".into(),
+        Duration::from_secs(1),
+    )
+    .with_desktop_directory(directory.clone());
+    lab.publish("gw-ack", &address, Mode::Message, "ack marker");
+    let timing = DispatchTiming::default();
+    let report = dispatch_message(&lab.storage, &mut carrier, &address, &now, &timing).unwrap();
+    assert!(
+        matches!(report, DispatchReport::Sent { state, .. } if state == AttemptState::OutcomeUnknown),
+        "{report:?}"
+    );
+    native.join().unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one native effect");
+    assert!(
+        gateway_journal(&lab).get("wake").is_none(),
+        "an unknown outcome never restores the spent proof in the durable journal"
+    );
+    // The host stays listening (non-blocking probe): any further hand-off is seen.
+    probe.set_nonblocking(true).unwrap();
+    lab.publish("gw-other", &address, Mode::Message, "other marker");
+    for _ in 0..2 {
+        assert!(!matches!(
+            dispatch_message(&lab.storage, &mut carrier, &address, &now, &timing).unwrap(),
+            DispatchReport::Sent { .. }
+        ));
+    }
+    assert!(
+        matches!(probe.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "no second native connection for a different event"
+    );
+    assert!(lab.attempt("gw-other").is_none());
+    // After a daemon restart nothing is re-homed either.
+    lab.channel.take().unwrap().stop();
+    let owner = bridge_adapters::server::private_directory(&directory).unwrap();
+    lab.registry = Arc::new(Mutex::new(
+        bridge_adapters::Registry::new(lab.config.clone(), owner).unwrap(),
+    ));
+    lab.channel = Some(
+        bridge_adapters::ChannelServer::start(
+            &lab.socket,
+            Arc::clone(&lab.registry),
+            Arc::clone(&lab.storage) as Arc<dyn Custody>,
+            DispatchTiming::default(),
+        )
+        .unwrap(),
+    );
+    let mut carrier = CodexQueueCarrier::new(
+        Arc::clone(&lab.registry),
+        "/absent-helper".into(),
+        Duration::from_secs(1),
+    )
+    .with_desktop_directory(directory);
+    for _ in 0..2 {
+        assert!(!matches!(
+            dispatch_message(&lab.storage, &mut carrier, &address, &now, &timing).unwrap(),
+            DispatchReport::Sent { .. }
+        ));
+    }
+    assert!(
+        matches!(probe.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "no native connection after the restart"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        lab.attempt("gw-ack").unwrap().state,
+        AttemptState::OutcomeUnknown
+    );
+    assert!(lab.attempt("gw-other").is_none());
+    second.stop();
+}
+
+/// Concurrent attestations and sends of one idle recipient race to commit the
+/// gateway: exactly one commit and one native hand-off happen.
+#[test]
+fn gateway_commit_and_hand_off_race_delivers_once() {
+    use std::os::unix::net::UnixListener;
+    let node = std::env::var("BRIDGE_TEST_NODE").expect("BRIDGE_TEST_NODE required");
+    let lab = Lab::new("gwrace");
+    let pipe = lab.dir.0.join("native.sock");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let native = gateway_host(
+        UnixListener::bind(&pipe).unwrap(),
+        "gw",
+        Arc::clone(&calls),
+        GatewayHost::Accept,
+        None,
+    );
+    let transcript = gateway_rollout(&lab, "gw");
+    let address = lab.codex_address("gw");
+    let mut first = Harnessed::start_desktop(&lab.codex_store, &pipe);
+    gateway_idle(&mut first, &lab, "gw", &transcript);
+    first.stop();
+    std::thread::sleep(Duration::from_millis(1100));
+    let mut second = Harnessed::start_desktop(&lab.codex_store, &pipe);
+    second.cmd(json!({"cmd":"desktop_frontend","node":node,"channel":lab.socket}));
+    lab.publish("gw-race", &address, Mode::Message, "race marker");
+    let sent = Arc::new(AtomicUsize::new(0));
+    let workers: Vec<_> = (0..4)
+        .map(|_| {
+            let registry = Arc::clone(&lab.registry);
+            let storage = Arc::clone(&lab.storage);
+            let address = address.clone();
+            let directory = lab.socket.parent().unwrap().to_path_buf();
+            let sent = Arc::clone(&sent);
+            std::thread::spawn(move || {
+                let mut carrier = CodexQueueCarrier::new(
+                    registry,
+                    "/absent-helper".into(),
+                    Duration::from_secs(1),
+                )
+                .with_desktop_directory(directory);
+                let timing = DispatchTiming::default();
+                if let Ok(DispatchReport::Sent { .. }) =
+                    dispatch_message(&storage, &mut carrier, &address, &now, &timing)
+                {
+                    sent.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    native.join().unwrap();
+    assert_eq!(sent.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        lab.attempt("gw-race").unwrap().state,
+        AttemptState::NativeAccepted
+    );
+    second.stop();
+}
+
+/// An unspent idle proof survives a daemon restart that happens while the
+/// application is down: the journal keeps the gone incarnation as a gateway
+/// candidate only because it carries the proof, and the queued message is still
+/// delivered once through the new Desktop frontend. A stamp that no longer matches
+/// (the transcript grew while the daemon was down) holds instead.
+#[test]
+fn unspent_gateway_proof_survives_a_daemon_restart() {
+    use std::os::unix::net::UnixListener;
+    let node = std::env::var("BRIDGE_TEST_NODE").expect("BRIDGE_TEST_NODE required");
+    for grown in [false, true] {
+        let mut lab = Lab::new("gwrst");
+        let pipe = lab.dir.0.join("native.sock");
+        let host = UnixListener::bind(&pipe).unwrap();
+        host.set_nonblocking(true).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let transcript = gateway_rollout(&lab, "gw");
+        let address = lab.codex_address("gw");
+        let mut first = Harnessed::start_desktop(&lab.codex_store, &pipe);
+        gateway_idle(&mut first, &lab, "gw", &transcript);
+        first.stop();
+        lab.channel.take().unwrap().stop();
+        let directory = lab.socket.parent().unwrap().to_path_buf();
+        let owner = bridge_adapters::server::private_directory(&directory).unwrap();
+        lab.registry = Arc::new(Mutex::new(
+            bridge_adapters::Registry::new(lab.config.clone(), owner).unwrap(),
+        ));
+        lab.channel = Some(
+            bridge_adapters::ChannelServer::start(
+                &lab.socket,
+                Arc::clone(&lab.registry),
+                Arc::clone(&lab.storage) as Arc<dyn Custody>,
+                DispatchTiming::default(),
+            )
+            .unwrap(),
+        );
+        if grown {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .unwrap();
+            writeln!(
+                file,
+                "{}",
+                json!({"type":"event_msg","payload":{"type":"x"}})
+            )
+            .unwrap();
+        }
+        let native = (!grown).then(|| {
+            host.set_nonblocking(false).unwrap();
+            gateway_host(
+                host.try_clone().unwrap(),
+                "gw",
+                Arc::clone(&calls),
+                GatewayHost::Accept,
+                None,
+            )
+        });
+        std::thread::sleep(Duration::from_millis(1100));
+        let mut second = Harnessed::start_desktop(&lab.codex_store, &pipe);
+        second.cmd(json!({"cmd":"desktop_frontend","node":node,"channel":lab.socket}));
+        lab.publish("gw-rst", &address, Mode::Message, "restart marker");
+        let mut carrier = CodexQueueCarrier::new(
+            Arc::clone(&lab.registry),
+            "/absent-helper".into(),
+            Duration::from_secs(1),
+        )
+        .with_desktop_directory(directory);
+        let timing = DispatchTiming::default();
+        let report = dispatch_message(&lab.storage, &mut carrier, &address, &now, &timing).unwrap();
+        if grown {
+            assert!(!matches!(report, DispatchReport::Sent { .. }), "{report:?}");
+            assert!(lab.attempt("gw-rst").is_none());
+        } else {
+            assert!(
+                matches!(report, DispatchReport::Sent { state, .. } if state == AttemptState::NativeAccepted),
+                "{report:?}"
+            );
+            native.unwrap().join().unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+        second.stop();
+    }
+}
+
+/// The last pre-write fence: after the one-shot proof is journaled as spent and
+/// the frontend connection is prepared, any change of the world (the thread's
+/// transcript grows, or a new hook of the thread renews the binding as active or
+/// awaiting input) makes the hand-off known-unsent with zero native bytes, keeps
+/// the proof spent and never restores unchecked old evidence; the control with no
+/// change delivers once. The pause seam runs at exactly that boundary.
+#[test]
+fn gateway_state_change_after_the_reservation_sends_zero_native_bytes() {
+    use std::os::unix::net::UnixListener;
+    let node = std::env::var("BRIDGE_TEST_NODE").expect("BRIDGE_TEST_NODE required");
+    for case in ["control", "transcript", "active_hook", "permission_hook"] {
+        let lab = Lab::new("gwfence");
+        let pipe = lab.dir.0.join("native.sock");
+        let listener = UnixListener::bind(&pipe).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (native, host) = if case == "control" {
+            (
+                Some(gateway_host(
+                    listener,
+                    "gw",
+                    Arc::clone(&calls),
+                    GatewayHost::Accept,
+                    None,
+                )),
+                None,
+            )
+        } else {
+            listener.set_nonblocking(true).unwrap();
+            (None, Some(listener))
+        };
+        let transcript = gateway_rollout(&lab, "gw");
+        let address = lab.codex_address("gw");
+        let mut first = Harnessed::start_desktop(&lab.codex_store, &pipe);
+        gateway_idle(&mut first, &lab, "gw", &transcript);
+        first.stop();
+        std::thread::sleep(Duration::from_millis(1100));
+        let mut second = Harnessed::start_desktop(&lab.codex_store, &pipe);
+        second.cmd(json!({"cmd":"desktop_frontend","node":node,"channel":lab.socket}));
+        let second = Arc::new(Mutex::new(second));
+        let change = {
+            let second = Arc::clone(&second);
+            let socket = lab.socket.clone();
+            let transcript = transcript.clone();
+            Arc::new(move || match case {
+                "transcript" => {
+                    use std::io::Write;
+                    let mut file = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&transcript)
+                        .unwrap();
+                    writeln!(
+                        file,
+                        "{}",
+                        json!({"type":"event_msg","payload":{"type":"x"}})
+                    )
+                    .unwrap();
+                }
+                "active_hook" => {
+                    second.lock().unwrap().hook(
+                        &socket,
+                        Harness::Codex,
+                        hook("UserPromptSubmit", "gw"),
+                    );
+                }
+                "permission_hook" => {
+                    second.lock().unwrap().hook(
+                        &socket,
+                        Harness::Codex,
+                        hook("PermissionRequest", "gw"),
+                    );
+                }
+                _ => {}
+            })
+        };
+        let mut carrier = CodexQueueCarrier::new(
+            Arc::clone(&lab.registry),
+            "/absent-helper".into(),
+            Duration::from_secs(1),
+        )
+        .with_desktop_directory(lab.socket.parent().unwrap().into())
+        .with_gateway_pause(change);
+        lab.publish("gw-fence", &address, Mode::Message, "fence marker");
+        let timing = DispatchTiming::default();
+        let report = dispatch_message(&lab.storage, &mut carrier, &address, &now, &timing).unwrap();
+        if case == "control" {
+            assert!(
+                matches!(report, DispatchReport::Sent { state, .. } if state == AttemptState::NativeAccepted),
+                "{report:?}"
+            );
+            native.unwrap().join().unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        } else {
+            assert!(
+                matches!(report, DispatchReport::Sent { state, .. } if state == AttemptState::KnownUnsent),
+                "{case}: {report:?}"
+            );
+            assert!(
+                matches!(host.unwrap().accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+                "{case}: zero native connection"
+            );
+            assert!(
+                gateway_journal(&lab).get("wake").is_none(),
+                "{case}: the spent proof is not restored over changed evidence"
+            );
+        }
+        // The carrier's pause seam shares the harness handle: release it first.
+        drop(carrier);
+        Arc::try_unwrap(second)
+            .ok()
+            .unwrap()
+            .into_inner()
+            .unwrap()
+            .stop();
+    }
+}
+
+/// A hand-off refused before any native write (the host offers no message tool)
+/// gives the one-shot proof back only because the fence passes again and the
+/// binding is exactly the one that stood after the spend: the journal holds the
+/// proof again with the same committed gateway, no native call was made, and the
+/// attempt is a known-unsent one.
+#[test]
+fn known_unsent_gateway_hand_off_restores_the_unchanged_proof() {
+    use std::os::unix::net::UnixListener;
+    let node = std::env::var("BRIDGE_TEST_NODE").expect("BRIDGE_TEST_NODE required");
+    let lab = Lab::new("gwrs");
+    let pipe = lab.dir.0.join("native.sock");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let native = gateway_host(
+        UnixListener::bind(&pipe).unwrap(),
+        "gw",
+        Arc::clone(&calls),
+        GatewayHost::Missing,
+        None,
+    );
+    let transcript = gateway_rollout(&lab, "gw");
+    let address = lab.codex_address("gw");
+    let mut first = Harnessed::start_desktop(&lab.codex_store, &pipe);
+    gateway_idle(&mut first, &lab, "gw", &transcript);
+    first.stop();
+    std::thread::sleep(Duration::from_millis(1100));
+    let mut second = Harnessed::start_desktop(&lab.codex_store, &pipe);
+    second.cmd(json!({"cmd":"desktop_frontend","node":node,"channel":lab.socket}));
+    lab.publish("gw-unsent", &address, Mode::Message, "unsent marker");
+    let mut carrier = CodexQueueCarrier::new(
+        Arc::clone(&lab.registry),
+        "/absent-helper".into(),
+        Duration::from_secs(1),
+    )
+    .with_desktop_directory(lab.socket.parent().unwrap().into());
+    let timing = DispatchTiming::default();
+    let report = dispatch_message(&lab.storage, &mut carrier, &address, &now, &timing).unwrap();
+    assert!(
+        matches!(report, DispatchReport::Sent { state, .. } if state == AttemptState::KnownUnsent),
+        "{report:?}"
+    );
+    native.join().unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "no message call was made");
+    let row = gateway_journal(&lab);
+    assert!(
+        row.get("wake").is_some(),
+        "the unchanged proof was given back: {row}"
+    );
+    assert_eq!(
+        row["wake"]["gateway"].as_array().map(Vec::len),
+        Some(2),
+        "with its committed gateway: {row}"
+    );
+    second.stop();
+}
+
+/// A fresh session in an arbitrary runtime store that no configuration names
+/// registers from its own lifecycle hook with no pre-enrollment, is journaled and
+/// survives a daemon restart, and every unsound shape is refused before any state
+/// changes: a store closed to writers is required (group-writable refused), the
+/// store must be a canonical path (a symlink and a non-canonical spelling are
+/// refused), the ancestor must carry a product marker (an unmarked process is not
+/// a harness), the session id must be a bounded identifier without controls, the
+/// event must be a supported lifecycle event, and an equal session id from a
+/// second live store is a conflict that leaves the first binding untouched.
+#[test]
+fn a_fresh_session_in_an_unlisted_runtime_store_registers_from_its_hook() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let lab = Lab::new("dyn");
+    let mkdir = |name: &str, mode: u32| {
+        let path = lab.dir.0.join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path.canonicalize().unwrap()
+    };
+    let bound = |session: &str| {
+        lab.registry
+            .lock()
+            .unwrap()
+            .attest_recipient(&lab.claude_address(session))
+            .is_ok()
+    };
+    let refused = |reply: &serde_json::Value, class: &str| {
+        assert!(
+            reply["stderr"].as_str().unwrap().contains(class),
+            "{class}: {reply}"
+        );
+    };
+
+    // The positive path: an unlisted, ordinary 0755 store.
+    let store = mkdir("dyn-store", 0o755);
+    let mut harness = Harnessed::start(Harness::ClaudeCode, &store);
+    let reply = harness.hook(
+        &lab.socket,
+        Harness::ClaudeCode,
+        hook("SessionStart", "dyn-1"),
+    );
+    assert_eq!(reply["status"], 0, "{reply}");
+    assert!(bound("dyn-1"));
+    let journal = lab.socket.with_extension("bindings.json");
+    let saved = std::fs::read_to_string(&journal).unwrap();
+    assert!(saved.contains("dyn-1") && saved.contains(store.to_str().unwrap()));
+
+    // A cold daemon restart restores the live route from the journal alone.
+    let owner = bridge_adapters::server::private_directory(lab.socket.parent().unwrap()).unwrap();
+    let mut restarted = bridge_adapters::Registry::new(lab.config.clone(), owner).unwrap();
+    let restored = restarted.attach_journal(&journal, now()).unwrap();
+    assert!(
+        restored
+            .iter()
+            .any(|a| a.address().native_session_id == "dyn-1"),
+        "the live dynamic-store route survives a restart"
+    );
+
+    // An equal session id from a second live store is a conflict.
+    let second_store = mkdir("dyn-second", 0o755);
+    let mut second = Harnessed::start(Harness::ClaudeCode, &second_store);
+    refused(
+        &second.hook(
+            &lab.socket,
+            Harness::ClaudeCode,
+            hook("SessionStart", "dyn-1"),
+        ),
+        "conflicting",
+    );
+    second.stop();
+
+    // Unsound stores and processes.
+    let writable = mkdir("dyn-writable", 0o775);
+    let mut h = Harnessed::start(Harness::ClaudeCode, &writable);
+    refused(
+        &h.hook(
+            &lab.socket,
+            Harness::ClaudeCode,
+            hook("SessionStart", "w-1"),
+        ),
+        "not_evidence",
+    );
+    h.stop();
+    let link = lab.dir.0.join("dyn-link");
+    symlink(&store, &link).unwrap();
+    let mut h = Harnessed::start(Harness::ClaudeCode, &link);
+    refused(
+        &h.hook(
+            &lab.socket,
+            Harness::ClaudeCode,
+            hook("SessionStart", "l-1"),
+        ),
+        "not_evidence",
+    );
+    h.stop();
+    let dotted = store.join("..").join("dyn-store");
+    let mut h = Harnessed::start(Harness::ClaudeCode, &dotted);
+    refused(
+        &h.hook(
+            &lab.socket,
+            Harness::ClaudeCode,
+            hook("SessionStart", "d-1"),
+        ),
+        "not_evidence",
+    );
+    h.stop();
+    let mut unmarked = Harnessed::start_unmarked(&lab.dir.0.join("plain-tool"), &store);
+    refused(
+        &unmarked.hook(
+            &lab.socket,
+            Harness::ClaudeCode,
+            hook("SessionStart", "u-1"),
+        ),
+        "not_evidence",
+    );
+    unmarked.stop();
+
+    // Bad session ids and unsupported lifecycle events on a good store.
+    for session in ["", "a\nb", &"x".repeat(300)] {
+        refused(
+            &harness.hook(
+                &lab.socket,
+                Harness::ClaudeCode,
+                hook("SessionStart", session),
+            ),
+            "not_evidence",
+        );
+    }
+    refused(
+        &harness.hook(&lab.socket, Harness::ClaudeCode, hook("Bogus", "dyn-2")),
+        "not_evidence",
+    );
+    for session in ["w-1", "l-1", "d-1", "u-1", "dyn-2"] {
+        assert!(!bound(session), "{session:?} must not be bound");
+    }
+    assert!(bound("dyn-1"), "the first binding is untouched");
+    harness.stop();
+}
+
+/// A configuration that still carries the removed `[[adapters.owner_relays]]`
+/// table starts the daemon normally, grants nothing for it and reports it in the
+/// daemon log as one explicit `legacy_owner_relays_ignored` migration warning, a legacy profile keeps its established `legacy_profile_migrated` event, and a
+/// current configuration logs no such event.
+#[test]
+fn daemon_logs_legacy_owner_relays_as_ignored_and_a_current_config_does_not() {
+    use std::io::Read;
+    // `mode`: "owner" (legacy owner_relays), "profile" (legacy profile) or "current".
+    let run = |mode: &str| -> String {
+        let dir = TempDir::new(mode);
+        let channel_dir = dir.0.join("ch");
+        bridge_adapters::server::private_directory(&channel_dir).unwrap();
+        let channel = channel_dir.join("c.sock");
+        let core = dir.0.join("core.sock");
+        let config = format!(
+            r#"database = "{db}"
+socket = "{core}"
+[limits]
+max_admitted_events = 100
+[[grant]]
+token = "legacy-log-token-0123456789abcdef"
+publisher = "probe-pub"
+recipients = ["*"]
+kinds = ["bridge.probe"]
+modes = ["message"]
+policies = ["keep_all"]
+[adapters]
+channel = "{channel}"
+host_id = "{HOST}"
+{policy}{owner}"#,
+            db = dir.0.join("b.db").display(),
+            core = core.display(),
+            channel = channel.display(),
+            policy = if mode == "profile" {
+                "[[adapters.profiles]]\nnamespace = \"claude-lab\"\nharness = \"ClaudeCode\"\nstore = \"/old/store\"\n[[adapters.profiles.executables]]\npath = \"/old/claude\"\nsha256 = \"00\"\nversion = \"1\"\ninject = true\nmessage = true\n"
+            } else {
+                "[[adapters.harnesses]]\nharness = \"ClaudeCode\"\nnamespace = \"claude-lab\"\ninject = true\nmessage = true\n"
+            },
+            owner = if mode == "owner" {
+                "[[adapters.owner_relays]]\npath = \"/old/native-owner\"\nsha256 = \"00\"\n"
+            } else {
+                ""
+            },
+        );
+        let config_path = dir.0.join("bridge.toml");
+        std::fs::write(&config_path, config).unwrap();
+        let mut daemon = std::process::Command::new(env!("CARGO_BIN_EXE_bridge-native-daemon"))
+            .arg(&config_path)
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        assert!(eventually(10_000, || channel.exists() && core.exists()));
+        daemon.kill().unwrap();
+        let mut log = String::new();
+        daemon
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut log)
+            .unwrap();
+        let _ = daemon.wait();
+        log
+    };
+    let legacy = run("owner");
+    assert!(
+        legacy.contains("\"event\":\"legacy_owner_relays_ignored\""),
+        "{legacy}"
+    );
+    assert!(legacy.contains("1 [[adapters.owner_relays]] entry ignored"));
+    assert!(!legacy.contains("legacy_profile_migrated"), "{legacy}");
+    // A legacy profile keeps its established event name and does not look like owner_relays.
+    let profile = run("profile");
+    assert!(
+        profile.contains("\"event\":\"legacy_profile_migrated\""),
+        "{profile}"
+    );
+    assert!(
+        !profile.contains("legacy_owner_relays_ignored"),
+        "{profile}"
+    );
+    let current = run("current");
+    assert!(
+        !current.contains("legacy_owner_relays_ignored") && !current.contains("legacy_profile"),
+        "{current}"
+    );
 }

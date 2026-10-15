@@ -158,8 +158,10 @@ Typed methods:
 V1 ingress uses these methods; legacy Requests/Responses remain separate.
 Capability reads disclose only the authenticated producer's effective policy,
 limits and supported operation/evidence/mode variants. They spend no evidence.
-Adapter capability results advertise supported verified host contract/build/path;
-profile pins alone do not constitute live native qualification evidence. Unsupported optional capabilities refuse explicitly.
+The native adapter currently advertises an empty `native_contracts` list: it
+discloses no host build or build digest, and harness policies are operator
+configuration and do not constitute live native evidence. Unsupported optional
+capabilities refuse explicitly.
 
 Publication first authenticates and compares an existing immutable v1 intent;
 exact accepted retry returns original custody even after route closure/expiry

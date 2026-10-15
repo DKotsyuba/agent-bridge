@@ -3,9 +3,13 @@
 //! native message tool, preserving the application's cross-task source label.
 //! The native pipe is read only from the attested harness OS environment;
 //! after any native send begins no queue fallback or automatic replay occurs.
+//! A recipient whose own environment names a native owner socket is instead
+//! woken, only while positively idle, through that owner ([`crate::owner`]),
+//! which is selected before the helper and application routes and has no
+//! fallback to them.
 //!
-//! The helper is the *qualified* Codex build of the recipient's binding,
-//! started for exactly one hand-off as
+//! The helper is the Codex executable the recipient's binding records (a process
+//! fact), started for exactly one hand-off as
 //! `sandbox-exec -p HELPER_POLICY <codex> app-server --listen stdio://`
 //! with a scrubbed environment whose `CODEX_HOME` is the attested store.
 //! The policy denies all network access and any process creation after the
@@ -34,6 +38,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bridge_core::dispatch::{AttemptRecord, Attestation, DispatchCarrier, Lifecycle, Outcome};
+use bridge_core::service::current_unix_millis;
 use bridge_core::{Harness, Mode, NativeAddress};
 use serde_json::{Value, json};
 
@@ -52,7 +57,7 @@ pub const DEFAULT_HELPER_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The Codex queue-only message carrier.
 pub struct CodexQueueCarrier {
-    /// The protected registry (recipient bindings and qualified builds).
+    /// The protected registry (recipient bindings).
     registry: Arc<Mutex<Registry>>,
     /// The OS confinement launcher (`/usr/bin/sandbox-exec`).
     sandbox: PathBuf,
@@ -60,6 +65,10 @@ pub struct CodexQueueCarrier {
     timeout: Duration,
     /// Protected adapter directory containing registered frontend sockets.
     desktop_directory: Option<PathBuf>,
+    /// Test seam: runs at the last pre-write boundary of a gateway hand-off,
+    /// after the proof was spent and the connection prepared, so a regression can
+    /// change the world at exactly that point. Always absent in production.
+    gateway_pause: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl CodexQueueCarrier {
@@ -70,7 +79,18 @@ impl CodexQueueCarrier {
             sandbox,
             timeout,
             desktop_directory: None,
+            gateway_pause: None,
         }
+    }
+
+    /// Installs a deterministic pause for race regressions: `pause` runs in a
+    /// gateway hand-off after its one-shot proof was journaled as spent and the
+    /// frontend connection and request frame are prepared, immediately before the
+    /// final pre-write fence. Not part of any production configuration.
+    #[doc(hidden)]
+    pub fn with_gateway_pause(mut self, pause: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.gateway_pause = Some(pause);
+        self
     }
 
     /// Enables application frontend discovery under the protected channel directory.
@@ -82,60 +102,125 @@ impl CodexQueueCarrier {
     /// Revalidates the MESSAGE-only recipient outside the registry lock, then
     /// checks the unchanged attempt epoch. Retired Desktop routes require their
     /// exact live frontend on both attest and send and never select a CLI helper.
+    /// A native owner route wakes only a positively idle recipient, whatever the
+    /// requested mode; helper and application routes keep their lifecycle rules.
     fn binding_for(
         &self,
         attempt: &AttemptRecord,
-    ) -> Result<(NativeAddress, RecipientBinding, Option<PathBuf>), String> {
+    ) -> Result<(NativeAddress, RecipientBinding, Route), String> {
         let address = NativeAddress::parse(&attempt.fence.recipient).map_err(|e| e.to_string())?;
         if address.harness != Harness::Codex {
             return Err("not a Codex recipient".into());
         }
-        let (attestation, binding, frontend) = self.message_recipient(&address)?;
+        let (attestation, binding, route) = self.message_recipient(&address)?;
         if binding.epoch != attempt.fence.endpoint_epoch {
             return Err("the endpoint epoch changed since the reservation".into());
         }
-        if !matches!(
-            attestation.lifecycle(),
-            Lifecycle::Active | Lifecycle::Inactive
-        ) || (attempt.requested_mode == Mode::Auto
-            && attestation.lifecycle() != Lifecycle::Inactive)
-        {
+        let lifecycle = attestation.lifecycle();
+        let allowed = if matches!(route, Route::Owner(_)) {
+            lifecycle == Lifecycle::Inactive
+        } else {
+            matches!(lifecycle, Lifecycle::Active | Lifecycle::Inactive)
+                && (attempt.requested_mode != Mode::Auto || lifecycle == Lifecycle::Inactive)
+        };
+        if !allowed {
             return Err("recipient lifecycle changed before message hand-off".into());
         }
-        Ok((address, binding, frontend))
+        Ok((address, binding, route))
     }
 
-    /// Takes an owned registry snapshot, releases its lock, revalidates current
-    /// OS/store/build/transcript facts and requires an exact-harness frontend
-    /// for application recipients. Failure holds before reservation or sending;
+    /// Starts a background evidence refresh (never hashing here), then takes an
+    /// owned registry snapshot, releases its lock, revalidates current
+    /// OS/store/executable/transcript facts and requires an exact-harness frontend
+    /// for application recipients. A recipient whose recorded incarnation ended is
+    /// attested through the MESSAGE-only gateway (unique live Desktop frontend,
+    /// fresh journaled epoch committed
+    /// before the snapshot is re-read), and a live `Unknown` route carrying an
+    /// unspent idle proof is attested `Inactive` only while that exact transcript
+    /// proof reads back unchanged. Failure holds before reservation or sending;
     /// no native/history/status request or caller evidence is manufactured.
     /// A final locked equality check rejects even same-epoch lifecycle changes
     /// during validation/probing before returning to either attest or send.
-    /// Returns the selected frontend path with the snapshot, so send performs
-    /// no further discovery after that check; invocation still verifies peers.
+    /// Returns the selected route with the snapshot, so send performs no
+    /// further discovery after that check; invocation still verifies peers.
+    /// A present native owner locator is selected before every legacy route and
+    /// holds when it cannot be proven; an absent one leaves them unchanged.
     fn message_recipient(
         &self,
         address: &NativeAddress,
-    ) -> Result<(Attestation, RecipientBinding, Option<PathBuf>), String> {
-        let candidate = { lock_registry(&self.registry).codex_message_candidate(address)? };
-        let result = candidate.validate()?;
-        let frontend = checked_frontend(
+    ) -> Result<(Attestation, RecipientBinding, Route), String> {
+        let mut candidate = { lock_registry(&self.registry).message_candidate(address)? };
+        let result = if candidate.needs_gateway() {
+            self.gateway_recipient(address, &mut candidate)?
+        } else {
+            candidate.validate()?
+        };
+        let route = checked_frontend(
             || {
+                if let Some(socket) = crate::owner::locate(&self.registry, result.1.harness)? {
+                    return if result.1.desktop_message_only {
+                        Err("a retired recipient cannot use a native owner route".into())
+                    } else {
+                        Ok(Route::Owner(socket))
+                    };
+                }
                 if result.1.desktop_message_only
                     || crate::os::process_env(result.1.harness.0, "CODEX_APP_TOOLS_PIPE_PATH")
                         .is_some()
                 {
                     self.desktop_directory.as_ref()
                         .and_then(|directory| crate::desktop::frontend_for(directory, result.1.harness))
-                        .map(Some)
+                        .map(Route::Application)
                         .ok_or_else(|| "registered Codex application frontend not available yet (transient hold)".into())
                 } else {
-                    Ok(None)
+                    Ok(Route::Helper)
                 }
             },
-            || lock_registry(&self.registry).codex_message_current(&candidate),
+            || lock_registry(&self.registry).message_current(&candidate),
         )?;
-        Ok((result.0, result.1, frontend))
+        Ok((result.0, result.1, route))
+    }
+}
+
+impl CodexQueueCarrier {
+    /// Attests the MESSAGE-only physical gateway of an idle Desktop address whose
+    /// recorded harness incarnation ended ([`crate::registry`] gateway evidence):
+    /// exactly one distinct live Desktop harness that qualifies for this binding
+    /// (same executable, store and native pipe) must own a probe-verified
+    /// frontend; zero or several hold. A gateway not yet committed for the
+    /// current snapshot is committed with a fresh, larger endpoint epoch,
+    /// journaled before the snapshot is re-read, so core fences it when the
+    /// attestation is reserved and never after a send. The returned attestation is
+    /// `Inactive`, MESSAGE-only and carries no caller or inject authority; every
+    /// transcript, process and route fact is proven again here, on attest and on
+    /// send.
+    fn gateway_recipient(
+        &self,
+        address: &NativeAddress,
+        candidate: &mut crate::registry::MessageCandidate,
+    ) -> Result<(Attestation, RecipientBinding), String> {
+        let directory = self
+            .desktop_directory
+            .as_ref()
+            .ok_or("no application frontend directory for the gateway route")?;
+        let mut qualified = crate::desktop::frontend_harnesses(directory)
+            .into_iter()
+            .filter(|harness| candidate.qualifies_gateway(*harness));
+        let (Some(gateway), None) = (qualified.next(), qualified.next()) else {
+            return Err(
+                "no unique qualified live Desktop gateway for the idle recipient (hold)".into(),
+            );
+        };
+        candidate.proves_idle()?;
+        if candidate.committed_gateway() != Some(gateway) {
+            lock_registry(&self.registry).commit_gateway(
+                candidate,
+                gateway,
+                current_unix_millis(),
+            )?;
+            *candidate = lock_registry(&self.registry).message_candidate(address)?;
+        }
+        candidate.validate_gateway()
     }
 }
 
@@ -143,6 +228,11 @@ impl DispatchCarrier for CodexQueueCarrier {
     /// Attests Codex MESSAGE recipients from fresh snapshot validation; anything else is not
     /// this carrier's (an error, which core treats as a hold). Application hosts
     /// also require a live compatible frontend before consuming any send attempt.
+    ///
+    /// A recipient whose own environment names a native owner socket is attested
+    /// for that owner route ([`crate::owner`]) before any helper or application
+    /// frontend is considered; it must be positively idle, and an unprovable,
+    /// unreadable or malformed locator is an error (a hold) with no fallback.
     fn attest(&mut self, recipient: &NativeAddress) -> Result<Attestation, String> {
         if recipient.harness != Harness::Codex {
             return Err("not a Codex recipient".into());
@@ -155,8 +245,25 @@ impl DispatchCarrier for CodexQueueCarrier {
     /// message route when the attested harness exposes it; CLI recipients use
     /// the confined queue helper. A selected application route never falls back
     /// after a failed or ambiguous exchange, preventing duplicate delivery.
+    ///
+    /// A native owner route, selected before the helper and application routes
+    /// when the recipient's environment names an owner socket, hands the
+    /// manifest to that owner only for a positively idle recipient (whatever the
+    /// requested mode), after at least 35 seconds of core budget are proven. A
+    /// failure before the request is written is known-unsent; afterwards only a
+    /// correlated, exactly shaped receipt is anything but an unknown outcome,
+    /// which is retained and never resent or replaced by another route.
+    ///
+    /// An application hand-off through a gateway or idle-proof route first spends
+    /// its one-shot proof in the route journal (an unrecordable spend sends
+    /// nothing), then runs a fresh logical and transcript fence after the frontend
+    /// connection and request frame are prepared and immediately before the first
+    /// byte (zero bytes on any change). The proof is restored only after a
+    /// known-unsent refusal while that fence passes again *and* the binding is
+    /// exactly the one that stood right after the spend, and the journal accepts
+    /// it; an accepted or possibly delivered hand-off never restores it.
     fn send(&mut self, attempt: &AttemptRecord) -> Outcome {
-        let (address, binding, frontend) = match self.binding_for(attempt) {
+        let (address, binding, route) = match self.binding_for(attempt) {
             Ok(found) => found,
             Err(reason) => {
                 return Outcome::KnownUnsent {
@@ -169,14 +276,70 @@ impl DispatchCarrier for CodexQueueCarrier {
             attempt.fence.attempt_seq,
             prefix_within(&attempt.fence.manifest_hash, 16)
         );
-        if let Some(frontend) = frontend {
-            return crate::desktop::via_frontend(
-                &frontend,
-                binding.harness,
-                &address.native_session_id,
-                &client_id,
-                &attempt.manifest,
-            );
+        match route {
+            Route::Owner(socket) => {
+                return crate::owner::deliver(
+                    &self.registry,
+                    &socket,
+                    binding.harness,
+                    Harness::Codex,
+                    &crate::owner::Handoff {
+                        thread_id: &address.native_session_id,
+                        call_id: &client_id,
+                        text: &attempt.manifest,
+                        deadline_ms: attempt.deadline_ms,
+                    },
+                );
+            }
+            Route::Application(frontend) => {
+                // A gateway hand-off spends its one-shot proof in the journal
+                // before the first native byte: an unrecordable spend sends
+                // nothing. A fresh logical and physical fence (binding, epoch,
+                // incarnation, gateway qualification and the exact transcript
+                // stamp) then runs after the durable reservation, at the last
+                // pre-write boundary; any change is known-unsent with zero bytes
+                // written. The proof is given back only after a refusal that
+                // proves nothing was written *and* the same fence still holds.
+                let fence = |proof: &crate::registry::WakeProof| -> Result<(), String> {
+                    let candidate = lock_registry(&self.registry).message_candidate(&address)?;
+                    candidate.revalidate_spent(binding.epoch, proof, binding.harness)?;
+                    lock_registry(&self.registry).message_current(&candidate)
+                };
+                let spent = if binding.gateway {
+                    match lock_registry(&self.registry).spend_wake(&address, binding.epoch) {
+                        Ok(spent) => Some(spent),
+                        Err(reason) => {
+                            return Outcome::KnownUnsent {
+                                evidence: format!(
+                                    "gateway proof could not be recorded; nothing sent: {reason}"
+                                ),
+                            };
+                        }
+                    }
+                } else {
+                    None
+                };
+                let outcome = crate::desktop::via_frontend_checked(
+                    &frontend,
+                    binding.harness,
+                    &address.native_session_id,
+                    &client_id,
+                    &attempt.manifest,
+                    || {
+                        if let Some(pause) = &self.gateway_pause {
+                            pause();
+                        }
+                        spent.as_ref().map_or(Ok(()), |spent| fence(spent.proof()))
+                    },
+                );
+                if let (Some(spent), Outcome::KnownUnsent { .. }) = (spent, &outcome)
+                    && fence(spent.proof()).is_ok()
+                {
+                    lock_registry(&self.registry).restore_wake(&address, spent);
+                }
+                return outcome;
+            }
+            Route::Helper => {}
         }
         let helper = Helper {
             sandbox: &self.sandbox,
@@ -188,18 +351,30 @@ impl DispatchCarrier for CodexQueueCarrier {
     }
 }
 
-/// Runs all frontend discovery/probing in `pick` before the final in-memory
-/// binding confirmation in `confirm`. Returns the selected Desktop path or
-/// None for a positively selected CLI route; either error refuses the hand-off.
+/// The one route a validated Codex MESSAGE hand-off takes; selected before any
+/// native write and never replaced by another after a failed or ambiguous
+/// exchange.
+pub(crate) enum Route {
+    /// The confined queue-only App Server helper (CLI recipients).
+    Helper,
+    /// The registered application frontend's source-labelled message tool.
+    Application(PathBuf),
+    /// The recipient's native owner socket, validated by [`crate::owner`].
+    Owner(PathBuf),
+}
+
+/// Runs all route discovery/probing in `pick` before the final in-memory
+/// binding confirmation in `confirm`. Returns what `pick` selected; either error
+/// refuses the hand-off.
 /// Callbacks must preserve that ordering and perform no native message writes.
 /// This fence detects changes during selection, not cancellation after invocation.
-pub(crate) fn checked_frontend(
-    pick: impl FnOnce() -> Result<Option<PathBuf>, String>,
+pub(crate) fn checked_frontend<T>(
+    pick: impl FnOnce() -> Result<T, String>,
     confirm: impl FnOnce() -> Result<(), String>,
-) -> Result<Option<PathBuf>, String> {
-    let frontend = pick()?;
+) -> Result<T, String> {
+    let selected = pick()?;
     confirm()?;
-    Ok(frontend)
+    Ok(selected)
 }
 
 /// Classifies the native answer to a written `thread/queue/add`.
@@ -208,7 +383,7 @@ pub(crate) fn checked_frontend(
 /// `client_id` is [`Outcome::NativeAccepted`] (with the native submission
 /// id as evidence). A native error, a malformed success or no answer is
 /// [`Outcome::OutcomeUnknown`]: the write happened, and no error of the
-/// loaded build is qualified as proof of no queue effect.
+/// Codex build counts as proof of no queue effect.
 pub fn classify_add(response: Option<&Value>, client_id: &str) -> Outcome {
     let bounded = |value: &Value| -> String {
         let text: String = value
@@ -255,7 +430,7 @@ pub fn classify_add(response: Option<&Value>, client_id: &str) -> Outcome {
 pub struct Helper<'a> {
     /// Confinement launcher.
     pub sandbox: &'a std::path::Path,
-    /// Qualified Codex executable.
+    /// Codex executable of the recipient's binding.
     pub executable: &'a std::path::Path,
     /// Attested store (`CODEX_HOME`).
     pub store: &'a std::path::Path,

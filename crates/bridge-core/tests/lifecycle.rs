@@ -736,12 +736,16 @@ fn unsupported_modes_are_refused_over_the_wire_before_acceptance() {
         .unwrap();
         storage.observe_binding(&message_only, 1_000).unwrap();
     });
-    let mut auto = body("evt-auto");
-    auto.mode = Mode::Auto;
+    let mut inject = body("evt-inject");
+    inject.mode = Mode::Inject;
     assert_eq!(
-        client.publish(RUN_TOKEN, &auto).unwrap_err().class,
+        client.publish(RUN_TOKEN, &inject).unwrap_err().class,
         "unsupported"
     );
+    // auto resolves per dispatch and needs only one loaded path.
+    let mut auto = body("evt-auto");
+    auto.mode = Mode::Auto;
+    client.publish(RUN_TOKEN, &auto).unwrap();
     client.publish(RUN_TOKEN, &body("evt-msg")).unwrap();
     running.shutdown();
     running.join();
@@ -749,7 +753,10 @@ fn unsupported_modes_are_refused_over_the_wire_before_acceptance() {
     let publisher = bridge_core::PublisherId::new("agent-run").unwrap();
     assert!(
         storage
-            .lookup(&publisher, &bridge_core::EventId::new("evt-auto").unwrap())
+            .lookup(
+                &publisher,
+                &bridge_core::EventId::new("evt-inject").unwrap()
+            )
             .unwrap()
             .is_none(),
         "an unsupported event is never accepted"

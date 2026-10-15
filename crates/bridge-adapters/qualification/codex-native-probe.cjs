@@ -287,9 +287,8 @@ else run('m2xp', 20 * 60_000, REQUIRED, async probe => {
     '[[grant]]', `token = "${publisher.token}"`, 'publisher = "bridge-probe"', `recipients = ["${recipient}"]`,
     'kinds = ["bridge.probe"]', 'modes = ["inject", "message"]', 'policies = ["keep_all"]',
     '[adapters]', `channel = "${channel}"`, `host_id = "${host}"`,
-    '[[adapters.profiles]]', `namespace = "${namespace}"`, 'harness = "Codex"', `store = "${store}"`,
-    '[[adapters.profiles.executables]]', `path = "${codex}"`, `sha256 = "${probe.checks.codex_sha256}"`,
-    'version = "probe"', 'inject = true', 'message = true', ''].join('\n'), { mode: 0o600 });
+    '[[adapters.harnesses]]', `namespace = "${namespace}"`, 'harness = "Codex"',
+    'inject = true', 'message = true', ''].join('\n'), { mode: 0o600 });
   const daemon = probe.spawn('daemon', path.join(bin, 'bridge-native-daemon'), [config]);
   if (!await probe.until(() => fs.existsSync(channel) && fs.existsSync(core), 10000)) throw new Error('daemon did not start');
 

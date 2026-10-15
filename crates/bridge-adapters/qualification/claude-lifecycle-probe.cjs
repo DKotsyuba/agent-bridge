@@ -2,7 +2,7 @@
  * Owned Claude frontend lifecycle qualification (Q4, Claude side): the real
  * `/clear` dispatch and the paid fork-while-`later`-pending custody case,
  * both observed THROUGH the Bridge composition — a live `bridge-native-daemon`
- * profile, the product `bridge-hook` as the receiver's own hooks and the
+ * (with a harness policy), the product `bridge-hook` as the receiver's own hooks and the
  * daemon's own Core database — never through a text reply.
  *
  * Unpaid phase (default, zero inference): one stock Claude Code 2.1.296
@@ -298,7 +298,7 @@ async function main(probe) {
   probe.checks.paid_phase_enabled = PAID;
 
   const host = 'q4-host', namespace = 'claude-q4';
-  // The profile store is the receiver's OWN store selection: its inherited
+  // The harness store is the receiver's OWN store selection: its inherited
   // CLAUDE_CONFIG_DIR when set, else $HOME/.claude — exactly what the
   // registry resolves from the harness process environment. Read-only.
   const store = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
@@ -328,9 +328,8 @@ async function main(probe) {
     '[[grant]]', `token = "${admin.token}"`, 'publisher = "bridge-probe-ops"', 'admin = true',
     'recipients = []', 'kinds = []', 'modes = []', 'policies = []',
     '[adapters]', `channel = "${channel}"`, `host_id = "${host}"`,
-    '[[adapters.profiles]]', `namespace = "${namespace}"`, 'harness = "ClaudeCode"', `store = "${store}"`,
-    '[[adapters.profiles.executables]]', `path = "${claude}"`, `sha256 = "${probe.checks.claude_sha256}"`,
-    'version = "probe"', 'inject = true', 'message = true', ''].join('\n'), { mode: 0o600 });
+    '[[adapters.harnesses]]', `namespace = "${namespace}"`, 'harness = "ClaudeCode"',
+    'inject = true', 'message = true', ''].join('\n'), { mode: 0o600 });
   const daemon = probe.spawn('daemon', path.join(bin, 'bridge-native-daemon'), [config]);
   if (!await probe.until(() => fs.existsSync(channel) && fs.existsSync(core), 10000)) throw new Error('daemon did not start');
 

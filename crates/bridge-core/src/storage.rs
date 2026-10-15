@@ -512,8 +512,10 @@ impl Storage {
     ///   dependency cycle is refused;
     /// - a recipient whose attested capabilities are known not to include a
     ///   path the mode needs (inject needs the inject path, message the
-    ///   message path, auto both) is refused with
-    ///   [`CoreError::Unsupported`] before acceptance;
+    ///   message path, auto at least one loaded path) is refused with
+    ///   [`CoreError::Unsupported`] before acceptance; an admitted auto event
+    ///   has its effective path selected and gated at dispatch, where an
+    ///   unloaded effective path is a visible hold with no native effect;
     /// - an event that could never be rendered (forbidden controls, escaped
     ///   size over the manifest bound) is refused before acceptance;
     /// - a hard cap reached: [`CoreError::Capacity`], nothing written.
@@ -791,6 +793,12 @@ fn creates_cycle(
 /// Refuses an event whose mode needs a path its recipient is known not to
 /// support.
 ///
+/// `inject` needs the inject path and `message` the message path. `auto`
+/// resolves per dispatch to whichever path the observed lifecycle selects
+/// (see `dispatch::resolve_mode`), so it needs only that at least one path is
+/// loaded; the effective path is gated again at dispatch, where an unloaded
+/// path is a visible hold with no native effect.
+///
 /// Support is known only after an adapter attested the recipient's loaded
 /// capabilities ([`Storage::observe_binding`] or any dispatch); an
 /// unknown recipient is accepted. This is a permanent condition, distinct
@@ -807,12 +815,12 @@ fn check_supported(tx: &Connection, envelope: &Envelope) -> Result<(), CoreError
     let Some((inject, message)) = known else {
         return Ok(());
     };
-    let (needs_inject, needs_message) = match envelope.mode {
-        crate::types::Mode::Inject => (true, false),
-        crate::types::Mode::Message => (false, true),
-        crate::types::Mode::Auto => (true, true),
+    let supported = match envelope.mode {
+        crate::types::Mode::Inject => inject,
+        crate::types::Mode::Message => message,
+        crate::types::Mode::Auto => inject || message,
     };
-    if (needs_inject && !inject) || (needs_message && !message) {
+    if !supported {
         return Err(CoreError::Unsupported(format!(
             "recipient {recipient} does not support mode {} (inject: {inject}, message: {message})",
             envelope.mode.as_str()

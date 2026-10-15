@@ -388,7 +388,7 @@ bridge service stop relay|core --home H --state S
 - `tests/root_composition.rs`: real core service, adapter registry and
   channel, real `bridge-root-mcp`, `bridge-root-relay` and `bridge`
   executables with kernel peer identities. The harness is a labeled
-  stand-in (the test executable qualified in an owned profile); it is **not**
+  stand-in (the test executable, recognized under an owned harness policy and store); it is **not**
   native Claude or Codex evidence.
 - `tests/operator_counts.rs`: real current-schema core service and the real
   `bridge` CLI: complete counts, CLI lineage transfer with the incident it

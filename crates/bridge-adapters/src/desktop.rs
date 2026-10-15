@@ -11,13 +11,12 @@
 //! message request starts are unknown and never fall back to a second route.
 
 use std::io::{Read, Write};
-#[cfg(test)]
-use std::os::unix::fs::MetadataExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 use bridge_core::dispatch::Outcome;
@@ -33,7 +32,7 @@ const HOST_TIMEOUT: Duration = Duration::from_secs(8);
 /// Connects a native Unix pipe under `deadline`, canceling a stalled connect.
 /// Returns a blocking stream after removing it from the temporary reactor.
 /// I/O, runtime creation and elapsed-deadline failures return an error.
-fn connect(pipe: &Path, deadline: Instant) -> std::io::Result<UnixStream> {
+pub(crate) fn connect(pipe: &Path, deadline: Instant) -> std::io::Result<UnixStream> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -55,7 +54,7 @@ fn connect(pipe: &Path, deadline: Instant) -> std::io::Result<UnixStream> {
 /// EOF, socket failure or expiration refuses the frame; partial bytes are not used.
 /// macOS can reject SO_RCVTIMEO after a peer closes despite buffered reply bytes;
 /// in that case only a nonblocking drain is attempted, never an unbounded read.
-fn read_exact(
+pub(crate) fn read_exact(
     stream: &mut UnixStream,
     mut bytes: &mut [u8],
     deadline: Instant,
@@ -80,7 +79,7 @@ fn read_exact(
 }
 
 /// Returns the positive remaining deadline budget, or a timeout error.
-fn remaining(deadline: Instant) -> std::io::Result<Duration> {
+pub(crate) fn remaining(deadline: Instant) -> std::io::Result<Duration> {
     let duration = deadline.saturating_duration_since(Instant::now());
     if duration.is_zero() {
         Err(std::io::ErrorKind::TimedOut.into())
@@ -346,6 +345,102 @@ mod tests {
         drop(reader);
         send.join().unwrap();
     }
+
+    /// A private scratch directory for one discovery or lifetime check.
+    fn private_dir(tag: &str) -> std::path::PathBuf {
+        let entropy = os::random_bytes().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "{tag}{:x}",
+            u64::from_le_bytes(entropy[..8].try_into().unwrap())
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    /// Only the frontend name shape yields a PID; a name that is not valid
+    /// UTF-8 is just skipped, never an abort of the whole scan.
+    #[test]
+    fn frontend_names_parse_to_a_pid_and_non_utf8_is_skipped() {
+        use std::os::unix::ffi::OsStrExt;
+        let parse = |name: &str| frontend_pid(std::ffi::OsStr::new(name));
+        assert_eq!(parse("ui2-dev-1234.sock"), Some(1234));
+        assert_eq!(parse("ui2-a-b-77.sock"), Some(77));
+        assert_eq!(parse("ui2-dev-12x.sock"), None);
+        assert_eq!(parse("ui2-dev-12.socket"), None);
+        assert_eq!(parse("c.sock"), None);
+        assert_eq!(
+            frontend_pid(std::ffi::OsStr::from_bytes(b"ui2-dev-\xff-5.sock")),
+            None
+        );
+    }
+
+    /// A current frontend is still found with thousands of stale frontend names
+    /// and unrelated entries in the directory (a daemon that never cleaned up
+    /// after crashed frontends): the old 512-entry prefix scan could miss it.
+    #[test]
+    fn current_frontend_is_found_beyond_thousands_of_stale_entries() {
+        let dir = private_dir("bs");
+        for index in 0..5_000u32 {
+            std::fs::File::create(dir.join(format!(
+                "{}{}.sock",
+                frontend_prefix(),
+                3_000_000 + index
+            )))
+            .unwrap();
+            std::fs::File::create(dir.join(format!("other-{index}.tmp"))).unwrap();
+        }
+        let current = dir.join(format!("{}{}.sock", frontend_prefix(), std::process::id()));
+        let _listener = UnixListener::bind(&current).unwrap();
+        let parent = &os::ancestry(std::process::id())[1];
+        let started = Instant::now();
+        assert_eq!(
+            frontend_for(&dir, (parent.pid, parent.start_time)),
+            Some(current)
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(frontend_for(&dir, (parent.pid, parent.start_time + 1)).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A relay whose parent channel is gone retires its own advertisement and
+    /// answers later requests with a known-unsent refusal; a foreign file that
+    /// later reuses the name is never unlinked. A live listener on the name
+    /// blocks binding, while the leftover of a dead one is replaced.
+    #[test]
+    fn closed_frontend_retires_only_its_own_socket() {
+        let dir = private_dir("br");
+        let channel = dir.join("c.sock");
+        let name = dir.join(format!("{}{}.sock", frontend_prefix(), std::process::id()));
+        let deliver = |_: &FrontendRequest, _: u32| Outcome::KnownUnsent {
+            evidence: String::new(),
+        };
+        let live = UnixListener::bind(&name).unwrap();
+        assert!(start_frontend_with_delivery(&channel, || true, deliver).is_err());
+        assert!(name.exists(), "a live endpoint is never replaced");
+        drop(live);
+        assert!(name.exists(), "the dead socket file is left behind");
+        let open = Arc::new(AtomicBool::new(true));
+        let flag = Arc::clone(&open);
+        let relay =
+            start_frontend_with_delivery(&channel, move || flag.load(Ordering::SeqCst), deliver)
+                .unwrap()
+                .unwrap();
+        assert!(connect(&name, Instant::now() + Duration::from_secs(2)).is_ok());
+        open.store(false, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while name.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "a closed frontend stays advertised"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::write(&name, b"foreign").unwrap();
+        drop(relay);
+        assert!(name.exists(), "a foreign file at the name is never removed");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 /// Returns the compiled frontend build's private socket prefix. Rolling upgrades
@@ -360,18 +455,29 @@ fn frontend_prefix() -> String {
 }
 
 /// Lifetime guard for the app-authorized MCP frontend's private delivery relay.
-/// Dropping it removes only its owned socket; the process exit ends its worker.
+/// Dropping it removes only its owned socket (the exact inode it bound, never a
+/// foreign or newer file that reuses the name); the process exit ends its worker.
 /// The worker holds the host endpoint solely in memory and accepts only the
 /// actual current adapter daemon identified through the private channel socket.
 pub struct FrontendRelay {
     /// Exclusively bound relay endpoint, under the protected adapter directory.
     path: std::path::PathBuf,
+    /// Device and inode of the socket this relay bound.
+    identity: (u64, u64),
+}
+
+/// Unlinks `path` only while it is still the socket inode `identity`; a missing,
+/// replaced or foreign file is left alone. Returns whether it unlinked.
+fn unlink_owned(path: &Path, identity: (u64, u64)) -> bool {
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|meta| (meta.dev(), meta.ino()) == identity && meta.file_type().is_socket())
+        && std::fs::remove_file(path).is_ok()
 }
 
 impl Drop for FrontendRelay {
     /// Unlinks only this instance's socket; never removes its parent directory.
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        unlink_owned(&self.path, self.identity);
     }
 }
 
@@ -430,9 +536,23 @@ pub fn start_frontend(channel: &Path) -> std::io::Result<Option<FrontendRelay>> 
     {
         return Err(std::io::ErrorKind::PermissionDenied.into());
     }
-    let parent = Arc::new(Mutex::new(Some(stream)));
-    start_frontend_with_delivery(channel, move |request, _owner| {
-        let mut guard = match parent.lock() {
+    let parent_start = os::process_facts(parent)
+        .map(|facts| facts.start_time)
+        .ok_or(std::io::ErrorKind::PermissionDenied)?;
+    let parent_stream = Arc::new(Mutex::new(Some(stream)));
+    let watched = Arc::clone(&parent_stream);
+    let alive = move || {
+        let open = match watched.try_lock() {
+            Ok(guard) => guard.is_some(),
+            // A hand-off is mid-exchange on the stream: still in use.
+            Err(TryLockError::WouldBlock) => true,
+            Err(TryLockError::Poisoned(_)) => false,
+        };
+        open && os::incarnation_alive(parent, parent_start)
+            && os::process_facts(std::process::id()).and_then(|me| me.parent) == Some(parent)
+    };
+    start_frontend_with_delivery(channel, alive, move |request, _owner| {
+        let mut guard = match parent_stream.lock() {
             Ok(guard) => guard,
             Err(_) => {
                 return Outcome::OutcomeUnknown {
@@ -501,29 +621,74 @@ fn start_frontend_with_pipe(
     pipe: std::path::PathBuf,
     node: std::path::PathBuf,
 ) -> std::io::Result<Option<FrontendRelay>> {
-    start_frontend_with_delivery(channel, move |request, owner| {
-        deliver(
-            &node,
-            &pipe,
-            &request.thread_id,
-            &request.call_id,
-            &request.text,
-            owner,
-        )
-    })
+    start_frontend_with_delivery(
+        channel,
+        || true,
+        move |request, owner| {
+            deliver(
+                &node,
+                &pipe,
+                &request.thread_id,
+                &request.call_id,
+                &request.text,
+                owner,
+            )
+        },
+    )
+}
+
+/// How often a relay re-checks that its parent channel is still usable.
+const RETIRE_POLL: Duration = Duration::from_millis(500);
+
+/// Whether `path` is a dead socket of this user: a socket file nobody listens on
+/// (connection refused). Only the exact name this process is about to own is
+/// ever asked, never a scan, so a live or foreign endpoint is never touched.
+fn dead_socket(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_socket())
+        && UnixStream::connect(path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionRefused)
 }
 
 /// Serves authenticated daemon requests through one fixed delivery callback.
 /// The callback receives only the closed frozen manifest and kernel owner uid;
 /// all peer checks and listener lifetime remain shared by production and tests.
+///
+/// `alive` says whether the relay can still deliver (its signed parent channel
+/// is open and the parent is the same live process); a monitor polls it and,
+/// the first time it is false, *retires* the relay: the relay unlinks only its
+/// own socket inode, so discovery stops advertising it, and every request
+/// accepted afterwards is a known-unsent refusal that reaches no host. A relay
+/// whose name is taken by a dead socket (an earlier process with the same PID
+/// that never cleaned up, connection refused) replaces that one file; a live or
+/// foreign endpoint makes binding fail.
+// ponytail: retired relays keep two idle threads until process exit (it follows stdin EOF); join them if relays ever outlive that.
 fn start_frontend_with_delivery(
     channel: &Path,
+    alive: impl Fn() -> bool + Send + 'static,
     delivery: impl Fn(&FrontendRequest, u32) -> Outcome + Send + 'static,
 ) -> std::io::Result<Option<FrontendRelay>> {
     let parent = channel.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
     let path = parent.join(format!("{}{}.sock", frontend_prefix(), std::process::id()));
-    let listener = UnixListener::bind(&path)?;
+    let listener = match UnixListener::bind(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse && dead_socket(&path) => {
+            std::fs::remove_file(&path)?;
+            UnixListener::bind(&path)?
+        }
+        bound => bound?,
+    };
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    let meta = std::fs::symlink_metadata(&path)?;
+    let identity = (meta.dev(), meta.ino());
+    let retired = Arc::new(AtomicBool::new(false));
+    let monitor_retired = Arc::clone(&retired);
+    let monitor_path = path.clone();
+    std::thread::spawn(move || {
+        while alive() {
+            std::thread::sleep(RETIRE_POLL);
+        }
+        monitor_retired.store(true, Ordering::SeqCst);
+        unlink_owned(&monitor_path, identity);
+    });
     let channel = channel.to_path_buf();
     std::thread::spawn(move || {
         for accepted in listener.incoming() {
@@ -553,6 +718,11 @@ fn start_frontend_with_delivery(
                 {
                     return Err(std::io::ErrorKind::InvalidData.into());
                 }
+                if retired.load(Ordering::SeqCst) {
+                    return Ok(Outcome::KnownUnsent {
+                        evidence: "signed frontend retired before sending".into(),
+                    });
+                }
                 Ok(delivery(&request, owner.uid))
             })();
             let value = match outcome {
@@ -576,7 +746,7 @@ fn start_frontend_with_delivery(
             }
         }
     });
-    Ok(Some(FrontendRelay { path }))
+    Ok(Some(FrontendRelay { path, identity }))
 }
 
 /// Closed daemon-to-frontend request. The daemon owns exact target and attempt
@@ -592,59 +762,128 @@ struct FrontendRequest {
     text: String,
 }
 
-/// Finds a live Bridge frontend socket belonging to the exact recipient harness
-/// incarnation. Only kernel PID/ancestry and the protected channel directory are
-/// used; filenames are not identity. A bounded, read-only connection probe skips
-/// dead sockets even when their filename PID was reused. Only signed-client
-/// protocol endpoints are preferred from this build; older labelled endpoints
-/// remain eligible only under a primary Node process. The native application still
-/// enforces its signed-client authorization; a filename grants no authority.
-/// The sending connection
-/// is independently rechecked below; probing never writes a request.
-pub fn frontend_for(directory: &Path, harness: (u32, u64)) -> Option<std::path::PathBuf> {
-    let prefix = frontend_prefix();
-    // ponytail: bounded 512-entry scan; maintain a live index if this ceiling matters.
-    let mut entries: Vec<_> = std::fs::read_dir(directory)
-        .ok()?
-        .take(512)
-        .flatten()
-        .collect();
-    entries.sort_by_key(|entry| !entry.file_name().to_string_lossy().starts_with(&prefix));
-    let deadline = Instant::now() + HOST_TIMEOUT;
-    for entry in entries {
-        let name = entry.file_name();
-        let name = name.to_str()?;
-        let Some(pid) = name
-            .strip_prefix("ui2-")
-            .and_then(|n| n.strip_suffix(".sock"))
-            .and_then(|n| n.rsplit_once('-'))
-            .and_then(|(_, pid)| pid.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        let chain = os::ancestry(pid);
-        if !chain
+/// Largest number of directory entries one discovery scan reads; an unusually
+/// large (hostile or never-cleaned) directory refuses to be scanned further, so
+/// discovery stays bounded in time and memory.
+const MAX_SCAN_ENTRIES: usize = 262_144;
+
+/// The PID a frontend socket file name carries (`ui2-<label>-<pid>.sock`), or
+/// `None` for any other name, including one that is not valid UTF-8. The PID is
+/// only a locator for the kernel checks that follow, never identity.
+fn frontend_pid(name: &std::ffi::OsStr) -> Option<u32> {
+    name.to_str()?
+        .strip_prefix("ui2-")?
+        .strip_suffix(".sock")?
+        .rsplit_once('-')?
+        .1
+        .parse()
+        .ok()
+}
+
+/// One probe-verified Bridge frontend: its socket, its PID and its process
+/// chain (itself first), all read from the kernel, never from the file name.
+struct LiveFrontend {
+    /// Socket path under the protected adapter directory.
+    path: std::path::PathBuf,
+    /// Whether the name carries this build's frontend label (preferred).
+    own_label: bool,
+    /// The frontend's process and its ancestors.
+    chain: Vec<os::ProcessFacts>,
+}
+
+impl LiveFrontend {
+    /// Whether this frontend may serve a hand-off under `harness`: the harness
+    /// incarnation is one of its ancestors and, for an endpoint of another build
+    /// label, its direct parent is a primary Node process.
+    fn serves(&self, harness: (u32, u64)) -> bool {
+        self.chain
             .iter()
             .skip(1)
             .any(|p| (p.pid, p.start_time) == harness)
-            || (!name.starts_with(&prefix)
-                && !chain
+            && (self.own_label
+                || self
+                    .chain
                     .get(1)
                     .and_then(|p| p.exe.as_ref())
                     .and_then(|exe| exe.file_name())
                     .is_some_and(|name| name == "node"))
-        {
-            continue;
+    }
+}
+
+/// Reads the whole protected directory (up to [`MAX_SCAN_ENTRIES`]) and returns
+/// every frontend that is alive right now, own-label endpoints first. Only names
+/// of the frontend shape with a PID the OS currently lists are examined, so
+/// thousands of dead or foreign entries neither hide a current frontend nor cost
+/// a connection each, and one name that is not valid UTF-8 skips only itself.
+/// A bounded, read-only connection probe drops dead sockets even when their
+/// filename PID was reused: the connected peer's kernel PID must equal the one in
+/// the name. Probing never writes a request. `wanted` filters candidates by their
+/// kernel facts *before* the probe; the iterator is lazy, so a caller that stops
+/// at the first match probes no further endpoint.
+fn live_frontends(
+    directory: &Path,
+    wanted: impl Fn(&LiveFrontend) -> bool,
+) -> impl Iterator<Item = LiveFrontend> {
+    let prefix = frontend_prefix();
+    let listed = os::live_pids();
+    let mut entries: Vec<_> = std::fs::read_dir(directory)
+        .ok()
+        .into_iter()
+        .flatten()
+        .take(MAX_SCAN_ENTRIES)
+        .flatten()
+        .filter_map(|entry| {
+            let pid = frontend_pid(&entry.file_name())?;
+            listed.contains(&pid).then_some((entry, pid))
+        })
+        .collect();
+    entries.sort_by_key(|(entry, _)| !entry.file_name().to_string_lossy().starts_with(&prefix));
+    let deadline = Instant::now() + HOST_TIMEOUT;
+    entries.into_iter().filter_map(move |(entry, pid)| {
+        let candidate = LiveFrontend {
+            path: entry.path(),
+            own_label: entry.file_name().to_string_lossy().starts_with(&prefix),
+            chain: os::ancestry(pid),
+        };
+        if !wanted(&candidate) {
+            return None;
         }
-        // A dead socket can share a reused PID with a current harness child.
-        // Probe without writing; EOF cannot initiate a native message.
-        if let Ok(stream) = connect(&entry.path(), deadline)
-            && os::peer_identity(&stream).is_ok_and(|peer| peer.pid == pid)
-        {
-            return Some(entry.path());
+        let stream = connect(&candidate.path, deadline).ok()?;
+        os::peer_identity(&stream)
+            .is_ok_and(|peer| peer.pid == pid)
+            .then_some(candidate)
+    })
+}
+
+/// Finds a live Bridge frontend socket belonging to the exact recipient harness
+/// incarnation. Only kernel PID/ancestry and the protected channel directory are
+/// used; filenames are not identity. See `live_frontends` for the scan. Only
+/// signed-client protocol endpoints are preferred from this build; older labelled
+/// endpoints remain eligible only under a primary Node process. The native
+/// application still enforces its signed-client authorization; a filename grants
+/// no authority. The sending connection is independently rechecked in
+/// [`via_frontend`].
+pub fn frontend_for(directory: &Path, harness: (u32, u64)) -> Option<std::path::PathBuf> {
+    live_frontends(directory, |frontend| frontend.serves(harness))
+        .next()
+        .map(|frontend| frontend.path)
+}
+
+/// Every distinct process incarnation `(pid, start_time)` that owns at least one
+/// live frontend (an ancestor of it), for choosing a physical gateway. The set
+/// holds candidates only: the registry must still qualify each one, and a
+/// frontend still has to pass [`frontend_for`] and [`via_frontend`] for it.
+pub(crate) fn frontend_harnesses(directory: &Path) -> Vec<(u32, u64)> {
+    let mut found: Vec<(u32, u64)> = Vec::new();
+    for frontend in live_frontends(directory, |_| true) {
+        for facts in frontend.chain.iter().skip(1) {
+            let incarnation = (facts.pid, facts.start_time);
+            if frontend.serves(incarnation) && !found.contains(&incarnation) {
+                found.push(incarnation);
+            }
         }
     }
-    None
+    found
 }
 
 /// Delivers once through a registered frontend for `harness`. A connection or
@@ -656,6 +895,23 @@ pub fn via_frontend(
     thread_id: &str,
     call_id: &str,
     text: &str,
+) -> Outcome {
+    via_frontend_checked(path, harness, thread_id, call_id, text, || Ok(()))
+}
+
+/// [`via_frontend`] with a last fence: `before_write` runs after the connection,
+/// the peer-ancestry proof and the request frame are all prepared and immediately
+/// before the first request byte is written, with no registry lock held by this
+/// function. An `Err` is known-unsent: nothing was written and the connection is
+/// dropped. The check must not block on further native effects; whatever it
+/// proves is proven as late as this function can place it.
+pub(crate) fn via_frontend_checked(
+    path: &Path,
+    harness: (u32, u64),
+    thread_id: &str,
+    call_id: &str,
+    text: &str,
+    before_write: impl FnOnce() -> Result<(), String>,
 ) -> Outcome {
     let deadline = Instant::now() + HOST_TIMEOUT + Duration::from_secs(2);
     let mut stream = match connect(path, deadline) {
@@ -677,9 +933,19 @@ pub fn via_frontend(
             evidence: "Codex frontend is not owned by the attested recipient harness".into(),
         };
     }
+    let Ok(body) =
+        serde_json::to_vec(&json!({"thread_id":thread_id,"call_id":call_id,"text":text}))
+    else {
+        return Outcome::KnownUnsent {
+            evidence: "Codex frontend request could not be encoded; nothing sent".into(),
+        };
+    };
+    if let Err(reason) = before_write() {
+        return Outcome::KnownUnsent {
+            evidence: format!("final pre-write fence refused; nothing sent: {reason}"),
+        };
+    }
     let result = (|| -> std::io::Result<Value> {
-        let body =
-            serde_json::to_vec(&json!({"thread_id":thread_id,"call_id":call_id,"text":text}))?;
         stream.set_write_timeout(Some(remaining(deadline)?))?;
         stream.write_all(&(body.len() as u32).to_le_bytes())?;
         stream.write_all(&body)?;

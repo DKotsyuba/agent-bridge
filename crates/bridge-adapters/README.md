@@ -1,7 +1,7 @@
 # bridge-adapters
 
 Native Codex / Claude Code adapters for Agent Bridge: the protected caller
-registry, quiet root hooks and qualified message carriers. They consume core's
+registry, quiet root hooks and message carriers. They consume core's
 single custody and attempt state (`DispatchCarrier`, `observe_binding`,
 `drain_inject`, `record_outcome`); there is no second attempt or hook store.
 
@@ -27,43 +27,58 @@ touched by anything here, and nothing in this crate installs a hook for you.
 
 - **Channel peer.** Every channel connection is identified by kernel peer
   credentials (PID, UID). A peer is a *hook of a harness* only if it runs as
-  the daemon's user and its nearest ancestor that is not an allowlisted shell
-  (`intermediates`) is a configured harness executable whose resolved path and
-  SHA-256 match a profile, whose file was last modified *and* last changed
-  (kernel ctime, which `cp -p` / `install -p` / `touch` cannot restore)
-  strictly before the whole second that process started, so the bytes
-  hashed at daemon startup are the bytes it started from (a replacement or
-  in-place rewrite after the start, even with a preserved mtime, and a change
-  in the start second itself are unproven: restart the harness a second or
-  more after installing a build; a benign chmod or link change after the
-  daemon warmed also moves the nanosecond ctime, which is part of the
-  daemon-start digest cache identity as well, so it needs BOTH a daemon
-  restart (re-hash, never under the serving lock) and a harness restart; a
-  native run should record the stock binary's inode, mtime and ctime before
-  and after to show it was not touched, which proves that run only, not that
-  the OS can never write it; the OS keeps
-  reporting the same executable path for the live process after a
-  replacement, so the path proves nothing, and none of this defends against
-  code that can move the clock backwards), and whose own store (`CODEX_HOME` /
-  `CLAUDE_CONFIG_DIR`, else `$HOME/.codex` / `$HOME/.claude`, read from that
-  process's own environment) is that profile's store. PID, UID, cwd, argv or
-  a process name alone never qualify. `Registry::new` (so every consumer that
-  constructs and then serves a registry, the daemon included) hashes every
-  configured harness and relay executable once before it returns
+  the daemon's user, a harness-level policy serves that harness product, and its
+  nearest ancestor that is not an allowlisted shell (`intermediates`) is a
+  process of that product: it runs as the same user, its resolved executable
+  path carries the product marker (the product name `codex` / `claude` or a
+  configured `executable_markers` entry; an environment variable never counts,
+  because every descendant of a harness inherits its store variables), the file
+  is a regular file owned by that user or root that no group or other user can
+  write and was last modified *and* last changed (kernel ctime, which `cp -p` /
+  `install -p` / `touch` cannot restore) strictly before the whole second the
+  process started, and its own store (`CODEX_HOME` / `CLAUDE_CONFIG_DIR`, else
+  `$HOME/.codex` / `$HOME/.claude`, read from that process's own environment) is
+  an absolute, already canonical directory owned by that user that no group or
+  other user can write (symlinks and non-canonical spellings are refused; the
+  store is checked again at every recipient use and journal restore). No store
+  path and no harness executable is predeclared and nothing is enrolled: a fresh
+  session in any such store registers from its own lifecycle hook. PID, UID, cwd,
+  argv or a process name alone never identify a harness, and the marker is best-effort
+  identification, not authentication (see the boundary below). Addresses use the
+  harness policy's single namespace, so an equal session id held by another live
+  incarnation conflicts. `Registry::new` hashes only the configured relay, owner
+  relay and audience executables once before it returns
   (`executable_digests_warmed` logs the daemon's cached/skipped/unqualified
   counts, as a warning when a file is missing, unreadable or changing or its
-  real hash differs from the configured digest, never paths or contents; about
-  one streamed read of those files, roughly 1.6 s per 246 MB optimized and
-  several times longer unoptimized), and keeps
-  the real digest per exact file identity (path, device and inode, length,
-  nanosecond mtime and ctime). Serving never hashes: a hook or relay request never reads
-  an executable under the registry lock. A file that was missing or unreadable
-  at startup, or is installed, replaced or modified afterwards (even a
-  same-size rewrite in the same second), has no digest for its identity and is
-  refused as unqualified (`NotEvidence`) until the daemon is restarted, which
-  re-hashes the then-current files; other warmed executables keep attesting.
-  After installing or updating a harness build, update its configured digest
-  and restart the daemon.
+  real hash differs from the configured digest, never paths or contents), and
+  keeps the real digest per exact file identity (path, device and inode, length,
+  nanosecond mtime and ctime), the newest identity per path only. Serving never
+  hashes: a request never reads an executable and no registry lock is held
+  across a read. When a configured file's identity changes (an application update,
+  a touch, a rename-replacement with identical bytes) the daemon notices within
+  about half a second and hashes it on a background thread (single-flight; the
+  opened descriptor's identity and the path's must be unchanged across the read,
+  otherwise nothing is cached); until that finishes the new identity has no
+  evidence and every route that needs it refuses *before changing any state*.
+  Nothing is trusted by hashing: the real digest must still equal the configured
+  one, and a process that started before the file's last change is never proven
+  loaded.
+- **Legacy configuration.** `[[adapters.profiles]]` (stores, executable paths,
+  digests and vendor `signature`) still parses as migration input only: the daemon
+  derives one harness policy per harness from it (its single namespace and the
+  union of the capability flags), logs one `legacy_profile_migrated` line per
+  profile, refuses two namespaces for one harness and refuses a configuration that
+  carries both forms, and nothing in a legacy entry authorizes a store or an
+  executable. The vendor signature checker is removed. A legacy `[[adapters.owner_relays]]`
+  table is parsed and discarded (it authorizes nothing, joins no digest cache and takes no
+  part in owner admission) and logged as `legacy_owner_relays_ignored`, also shown by
+  `bridge doctor`.
+- **Journal compatibility and rollback.** The route journal rows gained two optional
+  fields, `wake` (the idle proof, written on every Desktop idle owner hook) and
+  `pending` (read for compatibility only; never written, and such rows are dropped on restore). Rows deny unknown fields, so a daemon of an earlier
+  build refuses to start on a journal that contains them: rolling back needs a journal
+  written by that build or a fresh one. No migration rewrites rows and no schema or
+  authority changes; absent fields read as before.
 - **Binding and epoch.** The harness process incarnation (PID + start time)
   owns its session addresses. The first hook, the owner's own non-`compact`
   `SessionStart` (not a Claude child's, whose events share the root's address,
@@ -101,7 +116,7 @@ touched by anything here, and nothing in this crate installs a hook for you.
 ## Delivery paths
 
 - **inject**: at a root (`PostToolUse` / `UserPromptSubmit`) hook of the
-  addressed actor with qualified inject, the channel calls `drain_inject`
+  addressed actor with inject granted by the harness policy, the channel calls `drain_inject`
   (manifest frozen and `invoking` committed first), replies with the exact
   hook stdout line, and records `hook_submitted` only after the hook confirms
   the flushed digest. Anything else after the reply is `outcome_unknown`
@@ -126,7 +141,7 @@ touched by anything here, and nothing in this crate installs a hook for you.
   requests reach Node only over the child's inherited private descriptor; Rust
   checks the kernel parent PID/UID and exact call correlation, and closes an
   uncertain channel rather than replaying it. Only the supplied Node executable
-  is an allowed intermediate between the Rust child and qualified Codex harness.
+  is an allowed intermediate between the Rust child and the Codex harness.
   Old frontend builds cannot mask the active build during rolling updates.
   The confined CLI queue helper retains its cleared environment and restrictions.
   The native-client and Desktop regression tests require an explicitly prepared absolute
@@ -136,7 +151,7 @@ touched by anything here, and nothing in this crate installs a hook for you.
   is acceptance only. Any failure after the message request starts is unknown,
   retained and never followed by a second ordinary-queue send.
 - **Codex CLI message**: `sandbox-exec -p '(version 1)(allow default)(deny
-  network*)(deny process-fork)' <qualified codex> app-server --listen
+  network*)(deny process-fork)' <the binding's Codex executable> app-server --listen
   stdio://` with a scrubbed environment and `CODEX_HOME` = the attested store;
   only `initialize`, `initialized` and `thread/queue/add` are sent. One total
   budget bounds the exchange: a watchdog kills the helper at the deadline
@@ -146,7 +161,7 @@ touched by anything here, and nothing in this crate installs a hook for you.
   whose `queuedSubmission` echoes the same `clientUserMessageId` is
   acceptance; every native error (including validation-like and generic
   internal errors, which can follow a queue effect), a malformed success and
-  silence are unknown. No error of the loaded build is qualified as proof of
+  silence are unknown. No error of the Codex build counts as proof of
   no queue effect. Queue acceptance is storage,
   not delivery; `clientUserMessageId` never deduplicates. Without the launcher
   the Codex message capability is never granted (publication refuses before
@@ -202,13 +217,13 @@ touched by anything here, and nothing in this crate installs a hook for you.
   message capability is withdrawn and recorded in core, so later message
   publications refuse before acceptance; a missing descriptor is only a
   transient hold. An inbox that appears later in the same incarnation
-  restores the capability only if the loaded profile qualified `message`
-  (a profile with `message = false` stays refused). Every such change is
+  restores the capability only if the harness policy supports `message`
+  (a policy with `message = false` stays refused). Every such change is
   recorded in core first and applied to the registry only after that
   succeeded (a failed core write is retried, never left half-applied), and
   only to the exact binding observed: a renewed epoch or incarnation since
-  the observation makes it a hold and a re-attestation. Withdrawn but
-  qualified bindings are re-checked every 2 s even with nothing pending
+  the observation makes it a hold and a re-attestation. Withdrawn
+  bindings the harness policy grants message to are re-checked every 2 s even with nothing pending
   (publications refuse while message is withdrawn, so no dispatch would
   otherwise look). A daemon restart
   forgets callbacks; core's recheck deadlines then raise incidents, never
@@ -227,21 +242,35 @@ host_id = "this-host"
 # intermediates = ["/bin/sh", "/bin/bash", "/bin/zsh", "/bin/dash", "/usr/bin/env"]
 # max_call_age_ms = 600000
 
-[[adapters.profiles]]
-namespace = "claude-main"                   # native_store_namespace of addresses
+[[adapters.harnesses]]                      # one policy per harness product
 harness = "ClaudeCode"                      # or "Codex"
-store = "/abs/home/.claude"
-[[adapters.profiles.executables]]
-path = "/abs/resolved/claude/binary"
-sha256 = "<64 hex of the qualified build>"
-version = "<exact build version>"
+namespace = "claude-main"                   # native_store_namespace of addresses
 inject = true
 message = true
+# executable_markers = ["claude"]           # optional; default is the product name
 
 [[adapters.relays]]                          # optional: root MCP daemon build
 path = "/abs/root-mcp-daemon"
 sha256 = "<64 hex>"
 ```
+
+**Native owner route (`owner` module).** When the attested harness's own environment
+names `BRIDGE_NATIVE_OWNER_SOCKET`, both carriers select that route before the Codex
+helper, the application frontend and the Claude inbox, and never fall back after
+selecting it. The route needs a positively idle recipient (a Claude recipient needs no
+inbox descriptor), a canonical private socket, a connected peer that is the exact direct
+parent (PID, start, user) of the harness running a trusted executable (a regular file owned
+by that user or root, not writable by group or other, unchanged since the owner started; no
+path or digest is configured and a legacy `owner_relays` entry is ignored). An
+absent locator preserves every legacy route; a present malformed, non-UTF-8,
+untrusted or unavailable one, or an unreadable environment, holds. One six-key request
+and one five-key receipt cross the socket under one absolute 35-second budget, which the
+core attempt must still cover before connecting and immediately before the first byte.
+Only a correlated accepted receipt of the harness's own protocol is native acceptance
+(not context or processing); a known-unsent receipt needs a finite reason; everything
+after the write is an unknown outcome that is retained and never resent. The route is
+tested with a scripted stand-in owner and is not native-qualified; see the [qualification
+matrix](../../docs/qualification.md).
 
 Install `bridge-hook <channel> claude-code` (or `codex`) as the command of the
 `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
@@ -346,11 +375,12 @@ authentication; probes never extract, copy or write credentials.
 
 The adapter channel atomically persists only verified recipient bindings in its
 owner-only directory, with a bounded versioned mode-0600 snapshot. At restart it
-revalidates the same PID/start time, UID, executable bytes, native store and
-current profile, then renews the endpoint epoch and records the fence in core
+revalidates the same PID/start time, UID, recorded executable (a trusted,
+non-writable file unchanged since the process started) and canonical owner-only native
+store and the current harness policy, then renews the endpoint epoch and records the fence in core
 before serving. Lifecycle remains the last verified owner state: unknown and
 approval/input waits are never converted to idle. Retired, dead/reused-process,
-changed-store or unqualified-build routes cannot be restored. Caller records,
+changed-store or policy-less routes cannot be restored. Caller records,
 sealed proofs, native inbox secrets and message payloads are never in the cache.
 
 An already observed live recipient can therefore receive an addressed message
@@ -358,20 +388,104 @@ without any post-restart bridge_me or hook from the recipient. Recipient native
 endpoint/receipt checks still run before actual delivery. Earlier uncertain
 hand-offs remain retained and are never replayed by route recovery. The native
 boundary test covers delivery without recipient activity, larger renewed epochs,
-input-wait preservation, retired/dead routes, changed qualification and private
+input-wait preservation, retired/dead routes, changed executable or policy and private
 file protection. Successful native hooks initialize this snapshot. A missing
 interactive Claude recipient, including a session opened before this format,
-can also be discovered from its bounded owner-owned native session descriptor.
-Discovery rechecks the live process UID/start time, descriptor age, exact native
-store and qualified executable before persisting the route. Only native status
-supplies lifecycle; unknown/input waits stay held. Known and retired bindings
-are never overwritten, and discovery grants no MCP caller identity or proof.
+is not created from a native session descriptor: an address is registered only by the
+harness's own hook. A known live route stuck at `Unknown` is re-observed from its bounded
+owner-owned native session descriptor after rechecking the live process UID/start time,
+descriptor age and exact canonical native store. Only native status supplies lifecycle;
+unknown/input waits stay held. Retired bindings are never overwritten, and discovery
+grants no MCP caller identity or proof.
+
+A saved *live* route is restored with a strictly larger epoch and capabilities narrowed to
+the harness policy. A row written by the removed vendor verification (`pending`) was never
+proven and is dropped. Identity and lifecycle stay distinct: for a Codex Desktop route that
+carries an unspent idle proof, the route is `Unknown` and held until the harness's own next
+hook or its unspent idle proof (the exact transcript stamp from the earlier
+positive idle), re-read unchanged at attest and again at the last write before the native
+byte (message only, no inject, one-shot, spent before the write); a transcript that grew
+or was replaced meanwhile, a turn, a permission wait or a hook that moved the lifecycle
+holds.
+
+A known Claude route stuck at `Unknown` is likewise not trusted from its saved state:
+the next attest re-observes the owned native session descriptor and sets the lifecycle
+only from a descriptor that positively reports `idle` or `busy` for exactly the recorded
+session, PID and start time, executable and store, written at or after the process start;
+an unknown-status, stale, other-store, other-PID or reused-PID descriptor, a retired,
+held, input-waiting or already observed route change nothing. No hook,
+caller or inject is manufactured and the epoch is unchanged. This keeps the address and its
+history instead of dropping and rediscovering it. A recorded PID counts as
+the same incarnation only with its exact recorded start time: a reused PID is a different
+process, never authority, and its route survives only as an unspent idle-proof gateway
+candidate of the same configured thread and store.
+
+### Idle Codex Desktop recipient after an application restart
+
+After an application update or restart the Desktop harness is a new process and an
+idle thread fires no hook, so the recorded incarnation is gone and nothing renews
+the binding. A queued message to such an address is delivered through a MESSAGE-only
+**physical gateway** instead, with no caller, call or inject authority and no rebinding
+of the recorded harness (the thread's own next hook renews the binding the ordinary
+way). The route needs all of:
+
+1. The owner's own hook last left the lifecycle positively `Inactive` on a Desktop
+   harness (the application's native pipe in its environment). That stamps a private
+   *wake proof* binding the retained transcript's device and inode, length, nanosecond
+   modification and status-change times, a SHA-256 of its last 64 KiB and the thread id
+   read from its own `session_meta` header, all from one opened descriptor whose
+   metadata is unchanged across the read and whose path still resolves to the same owned
+   regular file. Every other lifecycle and a renewal clear it; a `SessionEnd` keeps the
+   proof stamped before it only under the existing narrow retired-Desktop idle exception
+   (positive pre-end idle and the same transcript inode), and any other retired binding
+   is never eligible.
+2. The recorded incarnation is dead.
+3. The transcript reads back with exactly the stamped identity, length, times, tail and
+   thread id. No time window is ever substituted for this proof; a write anywhere in the
+   file moves its status-change time, which a program cannot set back, so even a
+   same-length rewrite of the middle holds.
+4. Exactly one distinct live Desktop harness that started after the recorded one, from the
+   recorded executable (unchanged since it started) and store, owns a probe-verified frontend; zero or
+   several hold.
+
+The gateway is committed with a fresh, strictly larger endpoint epoch, journaled before core
+fences it and before any send, and every fact is proven again on attest and on send; a
+failed journal write restores the previous binding. The proof is one-shot and is spent in
+the journal *before* the first native write: a spend that cannot be recorded sends nothing
+(known-unsent; the next attempt must record the removal again before any write). After
+that durable reservation, and again at the last pre-write boundary (after the frontend
+connection, the peer-ancestry proof and the request frame are prepared, with no registry
+lock held), a fresh fence re-proves the binding at exactly its epoch, the dead recorded
+incarnation, the live gateway and the exact transcript stamp: a hook that
+renewed the binding, a new turn or permission wait, or any transcript change makes the
+hand-off known-unsent with zero native bytes written. Only such a refusal, and only while
+the same fence still holds and the journal accepts it, gives the proof back; an accepted or
+possibly delivered hand-off never does, so neither a crash nor a restart nor a
+different queued message can revive it. An unspent proof survives a daemon restart that
+happens while the application is down (the journal restore keeps a gone Codex incarnation
+only while it carries one); a spent one is gone. Active, awaiting-input, unknown, ended,
+changed-transcript, duplicate-gateway, other-store and live-old-incarnation cases hold, and
+an uncertain event is retained and never resent or re-homed. Pre-change journal rows carry
+no proof and are not eligible until the next owner idle hook. Known limits: a real resumed
+turn that has not yet appended to the transcript cannot be seen from the filesystem, and
+the host's flush order after `Stop` is unobserved (a late append only invalidates the stamp
+and holds), so a fixed read-only native thread-state query remains the required
+qualification step before claiming native idle proof. This route is tested with synthetic
+native-owner input only and is not native-qualified.
 
 Codex application frontends use a versioned private protocol, independently of
 release build labels. A daemon update prefers its current build but can retain
 an older labelled frontend under a primary Node process; kernel PID/incarnation,
 protected channel and native signed-client checks still apply. An unavailable
 frontend holds before reservation, so reconnection consumes no delivery retries.
+Discovery reads the whole protected directory, examines only frontend-shaped names
+whose PID the OS lists (so thousands of stale entries or one non-UTF-8 name neither
+hide a current frontend nor cost a connection each) and probes the socket peer's
+kernel PID. A frontend whose signed parent channel closed, whose parent exited or whose
+hand-off outcome became unknown retires its own advertisement by unlinking only its
+own socket inode within about half a second; a foreign or newer file at the name is
+never removed, a live listener on the name blocks binding, and the leftover of a dead
+one (connection refused) is replaced.
 
 ## Universal producer ingress
 

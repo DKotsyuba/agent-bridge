@@ -4,8 +4,8 @@
 //!
 //! Evidence level: contract wiring over real kernel identities, NOT native
 //! host qualification. The harness is a labeled stand-in: this very test
-//! executable re-run with `BRIDGE_IF_ROLE=harness`, qualified in an owned
-//! test profile by its own path and SHA-256. Its hooks are this executable
+//! executable re-run with `BRIDGE_IF_ROLE=harness`, marked as a harness by an
+//! `executable_markers` entry of the lab's harness policy. Its hooks are this executable
 //! re-run with `BRIDGE_IF_ROLE=hook` calling the product hook client
 //! (`ChannelClient::run_hook`) with Claude-shaped hook JSON. The frontend is
 //! started by the stand-in harness through `/bin/sh`, so the registry
@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use bridge_adapters::ChannelClient;
 use bridge_adapters::registry::{
-    CallerAttestor, Profile, QualifiedExecutable, Registry, RegistryConfig, RelayExecutable,
-    SealedProof, Unattested, file_sha256,
+    CallerAttestor, HarnessPolicy, Registry, RegistryConfig, RelayExecutable, SealedProof,
+    Unattested, file_sha256,
 };
 use bridge_adapters::server::{ChannelServer, Custody, private_directory};
 use bridge_client::BridgeClient;
@@ -339,8 +339,8 @@ fn lab(tag: &str) -> Lab {
 /// concise message defaults solely in the new policy test. Legacy labs retain
 /// their original exact grants and forbidden kind/mode cases. When the inherited
 /// Desktop capabilities select the signed Node frontend, only its exact canonical
-/// executable is admitted as an intermediate; the stand-in harness still must
-/// match its qualified executable digest and owned store. A different selected
+/// executable is admitted as an intermediate; the stand-in harness still must be
+/// a marked harness process with an owned canonical store. A different selected
 /// frontend or unavailable executable panics before starting the registry.
 fn lab_with_addresses(tag: &str, any: bool) -> Lab {
     let dir = scratch(tag);
@@ -402,7 +402,6 @@ fn lab_with_addresses(tag: &str, any: bool) -> Lab {
     let channel_dir = dir.join("ch");
     let owner = private_directory(&channel_dir).unwrap();
     let channel_socket = channel_dir.join("c.sock");
-    let harness_exe = std::env::current_exe().unwrap().canonicalize().unwrap();
     let relay_exe = PathBuf::from(env!("CARGO_BIN_EXE_bridge-root-relay"))
         .canonicalize()
         .unwrap();
@@ -424,21 +423,14 @@ fn lab_with_addresses(tag: &str, any: bool) -> Lab {
     let registry = Registry::new(
         RegistryConfig {
             host_id: HOST.into(),
-            profiles: [(NAMESPACE, &store), (NAMESPACE2, &store2)]
-                .into_iter()
-                .map(|(namespace, store)| Profile {
-                    namespace: namespace.into(),
-                    harness: Harness::ClaudeCode,
-                    store: store.clone(),
-                    executables: vec![QualifiedExecutable {
-                        sha256: file_sha256(&harness_exe).unwrap(),
-                        path: harness_exe.clone(),
-                        version: "stand-in".into(),
-                        inject: true,
-                        message: false,
-                    }],
-                })
-                .collect(),
+            harnesses: vec![HarnessPolicy {
+                harness: Harness::ClaudeCode,
+                namespace: NAMESPACE.into(),
+                inject: true,
+                message: false,
+                executable_markers: vec!["root_composition".into()],
+            }],
+            profiles: Vec::new(),
             intermediates,
             max_call_age_ms: 600_000,
             relays: vec![RelayExecutable {
@@ -446,6 +438,7 @@ fn lab_with_addresses(tag: &str, any: bool) -> Lab {
                 path: relay_exe.clone(),
             }],
             audiences: Vec::new(),
+            legacy_owner_relays: 0,
         },
         owner,
     )
@@ -1021,81 +1014,38 @@ fn lost_hook_reply_stays_a_manual_incident_without_resend() {
     drop(harness);
 }
 
-/// Equal session ids in different native stores are distinct callers: neither
-/// replays nor sees the other's events.
+/// Equal session ids in two native stores of one harness are one address, and
+/// a live incarnation holds it: the second store's hook is refused as
+/// conflicting, its calls never attest, and the first caller's custody and
+/// events are untouched. (Store paths are no longer namespaces; the single
+/// harness namespace makes this the collision rule.)
 #[test]
-fn equal_session_ids_in_two_stores_never_share_events() {
+fn equal_session_ids_in_two_stores_are_a_refused_collision() {
     let lab = lab("n");
-    // Two stand-in harnesses, one per store, each with a root session
-    // whose native id is the same `s1`.
     let mut first = Harnessed::start(&lab.store);
     let mut second = Harnessed::start(&lab.store2);
     let start = |session: &str| json!({"hook_event_name": "SessionStart", "session_id": session, "cwd": "/ignored"});
     lab.hook(&mut first, start("s1"));
     lab.hook(&mut first, start("s2"));
-    lab.hook(&mut second, start("s1"));
+    let refused = lab.hook(&mut second, start("s1"));
+    assert!(
+        refused.to_lowercase().contains("conflicting"),
+        "the second store's equal session id is a conflict: {refused}"
+    );
     let send = json!({"request_id": "same", "recipient": recipient("s2"), "kind": "root.note",
                       "mode": "inject", "body": "same body"});
     let from_first = lab.call(&mut first, "s1", "n-1", None, "bridge_send", send.clone());
-    let from_second = lab.call(&mut second, "s1", "n-2", None, "bridge_send", send.clone());
     assert_eq!(class(&from_first), "ok", "{from_first}");
-    assert_eq!(class(&from_second), "ok", "{from_second}");
-    let (one, two) = (
-        &from_first["structuredContent"]["custody"],
-        &from_second["structuredContent"]["custody"],
+    let from_second = lab.call(&mut second, "s1", "n-2", None, "bridge_send", send);
+    assert_ne!(
+        class(&from_second),
+        "ok",
+        "the refused store never attests: {from_second}"
     );
-    assert_eq!(one["replayed"], false);
+    let me_first = lab.call(&mut first, "s1", "n-3", None, "bridge_me", json!({}));
     assert_eq!(
-        two["replayed"], false,
-        "a foreign store's caller is not a replay"
-    );
-    assert_ne!(one["envelope_hash"], two["envelope_hash"]);
-    // Each caller sees exactly its own event.
-    let me_second = lab.call(&mut second, "s1", "n-3", None, "bridge_me", json!({}));
-    assert_eq!(
-        me_second["structuredContent"]["caller"]["address"]["native_store_namespace"],
-        NAMESPACE2
-    );
-    let status_second = lab.call(
-        &mut second,
-        "s1",
-        "n-4",
-        None,
-        "bridge_status",
-        json!({"request_id": "same"}),
-    );
-    assert_eq!(
-        status_second["structuredContent"]["custody"]["envelope_hash"],
-        two["envelope_hash"]
-    );
-    let status_first = lab.call(
-        &mut first,
-        "s1",
-        "n-5",
-        None,
-        "bridge_status",
-        json!({"request_id": "same"}),
-    );
-    assert_eq!(
-        status_first["structuredContent"]["custody"]["envelope_hash"],
-        one["envelope_hash"]
-    );
-    // Both events reach the recipient, one per natural hook, as two
-    // distinct framed events.
-    let prompt = json!({"hook_event_name": "UserPromptSubmit", "session_id": "s2", "prompt": "hi"});
-    let drained = [
-        lab.hook(&mut first, prompt.clone()),
-        lab.hook(&mut first, prompt),
-    ];
-    let ids: std::collections::BTreeSet<&str> = drained
-        .iter()
-        .filter_map(|out| out.split("event=\\\"").nth(1))
-        .filter_map(|rest| rest.split('\\').next())
-        .collect();
-    assert_eq!(ids.len(), 2, "{drained:?}");
-    assert!(
-        drained.iter().all(|out| out.contains("same body")),
-        "{drained:?}"
+        me_first["structuredContent"]["caller"]["address"]["native_store_namespace"],
+        NAMESPACE
     );
     drop((first, second));
 }

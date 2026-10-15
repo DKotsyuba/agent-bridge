@@ -333,11 +333,13 @@ mod tests {
         Registry::new(
             RegistryConfig {
                 host_id: "lab".into(),
+                harnesses: Vec::new(),
                 profiles: Vec::new(),
                 intermediates: Vec::new(),
                 max_call_age_ms: 10_000,
                 relays: Vec::new(),
                 audiences: Vec::new(),
+                legacy_owner_relays: 0,
             },
             0,
         )

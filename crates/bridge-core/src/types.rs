@@ -99,7 +99,7 @@ impl Harness {
 ///
 /// Composed of host id, harness, native store namespace and native session
 /// id, exactly as defined by the technical plan: the namespace identifies the
-/// actual native home/store/profile under the OS owner — never a cwd or
+/// actual native store under the OS owner — never a cwd or
 /// project name. Fork, `/clear` or a new native id produces a different
 /// recipient; display names never participate in routing.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -109,7 +109,8 @@ pub struct NativeAddress {
     pub host_id: String,
     /// Native harness product of the session.
     pub harness: Harness,
-    /// Native home/store/profile namespace under the OS owner.
+    /// Native store namespace under the OS owner (one per harness product in a
+    /// native daemon's harness policy).
     pub native_store_namespace: String,
     /// Native session identifier (Codex thread id or Claude session id).
     pub native_session_id: String,

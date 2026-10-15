@@ -2,6 +2,11 @@
 //! `priority = "later"`, a callback socket unique to each attempt, and
 //! positive closure of written-without-receipt hand-offs.
 //!
+//! A recipient whose own environment names a native owner socket is not sent
+//! an inbox frame at all: it is woken, only while positively idle and with no
+//! inbox descriptor needed, through that owner ([`crate::owner`]), selected
+//! before this carrier's inbox route and without fallback to it.
+//!
 //! The recipient is the exact harness process incarnation of the binding:
 //! its session descriptor (`<store>/sessions/*.json`) must name the
 //! attested session *and* that PID, and the inbox socket's kernel peer must
@@ -16,11 +21,11 @@
 //! `--messaging-socket-path`), so the message capability is withdrawn and
 //! recorded in core before any further acceptance; a descriptor not yet
 //! written is only a transient hold. An inbox that appears later in the
-//! same incarnation restores the message capability only when the loaded
-//! profile qualified it (never a promotion). Every such change is recorded
+//! same incarnation restores the message capability only when the harness
+//! policy grants it (never a promotion). Every such change is recorded
 //! in core first and applied to the registry only after that succeeded,
 //! and only to the exact binding (epoch and incarnation) it was observed
-//! under; withdrawn but qualified bindings are re-checked every 2 s even
+//! under; withdrawn bindings the policy grants message to are re-checked every 2 s even
 //! with no work pending, since publications refuse meanwhile.
 //!
 //! Receipts: the user frame names a callback socket this daemon binds in
@@ -300,7 +305,7 @@ pub(crate) struct SessionHint {
 /// Finds an owner-owned bounded native descriptor naming exactly `session` in
 /// `store`. Only current interactive Claude sessions can bootstrap a recipient.
 /// Returns no caller identity or credentials; registry must check UID, process
-/// incarnation, executable qualification and native store before trusting it.
+/// incarnation, marked-harness executable and native store before trusting it.
 /// Unknown/approval statuses remain held, and files cannot make a PID live.
 pub(crate) fn session_hint(store: &Path, session: &str, uid: u32) -> Option<SessionHint> {
     registry_entries(store, |p| p.extension().is_some_and(|x| x == "json"))
@@ -614,7 +619,7 @@ impl Hub {
     ///
     /// A positively disabled inbox withdraws message; an inbox advertised
     /// later by the same session and incarnation (native late binding)
-    /// restores it, never beyond the loaded build's qualification. A change
+    /// restores it, never beyond the harness policy's grant. A change
     /// is recorded in core first and applied to the registry only after
     /// that succeeded, so registry and core never disagree in the granting
     /// direction and a failed core write is simply retried by the next
@@ -678,7 +683,7 @@ impl Hub {
     }
 
     /// Re-checks every live Claude binding whose message capability was
-    /// withdrawn although its build is qualified, independent of pending
+    /// withdrawn although the harness policy grants it, independent of pending
     /// work: while message is withdrawn, publications refuse before
     /// acceptance, so no dispatch would ever re-attest the recipient. A late
     /// inbox restores message here (recorded in core first); a still
@@ -1082,6 +1087,64 @@ impl ClaudeLaterCarrier {
         })
     }
 
+    /// Validates the native owner route of a recipient whose own environment
+    /// names an owner socket: the shared message candidate is revalidated
+    /// outside the registry lock (exact PID/start, UID, executable and home), the
+    /// owner is proven the exact owner-relay direct parent, and
+    /// a final locked equality check closes the selection. It needs no inbox
+    /// descriptor. Every failure is a hold; there is no fallback to the inbox.
+    fn owner_route(
+        &self,
+        recipient: &NativeAddress,
+    ) -> Result<(Attestation, RecipientBinding, PathBuf), String> {
+        crate::registry::refresh_stale(&self.registry);
+        let candidate = { lock_registry(&self.registry).message_candidate(recipient)? };
+        let (attestation, binding) = candidate.validate()?;
+        let socket = crate::owner::locate(&self.registry, binding.harness)?
+            .ok_or("native owner locator is no longer present")?;
+        lock_registry(&self.registry).message_current(&candidate)?;
+        Ok((attestation, binding, socket))
+    }
+
+    /// One native owner hand-off of the frozen manifest for an owner-routed
+    /// recipient. The unchanged epoch and a positive idle lifecycle are
+    /// required, whatever the requested mode; anything else, and every failure
+    /// before the request is written, is known-unsent. No inbox frame, callback
+    /// socket or second route is ever used after this route is selected.
+    fn send_owner(&self, attempt: &AttemptRecord, address: &NativeAddress) -> Outcome {
+        let (attestation, binding, socket) = match self.owner_route(address) {
+            Ok(found) => found,
+            Err(reason) => {
+                return Outcome::KnownUnsent {
+                    evidence: format!("native owner route not proven: {reason}"),
+                };
+            }
+        };
+        if binding.epoch != attempt.fence.endpoint_epoch
+            || attestation.lifecycle() != bridge_core::dispatch::Lifecycle::Inactive
+        {
+            return Outcome::KnownUnsent {
+                evidence: "recipient epoch or idle lifecycle changed before owner hand-off".into(),
+            };
+        }
+        crate::owner::deliver(
+            &self.registry,
+            &socket,
+            binding.harness,
+            Harness::ClaudeCode,
+            &crate::owner::Handoff {
+                thread_id: &address.native_session_id,
+                call_id: &format!(
+                    "agent-bridge-{}-{}",
+                    attempt.fence.attempt_seq,
+                    crate::registry::prefix_within(&attempt.fence.manifest_hash, 16)
+                ),
+                text: &attempt.manifest,
+                deadline_ms: attempt.deadline_ms,
+            },
+        )
+    }
+
     /// Writes the authenticated `later` frame of `frame`. On failure
     /// returns the outcome: known-unsent while no byte can have left,
     /// unknown once the write started.
@@ -1148,21 +1211,32 @@ impl DispatchCarrier for ClaudeLaterCarrier {
     /// publications refuse before acceptance) and is returned as such, so
     /// core holds visibly instead of treating the path as supported; an
     /// inbox advertised later by the same session and incarnation (native
-    /// late binding) restores message, only if the loaded build is
-    /// qualified for it; a descriptor not yet written, or a malformed one,
+    /// late binding) restores message, only if the harness policy grants it; a
+    /// descriptor not yet written, or a malformed one,
     /// is a transient condition reported as an attestation error (a hold),
     /// never as disabled, enabled or inactive. While every callback slot is
     /// held by an unsettled hand-off the recipient is held too
     /// (`Hub::callback_capacity`), before core reserves an attempt.
+    ///
+    /// A recipient whose own environment names a native owner socket is attested
+    /// through that owner route instead ([`crate::owner`]): it needs no session
+    /// descriptor or inbox, requires the exact direct-parent owner running a
+    /// trusted executable, and
+    /// any unprovable, unreadable or malformed locator is an attestation error
+    /// (a hold) with no fallback to the inbox route. Only a positively idle
+    /// lifecycle may then be woken; an absent locator keeps the behavior above.
     fn attest(&mut self, recipient: &NativeAddress) -> Result<Attestation, String> {
         if recipient.harness != Harness::ClaudeCode {
             return Err("not a Claude recipient".into());
         }
         let (attestation, binding) = {
             let mut registry = lock_registry(&self.registry);
-            registry.discover_claude_recipient(recipient, current_unix_millis())?;
+            registry.discover_claude_recipient(recipient)?;
             registry.attest_recipient(recipient)?
         };
+        if crate::owner::locator(binding.harness.0)?.is_some() {
+            return Ok(self.owner_route(recipient)?.0);
+        }
         let changed = self.hub.sync_message(&self.registry, recipient, &binding)?;
         self.hub.callback_capacity()?;
         Ok(changed.unwrap_or(attestation))
@@ -1179,6 +1253,16 @@ impl DispatchCarrier for ClaudeLaterCarrier {
     /// after it), which is unknown; `held` alone
     /// holds until [`ClaudeTiming::held_recheck_ms`]; silence is written
     /// without receipt. A hand-off is never repeated here.
+    ///
+    /// For an owner-routed recipient (its environment names a native owner
+    /// socket) the frozen manifest instead goes through the native owner
+    /// ([`crate::owner`]) and none of the above applies: the unchanged epoch and
+    /// a positive idle lifecycle are required, whatever the requested mode, and
+    /// every failure before the request is written (including an unreadable
+    /// environment or a bad locator) is known-unsent. After the write only a
+    /// correlated, exactly shaped receipt is anything but an unknown outcome,
+    /// which is retained and never resent; no inbox frame, callback socket or
+    /// second route is used after selection.
     fn send(&mut self, attempt: &AttemptRecord) -> Outcome {
         let unsent = |evidence: String| Outcome::KnownUnsent { evidence };
         let Ok(address) = NativeAddress::parse(&attempt.fence.recipient) else {
@@ -1188,6 +1272,11 @@ impl DispatchCarrier for ClaudeLaterCarrier {
             Ok((_, binding)) => binding,
             Err(reason) => return unsent(format!("recipient not attested: {reason}")),
         };
+        match crate::owner::locator(binding.harness.0) {
+            Ok(None) => {}
+            Ok(Some(_)) => return self.send_owner(attempt, &address),
+            Err(reason) => return unsent(reason),
+        }
         if binding.epoch != attempt.fence.endpoint_epoch {
             return unsent("the endpoint epoch changed since the reservation".into());
         }

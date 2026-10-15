@@ -2,13 +2,13 @@
 //! hook commands and root MCP servers connect to.
 //!
 //! Every connection's peer is identified by the kernel (PID, UID) before a
-//! byte is read, and the registry resolves it to a qualified harness
-//! incarnation (see [`crate::registry`]). One JSON request line per
-//! connection:
+//! byte is read, and the registry resolves it to a marked harness incarnation
+//! that the harness policy enables (see [`crate::registry`]). One JSON request
+//! line per connection:
 //!
 //! - `{"op":"hook","harness":..,"payload":{native hook JSON}}` admits one
 //!   hook event. At a natural context point of the addressed actor with
-//!   qualified inject, the server drains through core
+//!   inject granted by the harness policy, the server drains through core
 //!   [`Storage::drain_inject`] — which commits the reserved, `invoking`,
 //!   frozen manifest *before* any byte is returned — and replies with the
 //!   exact stdout line the hook must print. The hook prints, flushes and
@@ -450,6 +450,11 @@ fn serve(stream: UnixStream, state: &ChannelState) {
     let Some(line) = read_line(&mut reader, IO_TIMEOUT) else {
         return;
     };
+    // A request line arrived: hash any configured relay, owner or audience
+    // executable whose file identity changed since the last hash (an application
+    // update) before any attestation, with the registry lock released; the common
+    // case only stats and returns.
+    crate::registry::refresh_stale(&state.registry);
     if serde_json::from_str::<serde_json::Value>(&line)
         .ok()
         .is_some_and(|value| value.get("api_version").is_some())
@@ -509,7 +514,7 @@ fn serve(stream: UnixStream, state: &ChannelState) {
     }
 }
 
-/// Admits one hook event and, at a qualified context point, drains.
+/// Admits one hook event and, at a context point with inject granted, drains.
 fn serve_hook(
     peer: os::PeerIdentity,
     harness: Harness,

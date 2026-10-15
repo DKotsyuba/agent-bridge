@@ -27,14 +27,16 @@ is supported native host MCP-call grammar. Payload meaning and local admission,
 sandbox/access/source/generation checks remain with the producer.
 
 The registry and custody locks never overlap; neither spans socket I/O. Serving
-reuses warmed executable identity/digest checks and current kernel process facts;
-it never hashes executable bytes under an admission lock.
+reuses warmed digest checks of the configured relay and audience
+executables and current kernel process facts (harness executables get no digest
+check: they are checked for owner, mode and unchanged-since-start process facts); it never hashes executable bytes under an
+admission lock.
 
 ## Verified origin and claim
 
 New registration requires one exact native MCP invocation or a registry-issued
 sealed transfer of it. Direct metadata joins one protected fresh PreToolUse
-record belonging to the same qualified harness incarnation and binding epoch.
+record belonging to the same verified harness incarnation and binding epoch.
 Mixed, ambiguous, foreign, stale, malformed and previously consumed evidence
 refuse. Root and child remain distinct even when they share a session address.
 An address, operation key, PID, cwd, environment, display name or model-authored
@@ -147,8 +149,9 @@ No credentials, raw proof strings or assertion keys enter ordinary Debug/log out
 ## Capabilities and acceptance controls
 
 Authenticated capabilities disclose only the producer's permitted boundary.
-Native host/build/digest and direct/nested path support are explicit. Declarative
-profile support is distinct from recorded native qualification. Initial
+Native host/build/digest facts are not advertised (the list is empty: no harness
+build is predeclared), so a consumer never reads a fake build. Harness-policy
+support is distinct from recorded native qualification. Initial
 host_observations is unsupported; existing lifecycle hooks/carriers remain intact.
 
 Decisive owned-process controls: direct/sealed reservation exclusivity versus
@@ -175,7 +178,7 @@ Optional TOML `adapters.audiences` entries have opaque `name`, authenticated
 The corresponding core producer policy explicitly grants the audience name.
 Do not share a backend credential or executable qualification with an untrusted
 frontend; this deployment trust declaration is not product permission. Missing
-configuration, wrong peer/build/producer/invocation or expired/revoked assertion
+configuration, wrong peer/executable/producer/invocation or expired/revoked assertion
 refuses before a new consume effect. Consumed receipts remain bounded per boot;
 exhaustion refuses new assertion capacity rather than dropping their identities.
 

@@ -21,6 +21,7 @@ dependencies = [
 name = "bridge-adapters"
 version = "0.2.0"
 dependencies = [
+ "bridge-adapters",
  "bridge-core",
  "bridge-protocol",
  "serde",

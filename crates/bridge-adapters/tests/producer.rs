@@ -89,7 +89,7 @@ fn registration(id: &str, op: &str, call: &str) -> Request {
     .unwrap()
 }
 
-/// Sends a public frame from a qualified harness descendant, preserving genuine
+/// Sends a public frame from a descendant of a marked harness process, preserving genuine
 /// kernel ancestry. Typed decoding keeps secrets redacted in test diagnostics.
 fn call(
     harness: &mut Harnessed,

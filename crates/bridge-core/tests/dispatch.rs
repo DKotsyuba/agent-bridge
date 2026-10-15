@@ -2070,9 +2070,28 @@ fn long_holds_escalate_to_an_incident_that_clears_with_the_hold() {
     assert!(storage.open_incidents(700_001, 10).unwrap().is_empty());
 }
 
+/// An attestation of `recipient` with exactly the given loaded paths.
+fn attest_with(
+    recipient: &NativeAddress,
+    lifecycle: Lifecycle,
+    inject: bool,
+    message: bool,
+) -> Attestation {
+    Attestation::verified(
+        recipient.clone(),
+        recipient.native_session_id.clone(),
+        1,
+        lifecycle,
+        Capabilities { inject, message },
+        "fixture-proof",
+    )
+    .unwrap()
+}
+
 /// Modes the recipient is known not to support are refused before
 /// acceptance, while an unknown recipient is accepted pending
-/// attestation.
+/// attestation. `auto` needs only that at least one path is loaded: it
+/// resolves per dispatch and its effective path is gated there.
 #[test]
 fn unsupported_modes_are_refused_before_acceptance_but_unknown_recipients_are_accepted() {
     let mut storage = store();
@@ -2084,38 +2103,59 @@ fn unsupported_modes_are_refused_before_acceptance_but_unknown_recipients_are_ac
             1_000,
         )
         .unwrap();
-    // The adapter attests that only message is loaded.
-    let message_only = Attestation::verified(
-        recipient.clone(),
-        "thread-caps",
-        1,
-        Lifecycle::Inactive,
-        Capabilities {
-            inject: false,
-            message: true,
-        },
-        "fixture-proof",
-    )
-    .unwrap();
-    storage.observe_binding(&message_only, 2_000).unwrap();
-    for mode in [Mode::Inject, Mode::Auto] {
-        assert!(
-            matches!(
-                storage.publish(
-                    &keep_all("agent-run", &format!("caps-{mode:?}"), &recipient, mode),
-                    3_000
-                ),
-                Err(CoreError::Unsupported(_))
-            ),
-            "{mode:?} needs the inject path"
-        );
-    }
+    // The adapter attests that only message is loaded: inject is refused,
+    // auto resolves to message and is admitted, message is admitted.
     storage
-        .publish(
-            &keep_all("agent-run", "caps-msg", &recipient, Mode::Message),
-            3_000,
+        .observe_binding(
+            &attest_with(&recipient, Lifecycle::Inactive, false, true),
+            2_000,
         )
         .unwrap();
+    assert!(
+        matches!(
+            storage.publish(
+                &keep_all("agent-run", "caps-inject", &recipient, Mode::Inject),
+                3_000
+            ),
+            Err(CoreError::Unsupported(_))
+        ),
+        "inject needs the inject path"
+    );
+    for mode in [Mode::Auto, Mode::Message] {
+        storage
+            .publish(
+                &keep_all("agent-run", &format!("caps-{mode:?}"), &recipient, mode),
+                3_000,
+            )
+            .unwrap();
+    }
+    // With neither path loaded every mode is refused before custody.
+    storage
+        .observe_binding(
+            &attest_with(&recipient, Lifecycle::Inactive, false, false),
+            3_500,
+        )
+        .unwrap();
+    for mode in [Mode::Inject, Mode::Message, Mode::Auto] {
+        let id = format!("caps-none-{mode:?}");
+        assert!(
+            matches!(
+                storage.publish(&keep_all("agent-run", &id, &recipient, mode), 3_600),
+                Err(CoreError::Unsupported(_))
+            ),
+            "{mode:?} has no loaded path"
+        );
+        assert!(
+            storage
+                .lookup(
+                    &bridge_core::PublisherId::new("agent-run").unwrap(),
+                    &bridge_core::EventId::new(&id).unwrap()
+                )
+                .unwrap()
+                .is_none(),
+            "{mode:?} was never accepted"
+        );
+    }
     // Unsupported is permanent and distinct from a transient hold: the
     // adapter re-attesting with the inject path loaded lifts the refusal.
     storage
@@ -2128,6 +2168,67 @@ fn unsupported_modes_are_refused_before_acceptance_but_unknown_recipients_are_ac
                 5_000
             )
             .is_ok()
+    );
+}
+
+/// An admitted `auto` event of a message-only recipient follows the
+/// lifecycle: positively inactive resolves to the message path and reserves
+/// one attempt; active resolves to inject, which is not loaded, so nothing is
+/// reserved or sent and the message path never takes it.
+#[test]
+fn auto_for_a_message_only_recipient_follows_the_lifecycle_without_effect() {
+    let mut storage = store();
+    let inactive = codex("thread-auto-idle");
+    let active = codex("thread-auto-busy");
+    for (recipient, lifecycle, event) in [
+        (&inactive, Lifecycle::Inactive, "auto-idle"),
+        (&active, Lifecycle::Active, "auto-busy"),
+    ] {
+        let attestation = attest_with(recipient, lifecycle, false, true);
+        storage.observe_binding(&attestation, 1_000).unwrap();
+        storage
+            .publish(&keep_all("agent-run", event, recipient, Mode::Auto), 2_000)
+            .unwrap();
+    }
+    let reserved = attempt(
+        storage
+            .reserve_next(
+                &attest_with(&inactive, Lifecycle::Inactive, false, true),
+                EffectiveMode::Message,
+                3_000,
+                &timing(),
+            )
+            .unwrap(),
+    );
+    assert_eq!(reserved.requested_mode, Mode::Auto);
+    assert_eq!(reserved.effective_mode, EffectiveMode::Message);
+
+    let busy = attest_with(&active, Lifecycle::Active, false, true);
+    assert!(matches!(
+        storage
+            .reserve_next(&busy, EffectiveMode::Message, 3_000, &timing())
+            .unwrap(),
+        Selection::Idle
+    ));
+    assert!(matches!(
+        storage
+            .reserve_next(&busy, EffectiveMode::Inject, 3_000, &timing())
+            .unwrap(),
+        Selection::Held(reason) if reason.contains("not loaded")
+    ));
+    assert!(
+        storage
+            .latest_attempt("agent-run", "auto-idle")
+            .unwrap()
+            .is_some(),
+        "the inactive recipient's event has its attempt"
+    );
+    assert!(
+        storage
+            .latest_attempt("agent-run", "auto-busy")
+            .unwrap()
+            .is_none(),
+        "the active recipient's event has no attempt and no native effect"
     );
 }
 

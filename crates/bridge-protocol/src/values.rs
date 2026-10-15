@@ -142,9 +142,9 @@ impl fmt::Debug for Payload {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Host {
-    /// Qualified Codex MCP metadata/hook contract.
+    /// Codex MCP metadata/hook contract.
     Codex,
-    /// Qualified Claude Code MCP metadata/hook contract.
+    /// Claude Code MCP metadata/hook contract.
     ClaudeCode,
 }
 

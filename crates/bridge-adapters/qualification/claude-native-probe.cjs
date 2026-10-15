@@ -98,9 +98,8 @@ run('m2cp', 15 * 60_000, REQUIRED, async probe => {
     '[[grant]]', `token = "${admin.token}"`, 'publisher = "bridge-probe-ops"', 'admin = true',
     'recipients = []', 'kinds = []', 'modes = []', 'policies = []',
     '[adapters]', `channel = "${channel}"`, `host_id = "${host}"`,
-    '[[adapters.profiles]]', `namespace = "${namespace}"`, 'harness = "ClaudeCode"', `store = "${store}"`,
-    '[[adapters.profiles.executables]]', `path = "${claude}"`, `sha256 = "${probe.checks.claude_sha256}"`,
-    'version = "probe"', 'inject = true', 'message = true', ''].join('\n'), { mode: 0o600 });
+    '[[adapters.harnesses]]', `namespace = "${namespace}"`, 'harness = "ClaudeCode"',
+    'inject = true', 'message = true', ''].join('\n'), { mode: 0o600 });
   const daemon = probe.spawn('daemon', path.join(bin, 'bridge-native-daemon'), [config]);
   if (!await probe.until(() => fs.existsSync(channel) && fs.existsSync(core), 10000)) throw new Error('daemon did not start');
 

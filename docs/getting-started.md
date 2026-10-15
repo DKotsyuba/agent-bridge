@@ -119,15 +119,10 @@ policies = []
 channel = "/ABS/state/ch/c.sock"
 host_id = "this-host"
 
-[[adapters.profiles]]            # one per native store you want to reach
-namespace = "claude-main"
+[[adapters.harnesses]]           # one policy per harness product; no store or executable
 harness = "ClaudeCode"           # or "Codex"
-store = "/ABS/home/.claude"
-[[adapters.profiles.executables]]
-path = "/ABS/resolved/path/to/claude"
-sha256 = "<64 hex SHA-256 of that exact build>"
-version = "<exact version>"
-inject = true                    # you assert this exact build supports hook injection
+namespace = "claude-main"
+inject = true                    # hook injection is supported for this harness
 message = true                   # and its message carrier
 
 [[adapters.relays]]              # the relay_binding printed by the installer
@@ -157,10 +152,11 @@ modes = ["message", "inject", "auto"]
 kinds = ["bridge.message"]
 ```
 
-Find the executable path with `realpath "$(command -v claude)"` and its digest with
-`shasum -a 256`. A configured digest enables a profile; it is not a claim that the
-build was qualified. Updating the harness changes its digest: update the
-configuration and restart the daemon.
+No store path or harness executable is configured: a fresh session in any canonical store
+you own (not writable by group or other) registers from its own lifecycle hook, and updating
+the harness needs no configuration change. A configuration written for the earlier
+per-store `[[adapters.profiles]]` still loads as migration input; see the [configuration
+reference](configuration.md#migrating-a-configuration-written-for-store-and-build-allowlists).
 
 ## 6. Start
 
@@ -204,9 +200,9 @@ step that nothing here does for you.
    refusal classes are in the [interfaces guide](../crates/bridge-interfaces/README.md).
    The session gets exactly `bridge_me`, `bridge_send` and `bridge_status`.
 3. **Receiving does not need enrollment.** A recipient needs no `bridge_me` call and no
-   manual session registration: a session that has a qualified native route (a
-   verified hook binding of an exact configured build) can be addressed. An unknown,
-   dead, permission-waiting or unqualified recipient is a visible hold, and an
+   manual session registration: a session that has a verified native route (a
+   hook binding of a marked harness process under the harness policy) can be addressed. An unknown,
+   dead, permission-waiting or unattested recipient is a visible hold, and an
    uncertain delivery is never resent for you.
 
 ## 8. Send and observe

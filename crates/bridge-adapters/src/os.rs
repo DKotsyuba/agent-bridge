@@ -13,7 +13,7 @@
 //! tokio's stable `peer_cred` (LOCAL_PEEREPID + getpeereid on macOS,
 //! SO_PEERCRED on Linux) and process facts from `sysinfo`.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
@@ -125,6 +125,17 @@ pub fn ancestry(pid: u32) -> Vec<ProcessFacts> {
     chain
 }
 
+/// Every process id the OS currently lists, from one process-table snapshot.
+///
+/// A cheap liveness prefilter for scans over many candidate PIDs (stale socket
+/// names): it proves nothing about identity, so a listed PID must still pass
+/// [`process_facts`]/[`ancestry`] and the incarnation checks before it counts.
+pub fn live_pids() -> std::collections::HashSet<u32> {
+    let mut system = System::new();
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    system.processes().keys().map(|pid| pid.as_u32()).collect()
+}
+
 /// Whether the exact process incarnation (`pid` started at `start_time`)
 /// is still alive.
 pub fn incarnation_alive(pid: u32, start_time: u64) -> bool {
@@ -144,9 +155,26 @@ pub fn random_bytes() -> std::io::Result<[u8; 32]> {
 /// it (never from a peer's message).
 ///
 /// Returns `None` when the variable is absent or the environment is not
-/// readable. Used only for a harness process's own store selection
+/// readable; a value that is not valid UTF-8 is returned byte-exact, never
+/// treated as absent. Used only for a harness process's own store selection
 /// (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`), never as caller identity.
 pub fn process_env(pid: u32, name: &str) -> Option<OsString> {
+    process_env_checked(pid, name).ok().flatten()
+}
+
+/// Like [`process_env`] but distinguishes positive absence from missing
+/// knowledge: `Ok(None)` means the environment was read, held entries and none
+/// is `name`; `Err` (kind `NotFound` for a gone process, `Unsupported` for an
+/// environment that came back empty) means the answer is unknown. An empty
+/// answer cannot be told apart from an unreadable one on this OS interface (a
+/// process that genuinely has no environment may report exec metadata entries
+/// instead, and then reads as positive absence). A present entry is matched on
+/// its raw bytes, so a value that is not valid UTF-8 is still present and is
+/// returned byte-exact, never reported as absent. A caller that must not treat
+/// unknown metadata as absence (the native owner locator) holds on `Err`.
+pub fn process_env_checked(pid: u32, name: &str) -> std::io::Result<Option<OsString>> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::ffi::OsStrExt;
     let mut system = System::new();
     let target = Pid::from_u32(pid);
     system.refresh_processes_specifics(
@@ -154,12 +182,23 @@ pub fn process_env(pid: u32, name: &str) -> Option<OsString> {
         true,
         ProcessRefreshKind::nothing().with_environ(UpdateKind::Always),
     );
-    let process = system.process(target)?;
-    let prefix = format!("{name}=");
-    process.environ().iter().find_map(|entry| {
-        let text = entry.to_str()?;
-        text.strip_prefix(&prefix).map(OsString::from)
-    })
+    let process = system
+        .process(target)
+        .ok_or_else(|| Error::new(ErrorKind::NotFound, "process is gone"))?;
+    if process.environ().is_empty() {
+        return Err(Error::new(
+            ErrorKind::Unsupported,
+            "process environment is empty or unreadable",
+        ));
+    }
+    let key = name.as_bytes();
+    Ok(process.environ().iter().find_map(|entry| {
+        let bytes = entry.as_bytes();
+        match bytes.strip_prefix(key) {
+            Some([b'=', value @ ..]) => Some(OsStr::from_bytes(value).to_os_string()),
+            _ => None,
+        }
+    }))
 }
 
 #[cfg(test)]
@@ -180,6 +219,19 @@ mod tests {
         let mut byte = [0u8; 1];
         (&left).read_exact(&mut byte).unwrap();
         assert_eq!(&byte, b"x");
+    }
+
+    /// Checked lookup reads this process's own environment: a present variable
+    /// is returned and an absent one is positive absence, not unknown.
+    #[test]
+    fn checked_env_reports_present_and_absent() {
+        let pid = std::process::id();
+        assert!(process_env_checked(pid, "PATH").unwrap().is_some());
+        assert!(
+            process_env_checked(pid, "BRIDGE_OS_TEST_UNSET")
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Ancestry starts with this process and its exact incarnation is alive.

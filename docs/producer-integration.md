@@ -40,7 +40,7 @@ Narrow `native_scopes` (exact `host/harness/store` prefixes), recipients, modes 
 kinds when you can. These are declarative permissions, not a catalog of
 implementations. A grant without `producer_v1` keeps legacy behavior and gains no v1
 mutation permission; operator grants are a separate realm. The installation owns the
-protected native hooks, the qualified host profiles and the registration endpoint:
+protected native hooks, the native harness policies and the registration endpoint:
 do not copy a caller-binding hook into each producer. Checks on source, access,
 admission, generation or business state remain at the producer's own trusted
 boundary; Bridge does not replace them. See [Configuration](configuration.md).
@@ -68,9 +68,11 @@ let capabilities = client.capabilities(persisted_capability_request_id)?;
 
 The SDK depends on `bridge-protocol`, `serde`, `serde_json` and `socket2` only: no
 core, SQLite, native carrier, MCP framework or connection pool. Capabilities come
-from the registration endpoint and combine authenticated core policy with native host,
-build and path facts. Registration and optional assertion consumption use that
-endpoint; publication, status, close and lifetime retirement use the core endpoint.
+from the registration endpoint and combine authenticated core policy with native path
+facts. The native adapter currently advertises an empty build-contract list
+(`native_contracts`), so no host build or build digest is disclosed. Registration and
+optional assertion consumption use that endpoint; publication, status, close and lifetime
+retirement use the core endpoint.
 Configured host support is distinct from a qualification receipt, and a feature that is
 not advertised is refused explicitly: check capabilities, do not infer them from DTO
 availability.
@@ -79,10 +81,11 @@ availability.
 
 At the actual MCP frontend, preserve the framework-protected `_meta` object separately
 from the arguments. `extract_native_evidence(host, &original_meta)` only parses an
-**unverified** candidate; the Bridge peer, build, store and hook join establishes
-authority. A caller address, native id or route string supplied by a model cannot
-substitute for that join. Direct MCP calls are supported where the host build is
-qualified; a nested inner call, an outer wrapper and host observations are not.
+**unverified** candidate; the Bridge verified peer, marked harness process, canonical
+store and hook join establishes authority. A caller address, native id or route string
+supplied by a model cannot substitute for that join. Direct MCP calls are supported on
+the host paths the adapter reports as supported; a nested inner call, an outer wrapper
+and host observations are not.
 
 1. Persist a stable registration request id and an opaque operation incarnation
    *before* calling `register_call(id, RegisterCallParams { ... })` with
@@ -115,7 +118,7 @@ no native fallback, duplicate sender or second event id repairs an uncertain res
 
 An authorized producer can instead use `Destination::Address` when `direct_address` is
 enabled. No recipient registration and no receiver `bridge_me` call is required, but the
-recipient must still have a qualified native route: an absent, dead or input-waiting
+recipient must still have an attested native route: an absent, dead or input-waiting
 recipient is a visible hold, never a guessed alternate chat.
 
 `status(id, StatusSelector::Event { event_id })` observes one owned registration, route
@@ -143,7 +146,7 @@ in-flight operation cannot still commit.
   manifests. If invoking committed first, the possible effect is retained and cannot be
   recalled; later evidence changes event status, never the immutable retirement counts. A
   scope retired before its first publication stays a permanent tombstone.
-- A Bridge restart restores qualified recipient links and durable route receipts. It loses
+- A Bridge restart restores still-live recipient bindings and durable route receipts. It loses
   ephemeral assertions and uncommitted call evidence, which a historical receipt cannot
   reconstruct. Identity and tombstone capacity refuse admission instead of silently
   evicting or reusing a key. There is no implicit job timeout.

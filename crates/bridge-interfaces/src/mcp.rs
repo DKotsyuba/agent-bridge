@@ -7,7 +7,7 @@
 //! registry to attest *this process's* caller and seal a single-use proof
 //! ([`bridge_adapters::RegistryAttestor::attest_sealed`]: the registry
 //! identifies the frontend by kernel peer credentials and requires it to
-//! descend from a qualified harness), and forwards `{proof, tool,
+//! descend from a marked harness the policy enables), and forwards `{proof, tool,
 //! arguments}` to the root relay ([`crate::root`]), which redeems the proof
 //! and enforces policy. Missing `_meta`, a model-supplied identity, or any
 //! attestation failure refuses the call before the relay is contacted.

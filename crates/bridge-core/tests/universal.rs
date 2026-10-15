@@ -1430,6 +1430,17 @@ fn public_capabilities_normalize_valid_legacy_duplicate_grants() {
         panic!("capabilities")
     };
     caps.validate().unwrap();
+    assert!(
+        caps.operations
+            .iter()
+            .all(|operation| !operation.contains("profile") && !operation.contains("enroll")),
+        "no runtime profile operation is exposed: {:?}",
+        caps.operations
+    );
+    assert!(
+        caps.native_contracts.is_empty(),
+        "no predeclared native build is advertised"
+    );
     assert_eq!(caps.modes, vec![Mode::Message, Mode::Inject]);
     assert_eq!(caps.grant.allowed_modes, caps.modes);
     assert_eq!(caps.policies, vec![PolicyKind::KeepAll, PolicyKind::Batch]);
@@ -1564,4 +1575,75 @@ fn preserve_lifetime_keeps_dispatch_and_freezes_disjoint_snapshot() {
             ..first.receipt
         }
     );
+}
+/// A producer whose grant permits only `auto` publishes by exact address to a
+/// recipient whose adapter loaded only the message path: `auto` is admitted
+/// (it resolves to message while positively inactive), explicit `message` and
+/// `inject` stay outside the unchanged grant, and with no loaded path `auto` is
+/// refused as unsupported before any custody row exists.
+#[test]
+fn auto_only_grant_reaches_a_message_only_recipient_and_nothing_else() {
+    let dir = TempDir::new("universal-auto-only");
+    let path = dir.path("state.db");
+    let mut storage = Storage::open(&path, bridge_core::Limits::new(100)).unwrap();
+    let mut only_auto = grant(TOKEN, "report-maker");
+    only_auto.modes = vec!["auto".into()];
+    storage
+        .install_producer_authorizer(Arc::new(ProducerAuthorizer::new(&[only_auto]).unwrap()))
+        .unwrap();
+    storage
+        .register_source_tag("report-maker", "report-maker")
+        .unwrap();
+    let recipient = codex("thread-message-only");
+    let direct = |event: &str, mode: Mode| PublishParams {
+        destination: Destination::Address {
+            address: recipient.to_canonical_string(),
+        },
+        mode,
+        ..publication("unused", event, None)
+    };
+    let loaded = |inject: bool, message: bool| {
+        bridge_core::dispatch::Attestation::verified(
+            recipient.clone(),
+            "thread-message-only",
+            1,
+            Lifecycle::Inactive,
+            bridge_core::dispatch::Capabilities { inject, message },
+            "fixture-proof",
+        )
+        .unwrap()
+    };
+    let events = |sql: &rusqlite::Connection| {
+        sql.query_row("SELECT COUNT(*) FROM events", [], |r| r.get::<_, u64>(0))
+            .unwrap()
+    };
+    let sql = rusqlite::Connection::open(&path).unwrap();
+
+    storage
+        .observe_binding(&loaded(false, true), 1_000)
+        .unwrap();
+    storage
+        .publish_v1(TOKEN, &direct("auto-ok", Mode::Auto), &|| 1_001)
+        .unwrap();
+    assert_eq!(events(&sql), 1);
+    for mode in [Mode::Message, Mode::Inject] {
+        let error = storage
+            .publish_v1(
+                TOKEN,
+                &direct(&format!("not-granted-{mode:?}"), mode),
+                &|| 1_002,
+            )
+            .unwrap_err();
+        assert_eq!(error.class, ErrorClass::Forbidden, "{mode:?}");
+    }
+    assert_eq!(events(&sql), 1, "ungranted modes created no custody");
+
+    storage
+        .observe_binding(&loaded(false, false), 2_000)
+        .unwrap();
+    let error = storage
+        .publish_v1(TOKEN, &direct("auto-none", Mode::Auto), &|| 2_001)
+        .unwrap_err();
+    assert_eq!(error.class, ErrorClass::Unsupported);
+    assert_eq!(events(&sql), 1, "no loaded path created no custody");
 }

@@ -50,7 +50,9 @@ Run the narrowest test for what you changed first (`cargo test -p bridge-core
   observation and processing are separate facts.
 - **No authority from labels.** Addresses, PIDs, working directories, names and
   model-written fields are never proof of identity; native proof comes from the
-  protected hook, kernel peer credentials and executable digests.
+  protected hook, kernel peer credentials, a marked harness process and its
+  executable state. Executable digests are checked only for Bridge's own relay,
+  and audience builds.
 - **Secrets stay out.** No token, credential, payload or parser text that can
   quote one appears in logs, errors, `Debug` output or documentation.
 - **Bridge never answers a permission request** for a recipient.

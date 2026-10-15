@@ -583,9 +583,8 @@ async function main(probe, settings) {
     `recipients=${JSON.stringify(threads.map(thread => `${host}/codex/${namespace}/${thread}`))}`, `kinds=${JSON.stringify([kind])}`,
     'modes=["inject","message"]', 'policies=["keep_all"]', '[grant.producer_v1]', 'registration=true', 'reply_policies=["self"]',
     `native_scopes=${JSON.stringify([`${host}/codex/${namespace}`])}`, '[adapters]', `channel=${JSON.stringify(channel)}`, `host_id=${JSON.stringify(host)}`,
-    '[[adapters.profiles]]', `namespace=${JSON.stringify(namespace)}`, 'harness="Codex"', `store=${JSON.stringify(settings.codex_store)}`,
-    '[[adapters.profiles.executables]]', `path=${JSON.stringify(settings.codex_executable)}`, `sha256=${JSON.stringify(probe.sha256(settings.codex_executable))}`,
-    'version="universal-probe"', 'inject=true', 'message=true', ''].join('\n'), { mode: 0o600 });
+    '[[adapters.harnesses]]', `namespace=${JSON.stringify(namespace)}`, 'harness="Codex"',
+    'inject=true', 'message=true', ''].join('\n'), { mode: 0o600 });
   /** Starts one root-owned Bridge incarnation with the same private config.
    * @param {string} label New process/log identity.
    * @returns {import('node:child_process').ChildProcess} Owned daemon process.
@@ -596,9 +595,7 @@ async function main(probe, settings) {
   const capabilities = await exchange(channel, token.token, `capabilities-${nonce}`, 'capabilities', {});
   probe.checks.capabilities = capabilities;
   probe.checks.unsupported_capabilities_honest = capabilities.features && capabilities.features.host_observations === false
-    && Array.isArray(capabilities.native_contracts) && capabilities.native_contracts.length > 0
-    && capabilities.native_contracts.every(contract => Array.isArray(contract.paths)
-      && contract.paths.some(item => item.path === 'nested_inner_mcp' && item.supported === false));
+    && Array.isArray(capabilities.native_contracts) && capabilities.native_contracts.length === 0;
   if (!probe.checks.unsupported_capabilities_honest) throw new Error('unsupported native capability projection mismatch');
   const inventories = await Promise.all(owners.map((owner, index) => inventory(probe, owner, threads[index], tool)));
   probe.checks.inventories = inventories; probe.checks.inventories_ready = inventories.every(item => item.ready === true);

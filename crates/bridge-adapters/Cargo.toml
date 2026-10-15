@@ -19,6 +19,12 @@ sysinfo = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 
+[dev-dependencies]
+# The crate's own fixture feature for its tests only: integration tests build
+# fixture callers, which production builds (no dev-dependencies, feature off) do
+# not contain.
+bridge-adapters = { path = ".", features = ["test-fixtures"] }
+
 [features]
 # Exposes explicit fixture constructors for consumer tests (never for
 # production builds): a test of the root-caller consumer can build a

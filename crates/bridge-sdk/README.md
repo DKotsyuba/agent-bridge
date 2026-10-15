@@ -43,7 +43,8 @@ let client = Client::new(Config::new(
 
 This validates configuration without any I/O. Credentials may rotate while the configured
 producer identity and retained keys stay stable. `capabilities` queries the registration
-endpoint and includes authenticated native host facts. Core handles publish, status,
+endpoint and includes authenticated native path facts (the native adapter advertises an
+empty `native_contracts` list). Core handles publish, status,
 close and retire; the adapter handles registration and optional audience assertions.
 Unsupported paths and features are refused explicitly.
 
@@ -51,9 +52,9 @@ Unsupported paths and features are refused explicitly.
 
 1. At the actual MCP frontend, preserve the protected `_meta` separately from the
    arguments. `extract_native_evidence(host, &original_meta)` yields an **unverified**
-   candidate. Only Bridge's qualified peer, build and hook join can verify it; no working
-   directory, environment, model-supplied address or parser result is authority. Direct
-   and nested paths are separate.
+   candidate. Only Bridge's verified peer, marked harness process and hook join can verify
+   it; no working directory, environment, model-supplied address or parser result is
+   authority. Direct and nested paths are separate.
 2. Persist a stable registration request id and an opaque operation incarnation before
    `register_call(id, RegisterCallParams { ... })`. Commit the returned route with your
    normal local admission. Historical receipt recovery grants no new invocation.

@@ -106,16 +106,11 @@ host_id = "this-host"                   # host component of every attested addre
 # intermediates = ["/bin/sh", "/bin/bash", "/bin/zsh", "/bin/dash", "/usr/bin/env"]
 # max_call_age_ms = 600000              # age of a hook record a caller may join
 
-[[adapters.profiles]]                   # one per native store
-namespace = "claude-main"               # native_store_namespace of its addresses
+[[adapters.harnesses]]                  # one policy per harness product; no store or executable
 harness = "ClaudeCode"                  # or "Codex"
-store = "/ABS/home/.claude"             # CODEX_HOME or the Claude config directory
-[[adapters.profiles.executables]]       # each build allowed to own sessions
-path = "/ABS/resolved/claude"
-sha256 = "<64 hex SHA-256 of the file>"
-version = "<label recorded in proof references>"
-inject = true                           # your assertion that this build supports it
-message = true
+namespace = "claude-main"               # native_store_namespace of its addresses
+inject = true                           # root hook context injection is supported
+message = true                          # the message carrier is supported
 
 [[adapters.relays]]                     # optional: the root relay build
 path = "/ABS/home/releases/<version>+<label>/bin/bridge-root-relay"
@@ -127,13 +122,75 @@ producer = "sample-producer"            # authenticated producer identity
 executable = { path = "/ABS/backend", sha256 = "<64 hex>" }
 ```
 
-A harness is recognized only if its resolved path and SHA-256 match a profile,
-its own store is that profile's store, and its file was last modified and changed
-before the process started. A configured digest enables a profile; it is not
-evidence that the build was qualified (see the [qualification
-matrix](qualification.md)). Executables are hashed once at daemon start; after
-updating a harness or relay build, update its digest and restart the daemon. The
-[adapter guide](../crates/bridge-adapters/README.md) explains the trust model.
+No store path and no harness executable is declared. A hook counts as a hook of a harness
+only when its parent chain reaches a process of that harness product (through the
+allowlisted `intermediates`, as the same user) for a harness kind that has a policy. That
+process must be positively marked as the product (its resolved executable path names `codex`
+or `claude`, or matches an explicit `executable_markers` entry), run from a regular
+file owned by you or root that no group or other user can write and that was not changed
+since the process started, and its own store, taken from its environment (`CODEX_HOME`,
+`CLAUDE_CONFIG_DIR`, else `$HOME/.codex` or `$HOME/.claude`), must be a canonical directory
+you own that no group or other user can write (a symlink or non-canonical spelling is
+refused, and the store is checked again at every use). A fresh session in any such store
+registers from its own lifecycle hook: there is nothing to enroll and no runtime
+operation to enroll with. Addresses use the policy's single namespace; an equal session id
+from a second live incarnation is refused as a conflict. The marker is best-effort
+identification, not authentication: same-user code that can fake the marker or the
+hook is the documented excluded hostile same-user case. The [adapter
+guide](../crates/bridge-adapters/README.md) explains the trust model.
+
+Only Bridge's own privileged components keep digest qualification: the `relays` and
+`audiences` builds are hashed at daemon start and again, in the background, whenever a
+configured file's identity changes (an update that leaves the approved bytes identical
+recovers by itself), and a *different* build is refused until you update its digest and
+restart the daemon.
+
+### Migrating a configuration written for store and build allowlists
+
+Earlier releases declared `[[adapters.profiles]]` with a store, a harness executable path,
+its SHA-256 and an optional vendor `signature`. Those entries still load, as migration
+input only: they authorize nothing (no store or executable is allowed or refused because of
+them, and `signature` is no longer checked). The daemon logs and `bridge doctor` reports one
+note per legacy profile and derives one harness policy per harness from it: its single
+namespace and the union of the `inject` and `message` flags of its executables. Two
+different namespaces for one harness are ambiguous and the daemon refuses to start until
+you configure `[[adapters.harnesses]]` explicitly; configuring both is refused too. A
+`[[adapters.owner_relays]]` table from an earlier release is not an error and not a
+setting: it is read and discarded, joins no digest cache, takes no part in owner admission
+and authorizes nothing, and the daemon log and `bridge doctor` report it as
+`legacy_owner_relays_ignored` (the owner route now trusts only the same-user direct-parent
+owner running a trusted, unchanged executable) until you delete the table. Prefer
+replacing the legacy entries with one `[[adapters.harnesses]]` entry per harness. Note that a
+policy now applies to every build of the harness, not only to the digests you listed.
+
+### Native owner route
+
+A supervisor that launched and owns a live Codex or Claude Code process may publish a
+private socket for it and name the socket in that process's own environment as
+`BRIDGE_NATIVE_OWNER_SOCKET`. Bridge then wakes the recipient through that owner, only
+while the recipient is positively idle, instead of through a legacy route. The variable
+is only a locator: Bridge connects only if the socket is a canonical absolute path
+owned by the daemon's user with mode `0600` in a private `0700` directory, and the
+connected process is the exact direct parent (PID, start time and user) of the
+attested harness, and that owner runs from a trusted executable: a regular file owned by
+you or root that no group or other user can write and that was not changed since the owner
+process started. No owner path or digest is configured, and no enrollment exists; an
+`owner_relays` entry from an earlier release is ignored and authorizes nothing.
+
+- A harness whose environment names no owner keeps every legacy route unchanged.
+- A present locator that is malformed, not valid UTF-8, untrusted or unavailable
+  holds the attempt. So does an environment that cannot be read. There is no fallback
+  to a queue, application or inbox route.
+- One request (`thread_id`, `call_id`, `text`, `native_pid`, `native_start_time`,
+  `wake_only`) and one receipt (`call_id`, `state`, `protocol`, `native_id`, `reason`)
+  are exchanged per attempt, framed by a four-byte little-endian length, at most 1 MiB
+  encoded and 98304 bytes of manifest text.
+- The exchange has one absolute 35-second budget. Nothing is sent unless the core
+  attempt still has at least 35 seconds left, checked before connecting and again
+  immediately before the first byte. After the request is written only a correlated,
+  exactly shaped receipt is anything but an unknown outcome, and an unknown outcome is
+  retained and never resent. An accepted receipt means the native owner observed
+  acceptance, not that the context was processed.
 
 Do not share a backend credential or executable qualification with an untrusted
 frontend: an audience entry is a deployment trust declaration, not a permission.

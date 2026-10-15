@@ -48,7 +48,7 @@ The protocol provides deterministic SHA-256 normalized publication `intent_hash`
 
 `ProducerConstraints`: `allowed_modes`, `allowed_policies`, `allowed_kinds`, `reply_policies`, `direct_address` boolean, `native_scopes` bounded opaque configuration strings. These facts disclose only this authenticated producer's configured permissions. They do not authorize operations themselves.
 
-`NativeContract`: `host`, `build_label`, `build_digest` (lowercase 64-hex SHA-256), `paths`. `HostPathCapability`: `path` (`direct_mcp` or `nested_inner_mcp`), `supported` boolean, `reason` optional bounded machine reason. Configured support is not a substitute for a qualification receipt. Baseline nested support is false until independent matching inner-call records are qualified; no outer `functions.exec` proof is shared across calls.
+`NativeContract`: `host`, `build_label`, `build_digest` (lowercase 64-hex SHA-256), `paths`. `HostPathCapability`: `path` (`direct_mcp` or `nested_inner_mcp`), `supported` boolean, `reason` optional bounded machine reason. Configured support is not a substitute for a qualification receipt. Baseline nested support is false until independent matching inner-call records are qualified; no outer `functions.exec` proof is shared across calls. The native adapter currently advertises an empty `native_contracts` list: no configured host build is disclosed and no native build digest is advertised, so no `NativeContract` entry appears.
 
 The protected hook's native `tool_name` must positively classify an actual supported host MCP invocation. Known outer wrapper, non-MCP or missing/unqualified name refuses `unsupported_host_path`. This is host grammar, not a producer/tool catalog.
 
@@ -68,7 +68,7 @@ The protected hook's native `tool_name` must positively classify an actual suppo
 | `assertion_audience` | Optional configured generic audience string |
 | `invocation_key` | Optional trusted-frontend opaque key; required iff assertion audience supplied |
 
-`CallEvidence` is tagged `type`: `native` with `host` and `metadata` original bounded JSON object, or `sealed` with redacted `proof`. The SDK metadata parser produces an unverified candidate only. Kernel peer/host build/store/protected hook join and one authoritative reserve/commit/finalize evidence-use path are provider responsibilities. No public DTO can itself assert verified authority.
+`CallEvidence` is tagged `type`: `native` with `host` and `metadata` original bounded JSON object, or `sealed` with redacted `proof`. The SDK metadata parser produces an unverified candidate only. Kernel peer/marked harness/store/protected hook join and one authoritative reserve/commit/finalize evidence-use path are provider responsibilities. No public DTO can itself assert verified authority.
 
 `RegistrationResult`: `receipt: RegistrationReceipt`, `evidence_state: CallerEvidenceState`, `assertion: Option<FreshAssertion>`. Evidence-state strings are `verified_at_registration`, `historical`, `fresh_assertion_available`. Historical returns no fresh assertion. Fresh availability requires an actual still-valid separately issued ephemeral assertion, not receipt lookup.
 

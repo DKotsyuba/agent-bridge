@@ -1,5 +1,5 @@
 //! Shared lab for adapter integration tests: an owned temporary directory,
-//! a qualified fixture harness profile, an in-memory custody store, the
+//! a harness-level fixture policy, an in-memory custody store, the
 //! real adapter channel and owned fixture harness processes.
 //!
 //! Nothing here touches a user's harness, store or session: every store is
@@ -14,7 +14,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use bridge_adapters::registry::{
-    Profile, QualifiedExecutable, Registry, RegistryConfig, RelayExecutable, file_sha256,
+    HarnessPolicy, Registry, RegistryConfig, RelayExecutable, file_sha256,
 };
 use bridge_adapters::server::{ChannelServer, Custody, private_directory};
 use bridge_core::dispatch::{AttemptRecord, DispatchTiming};
@@ -111,53 +111,59 @@ pub struct Lab {
     pub channel: Option<ChannelServer>,
 }
 
-/// Builds a profile qualifying the fixture executable.
-pub fn profile(namespace: &str, harness: Harness, store: &Path, sha256: &str) -> Profile {
-    Profile {
-        namespace: namespace.into(),
+/// The harness-level policy of the fixture lab: inject and message supported.
+pub fn harness_policy(namespace: &str, harness: Harness) -> HarnessPolicy {
+    HarnessPolicy {
         harness,
-        store: store.to_path_buf(),
-        executables: vec![QualifiedExecutable {
-            path: fixture_exe(),
-            sha256: sha256.into(),
-            version: "fixture".into(),
-            inject: true,
-            message: true,
-        }],
+        namespace: namespace.into(),
+        inject: true,
+        message: true,
+        executable_markers: vec!["bridge-fixture".into()],
     }
 }
 
 impl Lab {
-    /// A lab whose profiles qualify the fixture with `sha256` (the real
-    /// digest unless a test wants a mismatch).
+    /// A lab whose relay entries carry `sha256` (the real digest unless a test
+    /// wants a mismatch).
     pub fn with_digest(tag: &str, sha256: Option<String>) -> Lab {
+        Lab::build(tag, sha256)
+    }
+
+    /// Builds the lab. The registry names no native owner path or digest: the
+    /// owner route needs none.
+    fn build(tag: &str, sha256: Option<String>) -> Lab {
         let dir = TempDir::new(tag);
         let claude_store = dir.0.join("cs");
         let codex_store = dir.0.join("xs");
         std::fs::create_dir_all(&claude_store).unwrap();
         std::fs::create_dir_all(&codex_store).unwrap();
         let channel_dir = dir.0.join("ch");
-        let owner = private_directory(&channel_dir).unwrap();
+        let owner_uid = private_directory(&channel_dir).unwrap();
         let socket = channel_dir.join("c.sock");
         let sha = sha256.unwrap_or_else(|| file_sha256(&fixture_exe()).unwrap());
+        let exe = fixture_exe();
         let config = RegistryConfig {
             host_id: HOST.into(),
-            profiles: vec![
-                profile("claude-lab", Harness::ClaudeCode, &claude_store, &sha),
-                profile("codex-lab", Harness::Codex, &codex_store, &sha),
+            harnesses: vec![
+                harness_policy("claude-lab", Harness::ClaudeCode),
+                harness_policy("codex-lab", Harness::Codex),
             ],
+            profiles: Vec::new(),
             intermediates: ["/bin/sh", "/bin/bash", "/bin/zsh", "/bin/dash"]
                 .iter()
                 .map(PathBuf::from)
                 .collect(),
             max_call_age_ms: 600_000,
             relays: vec![RelayExecutable {
-                path: fixture_exe(),
+                path: exe.clone(),
                 sha256: sha.clone(),
             }],
             audiences: Vec::new(),
+            legacy_owner_relays: 0,
         };
-        let registry = Arc::new(Mutex::new(Registry::new(config.clone(), owner).unwrap()));
+        let registry = Arc::new(Mutex::new(
+            Registry::new(config.clone(), owner_uid).unwrap(),
+        ));
         let limits = serde_json::from_value(json!({"max_admitted_events": 1000})).unwrap();
         let mut storage = Storage::open_in_memory(limits).unwrap();
         storage.register_source_tag(PUBLISHER, PUBLISHER).unwrap();
@@ -268,25 +274,137 @@ impl Harnessed {
     /// Starts a CLI fixture harness whose store variable names `store`, stripping
     /// real Desktop capabilities so owned stand-ins cannot select the GUI route.
     pub fn start(harness: Harness, store: &Path) -> Harnessed {
-        Self::start_with_app(harness, store, None)
+        Self::start_with_app(&fixture_exe(), harness, store, None, None)
+    }
+
+    /// Starts a CLI fixture harness from the executable copy `exe` instead of the
+    /// shared fixture.
+    pub fn start_from(exe: &Path, harness: Harness, store: &Path) -> Harnessed {
+        Self::start_with_app(exe, harness, store, None, None)
+    }
+
+    /// Starts a fixture process with NO product marker: a copy of the fixture at
+    /// `copy` (an executable path that names no product marker of any lab policy)
+    /// that still names `store` in its environment, so it is not a Codex or Claude
+    /// harness for any hook it relays whatever its environment says.
+    pub fn start_unmarked(copy: &Path, store: &Path) -> Harnessed {
+        std::fs::copy(fixture_exe(), copy).unwrap();
+        let mut child = Command::new(copy)
+            .arg("harness")
+            .env("CLAUDE_CONFIG_DIR", store)
+            .env("CODEX_HOME", store)
+            .env_remove("CODEX_APP_TOOLS_PIPE_PATH")
+            .env_remove("CODEX_MCP_NODE_PATH")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        Harnessed {
+            child,
+            stdin,
+            stdout,
+        }
+    }
+
+    /// Starts an owned Codex Desktop stand-in from the executable copy `exe`.
+    pub fn start_desktop_from(exe: &Path, store: &Path, pipe: &Path) -> Harnessed {
+        Self::start_with_app(exe, Harness::Codex, store, Some(pipe), None)
     }
 
     /// Starts an owned Codex Desktop stand-in with its own native pipe capability;
     /// no installed application, frontend, or caller evidence is fabricated.
     pub fn start_desktop(store: &Path, pipe: &Path) -> Harnessed {
-        Self::start_with_app(Harness::Codex, store, Some(pipe))
+        Self::start_with_app(&fixture_exe(), Harness::Codex, store, Some(pipe), None)
     }
 
-    /// Starts the fixture with the specified store and optional owned Desktop pipe;
-    /// inherited application capabilities are removed for CLI stand-ins.
-    fn start_with_app(harness: Harness, store: &Path, pipe: Option<&Path>) -> Harnessed {
+    /// Starts a scripted stand-in native owner (a fixture process) whose direct
+    /// child is the harness fixture with `store` selected and the owner socket
+    /// named in its environment. `directory` is created private; the socket is
+    /// `directory/o.sock`. Commands are forwarded to the harness; the owner
+    /// commands `owner_script`, `owner_log`, `owner_stop_harness` and
+    /// `owner_die` are answered by the owner itself.
+    pub fn start_owned(harness: Harness, store: &Path, directory: &Path) -> Harnessed {
+        Self::start_owned_from(&fixture_exe(), harness, store, directory)
+    }
+
+    /// Like [`Harnessed::start_owned`] with the owner process started from
+    /// `owner_exe` (a copy of the fixture); its harness child still runs the
+    /// shared fixture, so the owner executable can be changed independently.
+    pub fn start_owned_from(
+        owner_exe: &Path,
+        harness: Harness,
+        store: &Path,
+        directory: &Path,
+    ) -> Harnessed {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(directory)
+            .unwrap();
         let variable = match harness {
             Harness::Codex => "CODEX_HOME",
             Harness::ClaudeCode => "CLAUDE_CONFIG_DIR",
         };
-        let mut command = Command::new(fixture_exe());
+        let mut child = Command::new(owner_exe)
+            .arg("owner")
+            .arg(directory)
+            .env("BRIDGE_FIXTURE_HARNESS_EXE", fixture_exe())
+            .env(variable, store)
+            .env_remove("CODEX_APP_TOOLS_PIPE_PATH")
+            .env_remove("CODEX_MCP_NODE_PATH")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut owned = Harnessed {
+            child,
+            stdin,
+            stdout,
+        };
+        // The owner answers only after its socket is bound; a script command is
+        // a cheap readiness barrier.
+        owned.cmd(json!({"cmd": "owner_script", "mode": "silent"}));
+        owned
+    }
+
+    /// Starts a plain (ownerless) harness stand-in whose own environment carries
+    /// `BRIDGE_NATIVE_OWNER_SOCKET` set to the raw bytes `locator`, which need not
+    /// be valid UTF-8 or name any socket.
+    pub fn start_with_locator(harness: Harness, store: &Path, locator: &[u8]) -> Harnessed {
+        use std::os::unix::ffi::OsStrExt;
+        Self::start_with_app(
+            &fixture_exe(),
+            harness,
+            store,
+            None,
+            Some(std::ffi::OsStr::from_bytes(locator)),
+        )
+    }
+
+    /// Starts the fixture with the specified store, optional owned Desktop pipe
+    /// and optional raw owner-locator environment value; inherited application
+    /// capabilities are removed for CLI stand-ins.
+    fn start_with_app(
+        exe: &Path,
+        harness: Harness,
+        store: &Path,
+        pipe: Option<&Path>,
+        locator: Option<&std::ffi::OsStr>,
+    ) -> Harnessed {
+        let variable = match harness {
+            Harness::Codex => "CODEX_HOME",
+            Harness::ClaudeCode => "CLAUDE_CONFIG_DIR",
+        };
+        let mut command = Command::new(exe);
         command
             .arg("harness")
+            // No default store exists for the other product: only the store
+            // variable below can name this harness's store.
+            .env("HOME", "/nonexistent-bridge-test-home")
             .env(variable, store)
             .env_remove("CODEX_APP_TOOLS_PIPE_PATH")
             .env_remove("CODEX_MCP_NODE_PATH")
@@ -294,6 +412,9 @@ impl Harnessed {
             .stdout(Stdio::piped());
         if let Some(pipe) = pipe {
             command.env("CODEX_APP_TOOLS_PIPE_PATH", pipe);
+        }
+        if let Some(locator) = locator {
+            command.env("BRIDGE_NATIVE_OWNER_SOCKET", locator);
         }
         let mut child = command.spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
@@ -347,6 +468,16 @@ impl Harnessed {
     }
 }
 
+impl Drop for Harnessed {
+    /// Kills and reaps the owned fixture process on every exit path, so a failing
+    /// assertion cannot leak it. After [`Harnessed::stop`] the process is already
+    /// reaped and both calls are harmless no-ops.
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// A native hook payload.
 pub fn hook(event: &str, session: &str) -> Value {
     json!({"hook_event_name": event, "session_id": session, "cwd": "/ignored"})
@@ -379,7 +510,12 @@ pub fn eventually(millis: u64, mut check: impl FnMut() -> bool) -> bool {
 /// Redeems a sealed proof from a relay process started directly by the
 /// test (not a harness descendant).
 pub fn relay_redeem(socket: &Path, proof: &str) -> Value {
-    let mut child = Command::new(fixture_exe())
+    relay_redeem_from(&fixture_exe(), socket, proof)
+}
+
+/// Like [`relay_redeem`] but the relay process runs from the executable `exe`.
+pub fn relay_redeem_from(exe: &Path, socket: &Path, proof: &str) -> Value {
+    let mut child = Command::new(exe)
         .arg("relay")
         .arg(socket)
         .stdin(Stdio::piped())

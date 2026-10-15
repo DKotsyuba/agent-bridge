@@ -164,7 +164,7 @@ impl ChannelClient {
 /// The daemon identifies *this* process by kernel peer credentials; the
 /// presented metadata alone attests nothing. Two compositions exist:
 ///
-/// - **Frontend.** A harness-launched MCP server (a qualified harness's own
+/// - **Frontend.** A harness-launched MCP server (a marked harness's own
 ///   descendant) presents native `_meta` with [`CallerAttestor::attest`],
 ///   or with [`RegistryAttestor::attest_sealed`] to also receive a sealed
 ///   single-use proof of the result.

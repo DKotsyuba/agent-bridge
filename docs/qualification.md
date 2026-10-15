@@ -7,12 +7,14 @@ this before relying on Bridge with a native host.
 owned test fixture or probe against the exact build named in the row, on macOS with
 Apple silicon, with the evidence checked by its own required checks. It is a result
 about that build and that scope at the time it was run, not a property of "Codex" or
-"Claude Code" in general and not a release guarantee. A harness build you configure
-(`[[adapters.profiles.executables]]` with a path and SHA-256) enables a profile; that
-digest is *configuration*, not qualification, and `bridge doctor` reports adapter
-capabilities and Telegram as `not_verified` for exactly this reason. A different
-harness build, a changed source revision or a different configuration is unqualified
-until its probes are run again.
+"Claude Code" in general and not a release guarantee. A harness policy you configure
+(`[[adapters.harnesses]]` with a namespace and the capabilities you assert; no store path or
+executable is declared) enables a harness; that policy is *configuration*, not
+qualification, and `bridge doctor` reports adapter capabilities and Telegram as
+`not_verified` for exactly this reason. Any build of the harness product can register, so
+the build named in a row records what was observed; Bridge does not enforce it, and no
+harness executable digest is checked. A different harness build, a changed source revision
+or a different configuration is unqualified until its probes are run again.
 
 | | |
 |---|---|
@@ -51,15 +53,17 @@ and uses no network or model. It is package and lifecycle evidence only.
 | `inject` through the recipient's own hook | Observed on owned sessions | Observed on the older builds below |
 | `message` carrier | Queue acceptance with native readback observed on owned sessions. **Application native message delivery observed once in an owner-operated session on the installed 0.2.0 service:** the signed Codex application frontend accepted a v1 direct-address message exactly once and the recipient chat returned a hidden acknowledgement, with no receiver `bridge_me` or manual enrollment; the root caller attestation worked after a final service restart and all earlier events and attempts stayed immutable. This is not consumer cutover, GUI clear, unload or restart qualification | Peer `later` message answered in a distinct turn observed on the older builds below |
 | Producer v1 direct-MCP registration and publication | Qualified: an unknown raw producer and a portable-SDK producer registered and published through the public protocol; two concurrent callers each received only their own message; restart recovered identical historical registration and custody; close and exact replay added no delivery attempts | **Not qualified** |
+| Owner-routed idle wake of a supervisor-owned live session (`BRIDGE_NATIVE_OWNER_SOCKET`) | Source-tested with a scripted stand-in owner only: exact direct-parent and owner-executable fences, one request frame, conservative receipt mapping, no resend or fallback. **Not qualified:** no native Codex turn or owner implementation was observed | Source-tested with a scripted stand-in owner only. **Not qualified:** no native Claude replay acknowledgement or owner implementation was observed |
+| Automatic recovery after an application update or restart: digest refresh for Bridge's own relay and audience builds, MESSAGE-only gateway to an idle Desktop thread, frontend discovery among thousands of stale entries | Source-tested with synthetic native-owner input only. **Not natively qualified:** no real Codex update, restart or model wake was observed through Bridge, and no real harness registered from an arbitrary runtime store; whether a resumed turn can exist before its transcript append, and the exact transcript flush order after `Stop`, are unobserved and need a manual native check (a fixed read-only native thread-state query if they differ). Registration no longer distinguishes a downgrade or a different build of the harness from the build you tested | Not applicable (no gateway); registration from an arbitrary canonical owner-only store is source-tested only |
 | Nested inner-call MCP | Unsupported | Unsupported |
 | Host observations (`host_observations`) | Absent: no operation and no capability | Absent |
-| Detached backend assertions (`consume_assertion`) and delivery-scope retirement | Implemented and fixture-tested; the native runs used a profile with these features off, so they are **not** qualified in a native deployment | Not qualified |
+| Detached backend assertions (`consume_assertion`) and delivery-scope retirement | Implemented and fixture-tested; the native runs used a harness policy with these features off, so they are **not** qualified in a native deployment | Not qualified |
 | Generic detached consumer | Not claimed | Not claimed |
 | Working applications, chats and global hooks | Only the single owner-operated delivery above; hook coexistence, GUI clear, unload and full application restart are not qualified | Not touched, not qualified |
 
 Claude Code builds 2.1.294 and 2.1.296 are legacy-version qualifiers. The Claude hook,
 caller, inject, `later` message, pause and lifecycle probes were run against 2.1.296
-(and a profile example references 2.1.294) at earlier source revisions. Those results
+(and an earlier `[[adapters.profiles]]` example referenced 2.1.294) at earlier source revisions. Those results
 are separate from the Codex qualification and from this source revision: re-run the
 probes against your exact Claude Code build and Bridge revision before relying on them.
 
@@ -73,6 +77,9 @@ probes against your exact Claude Code build and Bridge revision before relying o
   parsed value and the host refusing an unlisted tool, not that this value is what permits
   the listed tools. The `_meta.callId` equals `tool_use_id` observation holds on the named
   Codex build only; on another build a mismatch finds no record and refuses.
+- Owner-routed wake against a real supervisor, Codex build or Claude Code build: the
+  stand-in tests do not establish a native turn, a replayed user frame, a context
+  observation or a consumer result.
 - Linux or Windows operation, and any installation into a working application without a
   deliberate local test.
 - Live Telegram delivery. The notifier is exercised against a local HTTP stub only.

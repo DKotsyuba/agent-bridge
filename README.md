@@ -42,7 +42,7 @@ Bridge supports macOS on Apple silicon only. The core and library crates use
 Unix sockets and Unix file semantics, but other operating systems are not
 supported and nothing here claims Linux or Windows operation. Native-host
 support is per exact build and is explicit in the [qualification
-matrix](docs/qualification.md): configuring a build digest enables a profile, it
+matrix](docs/qualification.md): configuring a harness policy enables a harness, it
 is not a qualification result. Nested inner-call MCP paths, host observations and
 generic detached Claude consumers are not supported; live Telegram delivery has
 not been qualified.

@@ -16,6 +16,8 @@ use serde_json::{Value, json};
 
 use bridge_client::{DeliveryCounts, IncidentView};
 
+use bridge_adapters::registry::LEGACY_OWNER_RELAYS_PREFIX;
+
 use crate::config::{InterfacesConfig, read_secret};
 use crate::install::{BINARIES, file_sha256, load_state, verify_tree};
 use crate::lifecycle::{Component, alive, read_record};
@@ -293,26 +295,30 @@ fn adapters(path: &Path, release: Option<&Path>, push: &mut dyn FnMut(&str, &'st
         );
         return;
     };
-    for profile in &registry.profiles {
-        for executable in &profile.executables {
-            let on_disk = file_sha256(&executable.path).ok();
-            push(
-                &format!(
-                    "adapters.{}.{}",
-                    profile.harness.as_str(),
-                    profile.namespace
-                ),
-                if on_disk.as_deref() == Some(executable.sha256.as_str()) {
-                    "not_verified"
-                } else {
-                    "fail"
-                },
-                json!({"executable": executable.path, "version": executable.version,
-                       "declared_inject": executable.inject, "declared_message": executable.message,
-                       "file_matches_declared_sha256": on_disk.as_deref() == Some(executable.sha256.as_str()),
-                       "note": "declared capability; host qualification evidence is separate"}),
-            );
+    // Native recipients are governed by the harness-level policy only: no store
+    // path and no executable is predeclared. Legacy `profiles` still parse as
+    // migration input and are reported as such; they authorize nothing.
+    match registry.harness_policies() {
+        Ok((policies, notes)) => {
+            // Legacy profile notes keep the established `adapters.legacy_profiles`
+            // check; the ignored legacy owner_relays table has its own check.
+            for note in notes {
+                match note.strip_prefix(LEGACY_OWNER_RELAYS_PREFIX) {
+                    Some(text) => push("adapters.legacy_owner_relays_ignored", "warn", json!(text)),
+                    None => push("adapters.legacy_profiles", "warn", json!(note)),
+                }
+            }
+            for policy in policies {
+                push(
+                    &format!("adapters.harness.{}", policy.harness.as_str()),
+                    "not_verified",
+                    json!({"namespace": policy.namespace,
+                           "declared_inject": policy.inject, "declared_message": policy.message,
+                           "note": "declared capability; host qualification evidence is separate"}),
+                );
+            }
         }
+        Err(error) => push("adapters.harnesses", "fail", json!(error)),
     }
     let relay = release
         .map(|dir| dir.join("bin").join("bridge-root-relay"))
@@ -400,9 +406,74 @@ pub fn exit_code(checks: &[Check]) -> u8 {
 #[cfg(test)]
 mod tests {
     //! The recovery summary never reports pending work as clear and states
-    //! its incident sample coverage.
+    //! its incident sample coverage, and the adapter checks surface legacy
+    //! configuration notes.
 
     use super::*;
+
+    /// A legacy `[[adapters.owner_relays]]` table and a legacy profile load, grant
+    /// nothing and are reported as explicit warnings under their own check names
+    /// (`adapters.legacy_owner_relays_ignored`, and the established
+    /// `adapters.legacy_profiles` for the profile),
+    /// next to the derived harness policy, while a current configuration reports
+    /// neither.
+    #[test]
+    fn legacy_owner_relays_and_profiles_are_reported_as_warnings() {
+        let dir = std::env::temp_dir().join(format!("m2doc{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, text: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        let run = |path: &Path| {
+            let mut seen: Vec<(String, &'static str, Value)> = Vec::new();
+            adapters(path, None, &mut |name, status, detail| {
+                seen.push((name.to_string(), status, detail));
+            });
+            seen
+        };
+        let legacy = write(
+            "legacy.toml",
+            "[adapters]\nchannel = \"/x/c.sock\"\nhost_id = \"h\"\n\
+             [[adapters.profiles]]\nnamespace = \"claude-main\"\nharness = \"ClaudeCode\"\nstore = \"/s\"\n\
+             [[adapters.profiles.executables]]\npath = \"/a/claude\"\nsha256 = \"00\"\nversion = \"1\"\ninject = true\nmessage = true\n\
+             [[adapters.owner_relays]]\npath = \"/o/owner\"\nsha256 = \"11\"\n\
+             [[adapters.owner_relays]]\npath = \"relative\"\n",
+        );
+        let seen = run(&legacy);
+        let owner = seen
+            .iter()
+            .find(|(name, _, _)| name == "adapters.legacy_owner_relays_ignored")
+            .expect("owner_relays warning");
+        assert_eq!(owner.1, "warn");
+        assert!(
+            owner
+                .2
+                .as_str()
+                .unwrap()
+                .contains("2 [[adapters.owner_relays]] entries")
+        );
+        assert!(
+            seen.iter()
+                .any(|(name, status, _)| name == "adapters.legacy_profiles" && *status == "warn")
+        );
+        assert!(
+            seen.iter()
+                .any(|(name, _, _)| name == "adapters.harness.claude-code")
+        );
+        let current = write(
+            "current.toml",
+            "[adapters]\nchannel = \"/x/c.sock\"\nhost_id = \"h\"\n\
+             [[adapters.harnesses]]\nharness = \"ClaudeCode\"\nnamespace = \"claude-main\"\ninject = true\nmessage = true\n",
+        );
+        let seen = run(&current);
+        assert!(
+            seen.iter().all(|(name, _, _)| !name.contains("legacy")),
+            "{seen:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// Counts with the given waiting, review and incident numbers.
     fn counts(unhanded: u64, review: u64, open_incidents: u64) -> DeliveryCounts {

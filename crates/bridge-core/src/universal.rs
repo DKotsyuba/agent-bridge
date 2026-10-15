@@ -1070,8 +1070,9 @@ impl Storage {
         action().map_err(|e| mutation_error(e, reconciliation))
     }
     /// Authenticated policy-only core capabilities. Native ingress augments host
-    /// contracts/qualified acceptance and assertion cache capacity independently;
-    /// this core response never claims configured profiles were live-qualified.
+    /// contracts, acceptance and assertion cache capacity independently (it
+    /// advertises no native build contract); this core response never claims a
+    /// configured harness policy was live-verified.
     pub fn capabilities_v1(&self, credential: &str) -> Result<Capabilities, ApiError> {
         let auth = self.producer_authorizer()?;
         let grant = auth.authenticate(credential)?;
