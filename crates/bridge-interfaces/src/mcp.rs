@@ -251,6 +251,7 @@ fn call_tool(
                     let call_id = match &native_meta {
                         PresentedMeta::Claude { tool_use_id } => tool_use_id,
                         PresentedMeta::Codex { call_id, .. } => call_id,
+                        PresentedMeta::OpenCode { call_id, .. } => call_id,
                         PresentedMeta::Sealed { .. } => {
                             return Err((-32602, "native call identity missing"));
                         }

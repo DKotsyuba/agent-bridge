@@ -193,7 +193,7 @@ struct Receipt {
     call_id: String,
     /// `accepted`, `known_unsent` or `unknown`.
     state: String,
-    /// `codex_turn` or `claude_input` when accepted, else null.
+    /// `codex_turn`, `claude_input` or `opencode_input` when accepted, else null.
     #[serde(deserialize_with = "nullable")]
     protocol: Option<String>,
     /// Fresh native turn id or replayed user id when accepted, else null.
@@ -236,6 +236,7 @@ fn classify(frame: &[u8], call_id: &str, harness: Harness) -> Outcome {
     let protocol = match harness {
         Harness::Codex => "codex_turn",
         Harness::ClaudeCode => "claude_input",
+        Harness::OpenCode => "opencode_input",
     };
     match (
         receipt.state.as_str(),

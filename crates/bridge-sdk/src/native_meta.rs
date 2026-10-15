@@ -23,7 +23,10 @@ pub fn extract_native_evidence(
     }
     match host {
         Host::Codex => {
-            if map.contains_key("claudecode/toolUseId") {
+            if map.contains_key("claudecode/toolUseId")
+                || map.contains_key("ai.opencode/sessionID")
+                || map.contains_key("ai.agent_bridge/toolCallID")
+            {
                 return Err(ProtocolError::new("native_meta", "mixed host evidence"));
             }
             for key in ["threadId", "callId"] {
@@ -50,6 +53,8 @@ pub fn extract_native_evidence(
             if map.contains_key("threadId")
                 || map.contains_key("callId")
                 || map.contains_key("x-codex-turn-metadata")
+                || map.contains_key("ai.opencode/sessionID")
+                || map.contains_key("ai.agent_bridge/toolCallID")
             {
                 return Err(ProtocolError::new("native_meta", "mixed host evidence"));
             }
@@ -61,6 +66,29 @@ pub fn extract_native_evidence(
                     "missing native tool-use identifier",
                 ))?;
             validate_id("native_meta", value, MAX_ID_BYTES)?;
+        }
+        Host::OpenCode => {
+            if [
+                "threadId",
+                "callId",
+                "x-codex-turn-metadata",
+                "claudecode/toolUseId",
+            ]
+            .iter()
+            .any(|key| map.contains_key(*key))
+            {
+                return Err(ProtocolError::new("native_meta", "mixed host evidence"));
+            }
+            for key in ["ai.opencode/sessionID", "ai.agent_bridge/toolCallID"] {
+                let value = map
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .ok_or(ProtocolError::new(
+                        "native_meta",
+                        "missing trusted plugin call identifier",
+                    ))?;
+                validate_id("native_meta", value, MAX_ID_BYTES)?;
+            }
         }
     }
     Ok(CallEvidence::Native {

@@ -67,6 +67,8 @@ pub enum Harness {
     Codex,
     /// A Claude Code installation; sessions are identified by session id.
     ClaudeCode,
+    /// An OpenCode installation; sessions are identified by native session id.
+    OpenCode,
 }
 
 impl Harness {
@@ -77,6 +79,7 @@ impl Harness {
         match self {
             Harness::Codex => "codex",
             Harness::ClaudeCode => "claude-code",
+            Harness::OpenCode => "opencode",
         }
     }
 
@@ -88,6 +91,7 @@ impl Harness {
         match value {
             "codex" => Ok(Harness::Codex),
             "claude-code" => Ok(Harness::ClaudeCode),
+            "opencode" => Ok(Harness::OpenCode),
             other => Err(CoreError::InvalidEnvelope(format!(
                 "unknown harness {other:?}"
             ))),

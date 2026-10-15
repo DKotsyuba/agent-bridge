@@ -22,9 +22,100 @@ use bridge_core::{Harness, Mode, Storage};
 use common::*;
 use serde_json::json;
 
+/// The workspace gate runs the first-party plugin's synthetic Node lifecycle
+/// contract without native sessions, sockets, credentials or model inference.
+#[test]
+fn opencode_plugin_synthetic_lifecycle_contract() {
+    let node = std::env::var("BRIDGE_TEST_NODE").expect("BRIDGE_TEST_NODE required");
+    assert!(std::path::Path::new(&node).is_absolute());
+    let output = std::process::Command::new(node)
+        .arg("--test")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugins/opencode/index.test.js"
+        ))
+        .output()
+        .expect("synthetic plugin test starts");
+    assert!(
+        output.status.success(),
+        "synthetic plugin lifecycle contract failed"
+    );
+}
+
 /// Claude `_meta` for a tool-use id.
 fn claude_meta(call: &str) -> serde_json::Value {
     json!({"claudecode/toolUseId": call, "progressToken": 1})
+}
+
+/// OpenCode's trusted plugin context joins the actual same-session native hook
+/// once; vendor session-only metadata, wrong sessions and consumed calls refuse.
+/// Session discovery is unknown, only actual Stop is idle, and feed loss revokes
+/// readiness. Enabling unqualified hook injection is rejected at configuration.
+#[test]
+fn opencode_plugin_call_joins_only_its_actual_owned_session() {
+    let lab = Lab::new("ocm");
+    let mut harness = Harnessed::start(Harness::OpenCode, &lab.opencode_store);
+    let started = harness.hook(
+        &lab.socket,
+        Harness::OpenCode,
+        hook("SessionStart", "ses-root"),
+    );
+    assert_eq!(started["status"], 0, "{started}");
+    use bridge_core::dispatch::Lifecycle::{Active, Inactive, Unknown};
+    for (event, expected) in [
+        ("SessionStart", Unknown),
+        ("OpenCodeActivity", Active),
+        ("Stop", Inactive),
+        ("OpenCodeUnknown", Unknown),
+    ] {
+        harness.hook(&lab.socket, Harness::OpenCode, hook(event, "ses-root"));
+        let actual = lab
+            .registry
+            .lock()
+            .unwrap()
+            .attest_recipient(&lab.opencode_address("ses-root"))
+            .unwrap()
+            .0
+            .lifecycle();
+        assert_eq!(actual, expected, "{event}");
+    }
+    let mut invalid = lab.config.clone();
+    invalid
+        .harnesses
+        .iter_mut()
+        .find(|policy| policy.harness == Harness::OpenCode)
+        .unwrap()
+        .inject = true;
+    let owner = bridge_adapters::server::private_directory(lab.socket.parent().unwrap()).unwrap();
+    assert!(bridge_adapters::Registry::new(invalid, owner).is_err());
+    harness.hook(
+        &lab.socket,
+        Harness::OpenCode,
+        tool_hook("PreToolUse", "ses-root", "call-root", None),
+    );
+    let native =
+        json!({"ai.opencode/sessionID":"ses-root","ai.agent_bridge/toolCallID":"call-root"});
+    assert_eq!(
+        harness.mcp(&lab.socket, json!({"ai.opencode/sessionID":"ses-root"}))["err"],
+        "not_evidence"
+    );
+    assert_eq!(
+        harness.mcp(
+            &lab.socket,
+            json!({"ai.opencode/sessionID":"ses-other","ai.agent_bridge/toolCallID":"call-root"})
+        )["err"],
+        "conflicting"
+    );
+    let accepted = harness.mcp(&lab.socket, native.clone());
+    assert_eq!(accepted["ok"]["role"], "root", "{accepted}");
+    assert_eq!(accepted["ok"]["native_id"], "ses-root");
+    assert_eq!(
+        accepted["ok"]["address"],
+        lab.opencode_address("ses-root").to_canonical_string()
+    );
+    assert_eq!(accepted["ok"]["may_act_as_address"], true);
+    assert_eq!(harness.mcp(&lab.socket, native)["err"], "duplicate");
+    harness.stop();
 }
 
 /// Root and subagent callers join exactly one single-use record; replay, unknown, mixed-host and renewed-epoch ids refuse.

@@ -47,6 +47,28 @@ and uses no network or model. It is package and lifecycle evidence only.
 
 ## Native host matrix
 
+### Managed OpenCode owner wake
+
+A private local candidate was exercised with OpenCode 2.0.28 and Agent Run on
+2026-10-15. The first-party lifecycle plugin registered the actual native
+session from its private store and observed its first completed idle turn.
+One SDK publication then carried a newly generated marker, absent from the
+initial task, through Bridge's `opencode_input` owner route. The same session,
+PID and full process-birth identity executed turn two and called its real
+private `finish` tool once with that marker. The native transcript contains one
+matching input whose native message ID equals Bridge's acceptance receipt.
+There was one delivery attempt and no uncertain result. The completion notice
+arrived automatically in the bound Codex chat; supervisor process-group and
+descendant cleanup, private broker shutdown and socket retirement were verified.
+
+Exact executed SHA-256 values: Bridge daemon
+`41acb1c2e1c249686223596ee81eab1888460029e65c75d5ec83a0c593086433`,
+hook `eab945eae5ede7bb3da1ddc0214c4dbf1dedf83755b42d4df5d65fdec6655a08`,
+Agent Run `dc02e15291bdd36726777fc0d4dd5047f05e515c599a4820be3ba56cae7395d9`.
+This qualifies that managed live-session route on those local candidates.
+It does not qualify standalone OpenCode root MCP return delivery, child wake,
+context injection, an idle IDE application, installation or publication.
+
 | Capability | Codex 0.162.0-alpha.17.2 (SHA-256 `0d5ac7aae20c4eda6242428d5e218c55ba96d8763fda2a271088ff37104b9d28`) | Claude Code |
 |---|---|---|
 | Protected hook caller binding, root and child attestation | Observed on owned sessions | Observed on owned sessions of the older builds below |

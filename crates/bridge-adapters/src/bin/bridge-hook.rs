@@ -2,7 +2,7 @@
 //! adapter channel and prints Bridge context only when handed one.
 //!
 //! Usage (as the hook command of every relevant event):
-//! `bridge-hook <channel-socket> <claude-code|codex>` with the native hook
+//! `bridge-hook <channel-socket> <claude-code|codex|opencode>` with the native hook
 //! JSON on stdin. The command always exits 0 and prints nothing unless the
 //! channel handed a context reply, so a missing or failing Bridge never
 //! blocks or breaks the harness; Bridge keeps undelivered events.
@@ -18,7 +18,7 @@ use bridge_core::Harness;
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let (Some(socket), Some(harness)) = (args.next(), args.next()) else {
-        eprintln!("usage: bridge-hook <channel-socket> <claude-code|codex>");
+        eprintln!("usage: bridge-hook <channel-socket> <claude-code|codex|opencode>");
         return ExitCode::SUCCESS;
     };
     let Ok(harness) = Harness::parse(&harness) else {

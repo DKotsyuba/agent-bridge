@@ -84,7 +84,7 @@ write private configuration, install the hooks and send a first message.
 | `crates/bridge-client` | typed legacy publisher and operator client |
 | `crates/bridge-protocol` | dependency-light v1 wire DTOs, validation and fingerprints |
 | `crates/bridge-sdk` | synchronous v1 producer client |
-| `crates/bridge-adapters` | Codex and Claude Code adapters, `bridge-hook`, `bridge-native-daemon`, qualification probes |
+| `crates/bridge-adapters` | Codex, Claude Code and managed OpenCode adapters, lifecycle plugin, `bridge-hook`, `bridge-native-daemon`, qualification probes |
 | `crates/bridge-interfaces` | restricted root MCP and relay, `bridge` operator and install CLI |
 | `xtask` | `cargo xtask package`, `qualify` and `check-public` |
 | `install.sh` | installer for a locally built bundle |

@@ -64,6 +64,7 @@ impl Rig {
         let store = match harness {
             Harness::Codex => lab.codex_store.clone(),
             Harness::ClaudeCode => lab.claude_store.clone(),
+            Harness::OpenCode => lab.opencode_store.clone(),
         };
         let directory = lab.dir.0.join("ow");
         let mut native = match owner_exe {
@@ -73,8 +74,12 @@ impl Rig {
         let address = match harness {
             Harness::Codex => lab.codex_address(SESSION),
             Harness::ClaudeCode => lab.claude_address(SESSION),
+            Harness::OpenCode => lab.opencode_address(SESSION),
         };
         let carrier: Box<dyn DispatchCarrier> = match harness {
+            Harness::OpenCode => Box::new(bridge_adapters::opencode::OpenCodeOwnerCarrier::new(
+                Arc::clone(&lab.registry),
+            )),
             Harness::Codex => {
                 std::fs::write(lab.codex_store.join("behavior"), "accept").unwrap();
                 std::fs::write(lab.codex_store.join("probe_port"), "9").unwrap();
@@ -143,6 +148,7 @@ impl Rig {
             Harness::ClaudeCode => self.native.cmd(json!({"cmd": "frames"}))["frames"]
                 .as_array()
                 .map_or(0, Vec::len),
+            Harness::OpenCode => 0,
         }
     }
 
@@ -169,18 +175,19 @@ impl Rig {
         match self.harness {
             Harness::Codex => "codex_accept",
             Harness::ClaudeCode => "claude_accept",
+            Harness::OpenCode => "opencode_accept",
         }
     }
 }
 
-/// Both harnesses: a positively idle recipient gets exactly one closed
+/// All supported harnesses: a positively idle recipient gets exactly one closed
 /// six-key frame carrying the frozen manifest and exact native identity; the
 /// accepted receipt is native acceptance; a second dispatch sends nothing
 /// more; Auto and Message both use the owner route; no legacy queue or inbox
 /// is used, and Claude needs no inbox descriptor.
 #[test]
-fn idle_owner_receives_one_exact_frame_for_both_harnesses() {
-    for harness in [Harness::Codex, Harness::ClaudeCode] {
+fn idle_owner_receives_one_exact_frame_for_supported_harnesses() {
+    for harness in [Harness::Codex, Harness::ClaudeCode, Harness::OpenCode] {
         let mut rig = Rig::new("ow1", harness);
         if harness == Harness::ClaudeCode {
             // No descriptor may be needed: a descriptor-less Claude is held by
@@ -269,7 +276,7 @@ fn idle_owner_receives_one_exact_frame_for_both_harnesses() {
 /// sent again nor routed through the legacy queue or inbox.
 #[test]
 fn receipts_after_the_write_map_conservatively_and_never_resend() {
-    let cases: [(&str, bool); 15] = [
+    let cases: [(&str, bool); 16] = [
         ("known_unsent:not_idle", true),
         ("known_unsent:awaiting_input", true),
         ("known_unsent:budget", true),
@@ -284,17 +291,21 @@ fn receipts_after_the_write_map_conservatively_and_never_resend() {
         ("garbage", false),
         ("claude_accept", false),
         ("codex_accept", false),
+        ("opencode_accept", false),
         ("known_unsent:", false),
     ];
-    for harness in [Harness::Codex, Harness::ClaudeCode] {
+    for harness in [Harness::Codex, Harness::ClaudeCode, Harness::OpenCode] {
         for (mode, known_unsent) in cases {
             let wrong_protocol = match harness {
-                Harness::Codex => mode == "claude_accept",
-                Harness::ClaudeCode => mode == "codex_accept",
+                Harness::Codex => matches!(mode, "claude_accept" | "opencode_accept"),
+                Harness::ClaudeCode => matches!(mode, "codex_accept" | "opencode_accept"),
+                Harness::OpenCode => matches!(mode, "codex_accept" | "claude_accept"),
             };
             let right_protocol = matches!(
                 (harness, mode),
-                (Harness::Codex, "codex_accept") | (Harness::ClaudeCode, "claude_accept")
+                (Harness::Codex, "codex_accept")
+                    | (Harness::ClaudeCode, "claude_accept")
+                    | (Harness::OpenCode, "opencode_accept")
             );
             if right_protocol {
                 continue;
@@ -689,9 +700,16 @@ fn present_non_utf8_locator_holds_and_never_falls_back() {
         let store = match harness {
             Harness::Codex => lab.codex_store.clone(),
             Harness::ClaudeCode => lab.claude_store.clone(),
+            Harness::OpenCode => lab.opencode_store.clone(),
         };
         let mut native = Harnessed::start_with_locator(harness, &store, b"/not-utf8-\xff\xfe.sock");
         let (address, mut carrier): (NativeAddress, Box<dyn DispatchCarrier>) = match harness {
+            Harness::OpenCode => (
+                lab.opencode_address(SESSION),
+                Box::new(bridge_adapters::opencode::OpenCodeOwnerCarrier::new(
+                    Arc::clone(&lab.registry),
+                )),
+            ),
             Harness::Codex => {
                 std::fs::write(lab.codex_store.join("behavior"), "accept").unwrap();
                 std::fs::write(lab.codex_store.join("probe_port"), "9").unwrap();
@@ -751,6 +769,7 @@ fn present_non_utf8_locator_holds_and_never_falls_back() {
             Harness::ClaudeCode => native.cmd(json!({"cmd": "frames"}))["frames"]
                 .as_array()
                 .map_or(0, Vec::len),
+            Harness::OpenCode => 0,
         };
         assert_eq!(legacy, 0, "{harness:?}: no legacy fallback");
         native.stop();
@@ -773,6 +792,7 @@ fn non_parent_owner_is_refused_with_no_effect() {
         forged.cmd(json!({"cmd": "owner_script", "mode": match harness {
             Harness::Codex => "codex_accept",
             Harness::ClaudeCode => "claude_accept",
+            Harness::OpenCode => "opencode_accept",
         }}));
         std::thread::sleep(Duration::from_millis(1100));
         let mut rig = Rig::new("ow8", harness);

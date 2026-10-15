@@ -10,6 +10,29 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// A trusted plugin's exact per-call context is supported; vendor session-only,
+/// model-argument, malformed and mixed-host candidates never become evidence.
+#[test]
+fn opencode_plugin_metadata_requires_a_complete_separate_contract() {
+    let native = serde_json::json!({"ai.opencode/sessionID":"ses_native","ai.agent_bridge/toolCallID":"call_native"});
+    assert!(extract_native_evidence(Host::OpenCode, &native).is_ok());
+    assert_eq!(
+        serde_json::to_value(Host::OpenCode).unwrap(),
+        serde_json::json!("opencode")
+    );
+    for invalid in [
+        serde_json::json!({"ai.opencode/sessionID":"ses_native"}),
+        serde_json::json!({"arguments":native}),
+        serde_json::json!({"ai.opencode/sessionID":"ses_native","ai.agent_bridge/toolCallID":""}),
+        serde_json::json!({"ai.opencode/sessionID":"ses_native","ai.agent_bridge/toolCallID":"call_native","claudecode/toolUseId":"other"}),
+        serde_json::json!({"ai.opencode/sessionID":"ses_native","ai.agent_bridge/toolCallID":"call_native","callId":"other"}),
+    ] {
+        assert!(extract_native_evidence(Host::OpenCode, &invalid).is_err());
+    }
+    assert!(extract_native_evidence(Host::Codex, &native).is_err());
+    assert!(extract_native_evidence(Host::ClaudeCode, &native).is_err());
+}
+
 /// Synthetic publication fixture, deliberately unrelated to any consumer product.
 fn publication() -> PublishParams {
     PublishParams {

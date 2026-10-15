@@ -357,6 +357,7 @@ fn evidence(candidate: &CallEvidence) -> Result<PresentedMeta, CorrelationError>
                 (host, &meta),
                 (Host::Codex, PresentedMeta::Codex { .. })
                     | (Host::ClaudeCode, PresentedMeta::Claude { .. })
+                    | (Host::OpenCode, PresentedMeta::OpenCode { .. })
             ) {
                 return Err(CorrelationError::NotEvidence("mixed host evidence".into()));
             }

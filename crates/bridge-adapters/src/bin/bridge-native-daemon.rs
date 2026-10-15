@@ -167,6 +167,7 @@ fn main() -> ExitCode {
     )
     .with_desktop_directory(config.adapters.channel.parent().unwrap().to_path_buf());
     let terminate = Arc::new(AtomicBool::new(false));
+    let opencode = bridge_adapters::opencode::OpenCodeOwnerCarrier::new(Arc::clone(&registry));
     for signal in [SIGTERM, SIGINT] {
         let registered =
             signal_hook::flag::register_conditional_shutdown(signal, 1, Arc::clone(&terminate))
@@ -175,11 +176,13 @@ fn main() -> ExitCode {
             return fail("signal_registration_failed", "signal handlers unavailable");
         }
     }
-    let running =
-        match service::start_with_carriers(config.core, vec![Box::new(codex), Box::new(claude)]) {
-            Ok(running) => Arc::new(running),
-            Err(error) => return fail("service_start_failed", &error.to_string()),
-        };
+    let running = match service::start_with_carriers(
+        config.core,
+        vec![Box::new(codex), Box::new(claude), Box::new(opencode)],
+    ) {
+        Ok(running) => Arc::new(running),
+        Err(error) => return fail("service_start_failed", &error.to_string()),
+    };
     let custody: Arc<dyn Custody> = Arc::clone(&running) as Arc<dyn Custody>;
     late.attach(&custody);
     drop(custody);

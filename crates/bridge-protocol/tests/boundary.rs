@@ -2,6 +2,27 @@
 use bridge_protocol::*;
 use serde_json::{Value, json};
 
+/// OpenCode adds one exact host spelling while retaining the common canonical
+/// component grammar and refusing unknown, case-folded or malformed addresses.
+#[test]
+fn opencode_address_roundtrips_without_broadening_the_address_grammar() {
+    let address = NativeAddress::parse("local/opencode/main%2Fstore/ses_native").unwrap();
+    assert_eq!(address.harness, Host::OpenCode);
+    assert_eq!(address.store, "main/store");
+    assert_eq!(
+        address.canonical(),
+        "local/opencode/main%2Fstore/ses_native"
+    );
+    for invalid in [
+        "local/OpenCode/main/ses_native",
+        "local/open_code/main/ses_native",
+        "local/unknown/main/ses_native",
+        "local/opencode/main/%ZZ",
+    ] {
+        assert!(NativeAddress::parse(invalid).is_err());
+    }
+}
+
 /// Reusable accepted fixture set; contains only intentionally synthetic credentials.
 fn fixtures() -> Vec<Request> {
     serde_json::from_str::<Value>(include_str!("wire-v1.json")).unwrap()["requests"]

@@ -146,6 +146,9 @@ pub enum Host {
     Codex,
     /// Claude Code MCP metadata/hook contract.
     ClaudeCode,
+    /// Native context supplied by the trusted OpenCode Bridge plugin.
+    #[serde(rename = "opencode")]
+    OpenCode,
 }
 
 /// Canonical logical native recipient, containing no authority or kernel identity.
@@ -171,6 +174,7 @@ impl NativeAddress {
         let harness = match parts[1] {
             "codex" => Host::Codex,
             "claude-code" => Host::ClaudeCode,
+            "opencode" => Host::OpenCode,
             _ => return Err(ProtocolError::new("address", "unsupported native harness")),
         };
         let address = Self {
@@ -192,6 +196,7 @@ impl NativeAddress {
             match self.harness {
                 Host::Codex => "codex",
                 Host::ClaudeCode => "claude-code",
+                Host::OpenCode => "opencode",
             },
             encode_component(&self.store),
             encode_component(&self.session)

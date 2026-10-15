@@ -287,7 +287,7 @@ struct OwnerState {
 
 /// Renders the scripted receipt bytes for `mode` answering `request`, or
 /// `None` when the owner must stay silent. Modes: `codex_accept`,
-/// `claude_accept`, `known_unsent:<reason>`, `unknown:<reason>`, `wrong_call`,
+/// `claude_accept`, `opencode_accept`, `known_unsent:<reason>`, `unknown:<reason>`, `wrong_call`,
 /// `extra_key`, `dup_key`, `garbage`, `silent` and `stall`.
 fn owner_receipt(mode: &str, request: &Value) -> Option<Vec<u8>> {
     let call = request["call_id"].as_str().unwrap_or_default();
@@ -296,6 +296,7 @@ fn owner_receipt(mode: &str, request: &Value) -> Option<Vec<u8>> {
     let value = match mode.split_once(':').unwrap_or((mode, "")) {
         ("codex_accept", _) => accept("codex_turn"),
         ("claude_accept", _) => accept("claude_input"),
+        ("opencode_accept", _) => accept("opencode_input"),
         ("known_unsent", reason) => refuse("known_unsent", reason),
         ("unknown", reason) => refuse("unknown", reason),
         ("wrong_call", _) => {
@@ -1202,6 +1203,7 @@ fn universal_probe(
     let host = match PresentedMeta::from_mcp_meta(&metadata) {
         Ok(PresentedMeta::Codex { .. }) => Host::Codex,
         Ok(PresentedMeta::Claude { .. }) => Host::ClaudeCode,
+        Ok(PresentedMeta::OpenCode { .. }) => Host::OpenCode,
         _ => return json!({"error": "native evidence candidate refused"}),
     };
     let request = Request::new(

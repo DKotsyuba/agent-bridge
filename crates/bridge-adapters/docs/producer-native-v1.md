@@ -80,6 +80,32 @@ may be equal for different callers without collapsing their authority.
 
 ## Registration coordinator
 
+### OpenCode managed lifecycle
+
+The first-party [lifecycle plugin](../plugins/opencode/index.js) targets OpenCode
+2.0.28. Its native prompt and tool hooks observe actual session/call IDs; its
+execution event subscription reports activity, terminal execution and deletion.
+Session discovery starts `Unknown`; only a genuine terminal execution becomes
+`Inactive`. Lost subscriptions and disposal invalidate readiness. Parent facts
+come from `session.get`, never display labels or model arguments. The actual
+process's absolute `OPENCODE_DB` parent identifies its private store.
+
+OpenCode policies support `message` only; `inject=true` is rejected. A message
+uses the existing live launcher's exact direct-parent owner route with protocol
+`opencode_input`. Bridge neither guesses an HTTP endpoint nor starts a second
+scheduler. Correlated owner admission is native acceptance, not processing;
+uncertain outcomes retain their original identity without resend or fallback.
+
+The optional SDK metadata candidate requires both `ai.opencode/sessionID` and
+`ai.agent_bridge/toolCallID`. The second field belongs to the trusted first-party
+plugin contract: stock OpenCode MCP metadata supplies only the session ID and
+is insufficient. Parsing these fields grants no authority. Standalone OpenCode
+root MCP registration, child message wake and context injection are unqualified.
+
+Synthetic plugin checks run with `node --test
+crates/bridge-adapters/plugins/opencode/index.test.js`; they use no native host.
+Native wake qualification remains a separate manual check.
+
 1. Decode/validate v1 and authenticate via core's shared ProducerAuthorizer.
    Core/adapters use one immutable per-boot policy; no second credential or grant
    store lives in the registry.

@@ -145,7 +145,7 @@ pub struct Profile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessPolicy {
-    /// The harness product (`Codex` or `ClaudeCode`).
+    /// The harness product (`Codex`, `ClaudeCode` or `OpenCode`).
     pub harness: Harness,
     /// Default `native_store_namespace` component of this harness's addresses.
     pub namespace: String,
@@ -155,7 +155,7 @@ pub struct HarnessPolicy {
     pub message: bool,
     /// Case-insensitive substrings of the harness process's resolved executable
     /// path that positively mark it as this product. Empty means the product name
-    /// (`codex` or `claude`). An unrelated ancestor (a terminal, a build tool, a
+    /// (`codex`, `claude` or `opencode`). An unrelated ancestor (a terminal, a build tool, a
     /// generic wrapper) matches none and is never a harness. Best-effort
     /// identification, not authentication.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -407,6 +407,9 @@ pub enum CallerChannel {
     /// Codex `_meta.threadId` + `_meta.callId` joined to one `PreToolUse`
     /// hook record of the same thread.
     CodexCall,
+    /// Trusted OpenCode Bridge plugin context joined to its exact native hook call.
+    #[serde(rename = "opencode_call")]
+    OpenCodeCall,
 }
 
 /// Protected native MCP request metadata presented for caller attestation.
@@ -445,6 +448,15 @@ pub enum PresentedMeta {
         /// `_meta.threadId`: the calling thread (root or child).
         thread_id: String,
         /// `_meta.callId`: the per-call identifier.
+        call_id: String,
+    },
+    /// Native context carried by the first-party OpenCode Bridge plugin only.
+    /// Ordinary OpenCode MCP session metadata alone is not a complete contract.
+    #[serde(rename = "opencode")]
+    OpenCode {
+        /// Native ToolContext.sessionID, independent of model arguments.
+        session_id: String,
+        /// Native ToolContext.id joined to the plugin's protected PreToolUse record.
         call_id: String,
     },
     /// A sealed proof issued by the registry for an already attested
@@ -499,6 +511,9 @@ impl PresentedMeta {
             .iter()
             .any(|field| meta.contains_key(*field));
         let claude = meta.contains_key("claudecode/toolUseId");
+        let opencode = ["ai.opencode/sessionID", "ai.agent_bridge/toolCallID"]
+            .iter()
+            .any(|key| meta.contains_key(*key));
         let field = |name: &str| -> Result<String, CorrelationError> {
             let value = meta
                 .get(name)
@@ -506,8 +521,8 @@ impl PresentedMeta {
                 .ok_or_else(|| CorrelationError::NotEvidence(format!("_meta {name} missing")))?;
             checked_id(value, name).map_err(CorrelationError::NotEvidence)
         };
-        match (codex, claude) {
-            (true, false) => {
+        match (codex, claude, opencode) {
+            (true, false, false) => {
                 let Some(turn) = meta
                     .get("x-codex-turn-metadata")
                     .and_then(serde_json::Value::as_object)
@@ -532,8 +547,12 @@ impl PresentedMeta {
                     call_id: field("callId")?,
                 })
             }
-            (false, true) => Ok(PresentedMeta::Claude {
+            (false, true, false) => Ok(PresentedMeta::Claude {
                 tool_use_id: field("claudecode/toolUseId")?,
+            }),
+            (false, false, true) => Ok(PresentedMeta::OpenCode {
+                session_id: field("ai.opencode/sessionID")?,
+                call_id: field("ai.agent_bridge/toolCallID")?,
             }),
             _ => Err(CorrelationError::NotEvidence(
                 "_meta does not carry exactly one supported host contract".into(),
@@ -552,6 +571,7 @@ impl PresentedMeta {
         match self {
             PresentedMeta::Claude { tool_use_id } => Some((tool_use_id, Harness::ClaudeCode)),
             PresentedMeta::Codex { call_id, .. } => Some((call_id, Harness::Codex)),
+            PresentedMeta::OpenCode { call_id, .. } => Some((call_id, Harness::OpenCode)),
             PresentedMeta::Sealed { .. } => None,
         }
     }
@@ -709,6 +729,10 @@ impl CallerAttestor for Unattested {
 /// Native hook event names this registry understands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookKind {
+    /// OpenCode observed activity; never a context drain or caller record.
+    OpenCodeActivity,
+    /// OpenCode lost its lifecycle feed; readiness is explicitly unknown.
+    OpenCodeUnknown,
     /// Session started, resumed, cleared or compacted.
     SessionStart,
     /// A user prompt was submitted (natural context point).
@@ -735,6 +759,8 @@ impl HookKind {
     /// Parses the native `hook_event_name`.
     fn parse(name: &str) -> Option<Self> {
         Some(match name {
+            "OpenCodeActivity" => HookKind::OpenCodeActivity,
+            "OpenCodeUnknown" => HookKind::OpenCodeUnknown,
             "SessionStart" => HookKind::SessionStart,
             "UserPromptSubmit" => HookKind::UserPromptSubmit,
             "PreToolUse" => HookKind::PreToolUse,
@@ -752,6 +778,8 @@ impl HookKind {
     /// The native name, for hook output and proof references.
     pub fn as_str(self) -> &'static str {
         match self {
+            HookKind::OpenCodeActivity => "OpenCodeActivity",
+            HookKind::OpenCodeUnknown => "OpenCodeUnknown",
             HookKind::SessionStart => "SessionStart",
             HookKind::UserPromptSubmit => "UserPromptSubmit",
             HookKind::PreToolUse => "PreToolUse",
@@ -1064,6 +1092,7 @@ impl MessageCandidate {
                 match binding.address.harness {
                     Harness::Codex => "codex",
                     Harness::ClaudeCode => "claude",
+                    Harness::OpenCode => "opencode",
                 },
                 binding.harness.0,
                 binding.harness.1,
@@ -1339,6 +1368,12 @@ impl Registry {
                 profile.harness,
                 profile.executables.len()
             ));
+        }
+        if policies
+            .iter()
+            .any(|policy| policy.harness == Harness::OpenCode && policy.inject)
+        {
+            return Err("OpenCode hook context injection is not qualified".into());
         }
         Ok((policies, notes))
     }
@@ -1936,6 +1971,13 @@ impl Registry {
     ) -> Result<HookAdmission, CorrelationError> {
         let kind = HookKind::parse(&payload.hook_event_name)
             .ok_or_else(|| CorrelationError::NotEvidence("unsupported hook event".into()))?;
+        if harness != Harness::OpenCode
+            && matches!(kind, HookKind::OpenCodeActivity | HookKind::OpenCodeUnknown)
+        {
+            return Err(CorrelationError::NotEvidence(
+                "hook event belongs to another harness".into(),
+            ));
+        }
         let session =
             checked_id(&payload.session_id, "session_id").map_err(CorrelationError::NotEvidence)?;
         let agent = payload
@@ -1955,7 +1997,9 @@ impl Registry {
             (Some(agent), Harness::ClaudeCode) => {
                 (ActorRole::Child, agent.clone(), session.clone())
             }
-            (Some(agent), Harness::Codex) => (ActorRole::Child, agent.clone(), agent.clone()),
+            (Some(agent), Harness::Codex | Harness::OpenCode) => {
+                (ActorRole::Child, agent.clone(), agent.clone())
+            }
         };
         let address = NativeAddress::new(
             self.config.host_id.clone(),
@@ -2306,6 +2350,11 @@ impl Registry {
         {
             return Err(CorrelationError::Conflicting(call));
         }
+        if let PresentedMeta::OpenCode { session_id, .. } = meta
+            && *session_id != record.native_id
+        {
+            return Err(CorrelationError::Conflicting(call));
+        }
         Ok((
             VerifiedCaller::new(
                 binding.address.clone(),
@@ -2316,6 +2365,7 @@ impl Registry {
                 match harness {
                     Harness::ClaudeCode => CallerChannel::ClaudeToolUse,
                     Harness::Codex => CallerChannel::CodexCall,
+                    Harness::OpenCode => CallerChannel::OpenCodeCall,
                 },
             ),
             matched.incarnation,
@@ -2672,7 +2722,9 @@ fn is_positive_idle_event(
     payload: &HookPayload,
 ) -> bool {
     match kind {
-        HookKind::SessionStart => starts_own_session(kind, role, harness, payload),
+        HookKind::SessionStart => {
+            harness != Harness::OpenCode && starts_own_session(kind, role, harness, payload)
+        }
         HookKind::Stop => owns_address(role, harness),
         HookKind::Notification => {
             owns_address(role, harness)
@@ -2701,6 +2753,9 @@ fn next_lifecycle(
 ) -> Lifecycle {
     let owner = owns_address(role, harness);
     match kind {
+        HookKind::OpenCodeActivity => Lifecycle::Active,
+        HookKind::OpenCodeUnknown => Lifecycle::Unknown,
+        HookKind::SessionStart if harness == Harness::OpenCode => Lifecycle::Unknown,
         HookKind::SessionStart if starts_own_session(kind, role, harness, payload) => {
             Lifecycle::Inactive
         }
@@ -2728,13 +2783,22 @@ fn next_lifecycle(
     }
 }
 
-/// Resolves a harness process's own store directory from its own
-/// environment: `CODEX_HOME` or `CLAUDE_CONFIG_DIR`, else `$HOME/.codex`
-/// or `$HOME/.claude`.
+/// Resolves the harness's store from its OS environment, never hook arguments.
+/// Codex/Claude retain their existing home defaults. Supported owned OpenCode
+/// launches explicitly name OPENCODE_DB; its absolute parent is the store, with
+/// no guessed fallback for arbitrary unowned installations.
 fn harness_store(facts: &ProcessFacts, harness: Harness) -> Option<PathBuf> {
     let (variable, default) = match harness {
         Harness::Codex => ("CODEX_HOME", ".codex"),
         Harness::ClaudeCode => ("CLAUDE_CONFIG_DIR", ".claude"),
+        Harness::OpenCode => {
+            let database = PathBuf::from(os::process_env(facts.pid, "OPENCODE_DB")?);
+            return if database.is_absolute() {
+                database.parent().map(Path::to_path_buf)
+            } else {
+                None
+            };
+        }
     };
     if let Some(value) = os::process_env(facts.pid, variable) {
         return Some(PathBuf::from(value));
@@ -2775,6 +2839,7 @@ fn product_marked(facts: &ProcessFacts, policy: &HarnessPolicy) -> bool {
     let default = match policy.harness {
         Harness::Codex => "codex",
         Harness::ClaudeCode => "claude",
+        Harness::OpenCode => "opencode",
     };
     let Some(exe) = facts.exe.as_ref() else {
         return false;
