@@ -2,7 +2,7 @@
 
 Agent Bridge is a local, durable message service for coding-agent sessions. A
 producer (an agent tool, a CLI, a background worker) publishes an event addressed
-to one exact native session of Codex or Claude Code; Bridge keeps it in a
+to one exact native session of Codex, Claude Code or managed OpenCode; Bridge keeps it in a
 SQLite custody store, delivers it through the host's own native path, and
 reports honestly what is known. A delivery whose outcome is uncertain is
 retained and surfaced for a manual decision; it is never repeated
@@ -10,7 +10,7 @@ automatically.
 
 | | |
 |---|---|
-| Version | 0.2.0 (not published to crates.io; build from source) |
+| Version | 0.3.0 (not published to crates.io; build from source) |
 | Producer API | v1 (`bridge-protocol` / `bridge-sdk`), plus the legacy publisher and operator socket API |
 | Database | storage schema 6, forward migration only |
 | Platform | **macOS on Apple silicon (`aarch64-apple-darwin`) only** |
@@ -25,6 +25,8 @@ automatically.
   hook while it is active, `message` queues it through a native message path
   while it is idle, and `auto` chooses per delivery. Both requested and
   effective modes are recorded.
+  OpenCode supports only `message` through its native owner and lifecycle plugin;
+  it has no `inject` or context-injection path.
 - **Durable custody and honest evidence.** A receipt proves custody only.
   Native acceptance, hook emission, context observation and application
   processing are separate, never inferred from each other.

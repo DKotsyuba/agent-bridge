@@ -65,8 +65,8 @@ policies = []
 ```
 
 - A canonical address has four slash-separated components,
-  `host/harness/store-namespace/session`, where `harness` is `codex` or
-  `claude-code`. A component containing `/` or `%` is percent-encoded
+  `host/harness/store-namespace/session`, where `harness` is `codex`,
+  `claude-code` or `opencode`. A component containing `/` or `%` is percent-encoded
   losslessly (`%2F`, `%25`). `"*"` permits any well-formed address; delivery
   still requires a qualified native endpoint.
 - The `publisher` is the stamped identity of every event. Rotate a token without
@@ -94,6 +94,21 @@ Use narrower prefixes, recipients, modes and kinds when the deployment allows.
 session address receive replies there; it never grants root identity or any
 product permission. See [Producer integration](producer-integration.md).
 
+For a managed OpenCode recipient, grant message publication explicitly; this
+example uses a direct native address and does not enable standalone root MCP:
+
+```toml
+[[grant]]
+token = "<a distinct unguessable secret, at least 16 bytes>"
+publisher = "opencode-producer"
+recipients = ["this-host/opencode/opencode-main/session"]
+kinds = ["worker.completed"]
+modes = ["message"]
+policies = ["keep_all"]
+[grant.producer_v1]
+direct_address = true
+```
+
 ## Native adapters
 
 `bridge-native-daemon` adds an `[adapters]` table to the same file.
@@ -107,10 +122,16 @@ host_id = "this-host"                   # host component of every attested addre
 # max_call_age_ms = 600000              # age of a hook record a caller may join
 
 [[adapters.harnesses]]                  # one policy per harness product; no store or executable
-harness = "ClaudeCode"                  # or "Codex"
+harness = "ClaudeCode"                  # or "Codex"; OpenCode example below
 namespace = "claude-main"               # native_store_namespace of its addresses
 inject = true                           # root hook context injection is supported
 message = true                          # the message carrier is supported
+
+[[adapters.harnesses]]
+harness = "OpenCode"
+namespace = "opencode-main"
+inject = false                          # no OpenCode context injection
+message = true                          # requires native owner + lifecycle plugin
 
 [[adapters.relays]]                     # optional: the root relay build
 path = "/ABS/home/releases/<version>+<label>/bin/bridge-root-relay"
@@ -126,10 +147,11 @@ No store path and no harness executable is declared. A hook counts as a hook of 
 only when its parent chain reaches a process of that harness product (through the
 allowlisted `intermediates`, as the same user) for a harness kind that has a policy. That
 process must be positively marked as the product (its resolved executable path names `codex`
-or `claude`, or matches an explicit `executable_markers` entry), run from a regular
+or `claude` (or `opencode` for the plugin), or matches an explicit `executable_markers` entry), run from a regular
 file owned by you or root that no group or other user can write and that was not changed
 since the process started, and its own store, taken from its environment (`CODEX_HOME`,
-`CLAUDE_CONFIG_DIR`, else `$HOME/.codex` or `$HOME/.claude`), must be a canonical directory
+`CLAUDE_CONFIG_DIR`, else `$HOME/.codex` or `$HOME/.claude`; OpenCode uses its private
+`OPENCODE_DB` parent), must be a canonical directory
 you own that no group or other user can write (a symlink or non-canonical spelling is
 refused, and the store is checked again at every use). A fresh session in any such store
 registers from its own lifecycle hook: there is nothing to enroll and no runtime
@@ -165,7 +187,7 @@ policy now applies to every build of the harness, not only to the digests you li
 
 ### Native owner route
 
-A supervisor that launched and owns a live Codex or Claude Code process may publish a
+A supervisor that launched and owns a live Codex, Claude Code or OpenCode process may publish a
 private socket for it and name the socket in that process's own environment as
 `BRIDGE_NATIVE_OWNER_SOCKET`. Bridge then wakes the recipient through that owner, only
 while the recipient is positively idle, instead of through a legacy route. The variable
@@ -177,7 +199,11 @@ you or root that no group or other user can write and that was not changed since
 process started. No owner path or digest is configured, and no enrollment exists; an
 `owner_relays` entry from an earlier release is ignored and authorizes nothing.
 
-- A harness whose environment names no owner keeps every legacy route unchanged.
+- Codex and Claude without an owner keep their legacy routes. OpenCode has no
+  legacy carrier: it requires the owner and first-party lifecycle plugin, and is
+  message-only (`opencode_input`), with no injection or context path. Configure
+  the supervisor with the install activation's exact resolved `plugin_binding`
+  path and SHA-256, not a source-tree file or the moving `current` symlink.
 - A present locator that is malformed, not valid UTF-8, untrusted or unavailable
   holds the attempt. So does an environment that cannot be read. There is no fallback
   to a queue, application or inbox route.
@@ -214,7 +240,7 @@ channel = "/ABS/state/ch/c.sock"        # adapter channel; absent: every request
 
 [[root.callers]]                        # at least one
 host_id = "this-host"
-harness = "claude-code"                 # codex or claude-code
+harness = "claude-code"                 # codex or claude-code; standalone OpenCode root MCP is unqualified
 native_store_namespace = "claude-main"
 # native_session_id = "..."             # exact session; absent matches any root session of the store
 recipients = ["*"]                      # canonical addresses or "*"

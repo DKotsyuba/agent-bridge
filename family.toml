@@ -5,8 +5,8 @@ env_prefix = "AGENT_BRIDGE_"
 standard_version = "1.0.0-rc.2"
 devkit_version = "0.2.0"
 baseline = "rust-macos-2026-09-candidate1"
-# Local diagnostics and isolated package/lifecycle evidence exist; native
-# host, installed-host and Telegram qualification do not.
+# Local diagnostics, isolated package/lifecycle evidence and bounded native
+# candidate results exist; installed-host and Telegram qualification do not.
 qualification = "not_verified"
 
 [profiles]
@@ -25,7 +25,8 @@ qualified_hosts = []
 
 [release]
 enabled = false
-# Local bundle: release-manifest.json + SHA256SUMS + bin/ (six executables),
+# Local bundle: release-manifest.json + SHA256SUMS + bin/ (six executables)
+# + plugins/opencode/ (index.js and package.json),
 # installed by install.sh with an out-of-band SHA256SUMS digest.
 delivery_profile = "bridge-bundle-v1"
 trust_profile = "local-build-digest"

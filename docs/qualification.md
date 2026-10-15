@@ -7,7 +7,7 @@ this before relying on Bridge with a native host.
 owned test fixture or probe against the exact build named in the row, on macOS with
 Apple silicon, with the evidence checked by its own required checks. It is a result
 about that build and that scope at the time it was run, not a property of "Codex" or
-"Claude Code" in general and not a release guarantee. A harness policy you configure
+"Claude Code" or "OpenCode" in general and not a release guarantee. A harness policy you configure
 (`[[adapters.harnesses]]` with a namespace and the capabilities you assert; no store path or
 executable is declared) enables a harness; that policy is *configuration*, not
 qualification, and `bridge doctor` reports adapter capabilities and Telegram as
@@ -18,7 +18,7 @@ or a different configuration is unqualified until its probes are run again.
 
 | | |
 |---|---|
-| Source | Bridge 0.2.0, producer API v1 (wire, core and native contracts revision 3), storage schema 6 |
+| Source | Bridge 0.3.0, producer API v1 (wire, core and native contracts revision 3), storage schema 6 |
 | Platform | macOS, Apple silicon (`aarch64-apple-darwin`) |
 | Toolchain | Rust 1.98.1 |
 
@@ -38,7 +38,7 @@ These need no native harness and are what CI runs on macOS Apple silicon (see
 targets, the workspace tests, private-item Rustdoc and `cargo xtask check-public`. The
 tests exercise real service, adapter-channel, hook, relay and CLI executables with
 labeled stand-in harnesses (`bridge-fixture`) and scripted carriers. A stand-in harness is
-**not** native Claude Code or Codex evidence.
+**not** native Claude Code, Codex or OpenCode evidence.
 
 `cargo xtask qualify --prefix DIR` additionally runs the packaged release in one new
 isolated prefix: tamper refusal, install, version and hash, start, doctor, operator read,
@@ -69,14 +69,40 @@ This qualifies that managed live-session route on those local candidates.
 It does not qualify standalone OpenCode root MCP return delivery, child wake,
 context injection, an idle IDE application, installation or publication.
 
-| Capability | Codex 0.162.0-alpha.17.2 (SHA-256 `0d5ac7aae20c4eda6242428d5e218c55ba96d8763fda2a271088ff37104b9d28`) | Claude Code |
+That native proof used a source-tree plugin on the earlier local candidate.
+The v0.3 bundle now carries exactly `plugins/opencode/index.js` and
+`plugins/opencode/package.json`, attested and sealed with the release. Activation
+reports the exact resolved plugin entrypoint path and SHA-256 as `plugin_binding`;
+supervisors must use that binding. Package lifecycle checks are separate evidence
+and do not promote this installed plugin to native qualification.
+
+### IDE graph wake canaries
+
+Two isolated canaries ran on 2026-10-15 against the delivery path of source
+revision `c00e6fc` ("wake managed sessions without static enrollment"), one with
+the candidate5 IDE and Agent Run on Claude and one on Codex. Each observed: a
+naturally ended turn one; an `Auto` publication that resolved to `MESSAGE`; one
+delivery attempt with native acceptance; the same session executing turn two,
+which used a real IDE graph of 6 nodes and 6 edges; exactly one `stop` and one
+`finish`; and complete cleanup.
+
+| Canary | Run proof SHA-256 | Bridge receipt SHA-256 |
+|---|---|---|
+| Claude | `fa8e81cca87013189693c42aa6841ef379834323d0a5848e095881bf684b7ea3` | `bf96211e55216cfb6f37f4912e5fc4003070916e6f0a007be3f24156ddfeafa6` |
+| Codex | `b70e54ee94c48f8495c195ed0ca08161a200a4017d013e26eff4ca9c2a02e892` | `a2da9c53d445116bf5d48a49be4ae6b2b3e7004f731fb99b9e9c10697184f036` |
+
+This qualifies only the tested `c00e6fc` delivery path with the candidate5 IDE
+and Agent Run. It does not qualify every host build, and it does not qualify the
+v0.3.0 release artifact, which had not been built when these canaries ran.
+
+| Capability | Codex (legacy probes: 0.162.0-alpha.17.2, SHA-256 `0d5ac7aae20c4eda6242428d5e218c55ba96d8763fda2a271088ff37104b9d28`; owner canary scope above is separate) | Claude Code |
 |---|---|---|
 | Protected hook caller binding, root and child attestation | Observed on owned sessions | Observed on owned sessions of the older builds below |
 | `inject` through the recipient's own hook | Observed on owned sessions | Observed on the older builds below |
 | `message` carrier | Queue acceptance with native readback observed on owned sessions. **Application native message delivery observed once in an owner-operated session on the installed 0.2.0 service:** the signed Codex application frontend accepted a v1 direct-address message exactly once and the recipient chat returned a hidden acknowledgement, with no receiver `bridge_me` or manual enrollment; the root caller attestation worked after a final service restart and all earlier events and attempts stayed immutable. This is not consumer cutover, GUI clear, unload or restart qualification | Peer `later` message answered in a distinct turn observed on the older builds below |
 | Producer v1 direct-MCP registration and publication | Qualified: an unknown raw producer and a portable-SDK producer registered and published through the public protocol; two concurrent callers each received only their own message; restart recovered identical historical registration and custody; close and exact replay added no delivery attempts | **Not qualified** |
-| Owner-routed idle wake of a supervisor-owned live session (`BRIDGE_NATIVE_OWNER_SOCKET`) | Source-tested with a scripted stand-in owner only: exact direct-parent and owner-executable fences, one request frame, conservative receipt mapping, no resend or fallback. **Not qualified:** no native Codex turn or owner implementation was observed | Source-tested with a scripted stand-in owner only. **Not qualified:** no native Claude replay acknowledgement or owner implementation was observed |
-| Automatic recovery after an application update or restart: digest refresh for Bridge's own relay and audience builds, MESSAGE-only gateway to an idle Desktop thread, frontend discovery among thousands of stale entries | Source-tested with synthetic native-owner input only. **Not natively qualified:** no real Codex update, restart or model wake was observed through Bridge, and no real harness registered from an arbitrary runtime store; whether a resumed turn can exist before its transcript append, and the exact transcript flush order after `Stop`, are unobserved and need a manual native check (a fixed read-only native thread-state query if they differ). Registration no longer distinguishes a downgrade or a different build of the harness from the build you tested | Not applicable (no gateway); registration from an arbitrary canonical owner-only store is source-tested only |
+| Owner-routed idle wake of a supervisor-owned live session (`BRIDGE_NATIVE_OWNER_SOCKET`) | Observed for the tested `c00e6fc` delivery path with candidate5 IDE and Agent Run in the [IDE graph canary](#ide-graph-wake-canaries): one MESSAGE attempt, native acceptance and real turn two. This is a separate candidate result, not qualification of every Codex build or the v0.3 artifact | Observed in the matching Claude `c00e6fc`/candidate5/Agent Run canary with the same bounded MESSAGE wake and turn-two evidence; other builds and global applications remain unqualified |
+| Automatic recovery after an application update or restart: digest refresh for Bridge's own relay and audience builds, MESSAGE-only gateway to an idle Desktop thread, frontend discovery among thousands of stale entries | Source-tested with synthetic native-owner input only. **Not natively qualified:** no real Codex application update/restart wake through the Desktop gateway was observed; the separate live-session owner canary above does not qualify that gateway. Whether a resumed turn can exist before its transcript append, and the exact transcript flush order after `Stop`, need a manual native check (a fixed read-only native thread-state query if they differ). Registration no longer distinguishes a downgrade or a different build of the harness from the build you tested | Not applicable (no gateway); arbitrary-store recovery beyond the named live-session canary is source-tested only |
 | Nested inner-call MCP | Unsupported | Unsupported |
 | Host observations (`host_observations`) | Absent: no operation and no capability | Absent |
 | Detached backend assertions (`consume_assertion`) and delivery-scope retirement | Implemented and fixture-tested; the native runs used a harness policy with these features off, so they are **not** qualified in a native deployment | Not qualified |
@@ -99,9 +125,10 @@ probes against your exact Claude Code build and Bridge revision before relying o
   parsed value and the host refusing an unlisted tool, not that this value is what permits
   the listed tools. The `_meta.callId` equals `tool_use_id` observation holds on the named
   Codex build only; on another build a mismatch finds no record and refuses.
-- Owner-routed wake against a real supervisor, Codex build or Claude Code build: the
-  stand-in tests do not establish a native turn, a replayed user frame, a context
-  observation or a consumer result.
+- Owner-routed wake outside the tested `c00e6fc`/candidate5/Agent Run Codex and Claude
+  sessions and the earlier OpenCode candidate above. Those real supervisor canaries
+  establish their observed MESSAGE wake and turn two, not all host builds, global
+  applications, arbitrary context injection or native qualification of the v0.3 bundle.
 - Linux or Windows operation, and any installation into a working application without a
   deliberate local test.
 - Live Telegram delivery. The notifier is exercised against a local HTTP stub only.

@@ -36,7 +36,7 @@ executable (`command -v node`): the full workspace tests, including the determin
 Desktop regressions, require it and fail without it. Node is not needed to build or use
 Bridge or the SDK. Tests must use only isolated synthetic state:
 fresh temporary databases, private sockets, scripted carriers and fixture
-processes. A test must never touch your real Codex or Claude Code stores,
+processes. A test must never touch your real Codex, Claude Code or OpenCode stores,
 sessions or hooks, call a model, or use the network.
 
 The native probes in `crates/bridge-adapters/qualification/` need real harness

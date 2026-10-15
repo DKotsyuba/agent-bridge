@@ -29,6 +29,7 @@ fn opencode_plugin_synthetic_lifecycle_contract() {
     let node = std::env::var("BRIDGE_TEST_NODE").expect("BRIDGE_TEST_NODE required");
     assert!(std::path::Path::new(&node).is_absolute());
     let output = std::process::Command::new(node)
+        .arg("--expose-gc")
         .arg("--test")
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),

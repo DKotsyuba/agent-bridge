@@ -15,7 +15,7 @@
 //! bridge operator <config> resume <recipient>
 //! bridge operator <config> shutdown
 //! bridge notify <config>
-//! bridge package --from DIR --out DIR
+//! bridge package --from DIR --out DIR [--plugin-dir DIR]   (OpenCode plugin source: index.js + package.json)
 //! bridge verify <bundle> [--sums-sha256 HEX]   (attested only with the digest)
 //! bridge self-install --bundle DIR --home DIR --bin-dir DIR --sums-sha256 HEX
 //! bridge rollback --home DIR
@@ -186,7 +186,7 @@ fn dispatch(args: &Args) -> Result<(Value, u8), Failure> {
         "operator" => operator(args).map(|value| (value, 0)),
         "notify" => notify_command(args).map(|value| (value, 0)),
         "package" => {
-            args.closed(1, &["--from", "--out"])?;
+            args.closed(1, &["--from", "--out", "--plugin-dir"])?;
             let (manifest, sums) = install::package(
                 &args
                     .path("--from")
@@ -194,6 +194,7 @@ fn dispatch(args: &Args) -> Result<(Value, u8), Failure> {
                 &args
                     .path("--out")
                     .ok_or(Failure::Usage("--out is required".into()))?,
+                args.path("--plugin-dir").as_deref(),
             )?;
             Ok((json!({"manifest": manifest, "sums_sha256": sums}), 0))
         }

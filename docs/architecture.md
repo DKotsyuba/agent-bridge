@@ -13,10 +13,10 @@ protocol is in [Producer integration](producer-integration.md).
 producer ──► bridge-core service (SQLite custody, dispatch, recovery)
                   ▲   │ attempts
  operator CLI ────┘   ▼
-                bridge-adapters (registry, hooks, Codex / Claude carriers)
-                          │ native hook output, queue or message call
+                bridge-adapters (registry, hooks, lifecycle plugin, carriers)
+                          │ native hook output, queue, message or owner call
                           ▼
-                 Codex / Claude Code session
+                 Codex / Claude Code / managed OpenCode session
 ```
 
 - `bridge-core`: the service library and `bridge-daemon`.
@@ -49,6 +49,8 @@ producer ──► bridge-core service (SQLite custody, dispatch, recovery)
   client.
 - `bridge-adapters` and `bridge-interfaces`: native carriers and hooks, and the
   restricted root MCP, operator CLI and packaging.
+  OpenCode uses its lifecycle plugin and a message-only direct-parent owner route;
+  it never drains injected context. Codex and Claude retain their hook paths.
 
 ## Custody
 

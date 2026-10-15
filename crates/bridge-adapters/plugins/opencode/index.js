@@ -99,10 +99,27 @@ export default {
       ? observe('PreToolUse', event.sessionID, { tool_use_id: event.id, tool_name: event.tool }) : observe('OpenCodeUnknown', event.sessionID));
     const events = await ctx.event.subscribe();
     const iterator = events[Symbol.asyncIterator]();
+    /** @type {()=>void} Ends the one currently pending read, or a no-op between reads. */
+    let stopFeed = () => {};
+    /** @type {Promise<void>|undefined} Shared final drain and invalidation. */
+    let finalization;
+    /** Drain accepted work and invalidate retained actors exactly once.
+     * @returns {Promise<void>} Completion shared by feed loss and disposal. */
+    function finalize() {
+      active = false;
+      return finalization ??= serial.then(invalidate);
+    }
     /** @type {Promise<void>} Owned local native subscription; no progress polling. */
     const feed = (async () => {
       while (active) {
-        const value = await iterator.next();
+        /** @type {()=>void} Cancellation owned only by this pending read. */
+        let cancel;
+        /** @type {Promise<{done:boolean}>} Per-read cancellation; settled races can be collected. */
+        const stopped = new Promise(resolve => { cancel = () => resolve({ done: true }); });
+        stopFeed = cancel;
+        let value;
+        try { value = await Promise.race([iterator.next(), stopped]); }
+        finally { if (stopFeed === cancel) stopFeed = () => {}; }
         if (value.done) break;
         const event = value.value;
         const sessionID = event.data?.sessionID ?? event.data?.info?.id;
@@ -112,14 +129,22 @@ export default {
         else if (['session.execution.succeeded', 'session.execution.failed', 'session.execution.interrupted'].includes(event.type)) await observe('Stop', sessionID);
         else if (event.type === 'session.deleted') await observe('SessionEnd', sessionID);
       }
-    })().catch(() => {}).finally(async () => { if (active) { active = false; await serial; await invalidate(); } });
-    return async () => {
+    })().catch(() => {}).finally(async () => { if (active) await finalize(); });
+    /** @type {Promise<void>|undefined} One disposal shared by repeated callers. */
+    let cleanup;
+    /** Attempt every cleanup stage, awaiting native return, feed completion,
+     * serialized work and exactly one final invalidation before settling.
+     * @returns {Promise<void>} Shared completion; no cleanup continues afterwards.
+     * @throws {unknown} First stage failure, only after every stage settles. */
+    return () => cleanup ??= (async () => {
       active = false;
-      await prompt.dispose(); await tool.dispose();
-      void iterator.return?.().catch(() => {});
-      await serial;
-      await invalidate();
-      void feed;
-    };
+      stopFeed();
+      /** @type {{error:unknown}|undefined} First cleanup failure, surfaced after all stages. */
+      let failure;
+      for (const stage of [() => prompt.dispose(), () => tool.dispose(), () => iterator.return?.(), () => feed, finalize]) {
+        try { await stage(); } catch (error) { failure ??= { error }; }
+      }
+      if (failure) throw failure.error;
+    })();
   },
 };

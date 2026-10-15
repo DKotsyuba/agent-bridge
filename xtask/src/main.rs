@@ -13,7 +13,9 @@
 //! `package` builds every workspace binary in release mode (offline,
 //! locked) with `BRIDGE_BUILD_LABEL` (default: the 12-digit Git commit,
 //! `-dirty` when the worktree has changes) and writes a verified bundle
-//! with the built `bridge package`. It prints the manifest and the
+//! with the built `bridge package`, always passing the repository's
+//! `crates/bridge-adapters/plugins/opencode` directory so the bundle carries
+//! the OpenCode plugin. It prints the manifest and the
 //! `SHA256SUMS` digest to pass to `install.sh`.
 //!
 //! `qualify` exercises the real packaged product inside one new isolated
@@ -196,9 +198,12 @@ fn default_label() -> String {
 /// The binaries are located from Cargo's own artifact messages (so a
 /// `CARGO_TARGET_DIR` or configured target directory is honoured and a
 /// stale binary elsewhere is never packaged); all packaged executables
-/// must come from this build and one directory. Returns the `bridge
-/// package` result (`manifest`, `sums_sha256`).
+/// must come from this build and one directory. The repository's OpenCode
+/// plugin directory is always passed explicitly (never inferred by `bridge`
+/// from the working directory). Returns the `bridge package` result
+/// (`manifest`, `sums_sha256`).
 fn package(label: &str, out: &Path) -> Result<Value, String> {
+    let plugin = root().join("crates/bridge-adapters/plugins/opencode");
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let build = run_within(
         Command::new(cargo)
@@ -252,7 +257,9 @@ fn package(label: &str, out: &Path) -> Result<Value, String> {
         .args(["package", "--from"])
         .arg(&release)
         .arg("--out")
-        .arg(out))?;
+        .arg(out)
+        .arg("--plugin-dir")
+        .arg(&plugin))?;
     if !packaged.status.success() {
         return Err(format!(
             "bridge package failed: {}",
@@ -478,6 +485,32 @@ fn qualify(prefix: &Path) -> Result<(), String> {
     // Install A and check the installed build itself.
     let (code, activation_a) = install(&bundle_a, &sums_a)?;
     recorder.check("install_a", code == 0, activation_a.clone());
+    let plugin_entry = activation_a["plugin_binding"]["path"]
+        .as_str()
+        .map(PathBuf::from);
+    recorder.check(
+        "installed_plugin_binding_is_the_sealed_release_file",
+        plugin_entry.as_deref().is_some_and(|entry| {
+            entry.ends_with("plugins/opencode/index.js")
+                && entry.starts_with(home.join("releases"))
+                && entry
+                    .parent()
+                    .is_some_and(|dir| dir.join("package.json").is_file())
+                && std::fs::metadata(entry).is_ok_and(|meta| meta.permissions().readonly())
+                && activation_a["plugin_binding"]["sha256"]
+                    == packaged_a["manifest"]["plugin_files"][0]["sha256"]
+                && std::fs::read(entry)
+                    .ok()
+                    .zip(
+                        std::fs::read(
+                            root().join("crates/bridge-adapters/plugins/opencode/index.js"),
+                        )
+                        .ok(),
+                    )
+                    .is_some_and(|(installed, source)| installed == source)
+        }),
+        activation_a["plugin_binding"].clone(),
+    );
     let (_, version) = product(Command::new(bin.join("bridge")).arg("version"))?;
     recorder.check(
         "installed_version_is_a",
@@ -656,7 +689,10 @@ kinds = ["root.note"]
     let (code, activation_b) = install(&bundle_b, &sums_b)?;
     recorder.check(
         "install_b",
-        code == 0 && activation_b["previous"] == activation_a["current"],
+        code == 0
+            && activation_b["previous"] == activation_a["current"]
+            && activation_b["plugin_binding"]["sha256"] == activation_a["plugin_binding"]["sha256"]
+            && activation_b["plugin_binding"]["path"] != activation_a["plugin_binding"]["path"],
         activation_b.clone(),
     );
     let (_, report) = doctor(&daemon)?;
@@ -691,7 +727,9 @@ kinds = ["root.note"]
     )?;
     recorder.check(
         "rollback_to_a",
-        code == 0 && rolled["current"] == activation_a["current"],
+        code == 0
+            && rolled["current"] == activation_a["current"]
+            && rolled["plugin_binding"] == activation_a["plugin_binding"],
         rolled,
     );
     let (_, version) = product(Command::new(bin.join("bridge")).arg("version"))?;

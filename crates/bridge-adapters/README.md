@@ -1,7 +1,7 @@
 # bridge-adapters
 
-Native Codex / Claude Code adapters for Agent Bridge: the protected caller
-registry, quiet root hooks and message carriers. They consume core's
+Native Codex, Claude Code and managed OpenCode adapters for Agent Bridge: the protected caller
+registry, quiet root hooks, lifecycle plugin and message carriers. They consume core's
 single custody and attempt state (`DispatchCarrier`, `observe_binding`,
 `drain_inject`, `record_outcome`); there is no second attempt or hook store.
 
@@ -16,12 +16,13 @@ touched by anything here, and nothing in this crate installs a hook for you.
 
 | Piece | Role |
 |---|---|
-| `bridge-native-daemon` | core service + Codex and Claude carriers + adapter channel |
+| `bridge-native-daemon` | core service + Codex, Claude and OpenCode owner carriers + adapter channel |
 | `bridge-hook` | the harness hook command; forwards one hook event, prints Bridge context only when handed one, always exits 0 |
 | `registry` | harness incarnations, endpoint epochs, owner lifecycle, single-use call records, root-caller ABI |
 | `server` / `client` | the private adapter channel and its clients (`RegistryAttestor`) |
 | `codex` | `message` via one `thread/queue/add` in an OS-confined queue-only App Server helper |
 | `claude` | `message` via the authenticated native peer send with `priority = "later"` |
+| `opencode` / `plugins/opencode` | message-only `opencode_input` via the exact native owner; plugin lifecycle observations, no inject/context path |
 
 ## Trust model
 
@@ -30,14 +31,15 @@ touched by anything here, and nothing in this crate installs a hook for you.
   the daemon's user, a harness-level policy serves that harness product, and its
   nearest ancestor that is not an allowlisted shell (`intermediates`) is a
   process of that product: it runs as the same user, its resolved executable
-  path carries the product marker (the product name `codex` / `claude` or a
+  path carries the product marker (the product name `codex` / `claude` / `opencode` or a
   configured `executable_markers` entry; an environment variable never counts,
   because every descendant of a harness inherits its store variables), the file
   is a regular file owned by that user or root that no group or other user can
   write and was last modified *and* last changed (kernel ctime, which `cp -p` /
   `install -p` / `touch` cannot restore) strictly before the whole second the
   process started, and its own store (`CODEX_HOME` / `CLAUDE_CONFIG_DIR`, else
-  `$HOME/.codex` / `$HOME/.claude`, read from that process's own environment) is
+  `$HOME/.codex` / `$HOME/.claude`; OpenCode uses the parent of its explicit
+  `OPENCODE_DB`, read from that process's own environment) is
   an absolute, already canonical directory owned by that user that no group or
   other user can write (symlinks and non-canonical spellings are refused; the
   store is checked again at every recipient use and journal restore). No store
@@ -243,11 +245,17 @@ host_id = "this-host"
 # max_call_age_ms = 600000
 
 [[adapters.harnesses]]                      # one policy per harness product
-harness = "ClaudeCode"                      # or "Codex"
+harness = "ClaudeCode"                      # or "Codex"; OpenCode example below
 namespace = "claude-main"                   # native_store_namespace of addresses
 inject = true
 message = true
-# executable_markers = ["claude"]           # optional; default is the product name
+
+[[adapters.harnesses]]
+harness = "OpenCode"
+namespace = "opencode-main"
+inject = false                              # no OpenCode context injection
+message = true                              # owner + lifecycle plugin required
+# executable_markers = ["opencode"]         # optional; default is the product name
 
 [[adapters.relays]]                          # optional: root MCP daemon build
 path = "/abs/root-mcp-daemon"
@@ -255,28 +263,39 @@ sha256 = "<64 hex>"
 ```
 
 **Native owner route (`owner` module).** When the attested harness's own environment
-names `BRIDGE_NATIVE_OWNER_SOCKET`, both carriers select that route before the Codex
+names `BRIDGE_NATIVE_OWNER_SOCKET`, the carriers select that route before the Codex
 helper, the application frontend and the Claude inbox, and never fall back after
 selecting it. The route needs a positively idle recipient (a Claude recipient needs no
 inbox descriptor), a canonical private socket, a connected peer that is the exact direct
 parent (PID, start, user) of the harness running a trusted executable (a regular file owned
 by that user or root, not writable by group or other, unchanged since the owner started; no
 path or digest is configured and a legacy `owner_relays` entry is ignored). An
-absent locator preserves every legacy route; a present malformed, non-UTF-8,
+absent locator preserves Codex/Claude legacy routes; OpenCode requires the owner
+and has no legacy fallback. A present malformed, non-UTF-8,
 untrusted or unavailable one, or an unreadable environment, holds. One six-key request
 and one five-key receipt cross the socket under one absolute 35-second budget, which the
 core attempt must still cover before connecting and immediately before the first byte.
 Only a correlated accepted receipt of the harness's own protocol is native acceptance
 (not context or processing); a known-unsent receipt needs a finite reason; everything
 after the write is an unknown outcome that is retained and never resent. The route is
-tested with a scripted stand-in owner and is not native-qualified; see the [qualification
-matrix](../../docs/qualification.md).
+tested with a scripted stand-in owner and bounded real supervisor canaries; see
+the exact candidate scopes in the [qualification matrix](../../docs/qualification.md).
 
 Install `bridge-hook <channel> claude-code` (or `codex`) as the command of the
 `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
 `PermissionRequest`, `Notification`, `Stop`, `SubagentStop` and `SessionEnd`
 hooks. Installation into working applications is a separate, explicitly
 authorized step; nothing here installs anything.
+
+For managed OpenCode 2.0.28, use the first-party lifecycle plugin instead of
+installing Codex/Claude hook settings. The installed entrypoint is
+`<home>/current/plugins/opencode/index.js`; its supervisor must consume the exact
+canonical release path and SHA-256 from activation's `plugin_binding`, with
+absolute `channel` and `hookCommand` options and its native owner socket. The
+plugin observes prompt, tool and execution events without rewriting prompts.
+OpenCode delivery is message-only through that owner; standalone root MCP,
+child wake and context injection are unqualified. See the [configuration
+reference](../../docs/configuration.md#native-owner-route).
 
 ## Tests
 

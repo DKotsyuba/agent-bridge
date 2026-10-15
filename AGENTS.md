@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Agent Bridge: local durable message service for Codex and Claude Code sessions.
+Agent Bridge: local durable message service for Codex, Claude Code and managed OpenCode sessions.
 Full guide: [agent.md](agent.md). Process: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 - Rust 1.98.1 (`rust-toolchain.toml`), macOS Apple silicon only. Use `cargo +1.98.1 ... --offline` after one `cargo fetch --locked`.

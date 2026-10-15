@@ -50,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let result = match rpc.get("method").and_then(Value::as_str) {
             Some("initialize") => {
-                json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"generic-sdk-producer","version":"0.2.0"}})
+                json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"generic-sdk-producer","version":"0.3.0"}})
             }
             Some("ping") => json!({}),
             Some("tools/list") => {

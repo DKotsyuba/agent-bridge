@@ -100,6 +100,7 @@ fn fixture() -> Fixture {
         target: target(),
         core_schema: 4,
         files,
+        plugin_files: Vec::new(),
     };
     std::fs::write(
         home.join("releases").join("0.1.0+t").join(MANIFEST),

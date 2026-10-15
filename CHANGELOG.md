@@ -6,8 +6,23 @@ source, and the crates are not published to crates.io.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-15
+
 ### Added
 
+- Generic managed OpenCode 2.0.28 lifecycle support: an observation-only first-party
+  plugin (`crates/bridge-adapters/plugins/opencode`) that reports the actual native
+  session and execution lifecycle, the `Host`/`Harness` value `opencode` in the wire
+  contract and core, and a message-only `opencode_input` route through the exact
+  direct-parent native owner (no context injection, no resend or fallback; owner admission
+  is native acceptance, not processing). The producer SDK gains the `ai.opencode/sessionID`
+  plus `ai.agent_bridge/toolCallID` native metadata candidate and a manual single-publication
+  example (`publish`) for publication support. One isolated live-session candidate is
+  recorded in the qualification matrix; standalone OpenCode root MCP, child wake and
+  context injection stay unqualified.
+- Attested OpenCode plugin packaging and canonical activation binding, with
+  plugin-less legacy install/rollback compatibility. Plugin disposal awaits
+  every cleanup stage and reports the first failure after completion.
 - Automatic recovery after an application update or restart (source-tested; not natively
   qualified): a Bridge relay or audience executable whose file identity changed but whose
   real SHA-256 is still a configured one qualifies again by itself (background single-flight
@@ -26,8 +41,10 @@ source, and the crates are not published to crates.io.
   direct-parent owner (which must run a trusted, unchanged executable; no owner path or digest is configured), only while
   positively idle, with one request, a conservative receipt mapping, one absolute
   35-second budget guarded before connecting and before the write, and no fallback
-  or resend. Absent locators keep every legacy route. Source-tested with a scripted
-  stand-in owner; not native-qualified.
+  or resend. Absent locators keep Codex/Claude legacy routes. Source-tested with a scripted
+  stand-in owner and observed on the bounded `c00e6fc`/candidate5 IDE/Agent Run
+  Codex and Claude canaries in the qualification matrix; other builds and the
+  v0.3 release artifact remain natively unqualified.
 - Public repository documentation: getting started, configuration,
   architecture, producer integration and a qualification and support matrix.
 - `cargo xtask check-public`: verifies required files, Markdown links and
@@ -49,7 +66,7 @@ source, and the crates are not published to crates.io.
   `legacy_owner_relays_ignored` in the daemon log and `bridge doctor`. Relay and audience
   path and SHA-256 qualification are unchanged.
 - Native recipients are no longer trusted by predeclared exact store paths and harness
-  executable path and SHA-256. A fresh Codex or Claude Code session in any canonical store
+  executable path and SHA-256. A fresh Codex, Claude Code or managed OpenCode session in any canonical store
   you own that no group or other user can write registers from its genuine lifecycle hook
   with no pre-enrollment: the store comes from the verified harness process, the harness must
   carry a product marker and run from a trusted file unchanged since it started, and

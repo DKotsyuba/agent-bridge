@@ -102,7 +102,7 @@ plugin contract: stock OpenCode MCP metadata supplies only the session ID and
 is insufficient. Parsing these fields grants no authority. Standalone OpenCode
 root MCP registration, child message wake and context injection are unqualified.
 
-Synthetic plugin checks run with `node --test
+Synthetic plugin checks run with `node --expose-gc --test
 crates/bridge-adapters/plugins/opencode/index.test.js`; they use no native host.
 Native wake qualification remains a separate manual check.
 

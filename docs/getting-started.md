@@ -17,11 +17,11 @@ build.
 | Xcode command line tools (`xcode-select --install`) | linker, `/usr/bin/curl`, `/usr/bin/shasum`, `/usr/bin/sandbox-exec` |
 | [rustup](https://rustup.rs) with Rust 1.98.1 | pinned in `rust-toolchain.toml` |
 | A short directory you own for `TMPDIR` | Unix socket paths are limited to about 100 bytes |
-| An exact Codex or Claude Code build, run as the same user | the native session you want to reach; see the [qualification matrix](qualification.md) for what has been observed |
+| An exact Codex, Claude Code or managed OpenCode build, run as the same user | the native session you want to reach; OpenCode 2.0.28 requires a supervisor/owner and lifecycle plugin; see the [qualification matrix](qualification.md) |
 | Node.js (to run the full tests) | the full workspace tests need an absolute `BRIDGE_TEST_NODE` for the deterministic Desktop regressions, and native probes use Node; building, installing and running Bridge or the SDK does not |
 
 The daemon, hook and relay are ordinary user processes. Nothing needs `sudo`,
-and Bridge never edits your Codex or Claude Code configuration for you.
+and Bridge never edits your harness configuration for you.
 
 ## 2. Build and test
 
@@ -43,13 +43,14 @@ cargo +1.98.1 xtask package
 ```
 
 This builds every binary in release mode (offline, locked) and writes a verified
-bundle to `dist/agent-bridge-0.2.0+<label>`, where the label is the 12-digit Git
+bundle, including exactly the OpenCode plugin's `index.js` and `package.json`,
+to `dist/agent-bridge-0.3.0+<label>`, where the label is the 12-digit Git
 commit (`-dirty` when the tree has changes; pass `--label NAME` outside a Git
 checkout). It prints the manifest and `sums_sha256`. Install with that digest,
 passed exactly as printed:
 
 ```sh
-./install.sh --bundle "$PWD/dist/agent-bridge-0.2.0+<label>" --sums-sha256 <sums_sha256> \
+./install.sh --bundle "$PWD/dist/agent-bridge-0.3.0+<label>" --sums-sha256 <sums_sha256> \
   --home "$HOME/.agent-bridge" --bin-dir "$HOME/.local/bin"
 ```
 
@@ -59,6 +60,12 @@ anything from the copy, then seals the release under `<home>/releases/` and swit
 `<home>/current` atomically. It prints a `relay_binding` (the real release path and
 SHA-256 of `bridge-root-relay`) that you need in step 5. The home must be new, empty
 or an existing Bridge home owned by you and not writable by anyone else.
+
+The stable user-facing OpenCode entrypoint is
+`<home>/current/plugins/opencode/index.js`, with `package.json` beside it.
+Activation also reports `plugin_binding`: supervisors must consume its exact
+canonical release path and SHA-256, not the moving `current` path. Legacy
+plugin-less releases still install and roll back; their binding is `null`.
 
 To rehearse the whole install/upgrade/rollback cycle in a throwaway prefix without
 touching your installation, a harness or the network:
@@ -120,10 +127,16 @@ channel = "/ABS/state/ch/c.sock"
 host_id = "this-host"
 
 [[adapters.harnesses]]           # one policy per harness product; no store or executable
-harness = "ClaudeCode"           # or "Codex"
+harness = "ClaudeCode"           # or "Codex"; OpenCode example below
 namespace = "claude-main"
 inject = true                    # hook injection is supported for this harness
 message = true                   # and its message carrier
+
+[[adapters.harnesses]]
+harness = "OpenCode"
+namespace = "opencode-main"
+inject = false                   # OpenCode is message-only
+message = true                   # requires owner + lifecycle plugin
 
 [[adapters.relays]]              # the relay_binding printed by the installer
 path = "/ABS/home/releases/<version>+<label>/bin/bridge-root-relay"
@@ -175,9 +188,14 @@ configuration.
 
 ## 7. Connect a native session
 
-Bridge reaches a session only through that session's own hooks and, for sending, a
-restricted MCP server. Installing them in a working application is a deliberate manual
-step that nothing here does for you.
+Codex and Claude use their own hooks and a restricted MCP server for sending.
+Managed OpenCode 2.0.28 requires its first-party lifecycle plugin and an exact
+direct-parent native owner exposing `BRIDGE_NATIVE_OWNER_SOCKET`; the supervisor
+must load the installed `plugin_binding` path/hash from step 3, with absolute
+`channel` and `hookCommand` options. Its native store is a private canonical
+parent of `OPENCODE_DB`. OpenCode has no inject/context path or qualified standalone
+root MCP path; use the v1 producer API for publication. These integrations are
+deliberate manual steps; packaging does not activate them in working applications.
 
 1. **Hooks.** Set `bridge-hook <channel> claude-code` (or `codex`) as the command of
    the `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
@@ -228,7 +246,8 @@ explicit permissions; see [Producer integration](producer-integration.md).
 
 ## 10. Upgrade and roll back
 
-Run steps 3 again with the new bundle, update the relay binding in `daemon.toml`, and
+Run step 3 again with the new bundle, update the relay binding in `daemon.toml` and
+the OpenCode supervisor's plugin binding from activation, then
 restart both services (activation never restarts daemons). `bridge rollback --home H`
 switches program code back; the custody database, incidents and configuration stay, and
 a release with an older core schema than one already activated is refused.
