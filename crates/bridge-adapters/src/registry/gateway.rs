@@ -507,6 +507,7 @@ mod tests {
             desktop_idle_transcript: None,
             wake: None,
             pending: false,
+            role: None,
         }
     }
 

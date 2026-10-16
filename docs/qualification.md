@@ -18,7 +18,7 @@ or a different configuration is unqualified until its probes are run again.
 
 | | |
 |---|---|
-| Source | Bridge 0.3.0, producer API v1 (wire, core and native contracts revision 3), storage schema 6 |
+| Source | Bridge 0.3.1, producer API v1 (wire, core and native contracts revision 3), storage schema 6 |
 | Platform | macOS, Apple silicon (`aarch64-apple-darwin`) |
 | Toolchain | Rust 1.98.1 |
 
@@ -115,8 +115,21 @@ caller, inject, `later` message, pause and lifecycle probes were run against 2.1
 are separate from the Codex qualification and from this source revision: re-run the
 probes against your exact Claude Code build and Bridge revision before relying on them.
 
+The Claude native probe was also run on builds 2.1.295 and 2.1.296 against the source candidate that
+removed the 4096-byte inbox cap, with the first message event carrying exactly 16384 UTF-8 payload
+bytes of multibyte text plus a marker (`message_payload_exact_16384_utf8_bytes`). On each build one
+delivery attempt was made, the native transcript recorded `context_observed` (and `native_accepted`)
+for it, the marker was quoted in a distinct unprompted turn, the native tool inventory stayed closed,
+the pause/no-wake window held with no turn and the resume answered, and the receiver and daemon exited
+with code 0 with no orphan processes. That result covers only those two builds and that payload size;
+other builds and larger payloads stay unqualified.
+
 ## What is explicitly not established
 
+- Native acceptance of a legacy-inbox message above 16384 UTF-8 payload bytes, or on a Claude build
+  other than 2.1.295 and 2.1.296. Bridge's 98304-byte rendered-manifest bound is a source
+  limit, not a measured native one; the former 4096-byte inbox cap had no recorded native
+  basis. This is a source-candidate result, not a claim about any released artifact.
 - Any native result for a harness build other than the ones named above.
 - Native semantics of negative receipt statuses and of an early `held` followed by a
   terminal receipt on the Claude inbox: negatives and contradictions are treated as

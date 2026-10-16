@@ -101,6 +101,382 @@ fn publication(route: &str, event: &str, lifetime: Option<&str>) -> PublishParam
         delivery_scope_key: lifetime.map(str::to_owned),
     }
 }
+
+/// Actual v1 latest publications expose independent lifetime watermarks while
+/// legacy scopes remain readable and malformed retained scopes fail closed.
+#[test]
+fn scoped_latest_retention_uses_the_lifetime_watermark() {
+    let dir = TempDir::new("retention-scope");
+    let path = dir.path("state.db");
+    let mut storage = store(&path);
+    let route = storage
+        .register_call(
+            TOKEN,
+            "register",
+            &registration("job"),
+            Some(&origin("use", "root")),
+            &|| 1000,
+        )
+        .unwrap();
+    for (id, lifetime, revision) in [
+        ("a1", Some("one"), 1),
+        ("a2", Some("one"), 2),
+        ("b1", Some("two"), 7),
+        ("legacy", None, 3),
+    ] {
+        let mut event = publication(&route.route_key, id, lifetime);
+        event.policy = Policy::Latest {
+            stream: "view".into(),
+            revision,
+        };
+        storage.publish_v1(TOKEN, &event, &|| 1001).unwrap();
+    }
+    for (id, expected) in [("a1", 2), ("a2", 2), ("b1", 7), ("legacy", 3)] {
+        assert_eq!(
+            storage
+                .retention("report-maker", id)
+                .unwrap()
+                .unwrap()
+                .latest_watermark,
+            Some(expected)
+        );
+    }
+    let sql = rusqlite::Connection::open(&path).unwrap();
+    for malformed in [
+        "broken".to_string(),
+        [
+            "report-maker",
+            "x",
+            "done",
+            "message",
+            "",
+            "",
+            "latest",
+            "view",
+            "wrong",
+        ]
+        .join("\u{1f}"),
+    ] {
+        sql.execute(
+            "UPDATE events SET scope_key=?1 WHERE event_id='a1'",
+            [malformed],
+        )
+        .unwrap();
+        assert!(matches!(
+            storage.retention("report-maker", "a1"),
+            Err(bridge_core::CoreError::Integrity(_))
+        ));
+    }
+}
+
+/// Retiring a lifetime permanently rejects manual retries. A late unsent
+/// result never disposes earlier possible effects; zero-effect work closes,
+/// and neither kind remains in the scheduler's eligible rotation.
+#[test]
+fn retired_scope_unsent_preserves_history_and_rejects_retry() {
+    use bridge_core::recovery::{DeliveryState, EvidenceTier};
+    for history in [false, true] {
+        let dir = TempDir::new("retired-unsent");
+        let mut storage = store(&dir.path("state.db"));
+        let route = storage
+            .register_call(
+                TOKEN,
+                "register",
+                &registration("job"),
+                Some(&origin("use", "root")),
+                &|| 1000,
+            )
+            .unwrap();
+        storage
+            .publish_v1(
+                TOKEN,
+                &publication(&route.route_key, "event", Some("life")),
+                &|| 1001,
+            )
+            .unwrap();
+        let recipient = codex("caller");
+        let attestation = attest(&recipient, Lifecycle::Inactive, 1);
+        let Selection::Attempt(mut current) = storage
+            .reserve_next(
+                &attestation,
+                EffectiveMode::Message,
+                1002,
+                &DispatchTiming::default(),
+            )
+            .unwrap()
+        else {
+            panic!("reservation")
+        };
+        storage
+            .mark_invoking(&current.fence, &attestation, 1003)
+            .unwrap();
+        if history {
+            storage
+                .record_outcome(
+                    &current.fence,
+                    Outcome::OutcomeUnknown {
+                        reason: "fixture original unknown".into(),
+                    },
+                    1004,
+                )
+                .unwrap();
+            storage
+                .authorize_manual_retry(
+                    "report-maker",
+                    "event",
+                    "operator",
+                    "fixture deliberate duplicate risk",
+                    1005,
+                )
+                .unwrap();
+            let Selection::Attempt(next) = storage
+                .reserve_next(
+                    &attestation,
+                    EffectiveMode::Message,
+                    1006,
+                    &DispatchTiming::default(),
+                )
+                .unwrap()
+            else {
+                panic!("retry reservation")
+            };
+            current = next;
+            storage
+                .mark_invoking(&current.fence, &attestation, 1007)
+                .unwrap();
+        }
+        storage
+            .retire_delivery_scope(
+                TOKEN,
+                "retire",
+                &RetireDeliveryScopeParams {
+                    scope_key: "life".into(),
+                    action: RetirementAction::RetireUnhanded,
+                },
+                &|| 1008,
+            )
+            .unwrap();
+        storage
+            .record_outcome(
+                &current.fence,
+                Outcome::KnownUnsent {
+                    evidence: "fixture latest helper never wrote".into(),
+                },
+                1009,
+            )
+            .unwrap();
+        let evidence = storage
+            .delivery_evidence("report-maker", "event")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            evidence.delivery,
+            if history {
+                DeliveryState::Review
+            } else {
+                DeliveryState::Disposed
+            }
+        );
+        if history {
+            assert!(
+                evidence
+                    .tiers
+                    .iter()
+                    .any(|row| row.tier == EvidenceTier::Unknown)
+            );
+            assert!(
+                evidence.incident.is_some(),
+                "preserved uncertainty stays visible"
+            );
+        }
+        assert!(
+            storage
+                .authorize_manual_retry(
+                    "report-maker",
+                    "event",
+                    "operator",
+                    "fixture blocked retry",
+                    1010
+                )
+                .is_err()
+        );
+        assert!(
+            storage
+                .recipients_with_work(100_000, 100, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            storage
+                .reserve_next(
+                    &attestation,
+                    EffectiveMode::Message,
+                    100_000,
+                    &DispatchTiming::default()
+                )
+                .unwrap(),
+            Selection::Idle
+        );
+        assert!(
+            storage
+                .next_pending(&recipient.to_canonical_string(), 100)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+/// A still-uncertain retired event refuses operator retry without clearing
+/// its retained incident, state or audit history.
+#[test]
+fn retired_scope_manual_retry_is_fenced_before_any_mutation() {
+    let dir = TempDir::new("retired-retry");
+    let mut storage = store(&dir.path("state.db"));
+    let route = storage
+        .register_call(
+            TOKEN,
+            "register",
+            &registration("job"),
+            Some(&origin("use", "root")),
+            &|| 1000,
+        )
+        .unwrap();
+    storage
+        .publish_v1(
+            TOKEN,
+            &publication(&route.route_key, "event", Some("life")),
+            &|| 1001,
+        )
+        .unwrap();
+    let attestation = attest(&codex("caller"), Lifecycle::Inactive, 1);
+    let Selection::Attempt(current) = storage
+        .reserve_next(
+            &attestation,
+            EffectiveMode::Message,
+            1002,
+            &DispatchTiming::default(),
+        )
+        .unwrap()
+    else {
+        panic!("reservation")
+    };
+    storage
+        .mark_invoking(&current.fence, &attestation, 1003)
+        .unwrap();
+    storage
+        .record_outcome(
+            &current.fence,
+            Outcome::OutcomeUnknown {
+                reason: "fixture unknown".into(),
+            },
+            1004,
+        )
+        .unwrap();
+    storage
+        .retire_delivery_scope(
+            TOKEN,
+            "retire",
+            &RetireDeliveryScopeParams {
+                scope_key: "life".into(),
+                action: RetirementAction::RetireUnhanded,
+            },
+            &|| 1005,
+        )
+        .unwrap();
+    let before = storage.delivery_evidence("report-maker", "event").unwrap();
+    let audit = storage.audit_entries(100).unwrap();
+    assert!(matches!(
+        storage.authorize_manual_retry(
+            "report-maker",
+            "event",
+            "operator",
+            "fixture blocked retry",
+            1006
+        ),
+        Err(bridge_core::CoreError::Fence(_))
+    ));
+    assert_eq!(
+        storage.delivery_evidence("report-maker", "event").unwrap(),
+        before
+    );
+    assert_eq!(storage.audit_entries(100).unwrap(), audit);
+}
+
+/// An orphan unhanded row from an older build cannot spin in work rotation or
+/// appear dispatchable. Its content-free diagnostics expose the scope fence.
+#[test]
+fn retired_scope_legacy_unhanded_row_has_consistent_visible_fence() {
+    let dir = TempDir::new("retired-orphan");
+    let path = dir.path("state.db");
+    let mut storage = store(&path);
+    let route = storage
+        .register_call(
+            TOKEN,
+            "register",
+            &registration("job"),
+            Some(&origin("use", "root")),
+            &|| 1000,
+        )
+        .unwrap();
+    storage
+        .publish_v1(
+            TOKEN,
+            &publication(&route.route_key, "event", Some("life")),
+            &|| 1001,
+        )
+        .unwrap();
+    storage
+        .retire_delivery_scope(
+            TOKEN,
+            "retire",
+            &RetireDeliveryScopeParams {
+                scope_key: "life".into(),
+                action: RetirementAction::RetireUnhanded,
+            },
+            &|| 1002,
+        )
+        .unwrap();
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE events SET delivery='unhanded' WHERE event_id='event'",
+            [],
+        )
+        .unwrap();
+    let recipient = codex("caller");
+    assert!(
+        storage
+            .recipients_with_work(2000, 100, None)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        storage
+            .next_pending(&recipient.to_canonical_string(), 100)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        storage
+            .reserve_next(
+                &attest(&recipient, Lifecycle::Inactive, 1),
+                EffectiveMode::Message,
+                2000,
+                &DispatchTiming::default()
+            )
+            .unwrap(),
+        Selection::Idle
+    );
+    assert!(
+        storage
+            .delivery_evidence("report-maker", "event")
+            .unwrap()
+            .unwrap()
+            .hold_reason
+            .unwrap()
+            .contains("scope retired")
+    );
+}
 /// Checks atomic claims/route/request commit, loss of receipt recovery, no
 /// cross-producer evidence reuse and logical scopes surviving renewal/restart.
 #[test]

@@ -14,7 +14,11 @@
 //!     print (a lost reply).
 //!   - `{"cmd":"mcp","socket":..,"meta":{..}}` runs `bridge-fixture mcp`
 //!     as its child (a harness-launched MCP server) and answers its
-//!     attestation result.
+//!     attestation result. With `"node":<path>` the child is instead the
+//!     production signed frontend: that Node runs the embedded desktop client,
+//!     which spawns `bridge-fixture mcp` as its Rust child; the Node process gets
+//!     `CODEX_MCP_NODE_PATH` = `"node_path"` (default `"node"`) and, unless
+//!     `"pipe"` is null, `CODEX_APP_TOOLS_PIPE_PATH` = `"pipe"`.
 //!   - `{"cmd":"desktop_frontend","node":..,"channel":..}` starts one
 //!     test-provisioned Node primary and its Rust typed relay under this exact
 //!     harness. Both inputs are UTF-8 paths; the native mock pipe is inherited
@@ -609,10 +613,33 @@ fn run_mcp_server(command: &Value) -> Value {
     json!({"responses": responses})
 }
 
-/// Runs `bridge-fixture mcp` as a child (the harness's MCP server).
+/// Runs `bridge-fixture mcp` as a child (the harness's MCP server), directly
+/// or, when `command["node"]` names a Node runtime, as the Rust child of the
+/// embedded signed desktop client run by that Node (see the module inventory
+/// for `node_path` and `pipe`). Answers the attestation JSON, or an error object.
 fn run_mcp(command: &Value) -> Value {
     let exe = std::env::current_exe().expect("own exe");
-    let mut child = Command::new(exe)
+    let mut child = match command["node"].as_str() {
+        Some(node) => {
+            let mut frontend = Command::new(node);
+            frontend
+                .arg("-e")
+                .arg(include_str!("../../assets/desktop-client.cjs"))
+                .arg("--")
+                .arg(exe)
+                .env(
+                    "CODEX_MCP_NODE_PATH",
+                    command["node_path"].as_str().unwrap_or(node),
+                );
+            match command["pipe"].as_str() {
+                Some(pipe) => frontend.env("CODEX_APP_TOOLS_PIPE_PATH", pipe),
+                None => frontend.env_remove("CODEX_APP_TOOLS_PIPE_PATH"),
+            };
+            frontend
+        }
+        None => Command::new(exe),
+    };
+    let mut child = child
         .arg(if command["seal"].as_bool() == Some(true) {
             "mcp-seal"
         } else {

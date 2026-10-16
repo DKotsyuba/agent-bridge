@@ -90,7 +90,19 @@ Session discovery starts `Unknown`; only a genuine terminal execution becomes
 come from `session.get`, never display labels or model arguments. The actual
 process's absolute `OPENCODE_DB` parent identifies its private store.
 
-OpenCode policies support `message` only; `inject=true` is rejected. A message
+OpenCode policies support `message` only; `inject=true` is rejected. A child
+session never has the `message` capability, including a binding renewed from an
+older one that had it (the capability is withdrawn at renewal). A child's own
+`SessionEnd` retires its binding to `Unknown`, and a child `Stop` never makes it
+`Inactive`; child wake stays unqualified. Root attestation is unchanged. The route journal records whether an OpenCode address
+is a root or a child: a recorded root keeps `message` across a restart with no new
+hook, while a recorded child, or a row written by an earlier build without that fact, is
+restored with `message` withheld until the address's own next hook (a root then regains
+it; a child does not). An earlier build refuses a journal that holds the new field. Under
+sustained native-feed overload the plugin drops observations, queues one
+invalidation that makes every retained session `Unknown`, and accepts nothing
+until it has run, so a later `Stop` cannot restore readiness it invalidated.
+A message
 uses the existing live launcher's exact direct-parent owner route with protocol
 `opencode_input`. Bridge neither guesses an HTTP endpoint nor starts a second
 scheduler. Correlated owner admission is native acceptance, not processing;

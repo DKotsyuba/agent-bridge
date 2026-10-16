@@ -1152,7 +1152,7 @@ impl Storage {
 /// possible even after their current reservation was proven uninvoked. Held
 /// states are retained conservatively; producer retirement never uses operator
 /// disposal authority to erase uncertainty or accepted handoff history.
-const POSSIBLE_EFFECT: &str = "(e.duplicate_risk != 0 OR e.delivery IN('invoking','held','review','accepted','hook_submitted') OR EXISTS(SELECT 1 FROM attempt_members m JOIN attempts a ON a.attempt_seq=m.attempt_seq WHERE m.publisher_id=e.publisher_id AND m.event_id=e.event_id AND a.state IN('invoking','native_held','written_no_receipt','outcome_unknown','native_accepted','hook_submitted')) OR EXISTS(SELECT 1 FROM evidence v WHERE v.publisher_id=e.publisher_id AND v.event_id=e.event_id AND v.tier IN('unknown','native_held','written_no_receipt','native_accepted','hook_emitted','context_observed','application_processed')))";
+pub(crate) const POSSIBLE_EFFECT: &str = "(e.duplicate_risk != 0 OR e.delivery IN('invoking','held','review','accepted','hook_submitted') OR EXISTS(SELECT 1 FROM attempt_members m JOIN attempts a ON a.attempt_seq=m.attempt_seq WHERE m.publisher_id=e.publisher_id AND m.event_id=e.event_id AND a.state IN('invoking','native_held','written_no_receipt','outcome_unknown','native_accepted','hook_submitted')) OR EXISTS(SELECT 1 FROM evidence v WHERE v.publisher_id=e.publisher_id AND v.event_id=e.event_id AND v.tier IN('unknown','native_held','written_no_receipt','native_accepted','hook_emitted','context_observed','application_processed')))";
 /// Reads exact lifecycle request identity; changed target/action/reason conflicts.
 fn replay_lifecycle<T: DeserializeOwned>(
     tx: &Connection,

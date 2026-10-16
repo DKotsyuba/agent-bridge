@@ -24,8 +24,51 @@ use serde_json::{Value, json};
 
 use crate::os;
 
-/// Maximum native-host response bytes, matching the application's contract.
+/// Maximum native-host frame bytes, matching the application's contract (the
+/// signed client enforces it on the host pipe; the mock host reads with it).
+#[cfg(test)]
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
+/// Largest identifier (`thread_id`, `call_id`) one private hand-off carries,
+/// in bytes: core's field bound, so every admitted native session id fits.
+const MAX_ID_BYTES: usize = bridge_core::MAX_FIELD_BYTES;
+
+/// Largest private hand-off frame body, in bytes, on both private links (the
+/// daemon to the frontend relay, and the Rust child to its signed Node parent
+/// over descriptor 3). A request is the JSON object
+/// `{"call_id":..,"text":..,"thread_id":..}` whose fields [`private_request`]
+/// admits: text up to core's framing bound and ids up to [`MAX_ID_BYTES`],
+/// with no control character but tab, newline and carriage return in text.
+/// JSON escaping at most doubles each admitted byte (`\\`, `\"`, `\t`, `\n`,
+/// `\r`), and the fixed keys and punctuation take 39 bytes, so every admitted
+/// request fits; the 64-byte allowance keeps that margin explicit. The
+/// embedded signed client (`assets/desktop-client.cjs`) carries the same
+/// number as `FRAME_LIMIT`, checked by a unit test.
+const MAX_PRIVATE_FRAME_BYTES: usize =
+    2 * bridge_core::framing::MAX_FRAMED_BYTES + 2 * 2 * MAX_ID_BYTES + 64;
+
+/// Validates and encodes one private hand-off request. `text` is a frozen
+/// core manifest (at most [`bridge_core::framing::MAX_FRAMED_BYTES`] bytes;
+/// tab, newline and carriage return are its only permitted controls) and both
+/// ids are nonempty, at most [`MAX_ID_BYTES`] bytes and control-free. Returns
+/// the JSON body, which is then within [`MAX_PRIVATE_FRAME_BYTES`]; `None`
+/// for any request outside that closed domain, which callers refuse before
+/// writing a byte.
+fn private_request(thread_id: &str, call_id: &str, text: &str) -> Option<Vec<u8>> {
+    let id = |value: &str| {
+        !value.is_empty() && value.len() <= MAX_ID_BYTES && !value.chars().any(char::is_control)
+    };
+    let admitted = id(thread_id)
+        && id(call_id)
+        && text.len() <= bridge_core::framing::MAX_FRAMED_BYTES
+        && !text
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r'));
+    let body = serde_json::to_vec(&json!({"thread_id":thread_id,"call_id":call_id,"text":text}))
+        .ok()
+        .filter(|body| admitted && body.len() <= MAX_PRIVATE_FRAME_BYTES)?;
+    Some(body)
+}
 /// Total delivery deadline, including the read-only inventory request.
 const HOST_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -321,6 +364,49 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// The signed client enforces exactly the Rust bounds (no separate
+    /// configuration), and the private frame bound covers the serializer's
+    /// real growth for the worst admitted request of every escaping class,
+    /// while anything outside the admitted domain is refused before a write.
+    #[test]
+    fn private_frame_bound_is_closed_and_shared_with_the_signed_client() {
+        use bridge_core::framing::MAX_FRAMED_BYTES;
+        let asset = include_str!("../assets/desktop-client.cjs");
+        for (name, value) in [
+            ("TEXT_LIMIT", MAX_FRAMED_BYTES),
+            ("ID_LIMIT", MAX_ID_BYTES),
+            ("FRAME_LIMIT", MAX_PRIVATE_FRAME_BYTES),
+        ] {
+            assert!(asset.contains(&format!("const {name}={value};")), "{name}");
+        }
+        for unit in ["\\", "\"", "\n", "\t", "\r", "\u{e9}", "\u{1F600}", "a"] {
+            let id = unit.repeat(MAX_ID_BYTES / unit.len());
+            let id = if id.chars().any(char::is_control) {
+                "\\".repeat(MAX_ID_BYTES)
+            } else {
+                id
+            };
+            let text = unit.repeat(MAX_FRAMED_BYTES / unit.len());
+            let body = private_request(&id, &id, &text).expect(unit);
+            assert!(body.len() <= MAX_PRIVATE_FRAME_BYTES, "{unit:?}");
+        }
+        let full = "\\".repeat(MAX_FRAMED_BYTES);
+        let id = "\\".repeat(MAX_ID_BYTES);
+        assert!(private_request(&id, &id, &full).is_some());
+        for (thread, call, text) in [
+            ("", "c", "t"),
+            ("t", "", "t"),
+            (&*"a".repeat(MAX_ID_BYTES + 1), "c", "t"),
+            ("t", &*"a".repeat(MAX_ID_BYTES + 1), "t"),
+            ("t\n", "c", "t"),
+            ("t", "c", &*"a".repeat(MAX_FRAMED_BYTES + 1)),
+            ("t", "c", "nul\u{0}"),
+            ("t", "c", "c1\u{85}"),
+        ] {
+            assert!(private_request(thread, call, text).is_none(), "{text:.8}");
+        }
+    }
+
     /// Partial reads cannot renew the shared timeout, preventing slow frames
     /// from keeping a hand-off alive beyond its absolute deadline.
     #[test]
@@ -565,12 +651,15 @@ pub fn start_frontend(channel: &Path) -> std::io::Result<Option<FrontendRelay>> 
                 evidence: "signed frontend channel closed before sending".into(),
             };
         };
+        let Some(body) = private_request(&request.thread_id, &request.call_id, &request.text)
+        else {
+            return Outcome::KnownUnsent {
+                evidence: "signed frontend request outside the private frame bound; nothing sent"
+                    .into(),
+            };
+        };
         let deadline = Instant::now() + HOST_TIMEOUT;
-        let result = exchange(
-            stream,
-            &json!({"thread_id":request.thread_id,"call_id":request.call_id,"text":request.text}),
-            deadline,
-        );
+        let result = exchange(stream, &body, deadline);
         match result {
             Ok(v) if v["call_id"] == request.call_id && v["state"] == "accepted" => {
                 Outcome::NativeAccepted {
@@ -590,21 +679,20 @@ pub fn start_frontend(channel: &Path) -> std::io::Result<Option<FrontendRelay>> 
     })
 }
 
-/// Exchanges one bounded typed frontend frame under one absolute deadline.
-/// Returns decoded JSON or an I/O/JSON error; callers conservatively retain any
-/// failure after write and check their own connection or explicit correlation.
-fn exchange(stream: &mut UnixStream, request: &Value, deadline: Instant) -> std::io::Result<Value> {
-    let body = serde_json::to_vec(request)?;
-    if body.len() > MAX_FRAME_BYTES {
-        return Err(std::io::ErrorKind::InvalidData.into());
-    }
+/// Exchanges one private hand-off frame under one absolute deadline: writes
+/// `body` (an encoded [`private_request`], so within [`MAX_PRIVATE_FRAME_BYTES`])
+/// and reads one reply frame of at most that bound. Returns decoded JSON or an
+/// I/O/JSON error (a reply over the bound is `InvalidData`); callers
+/// conservatively retain any failure after write and check their own
+/// connection or explicit correlation.
+fn exchange(stream: &mut UnixStream, body: &[u8], deadline: Instant) -> std::io::Result<Value> {
     stream.set_write_timeout(Some(remaining(deadline)?))?;
     stream.write_all(&(body.len() as u32).to_le_bytes())?;
-    stream.write_all(&body)?;
+    stream.write_all(body)?;
     let mut head = [0; 4];
     read_exact(stream, &mut head, deadline)?;
     let n = u32::from_le_bytes(head) as usize;
-    if n == 0 || n > MAX_FRAME_BYTES {
+    if n == 0 || n > MAX_PRIVATE_FRAME_BYTES {
         return Err(std::io::ErrorKind::InvalidData.into());
     }
     let mut body = vec![0; n];
@@ -652,6 +740,8 @@ fn dead_socket(path: &Path) -> bool {
 /// Serves authenticated daemon requests through one fixed delivery callback.
 /// The callback receives only the closed frozen manifest and kernel owner uid;
 /// all peer checks and listener lifetime remain shared by production and tests.
+/// A request frame over [`MAX_PRIVATE_FRAME_BYTES`] or outside the
+/// `private_request` domain is refused (known-unsent) before the callback.
 ///
 /// `alive` says whether the relay can still deliver (its signed parent channel
 /// is open and the parent is the same live process); a monitor polls it and,
@@ -706,16 +796,13 @@ fn start_frontend_with_delivery(
                 let mut header = [0; 4];
                 read_exact(&mut stream, &mut header, deadline)?;
                 let n = u32::from_le_bytes(header) as usize;
-                if n == 0 || n > MAX_FRAME_BYTES {
+                if n == 0 || n > MAX_PRIVATE_FRAME_BYTES {
                     return Err(std::io::ErrorKind::InvalidData.into());
                 }
                 let mut body = vec![0; n];
                 read_exact(&mut stream, &mut body, deadline)?;
                 let request: FrontendRequest = serde_json::from_slice(&body)?;
-                if request.thread_id.is_empty()
-                    || request.call_id.is_empty()
-                    || request.text.len() > bridge_core::framing::MAX_FRAMED_BYTES
-                {
+                if private_request(&request.thread_id, &request.call_id, &request.text).is_none() {
                     return Err(std::io::ErrorKind::InvalidData.into());
                 }
                 if retired.load(Ordering::SeqCst) {
@@ -887,7 +974,9 @@ pub(crate) fn frontend_harnesses(directory: &Path) -> Vec<(u32, u64)> {
 }
 
 /// Delivers once through a registered frontend for `harness`. A connection or
-/// peer mismatch is known-unsent; after any request write the result is unknown
+/// peer mismatch, or a request outside the closed private frame domain
+/// (`private_request`: text over core's framing bound, oversized or
+/// control-bearing ids), is known-unsent; after any request write the result is unknown
 /// unless a valid typed receipt says accepted/known-unsent. No host/queue fallback.
 pub fn via_frontend(
     path: &Path,
@@ -933,11 +1022,9 @@ pub(crate) fn via_frontend_checked(
             evidence: "Codex frontend is not owned by the attested recipient harness".into(),
         };
     }
-    let Ok(body) =
-        serde_json::to_vec(&json!({"thread_id":thread_id,"call_id":call_id,"text":text}))
-    else {
+    let Some(body) = private_request(thread_id, call_id, text) else {
         return Outcome::KnownUnsent {
-            evidence: "Codex frontend request could not be encoded; nothing sent".into(),
+            evidence: "Codex frontend request outside the private frame bound; nothing sent".into(),
         };
     };
     if let Err(reason) = before_write() {
@@ -945,21 +1032,7 @@ pub(crate) fn via_frontend_checked(
             evidence: format!("final pre-write fence refused; nothing sent: {reason}"),
         };
     }
-    let result = (|| -> std::io::Result<Value> {
-        stream.set_write_timeout(Some(remaining(deadline)?))?;
-        stream.write_all(&(body.len() as u32).to_le_bytes())?;
-        stream.write_all(&body)?;
-        let mut head = [0; 4];
-        read_exact(&mut stream, &mut head, deadline)?;
-        let n = u32::from_le_bytes(head) as usize;
-        if n == 0 || n > MAX_FRAME_BYTES {
-            return Err(std::io::ErrorKind::InvalidData.into());
-        }
-        let mut body = vec![0; n];
-        read_exact(&mut stream, &mut body, deadline)?;
-        Ok(serde_json::from_slice(&body)?)
-    })();
-    match result {
+    match exchange(&mut stream, &body, deadline) {
         Ok(v) if v["state"]=="accepted" => Outcome::NativeAccepted{evidence:format!("Codex application frontend accepted {call_id}; source-labelled native route")},
         Ok(v) if v["state"]=="known_unsent" => Outcome::KnownUnsent{evidence:v["detail"].as_str().unwrap_or("frontend refused before host send").to_string()},
         _ => Outcome::OutcomeUnknown{reason:"Codex frontend hand-off may have reached the application; no fallback or automatic resend".into()},

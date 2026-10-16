@@ -10,7 +10,7 @@ process.
 Agent Bridge is a local durable message service for Codex, Claude Code and managed OpenCode
 sessions: producers publish events to an exact native address, Bridge keeps them
 in SQLite custody and delivers them through native hooks or queues, and every
-uncertain outcome is retained for a manual decision. Source version 0.3.0,
+uncertain outcome is retained for a manual decision. Source version 0.3.1,
 producer API v1, storage schema 6, macOS on Apple silicon only.
 
 ## Map
@@ -58,7 +58,7 @@ Run the narrowest test for what you changed first (`cargo test -p bridge-core
   quote one appears in logs, errors, `Debug` output or documentation.
 - **Bridge never answers a permission request** for a recipient.
 - **Migrations preserve** accepted bytes, hashes, identifiers and uncertain
-  attempt history; unknown or newer databases are refused untouched.
+  attempt history; unknown or newer databases are refused before any Bridge schema or journal-mode change.
 
 ## Rules for changes
 

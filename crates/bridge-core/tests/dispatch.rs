@@ -28,6 +28,148 @@ fn timing() -> DispatchTiming {
     DispatchTiming::default()
 }
 
+/// Late batch evidence settles only members still owned by the old attempt.
+/// Disposed members and newer invoking, accepted or unknown attempts retain
+/// their states and incidents; every original member still receives evidence.
+#[test]
+fn late_batch_outcomes_fence_each_member_independently() {
+    for sibling in ["disposed", "invoking", "accepted", "unknown"] {
+        for refusal in [false, true] {
+            let mut storage = store();
+            let recipient = codex("batch-owner");
+            let attestation = attest(&recipient, Lifecycle::Inactive, 1);
+            for id in ["a", "b"] {
+                storage
+                    .publish(&batched("agent-run", id, &recipient, "pair"), 1000)
+                    .unwrap();
+            }
+            let first = attempt(
+                storage
+                    .reserve_next(&attestation, EffectiveMode::Message, 2000, &timing())
+                    .unwrap(),
+            );
+            assert_eq!(first.members.len(), 2);
+            storage
+                .mark_invoking(&first.fence, &attestation, 2001)
+                .unwrap();
+            storage
+                .record_outcome(
+                    &first.fence,
+                    Outcome::OutcomeUnknown {
+                        reason: "fixture lost receipt".into(),
+                    },
+                    2002,
+                )
+                .unwrap();
+            if sibling == "disposed" {
+                storage
+                    .dispose_event("agent-run", "a", "operator", "fixture decision", 3000)
+                    .unwrap();
+            } else {
+                storage
+                    .authorize_manual_retry("agent-run", "a", "operator", "fixture retry", 3000)
+                    .unwrap();
+                let second = attempt(
+                    storage
+                        .reserve_next(&attestation, EffectiveMode::Message, 3001, &timing())
+                        .unwrap(),
+                );
+                assert_eq!(second.members.len(), 1);
+                storage
+                    .mark_invoking(&second.fence, &attestation, 3002)
+                    .unwrap();
+                let outcome = match sibling {
+                    "accepted" => Some(Outcome::NativeAccepted {
+                        evidence: "fixture queue accepted".into(),
+                    }),
+                    "unknown" => Some(Outcome::OutcomeUnknown {
+                        reason: "fixture newer lost receipt".into(),
+                    }),
+                    _ => None,
+                };
+                if let Some(outcome) = outcome {
+                    storage
+                        .record_outcome(&second.fence, outcome, 3003)
+                        .unwrap();
+                }
+            }
+            let before = storage
+                .delivery_evidence("agent-run", "a")
+                .unwrap()
+                .unwrap();
+            let incidents = storage
+                .incidents(true, 4000, 100)
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.event_id == "a")
+                .collect::<Vec<_>>();
+            if refusal {
+                storage
+                    .record_outcome(
+                        &first.fence,
+                        Outcome::PermanentRefusal {
+                            reason: "fixture old refusal".into(),
+                        },
+                        4000,
+                    )
+                    .unwrap();
+            } else {
+                storage
+                    .record_evidence(
+                        "agent-run",
+                        "b",
+                        first.fence.attempt_seq,
+                        EvidenceTier::KnownUnsent,
+                        "fixture old helper never wrote",
+                        4000,
+                    )
+                    .unwrap();
+            }
+            let after = storage
+                .delivery_evidence("agent-run", "a")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                after.delivery, before.delivery,
+                "sibling {sibling}, refusal {refusal}"
+            );
+            assert_eq!(after.attempts_made, before.attempts_made);
+            if sibling != "disposed" {
+                assert_eq!(
+                    after.attempt, before.attempt,
+                    "the newer attempt is untouched"
+                );
+            }
+            assert_eq!(
+                storage
+                    .incidents(true, 4000, 100)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|row| row.event_id == "a")
+                    .collect::<Vec<_>>(),
+                incidents
+            );
+            for id in ["a", "b"] {
+                assert!(
+                    storage
+                        .delivery_evidence("agent-run", id)
+                        .unwrap()
+                        .unwrap()
+                        .tiers
+                        .iter()
+                        .any(|entry| entry.attempt_seq == first.fence.attempt_seq
+                            && entry.tier
+                                == if refusal {
+                                    EvidenceTier::Refused
+                                } else {
+                                    EvidenceTier::KnownUnsent
+                                })
+                );
+            }
+        }
+    }
+}
+
 /// Unwraps a reserved or invoking attempt from a selection.
 fn attempt(selection: Selection) -> bridge_core::dispatch::AttemptRecord {
     match selection {

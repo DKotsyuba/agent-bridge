@@ -4,6 +4,12 @@
 /** @typedef {{threadStartKind:'all'}|{arguments:{threadId:string,prompt:string},callerSource:'codex',callId:string,namespace:string,threadId:string,tool:'send_message_to_thread',turnId:string}} NativeParams Closed native request variants. */
 /** Native IPC, with no external network or file access. @type {typeof import('node:net')} */
 const net = require('node:net');
+/** Largest message text in UTF-8 bytes: core's framing bound (Rust `MAX_FRAMED_BYTES`). @type {number} */
+const TEXT_LIMIT=98304;
+/** Largest thread/call id in UTF-8 bytes: core's field bound (Rust `MAX_ID_BYTES`). @type {number} */
+const ID_LIMIT=256;
+/** Largest private request frame body: doubled text and ids plus the JSON skeleton allowance (Rust `MAX_PRIVATE_FRAME_BYTES`). @type {number} */
+const FRAME_LIMIT=197696;
 /** Execute one closed native message request in this signed process. @param {{thread_id:string,call_id:string,text:string}} request Frozen fields. @returns {Promise<{state:'accepted'|'known_unsent'|'unknown'}>} One conservative receipt. */
 function nativeMessage(request) {
   return new Promise(resolve => {
@@ -53,7 +59,7 @@ function rpc(id,method,params) {
 /** Perform only discovery then one exact send, never retry/fallback. @param {{thread_id:string,call_id:string,text:string}} request Frozen parent fields. @returns {Promise<void>} One typed stdout receipt. */
 async function perform(request) {
   try {
-    if(JSON.stringify(Object.keys(request).sort())!==JSON.stringify(['call_id','text','thread_id'])||!['thread_id','call_id','text'].every(k=>typeof request[k]==='string'&&request[k])||Buffer.byteLength(request.text)>65536) throw new Error('invalid request');
+    if(JSON.stringify(Object.keys(request).sort())!==JSON.stringify(['call_id','text','thread_id'])||!['thread_id','call_id','text'].every(k=>typeof request[k]==='string'&&request[k])||Buffer.byteLength(request.text)>TEXT_LIMIT||Buffer.byteLength(request.thread_id)>ID_LIMIT||Buffer.byteLength(request.call_id)>ID_LIMIT) throw new Error('invalid request');
     socket=net.createConnection(process.env.CODEX_APP_TOOLS_PIPE_PATH);
     await new Promise((resolve,reject)=>{socket.once('connect',resolve);socket.once('error',reject);});
     const listed=await rpc(1,'tools/list',{threadStartKind:'all'});
@@ -74,7 +80,7 @@ function singleClient() {
   let input=Buffer.alloc(0);
   /** Emit a pre-call refusal for malformed standalone input. @returns {void} */
   const fail=()=>process.stdout.write(JSON.stringify({id:1,result:{state:'known_unsent'}})+'\n',()=>process.exit(0));
-  process.stdin.on('data',b=>{if(input.length+b.length>131072)return fail();input=Buffer.concat([input,b]);const end=input.indexOf(10);if(end>=0){process.stdin.pause();try{void nativeMessage(JSON.parse(input.subarray(0,end).toString('utf8'))).then(result=>process.stdout.write(JSON.stringify({id:1,result})+'\n',()=>process.exit(0)));}catch{fail();}}});
+  process.stdin.on('data',b=>{if(input.length+b.length>FRAME_LIMIT+1)return fail();input=Buffer.concat([input,b]);const end=input.indexOf(10);if(end>=0){process.stdin.pause();try{void nativeMessage(JSON.parse(input.subarray(0,end).toString('utf8'))).then(result=>process.stdout.write(JSON.stringify({id:1,result})+'\n',()=>process.exit(0)));}catch{fail();}}});
   process.stdin.on('error',fail);
   process.stdin.on('end',()=>{if(!input.includes(10))fail();});
 }
@@ -96,9 +102,9 @@ function mcpFrontend() {
   /** One in-flight delivery; concurrent frames close only this owned child. @type {boolean} */
   let active=false;
   child.stdio[3].on('data',b=>{
-    if(bytes.length+b.length>131076)return child.kill();
+    if(bytes.length+b.length>FRAME_LIMIT+4)return child.kill();
     bytes=Buffer.concat([bytes,b]);if(bytes.length<4)return;
-    const n=bytes.readUInt32LE(0);if(!n||n>131072)return child.kill();if(bytes.length<n+4)return;
+    const n=bytes.readUInt32LE(0);if(!n||n>FRAME_LIMIT)return child.kill();if(bytes.length<n+4)return;
     if(active||bytes.length!==n+4)return child.kill();
     active=true;let request;try{request=JSON.parse(bytes.subarray(4).toString('utf8'));}catch{return child.kill();}bytes=Buffer.alloc(0);
     void nativeMessage(request).then(result=>{const body=Buffer.from(JSON.stringify({...result,call_id:request.call_id})),head=Buffer.alloc(4);head.writeUInt32LE(body.length);child.stdio[3].write(Buffer.concat([head,body]));active=false;});

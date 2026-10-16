@@ -882,7 +882,9 @@ struct Binding {
     /// Harness executable of the binding, as the verified process runs it (a
     /// process fact, never an allowlist entry).
     executable: PathBuf,
-    /// Set by root `SessionEnd`; normal recipient and caller authority stays refused.
+    /// Set by the root's `SessionEnd`, and by an OpenCode child's own
+    /// `SessionEnd` (its own address ended); normal recipient and caller
+    /// authority stays refused until a renewal.
     retired: bool,
     /// Positive pre-end Desktop owner idleness, granting only native MESSAGE
     /// candidate eligibility. Missing legacy facts keep tombstones held. Old
@@ -910,6 +912,15 @@ struct Binding {
     /// address afresh. Absent in journals of other builds; omitted when false.
     #[serde(default, skip_serializing_if = "is_false")]
     pending: bool,
+    /// OpenCode only: the actor whose own hooks feed this address (`Root`, or
+    /// `Child` for a subagent session, which is never a MESSAGE recipient),
+    /// recorded at binding. `None` for every other harness (their rows keep
+    /// their shape) and in OpenCode rows written by earlier builds: such a row
+    /// is ambiguous, restored without MESSAGE until the address's own next hook
+    /// renews it with the actor recorded. An earlier build refuses a journal
+    /// carrying this field (rows deny unknown fields), like `wake`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    role: Option<ActorRole>,
 }
 
 /// Serde omission predicate for the private idle fact: false carries no new
@@ -1451,7 +1462,10 @@ impl Registry {
     /// fields, so a daemon of an earlier build refuses to start on a journal that
     /// contains them; rolling back
     /// needs a compatible (earlier) journal or a fresh one, and no migration rewrites
-    /// rows. Current harness policy capabilities bound recovery; unknown/input-wait
+    /// rows. A live OpenCode row keeps MESSAGE only when it records its actor as
+    /// the root (`Binding.role`): a recorded child, or an earlier build's row
+    /// with no actor fact, is restored with MESSAGE withheld, so core refuses a
+    /// message to it before acceptance until its own next hook renews it. Current harness policy capabilities bound recovery; unknown/input-wait
     /// lifecycle stays such. No hook is manufactured and no caller/proof record is
     /// restored.
     /// Returns fresh recipient attestations for core to fence before serving.
@@ -1598,13 +1612,23 @@ impl Registry {
     /// Sets a restored binding's capabilities from the current harness policy:
     /// the saved capabilities are only ever narrowed, message is not granted on a
     /// host that disabled it, and the policy label replaces the saved one.
+    /// An OpenCode row recorded as a child is never qualified for MESSAGE, and
+    /// one without a recorded actor (an earlier build's row) is restored with
+    /// MESSAGE withheld, so core refuses messages to it before acceptance until
+    /// its own next hook records the actor (see [`Registry::admit_hook`]).
     fn apply_policy(&self, binding: &mut Binding, policy: &HarnessPolicy) {
+        let opencode = binding.address.harness == Harness::OpenCode;
         binding.qualified = Capabilities {
             inject: policy.inject,
-            message: policy.message && !self.message_disabled.contains(&binding.address.harness),
+            message: policy.message
+                && !self.message_disabled.contains(&binding.address.harness)
+                && !(opencode && binding.role == Some(ActorRole::Child)),
         };
         binding.capabilities.inject &= binding.qualified.inject;
         binding.capabilities.message &= binding.qualified.message;
+        if opencode && binding.role.is_none() {
+            binding.capabilities.message = false;
+        }
         binding.version = POLICY_LABEL.to_string();
     }
 
@@ -1743,10 +1767,15 @@ impl Registry {
     /// environment, that is a canonical directory owned by the owner and not
     /// writable by group or other ([`private_store`]). No store path and no
     /// executable is predeclared.
+    ///
+    /// `frontend` is true only for a Codex MCP caller attestation: then the
+    /// peer's direct parent alone may be the signed Node frontend hop (see
+    /// [`signed_node_hop`]) and is skipped before the walk; hooks never get it.
     fn harness_of(
         &mut self,
         peer: PeerIdentity,
         harness: Harness,
+        frontend: bool,
     ) -> Result<HarnessMatch, CorrelationError> {
         if peer.uid != self.owner_uid {
             return Err(CorrelationError::NotEvidence(
@@ -1757,7 +1786,12 @@ impl Registry {
         let Some((_, ancestors)) = chain.split_first() else {
             return Err(CorrelationError::NotEvidence("peer process is gone".into()));
         };
-        let candidate = ancestors.iter().find(|facts| {
+        let hop = frontend
+            && harness == Harness::Codex
+            && ancestors
+                .first()
+                .is_some_and(|parent| signed_node_hop(peer.pid, parent, self.owner_uid));
+        let candidate = ancestors[usize::from(hop)..].iter().find(|facts| {
             !facts
                 .exe
                 .as_ref()
@@ -1942,6 +1976,15 @@ impl Registry {
     /// Root Desktop SessionEnd can retain only prior positive owner Inactive
     /// message eligibility and the exact owned regular sessions transcript inode;
     /// retirement and Unknown lifecycle remain, and renewal clears both facts.
+    /// OpenCode bindings record their actor (`Binding.role`, from the hook:
+    /// root without `agent_id`, child with it). A child (its own address, never
+    /// positively idle) is bound without the MESSAGE capability, so core refuses
+    /// a message to it before acceptance; its `Stop` never makes it idle; its
+    /// own `SessionEnd` retires its binding with Unknown lifecycle. An OpenCode
+    /// binding whose recorded actor differs from, or lacks, this hook's actor
+    /// (an earlier build's row, restored with MESSAGE withheld) is renewed with
+    /// a new epoch, so a root regains MESSAGE and a child keeps it withdrawn.
+    /// Caller attestation is unchanged.
     ///
     /// The binding's namespace and capabilities come from the harness-level policy
     /// of the matched harness, its store from the harness process's own
@@ -1989,7 +2032,7 @@ impl Registry {
         if kind == HookKind::PreToolUse && payload.tool_use_id.is_some() {
             self.ensure_call_capacity()?;
         }
-        let matched = self.harness_of(peer, harness)?;
+        let matched = self.harness_of(peer, harness, false)?;
         // Claude children share the root session's address; Codex children
         // are their own threads with their own addresses.
         let (role, native_id, address_session) = match (&agent, harness) {
@@ -2009,9 +2052,16 @@ impl Registry {
         )
         .map_err(|error| CorrelationError::NotEvidence(error.to_string()))?;
         let key = address.to_canonical_string();
+        // An OpenCode child never becomes positively idle (it does not own a
+        // wakeable session), so no MESSAGE to it could ever be delivered: its
+        // binding never advertises the capability and core refuses such a
+        // publication before acceptance instead of holding it forever.
+        let opencode_child = harness == Harness::OpenCode && role == ActorRole::Child;
         let capabilities = Capabilities {
             inject: matched.policy.inject,
-            message: matched.policy.message && !self.message_disabled.contains(&harness),
+            message: matched.policy.message
+                && !self.message_disabled.contains(&harness)
+                && !opencode_child,
         };
         let transcript = payload
             .transcript_path
@@ -2029,10 +2079,14 @@ impl Registry {
                 }
                 (true, Some(binding.epoch))
             }
+            // An OpenCode binding without this actor recorded (an earlier
+            // build's row, restored with MESSAGE withheld) is renewed from the
+            // address's own hook, so core records the actor's true capability.
             Some(binding) => (
                 starts_own_session(kind, role, harness, payload)
                     || binding.retired
-                    || binding.pending,
+                    || binding.pending
+                    || (harness == Harness::OpenCode && binding.role != Some(role)),
                 Some(binding.epoch),
             ),
             None => (true, None),
@@ -2064,6 +2118,7 @@ impl Registry {
                     desktop_idle_transcript: None,
                     wake: None,
                     pending: false,
+                    role: (harness == Harness::OpenCode).then_some(role),
                 },
             );
         }
@@ -2087,6 +2142,10 @@ impl Registry {
                 None
             };
             binding.desktop_idle_message = binding.desktop_idle_transcript.is_some();
+            binding.retired = true;
+        } else if kind == HookKind::SessionEnd && opencode_child {
+            // The child's own address ended (its native session was deleted):
+            // retire it truthfully; there is no idle exception for a child.
             binding.retired = true;
         }
         binding.lifecycle = next_lifecycle(binding.lifecycle, kind, role, harness, payload);
@@ -2300,7 +2359,7 @@ impl Registry {
         };
         let call = call.to_string();
         checked_id(&call, "call id").map_err(CorrelationError::NotEvidence)?;
-        let matched = self.harness_of(peer, harness)?;
+        let matched = self.harness_of(peer, harness, true)?;
         let max_age = self.config.max_call_age_ms;
         let records = self
             .calls
@@ -2740,7 +2799,7 @@ fn is_positive_idle_event(
 /// awaits its subagent); `AskUserQuestion`, permission requests and
 /// permission notifications await input; the owner's own `Stop`, idle-prompt
 /// notification and non-`compact` `SessionStart` are idle; the owner's
-/// `SessionEnd` is unknown. Every other event (`SubagentStop`, a Claude
+/// `SessionEnd`, and an OpenCode child's own `SessionEnd`, is unknown. Every other event (`SubagentStop`, a Claude
 /// child's `Stop`, `SessionStart`, `SessionEnd` or idle notification, other
 /// notification types, a `compact` restart) keeps `current`, which for a new or renewed
 /// binding is unknown: only the owner's own events may establish idle.
@@ -2778,7 +2837,8 @@ fn next_lifecycle(
         },
         HookKind::Stop if owner => Lifecycle::Inactive,
         HookKind::Stop | HookKind::SubagentStop => current,
-        HookKind::SessionEnd if owner => Lifecycle::Unknown,
+        // An OpenCode child's end is its own address ending (it is retired).
+        HookKind::SessionEnd if owner || harness == Harness::OpenCode => Lifecycle::Unknown,
         HookKind::SessionEnd => current,
     }
 }
@@ -2898,6 +2958,36 @@ fn executable_current(exe: &Path, facts: &ProcessFacts, owner_uid: u32) -> Resul
     Ok(())
 }
 
+/// Whether `parent`, the kernel parent of the MCP peer `peer_pid`, is the
+/// signed Node frontend hop of a Codex application MCP server: the launched
+/// Bridge MCP process replaced itself (same PID, `exec`) with the
+/// host-supplied Node runtime, which runs the Rust MCP child (the peer).
+///
+/// All of these must hold, so neither an environment value nor a PID alone
+/// is authority: the hop runs as `owner_uid`; its kernel-resolved executable
+/// is current ([`executable_current`]) and is exactly the runtime that the
+/// host named in the hop's own preserved exec-time environment
+/// (`CODEX_MCP_NODE_PATH`, both paths canonical); that environment also holds
+/// the application pipe capability (`CODEX_APP_TOOLS_PIPE_PATH`); and the
+/// peer's environment carries `BRIDGE_DESKTOP_PARENT_PID` naming the hop's
+/// kernel PID (the frontend stamps it when it spawns its child, after removing
+/// both capability variables from the child). Unreadable facts refuse. The
+/// harness above the hop is still proven by every ordinary check.
+fn signed_node_hop(peer_pid: u32, parent: &ProcessFacts, owner_uid: u32) -> bool {
+    let Some(exe) = parent.exe.as_deref() else {
+        return false;
+    };
+    let declared = os::process_env(parent.pid, "CODEX_MCP_NODE_PATH")
+        .and_then(|path| Path::new(&path).canonicalize().ok());
+    parent.uid == Some(owner_uid)
+        && executable_current(exe, parent, owner_uid).is_ok()
+        && declared.is_some()
+        && declared == exe.canonicalize().ok()
+        && os::process_env(parent.pid, "CODEX_APP_TOOLS_PIPE_PATH").is_some()
+        && os::process_env(peer_pid, "BRIDGE_DESKTOP_PARENT_PID")
+            .is_some_and(|pid| pid.to_str() == Some(parent.pid.to_string().as_str()))
+}
+
 /// Starts a background evidence refresh of a serving registry when a configured
 /// executable has a new file identity; never blocks and never hashes on the
 /// caller's thread (see `refresh_stale`). The daemon calls it periodically
@@ -2974,6 +3064,7 @@ mod tests {
             desktop_idle_transcript: Some((4, 5)),
             wake: None,
             pending: false,
+            role: None,
         };
         let candidate = MessageCandidate {
             binding: binding.clone(),
@@ -3717,6 +3808,7 @@ mod tests {
             desktop_idle_transcript: None,
             wake: None,
             pending: false,
+            role: None,
         }
     }
 
@@ -3950,6 +4042,7 @@ mod tests {
                 desktop_idle_transcript: None,
                 wake: None,
                 pending: false,
+                role: None,
             },
             policy: HarnessPolicy {
                 harness: Harness::ClaudeCode,

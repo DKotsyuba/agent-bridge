@@ -330,10 +330,15 @@ fn unknown_versions_and_foreign_files_are_refused_untouched() {
                 )
                 .unwrap();
         }
+        let before = database_files(&path);
         assert!(matches!(
             Storage::open(&path, Limits::new(10)),
             Err(CoreError::Integrity(_))
         ));
+        assert!(
+            database_files(&path) == before,
+            "refusal preserves every database byte and sidecar"
+        );
         assert_eq!(
             version(&path),
             stored,
@@ -346,15 +351,92 @@ fn unknown_versions_and_foreign_files_are_refused_untouched() {
         .unwrap()
         .execute_batch("CREATE TABLE notes (body TEXT); INSERT INTO notes VALUES ('keep me');")
         .unwrap();
+    let before = database_files(&foreign);
     assert!(matches!(
         Storage::open(&foreign, Limits::new(10)),
         Err(CoreError::Integrity(_))
     ));
+    assert!(
+        database_files(&foreign) == before,
+        "foreign database bytes and sidecars stay untouched"
+    );
     let notes: String = Connection::open(&foreign)
         .unwrap()
         .query_row("SELECT body FROM notes", [], |row| row.get(0))
         .unwrap();
     assert_eq!(notes, "keep me");
+}
+
+/// Captures the database and SQLite sidecars without opening SQLite itself;
+/// missing sidecars remain distinct from empty ones and read failures panic.
+fn database_files(path: &std::path::Path) -> Vec<Option<Vec<u8>>> {
+    ["", "-wal", "-shm", "-journal"]
+        .into_iter()
+        .map(
+            |suffix| match std::fs::read(format!("{}{suffix}", path.display())) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("fixture snapshot failed: {error}"),
+            },
+        )
+        .collect()
+}
+
+/// Refusal preserves durable bytes, journal mode and sidecar presence in each
+/// journal mode, including a newer schema committed only in a live WAL. SQLite
+/// may update advisory wal-index read marks (bytes 100..120), never DB/WAL data.
+#[test]
+fn unsupported_journal_modes_and_live_sidecars_are_preserved() {
+    let dir = TempDir::new("journal-refusal");
+    for mode in ["DELETE", "TRUNCATE", "PERSIST", "WAL"] {
+        for foreign in [false, true] {
+            let path = dir.path(&format!("{mode}-{foreign}.db"));
+            let keeper = Connection::open(&path).unwrap();
+            keeper.pragma_update(None, "journal_mode", mode).unwrap();
+            keeper.execute_batch(if foreign {
+                "CREATE TABLE notes(body TEXT); INSERT INTO notes VALUES('synthetic retained bytes');"
+            } else {
+                "CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO schema_meta VALUES('schema_version', '999');"
+            }).unwrap();
+            let before = database_files(&path);
+            assert!(matches!(
+                Storage::open(&path, Limits::new(10)),
+                Err(CoreError::Integrity(_))
+            ));
+            let after = database_files(&path);
+            assert!(
+                [0, 1, 3]
+                    .into_iter()
+                    .all(|index| after[index] == before[index]),
+                "refusal changed {mode} foreign={foreign} durable database, WAL or journal bytes"
+            );
+            assert_eq!(
+                after[2].is_some(),
+                before[2].is_some(),
+                "SHM presence changed"
+            );
+            if let (Some(before), Some(after)) = (&before[2], &after[2]) {
+                assert_eq!(before.len(), after.len());
+                let differences: Vec<_> = before
+                    .iter()
+                    .zip(after)
+                    .enumerate()
+                    .filter(|(_, (left, right))| left != right)
+                    .map(|(offset, (left, right))| (offset, *left, *right))
+                    .collect();
+                eprintln!("{mode} foreign={foreign} SHM read-mark differences: {differences:?}");
+                assert!(
+                    differences
+                        .iter()
+                        .all(|(offset, _, _)| (100..120).contains(offset))
+                );
+            }
+            let after: String = keeper
+                .pragma_query_value(None, "journal_mode", |row| row.get(0))
+                .unwrap();
+            assert_eq!(after, mode.to_ascii_lowercase());
+        }
+    }
 }
 
 /// A migration that fails partway leaves no partial schema: the whole

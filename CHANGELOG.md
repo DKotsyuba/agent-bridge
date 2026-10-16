@@ -6,6 +6,61 @@ source, and the crates are not published to crates.io.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-16
+
+### Fixed
+
+- The Claude native inbox carrier no longer refuses a manifest over 4096 bytes as a
+  permanent refusal. Its bound is now core's 98304-byte framing bound (the one the owner
+  and Desktop routes already use), so a core-admitted body (including a full 16 KiB body
+  whose escaping and source-wrapper overhead fits that bound; 16 KiB of `"` does not) is
+  written as one unchunked inbox message. A larger manifest
+  still refuses before any byte is written. The former 4096-byte value had no recorded native basis.
+  Native acceptance is qualified only for the tested 16384-byte payload on Claude Code 2.1.295 and
+  2.1.296; larger payloads and other builds remain unqualified.
+- OpenCode plugin: sustained native-feed overload now invalidates readiness once per separated
+  overload episode, including after an intervening `Stop`, and accepts nothing behind a queued
+  invalidation. The pending bound, FIFO order and cleanup are unchanged.
+- OpenCode child sessions never receive the `message` capability (also withdrawn from older
+  bindings at renewal); a child `SessionEnd` retires to `Unknown` and a child `Stop` never
+  makes it `Inactive`. The route journal now records an OpenCode address's role: a recorded
+  root keeps its message capability across a restart without a new hook; a child, or a row from an
+  earlier build, is restored with message withheld until the address's own next hook (a one-time
+  wait for such a root). An earlier build refuses a journal holding the new field, so rolling back
+  needs an earlier or fresh journal. Child wake remains unqualified.
+- Codex Desktop: rendered text is bounded at 98304 bytes and the private frame at 197696 bytes,
+  shared by the Rust and JavaScript sides; only tab, newline and carriage-return controls are
+  accepted and ids are bounded and control-free. Oversize is refused before any write. The
+  supplied signed Node hop is skipped only when the Rust peer's direct parent is the owner Node
+  process whose executable matches its own preserved `CODEX_MCP_NODE_PATH`, with the tools pipe
+  in its environment and the peer's `BRIDGE_DESKTOP_PARENT_PID` equal to its PID; no hook or
+  non-Codex exemption.
+- Adapter sockets are claimed under a lifetime lock and a stale socket is reclaimed only after a
+  refused connection with an unchanged inode, same user; readiness requires both the core and
+  adapter-channel sockets from the spawned process, each a distinct OS socket (so other aliases
+  of one socket, such as a case variant or hard link, are never ready), and a configuration naming the same endpoint
+  for both (literal, `.` or symlinked-directory alias) is refused before spawning, as is a required
+  socket path (core and channel for the core, relay socket for the relay) whose final component is a
+  symlink, dangling or not; the link is left unchanged.
+- Documentation: inbox size wording is the 98304-byte bound everywhere, and the store
+  revalidation statement distinguishes the routes that recheck the store from the legacy Claude
+  inbox route, which checks incarnation and each descriptor/token file.
+- Batch outcomes: a late batch outcome keeps evidence for every frozen member but changes
+  state and incidents only for members still owned by that exact attempt.
+- `retire_unhanded` permanently rejects manual retry. A late known-unsent outcome closes a
+  retired member only when no historical possible-effect risk exists, otherwise the review and a
+  visible incident remain. Retired orphan rows from older builds are excluded from selection and
+  work listings and show a scope-fence diagnostic.
+- Lifetime `latest` retention uses the full scoped key and `scoped_watermarks`; unscoped legacy
+  keys use `watermarks`; a malformed or mismatched lifetime refuses.
+- Rollback schema validation or migration holds an exclusive lock through enabling WAL, and a
+  foreign, unknown or newer database is refused before Bridge makes any schema or journal-mode
+  change and without a close-time WAL checkpoint. SQLite's own recovery of an interrupted rollback
+  journal may restore committed content first, and ordinary WAL reads or recovery may rewrite advisory
+  `-shm` WAL-index metadata (the main and WAL bytes of a refused WAL database are preserved).
+- Request reads use a separate absolute idle deadline and a request deadline that starts at the
+  first nonempty byte buffer; an interrupted read renews neither.
+
 ## [0.3.0] - 2026-10-15
 
 ### Added

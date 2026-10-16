@@ -186,3 +186,134 @@ test('feed cancellation retains no handler per completed native event', { timeou
     syncBuiltinESMExports();
   }
 });
+
+test('separated overflow episodes each invalidate, with a Stop between them', { timeout: 10000 }, async () => {
+  /** @type {Array<Record<string,string>>} Metadata sent to the existing hook client. */
+  const calls = [];
+  /** @type {Array<()=>void>} Hook completions withheld while the native consumer is slow. */
+  const held = [];
+  /** @type {boolean} Whether new hook writes are withheld instead of completed. */
+  let slow = true;
+  mock.method(childProcess, 'execFile', (command, args, options, callback) => ({ stdin: new Writable({
+    /** Record one hook payload and complete the fake hook process, immediately or on release.
+     * @param {Buffer} bytes UTF-8 JSON metadata written to the hook's stdin.
+     * @param {string} encoding Stream encoding, unused for buffers.
+     * @param {(error?:Error|null)=>void} done Acknowledges the stdin write, always without error.
+     * @returns {void} Appends the parsed payload to `calls`; while `slow`, the exec callback is
+     *   withheld in `held` until the test releases it, otherwise it fires at once. */
+    write(bytes, encoding, done) {
+      calls.push(JSON.parse(bytes.toString()));
+      done();
+      if (slow) held.push(() => callback(null, '', '')); else callback(null, '', '');
+    },
+  }) }));
+  syncBuiltinESMExports();
+  const { default: plugin } = await import('./index.js');
+  /** @type {Map<string,(event:object)=>Promise<void>>} Native registered callbacks. */
+  const hooks = new Map();
+  /** @type {(value:{done:boolean,value?:object})=>void} Active native event consumer. */
+  let next;
+  const context = {
+    app: { version: '2.0.28' }, options: { channel: '/owned/channel', hookCommand: '/owned/hook' },
+    session: { get: async ({ sessionID }) => ({ id: sessionID }),
+      hook: async (name, callback) => { hooks.set(name, callback); return { dispose: async () => {} }; } },
+    tool: { hook: async (name, callback) => { hooks.set(name, callback); return { dispose: async () => {} }; } },
+    event: { subscribe: async () => ({ [Symbol.asyncIterator]: () => ({
+      next: () => new Promise(resolve => { next = resolve; }),
+      return: async () => { next({ done: true }); return { done: true }; },
+    }) }) },
+  };
+  /** Release every withheld hook until all accepted work and the queued invalidation settled.
+   * @returns {Promise<void>} Quiescence after a bounded number of event-loop turns. */
+  async function drain() {
+    slow = false;
+    for (let turn = 0; turn < 50; turn++) {
+      for (const release of held.splice(0)) release();
+      await new Promise(resolve => setImmediate(resolve));
+    }
+  }
+  /** Overload the bounded queue while its first hook is withheld.
+   * @returns {Promise<void>} Settled after the burst and a full drain. */
+  async function burst() {
+    slow = true;
+    for (let index = 0; index < 70; index++) hooks.get('prompt')({ sessionID: 'root' });
+    await drain();
+  }
+  /** @returns {string[]} Hook event names recorded so far. */
+  const names = () => calls.map(value => value.hook_event_name);
+  try {
+    const dispose = await plugin.setup(context);
+    await burst();
+    assert.equal(names().filter(name => name === 'OpenCodeActivity').length, 64, 'excess activity is dropped, not buffered');
+    assert.equal(names().at(-1), 'OpenCodeUnknown', 'first episode invalidates after accepted work');
+    next({ done: false, value: { type: 'session.execution.succeeded', data: { sessionID: 'root' } } });
+    await drain();
+    assert.equal(names().at(-1), 'Stop', 'a Stop between episodes is still delivered');
+    await burst();
+    assert.equal(names().filter(name => name === 'OpenCodeActivity').length, 128);
+    assert.equal(names().at(-1), 'OpenCodeUnknown', 'second separated episode invalidates the stale Stop');
+    assert.equal(names().filter(name => name === 'OpenCodeUnknown').length, 2);
+    await dispose();
+  } finally {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  }
+});
+
+test('no observation is accepted behind a queued overload invalidation', { timeout: 10000 }, async () => {
+  /** @type {Array<Record<string,string>>} Metadata sent to the existing hook client. */
+  const calls = [];
+  /** @type {Array<()=>void>} Hook completions released one at a time by the test. */
+  const held = [];
+  /** @type {boolean} Whether new hook writes are withheld instead of completed. */
+  let slow = true;
+  mock.method(childProcess, 'execFile', (command, args, options, callback) => ({ stdin: new Writable({
+    /** Record one hook payload and complete the fake hook process, immediately or on release.
+     * @param {Buffer} bytes UTF-8 JSON metadata written to the hook's stdin.
+     * @param {string} encoding Stream encoding, unused for buffers.
+     * @param {(error?:Error|null)=>void} done Acknowledges the stdin write, always without error.
+     * @returns {void} Appends the parsed payload to `calls`; while `slow`, the exec callback is
+     *   withheld in `held` until the test releases it, otherwise it fires at once. */
+    write(bytes, encoding, done) {
+      calls.push(JSON.parse(bytes.toString()));
+      done();
+      if (slow) held.push(() => callback(null, '', '')); else callback(null, '', '');
+    },
+  }) }));
+  syncBuiltinESMExports();
+  const { default: plugin } = await import('./index.js');
+  /** @type {Map<string,(event:object)=>Promise<void>>} Native registered callbacks. */
+  const hooks = new Map();
+  /** @type {(value:{done:boolean,value?:object})=>void} Active native event consumer. */
+  let next;
+  const context = {
+    app: { version: '2.0.28' }, options: { channel: '/owned/channel', hookCommand: '/owned/hook' },
+    session: { get: async ({ sessionID }) => ({ id: sessionID }),
+      hook: async (name, callback) => { hooks.set(name, callback); return { dispose: async () => {} }; } },
+    tool: { hook: async (name, callback) => { hooks.set(name, callback); return { dispose: async () => {} }; } },
+    event: { subscribe: async () => ({ [Symbol.asyncIterator]: () => ({
+      next: () => new Promise(resolve => { next = resolve; }),
+      return: async () => { next({ done: true }); return { done: true }; },
+    }) }) },
+  };
+  /** @returns {Promise<void>} One event-loop turn, letting released hooks settle. */
+  const turn = () => new Promise(resolve => setImmediate(resolve));
+  try {
+    const dispose = await plugin.setup(context);
+    for (let index = 0; index < 70; index++) hooks.get('prompt')({ sessionID: 'root' });
+    await turn();
+    // Complete two withheld hooks so one accepted slot frees while the invalidation is still queued.
+    for (let index = 0; index < 2; index++) { held.shift()(); await turn(); }
+    next({ done: false, value: { type: 'session.execution.succeeded', data: { sessionID: 'root' } } });
+    hooks.get('prompt')({ sessionID: 'root' });
+    slow = false;
+    for (let index = 0; index < 50; index++) { for (const release of held.splice(0)) release(); await turn(); }
+    const names = calls.map(value => value.hook_event_name);
+    assert.equal(names.at(-1), 'OpenCodeUnknown', 'the invalidation is the last word after the overload');
+    assert.equal(names.includes('Stop'), false, 'a restoring Stop is not queued behind the invalidation');
+    await dispose();
+  } finally {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  }
+});

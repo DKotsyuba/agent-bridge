@@ -13,12 +13,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bridge_adapters::RegistryAttestor;
-use bridge_adapters::claude::{ClaudeLaterCarrier, ClaudeTiming};
+use bridge_adapters::claude::{ClaudeLaterCarrier, ClaudeTiming, MAX_MESSAGE_BYTES};
 use bridge_adapters::codex::CodexQueueCarrier;
 use bridge_adapters::registry::{CallerAttestor, PresentedMeta, SealedProof, Unattested};
 use bridge_adapters::server::Custody;
-use bridge_core::dispatch::{AttemptState, DispatchReport, DispatchTiming, dispatch_message};
-use bridge_core::{Harness, Mode, Storage};
+use bridge_core::dispatch::{
+    AttemptRecord, AttemptState, Attestation, DispatchCarrier, DispatchReport, DispatchTiming,
+    Outcome, dispatch_message,
+};
+use bridge_core::{Harness, Mode, NativeAddress, Storage};
 use common::*;
 use serde_json::json;
 
@@ -117,6 +120,202 @@ fn opencode_plugin_call_joins_only_its_actual_owned_session() {
     assert_eq!(accepted["ok"]["may_act_as_address"], true);
     assert_eq!(harness.mcp(&lab.socket, native)["err"], "duplicate");
     harness.stop();
+}
+
+/// An OpenCode child (the plugin's `agent_id` = its own session id) is never a
+/// MESSAGE recipient: a message publication to its address refuses before
+/// acceptance, while the root's is accepted. Its `Stop` never makes it idle,
+/// its caller attestation still joins as the child, and its own `SessionEnd`
+/// retires its binding while the root binding stays served and idle-capable.
+#[test]
+fn opencode_child_refuses_messages_before_custody_and_retires_at_its_end() {
+    let lab = Lab::new("ock");
+    let mut harness = Harnessed::start(Harness::OpenCode, &lab.opencode_store);
+    let child = |event: &str| json!({"hook_event_name": event, "session_id": "ses-kid", "agent_id": "ses-kid", "source": "opencode"});
+    harness.hook(
+        &lab.socket,
+        Harness::OpenCode,
+        hook("SessionStart", "ses-top"),
+    );
+    harness.hook(&lab.socket, Harness::OpenCode, child("SessionStart"));
+    let kid = lab.opencode_address("ses-kid");
+    let top = lab.opencode_address("ses-top");
+    let refused = lab.try_publish("evt-kid", &kid, Mode::Message).unwrap_err();
+    assert!(
+        refused.contains("unsupported") || refused.contains("capab"),
+        "{refused}"
+    );
+    assert!(lab.attempt("evt-kid").is_none());
+    lab.try_publish("evt-top", &top, Mode::Message).unwrap();
+    let lifecycle = |address: &NativeAddress| {
+        lab.registry
+            .lock()
+            .unwrap()
+            .attest_recipient(address)
+            .map(|(attestation, _)| attestation.lifecycle())
+    };
+    harness.hook(&lab.socket, Harness::OpenCode, child("Stop"));
+    assert_ne!(
+        lifecycle(&kid).unwrap(),
+        bridge_core::dispatch::Lifecycle::Inactive
+    );
+    harness.hook(
+        &lab.socket,
+        Harness::OpenCode,
+        tool_hook("PreToolUse", "ses-kid", "call-kid", Some("ses-kid")),
+    );
+    let caller = harness.mcp(
+        &lab.socket,
+        json!({"ai.opencode/sessionID":"ses-kid","ai.agent_bridge/toolCallID":"call-kid"}),
+    );
+    assert_eq!(caller["ok"]["role"], "child", "{caller}");
+    harness.hook(&lab.socket, Harness::OpenCode, child("SessionEnd"));
+    assert!(lifecycle(&kid).is_err(), "the ended child stays retired");
+    harness.hook(&lab.socket, Harness::OpenCode, hook("Stop", "ses-top"));
+    assert_eq!(
+        lifecycle(&top).unwrap(),
+        bridge_core::dispatch::Lifecycle::Inactive
+    );
+    harness.stop();
+}
+
+/// A daemon restart over a route journal written by an earlier build, whose
+/// OpenCode rows carry no actor fact and whose child row still advertises
+/// MESSAGE, never lets core accept a message for the live child: the restored
+/// child and the ambiguous old root are both refused before acceptance, yet
+/// kept (no row is lost). A root row recorded by this build is restored with
+/// MESSAGE and accepts with no new hook. The old root regains MESSAGE from its
+/// own next genuine hook (the role is then recorded), the child's next hook
+/// keeps it refused, and a later restart restores both from their recorded
+/// roles with no hook. A Codex row is restored unchanged and never gains a role.
+#[test]
+fn restart_over_an_old_journal_never_restores_opencode_child_messages() {
+    let mut lab = Lab::new("ocj");
+    let mut harness = Harnessed::start(Harness::OpenCode, &lab.opencode_store);
+    let mut codex = Harnessed::start(Harness::Codex, &lab.codex_store);
+    let child = |event: &str| json!({"hook_event_name": event, "session_id": "ses-kid", "agent_id": "ses-kid", "source": "opencode"});
+    harness.hook(
+        &lab.socket,
+        Harness::OpenCode,
+        hook("SessionStart", "ses-top"),
+    );
+    harness.hook(
+        &lab.socket,
+        Harness::OpenCode,
+        hook("SessionStart", "ses-old"),
+    );
+    harness.hook(&lab.socket, Harness::OpenCode, child("SessionStart"));
+    codex.hook(
+        &lab.socket,
+        Harness::Codex,
+        hook("SessionStart", "thread-j"),
+    );
+    let (kid, top, old, thread) = (
+        lab.opencode_address("ses-kid"),
+        lab.opencode_address("ses-top"),
+        lab.opencode_address("ses-old"),
+        lab.codex_address("thread-j"),
+    );
+    let journal = lab.socket.with_extension("bindings.json");
+    // Every saved row by the session id in its address, epoch removed.
+    let rows = || -> std::collections::BTreeMap<String, serde_json::Value> {
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+        snapshot["bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                let mut row = row.clone();
+                row.as_object_mut().unwrap().remove("epoch");
+                let address = row["address"].to_string();
+                let name = ["ses-kid", "ses-top", "ses-old", "thread-j"]
+                    .into_iter()
+                    .find(|name| address.contains(name))
+                    .unwrap();
+                (name.to_string(), row)
+            })
+            .collect()
+    };
+    // Starts a fresh registry and channel over the saved journal.
+    let start = |lab: &mut Lab| {
+        let owner =
+            bridge_adapters::server::private_directory(lab.socket.parent().unwrap()).unwrap();
+        lab.registry = Arc::new(Mutex::new(
+            bridge_adapters::Registry::new(lab.config.clone(), owner).unwrap(),
+        ));
+        lab.channel = Some(
+            bridge_adapters::ChannelServer::start(
+                &lab.socket,
+                Arc::clone(&lab.registry),
+                Arc::clone(&lab.storage) as Arc<dyn Custody>,
+                DispatchTiming::default(),
+            )
+            .unwrap(),
+        );
+    };
+    let before = rows();
+    assert_eq!(before["ses-top"]["role"], "root");
+    assert_eq!(before["ses-kid"]["role"], "child");
+    assert!(
+        before["thread-j"].get("role").is_none(),
+        "Codex rows keep their shape"
+    );
+    // Rewrite the journal as an earlier build wrote it: no actor fact on the
+    // child and the `ses-old` root, and the child still advertising MESSAGE.
+    lab.channel.take().unwrap().stop();
+    let mut snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+    for row in snapshot["bindings"].as_array_mut().unwrap() {
+        let text = row["address"].to_string();
+        if text.contains("ses-kid") || text.contains("ses-old") {
+            row.as_object_mut().unwrap().remove("role");
+        }
+        if text.contains("ses-kid") {
+            row["capabilities"]["message"] = json!(true);
+            row["qualified"]["message"] = json!(true);
+        }
+    }
+    std::fs::write(&journal, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    start(&mut lab);
+    let refused = lab.try_publish("evt-kid", &kid, Mode::Message);
+    assert!(
+        refused.is_err(),
+        "the restored child must not take messages"
+    );
+    assert!(lab.attempt("evt-kid").is_none());
+    lab.try_publish("evt-top", &top, Mode::Message).unwrap();
+    lab.try_publish("evt-old", &old, Mode::Message).unwrap_err();
+    lab.try_publish("evt-j", &thread, Mode::Message).unwrap();
+    let restored = rows();
+    assert_eq!(restored.len(), 4, "no row is lost");
+    assert_eq!(
+        restored["thread-j"], before["thread-j"],
+        "the Codex row is unchanged"
+    );
+    assert!(restored["ses-old"].get("role").is_none());
+    harness.hook(
+        &lab.socket,
+        Harness::OpenCode,
+        hook("OpenCodeActivity", "ses-old"),
+    );
+    lab.try_publish("evt-old2", &old, Mode::Message).unwrap();
+    harness.hook(&lab.socket, Harness::OpenCode, child("OpenCodeActivity"));
+    lab.try_publish("evt-kid2", &kid, Mode::Message)
+        .unwrap_err();
+    let renewed = rows();
+    assert_eq!(renewed["ses-old"]["role"], "root");
+    assert_eq!(renewed["ses-kid"]["role"], "child");
+    assert_eq!(renewed["ses-kid"]["capabilities"]["message"], false);
+    // Later restarts restore from the recorded roles with no hook at all.
+    lab.channel.take().unwrap().stop();
+    start(&mut lab);
+    lab.try_publish("evt-old3", &old, Mode::Message).unwrap();
+    lab.try_publish("evt-top3", &top, Mode::Message).unwrap();
+    lab.try_publish("evt-kid3", &kid, Mode::Message)
+        .unwrap_err();
+    harness.stop();
+    codex.stop();
 }
 
 /// Root and subagent callers join exactly one single-use record; replay, unknown, mixed-host and renewed-epoch ids refuse.
@@ -624,6 +823,152 @@ fn claude_later_held_release_receipts_and_transcript_closure() {
     assert!(eventually(6_000, || tiers("evt-quiet")
         .contains(&"context_observed".to_string())));
     harness.stop();
+}
+
+/// A full 16 KiB UTF-8 body (the advertised root body bound), escaped and
+/// wrapped past the former 4096-byte inbox cap, is written to the Claude
+/// inbox byte-exact in one frame, not refused.
+#[test]
+fn claude_later_delivers_a_full_16_kib_body_exactly() {
+    let lab = Lab::new("cb16");
+    let address = lab.claude_address("sess-16");
+    let custody = Arc::clone(&lab.storage) as Arc<dyn Custody>;
+    let mut carrier =
+        ClaudeLaterCarrier::new(Arc::clone(&lab.registry), custody, ClaudeTiming::default())
+            .unwrap();
+    let mut harness = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    harness.cmd(json!({"cmd": "inbox", "session_id": "sess-16", "behavior": "none"}));
+    harness.hook(
+        &lab.socket,
+        Harness::ClaudeCode,
+        hook("SessionStart", "sess-16"),
+    );
+    harness.hook(&lab.socket, Harness::ClaudeCode, hook("Stop", "sess-16"));
+    let body = "&\u{e9}\u{1F600}\n".repeat(2048);
+    assert_eq!(body.len(), 16 * 1024);
+    lab.publish("evt-16k", &address, Mode::Message, &body);
+    let report = dispatch_message(
+        &lab.storage,
+        &mut carrier,
+        &address,
+        &now,
+        &DispatchTiming::default(),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            report,
+            DispatchReport::Sent {
+                state: AttemptState::WrittenNoReceipt,
+                ..
+            }
+        ),
+        "{report:?}"
+    );
+    let manifest = lab.attempt("evt-16k").unwrap().manifest;
+    assert!(manifest.len() > 4096);
+    let frames = harness.cmd(json!({"cmd": "frames"}));
+    assert_eq!(frames["frames"].as_array().unwrap().len(), 1);
+    assert_eq!(frames["frames"][0]["message"]["content"], manifest);
+    harness.stop();
+}
+
+/// Carrier decorator that pads the frozen manifest to an exact byte length
+/// before the real Claude carrier sees it, so the inbox size boundary is
+/// reachable although core never frames more than its own bound.
+struct PaddedManifest {
+    /// The real carrier under test.
+    inner: ClaudeLaterCarrier,
+    /// Exact manifest length handed to the inner carrier, in bytes.
+    len: usize,
+}
+
+impl DispatchCarrier for PaddedManifest {
+    /// Delegates attestation unchanged.
+    fn attest(&mut self, recipient: &NativeAddress) -> Result<Attestation, String> {
+        self.inner.attest(recipient)
+    }
+
+    /// Hands the inner carrier the attempt with its manifest extended by
+    /// trailing spaces to exactly `len` bytes (never shortened).
+    fn send(&mut self, attempt: &AttemptRecord) -> Outcome {
+        let mut padded = attempt.clone();
+        assert!(padded.manifest.len() <= self.len);
+        padded
+            .manifest
+            .push_str(&" ".repeat(self.len - padded.manifest.len()));
+        self.inner.send(&padded)
+    }
+}
+
+/// Sends one small event whose manifest is padded to `len` bytes through a
+/// live fixture inbox; returns the report and the frames the inbox received.
+fn claude_padded_send(tag: &str, len: usize) -> (DispatchReport, Vec<serde_json::Value>) {
+    let lab = Lab::new(tag);
+    let address = lab.claude_address("sess-pad");
+    let custody = Arc::clone(&lab.storage) as Arc<dyn Custody>;
+    let inner =
+        ClaudeLaterCarrier::new(Arc::clone(&lab.registry), custody, ClaudeTiming::default())
+            .unwrap();
+    let mut carrier = PaddedManifest { inner, len };
+    let mut harness = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    harness.cmd(json!({"cmd": "inbox", "session_id": "sess-pad", "behavior": "none"}));
+    harness.hook(
+        &lab.socket,
+        Harness::ClaudeCode,
+        hook("SessionStart", "sess-pad"),
+    );
+    harness.hook(&lab.socket, Harness::ClaudeCode, hook("Stop", "sess-pad"));
+    lab.publish("evt-pad", &address, Mode::Message, "small");
+    let report = dispatch_message(
+        &lab.storage,
+        &mut carrier,
+        &address,
+        &now,
+        &DispatchTiming::default(),
+    )
+    .unwrap();
+    let frames = harness.cmd(json!({"cmd": "frames"}))["frames"]
+        .as_array()
+        .unwrap()
+        .clone();
+    harness.stop();
+    (report, frames)
+}
+
+/// The inbox bound is exact: a manifest of exactly `MAX_MESSAGE_BYTES` is
+/// written as one frame; one byte more is a permanent refusal and nothing
+/// reaches the inbox (no frame, no resend, no chunking).
+#[test]
+fn claude_later_inbox_bound_is_exact_and_refusal_writes_nothing() {
+    let (report, frames) = claude_padded_send("cbx", MAX_MESSAGE_BYTES);
+    assert!(
+        matches!(
+            report,
+            DispatchReport::Sent {
+                state: AttemptState::WrittenNoReceipt,
+                ..
+            }
+        ),
+        "{report:?}"
+    );
+    assert_eq!(frames.len(), 1);
+    assert_eq!(
+        frames[0]["message"]["content"].as_str().unwrap().len(),
+        MAX_MESSAGE_BYTES
+    );
+    let (report, frames) = claude_padded_send("cby", MAX_MESSAGE_BYTES + 1);
+    assert!(
+        matches!(
+            report,
+            DispatchReport::Sent {
+                state: AttemptState::PermanentRefusal,
+                ..
+            }
+        ),
+        "{report:?}"
+    );
+    assert!(frames.is_empty(), "{frames:?}");
 }
 
 /// A recipient whose loaded harness positively runs without a native inbox
@@ -1679,6 +2024,69 @@ fn codex_child_thread_has_its_own_address_and_drains_only_its_own() {
     harness.stop();
 }
 
+/// The production Desktop chain (Codex harness, the signed Node frontend that
+/// replaced the launched MCP process, its Rust MCP child) attests the child's
+/// caller through exactly that one Node hop: real Node runs the embedded
+/// client, which removes both capability variables from the child. The hop is
+/// refused when Node is not the runtime its host environment named, when the
+/// application pipe capability is absent, and for a non-Codex harness; the
+/// direct (Node-free) MCP child keeps attesting as before.
+#[test]
+fn signed_node_hop_attests_only_the_qualified_codex_frontend_child() {
+    let Some(node) = std::env::var("BRIDGE_TEST_NODE").ok() else {
+        eprintln!("signed Node hop check skipped: BRIDGE_TEST_NODE missing");
+        return;
+    };
+    let lab = Lab::new("nh");
+    let pipe = lab.dir.0.join("app.sock");
+    let mut harness = Harnessed::start(Harness::Codex, &lab.codex_store);
+    let meta =
+        |call: &str| json!({"threadId": "thread-n", "callId": call, "x-codex-turn-metadata": {}});
+    let attest =
+        |harness: &mut Harnessed, call: &str, node_path: &str, pipe: Option<&std::path::Path>| {
+            harness.hook(
+                &lab.socket,
+                Harness::Codex,
+                tool_hook("PreToolUse", "thread-n", call, None),
+            );
+            harness.cmd(
+                json!({"cmd": "mcp", "socket": lab.socket, "meta": meta(call),
+            "node": node, "node_path": node_path, "pipe": pipe}),
+            )
+        };
+    let qualified = attest(&mut harness, "call-n1", &node, Some(&pipe));
+    assert_eq!(
+        qualified["ok"]["address"],
+        lab.codex_address("thread-n").to_canonical_string(),
+        "{qualified}"
+    );
+    for (call, node_path, pipe) in [
+        ("call-n2", "/usr/bin/true", Some(pipe.as_path())),
+        ("call-n3", node.as_str(), None),
+    ] {
+        let refused = attest(&mut harness, call, node_path, pipe);
+        assert!(refused.get("ok").is_none(), "{call}: {refused}");
+    }
+    harness.hook(
+        &lab.socket,
+        Harness::Codex,
+        tool_hook("PreToolUse", "thread-n", "call-n4", None),
+    );
+    let direct = harness.mcp(&lab.socket, meta("call-n4"));
+    assert_eq!(direct["ok"]["may_act_as_address"], true, "{direct}");
+    harness.stop();
+    let mut claude = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    claude.hook(
+        &lab.socket,
+        Harness::ClaudeCode,
+        tool_hook("PreToolUse", "sess-n", "tu-n", None),
+    );
+    let refused = claude.cmd(json!({"cmd": "mcp", "socket": lab.socket,
+        "meta": claude_meta("tu-n"), "node": node, "pipe": pipe}));
+    assert!(refused.get("ok").is_none(), "{refused}");
+    claude.stop();
+}
+
 /// A message capability unavailable on the host refuses publication before acceptance.
 #[test]
 fn unsupported_message_capability_refuses_before_acceptance() {
@@ -1872,6 +2280,74 @@ fn codex_helper_total_budget_survives_floods_and_stalled_writes() {
         assert!(took < Duration::from_secs(5), "{behavior} took {took:?}");
     }
     harness.stop();
+}
+
+/// A real `bridge-native-daemon` killed with SIGKILL leaves its core and
+/// channel sockets behind; a restart with the same configuration reclaims both
+/// stale sockets and serves the channel from the new process. While that
+/// daemon lives, a rival daemon with its own core socket but the same channel
+/// refuses at the channel lock and leaves the live endpoints served.
+#[test]
+fn native_daemon_restarts_after_a_crash_left_stale_sockets() {
+    let dir = TempDir::new("cr");
+    let channel_dir = dir.0.join("ch");
+    bridge_adapters::server::private_directory(&channel_dir).unwrap();
+    let channel = channel_dir.join("c.sock");
+    let core = dir.0.join("core.sock");
+    let config = format!(
+        "database = \"{db}\"\nsocket = \"{core}\"\n[limits]\nmax_admitted_events = 10\n[adapters]\nchannel = \"{channel}\"\nhost_id = \"{HOST}\"\n[[adapters.harnesses]]\nharness = \"ClaudeCode\"\nnamespace = \"claude-lab\"\ninject = true\nmessage = true\nexecutable_markers = [\"bridge-fixture\"]\n",
+        db = dir.0.join("b.db").display(),
+        core = core.display(),
+        channel = channel.display(),
+    );
+    let config_path = dir.0.join("bridge.toml");
+    std::fs::write(&config_path, config).unwrap();
+    // A rival daemon with its own core socket and database but the same channel.
+    let rival_path = dir.0.join("rival.toml");
+    std::fs::write(
+        &rival_path,
+        std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replace("core.sock", "rival.sock")
+            .replace("b.db", "r.db"),
+    )
+    .unwrap();
+    let spawn = |config: &std::path::Path| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_bridge-native-daemon"))
+            .arg(config)
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    let served_by = |socket: &std::path::Path, pid: u32| {
+        std::os::unix::net::UnixStream::connect(socket)
+            .ok()
+            .and_then(|stream| bridge_adapters::os::peer_identity(&stream).ok())
+            .is_some_and(|peer| peer.pid == pid)
+    };
+    let mut first = spawn(&config_path);
+    assert!(eventually(10_000, || served_by(&channel, first.id())
+        && served_by(&core, first.id())));
+    first.kill().unwrap();
+    first.wait().unwrap();
+    assert!(
+        channel.exists() && core.exists(),
+        "a crash leaves both sockets"
+    );
+    let mut second = spawn(&config_path);
+    assert!(
+        eventually(10_000, || served_by(&channel, second.id())
+            && served_by(&core, second.id())),
+        "the restarted daemon serves its channel: {:?}",
+        second.try_wait()
+    );
+    let mut rival = spawn(&rival_path);
+    let status = rival.wait().unwrap();
+    assert!(!status.success(), "a rival never takes a live channel");
+    assert!(served_by(&channel, second.id()) && served_by(&core, second.id()));
+    assert!(second.try_wait().unwrap().is_none());
+    second.kill().unwrap();
+    second.wait().unwrap();
 }
 
 /// The real `bridge-native-daemon` composition: the probe MCP server
@@ -2739,6 +3215,143 @@ fn signed_parent_private_channel_delivers_one_message() {
         "{result:?}"
     );
     native.join().unwrap();
+    stop.store(true, Ordering::Relaxed);
+    drop(daemon.join().unwrap());
+}
+
+/// The whole production Desktop chain (daemon hand-off, Rust relay child, its
+/// private descriptor to the signed Node parent, the native host pipe) carries
+/// every manifest core can frame: a 16 KiB body of `&` (rendered to 80 KiB),
+/// and a full-bound manifest of backslashes with worst-case escaped ids, whose
+/// private JSON frame doubles. Each reaches the host byte-exact as one call. A
+/// manifest one byte over core's bound is refused before any byte is written,
+/// and the same frontend still delivers afterwards (its child was not killed).
+#[test]
+fn signed_parent_carries_every_core_framed_manifest() {
+    use bridge_core::framing::MAX_FRAMED_BYTES;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::process::{Command, Stdio};
+    let Some(node) = std::env::var_os("BRIDGE_TEST_NODE") else {
+        eprintln!("signed parent bound check skipped: BRIDGE_TEST_NODE missing");
+        return;
+    };
+    let dir = TempDir::new("sb");
+    let channel = dir.0.join("c.sock");
+    let listener = UnixListener::bind(&channel).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopping = Arc::clone(&stop);
+    let daemon = std::thread::spawn(move || {
+        let mut peers = Vec::new();
+        while !stopping.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((stream, _)) => peers.push(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+        peers
+    });
+    let pipe = dir.0.join("h.sock");
+    let host = UnixListener::bind(&pipe).unwrap();
+    let prompts = Arc::new(Mutex::new(Vec::<(String, String, String)>::new()));
+    let seen = Arc::clone(&prompts);
+    // One native connection per delivery; every accepted one completes the
+    // fixed inventory and message call and records the exact host arguments.
+    let native = std::thread::spawn(move || {
+        for _ in 0..3 {
+            let (mut stream, _) = host.accept().unwrap();
+            for id in [1, 2] {
+                let mut head = [0; 4];
+                stream.read_exact(&mut head).unwrap();
+                let mut body = vec![0; u32::from_le_bytes(head) as usize];
+                stream.read_exact(&mut body).unwrap();
+                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(request["id"], id);
+                let result = if id == 1 {
+                    json!({"tools":[{"name":"send_message_to_thread","namespace":"codex_app"}]})
+                } else {
+                    let params = &request["params"];
+                    seen.lock().unwrap().push((
+                        params["threadId"].as_str().unwrap().to_string(),
+                        params["callId"].as_str().unwrap().to_string(),
+                        params["arguments"]["prompt"].as_str().unwrap().to_string(),
+                    ));
+                    json!({"success":true})
+                };
+                let bytes =
+                    serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"result":result})).unwrap();
+                stream
+                    .write_all(&(bytes.len() as u32).to_le_bytes())
+                    .unwrap();
+                stream.write_all(&bytes).unwrap();
+            }
+        }
+    });
+    let mut child = Command::new(node)
+        .arg("-e")
+        .arg(include_str!("../assets/desktop-client.cjs"))
+        .arg("--")
+        .arg(fixture_exe())
+        .arg("desktop-child")
+        .arg(&channel)
+        .env("CODEX_APP_TOOLS_PIPE_PATH", &pipe)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut ready = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+    assert_eq!(ready.trim(), "ready");
+    let me = bridge_adapters::os::process_facts(std::process::id()).unwrap();
+    let path = bridge_adapters::desktop::frontend_for(&dir.0, (me.pid, me.start_time)).unwrap();
+    let deliver = |thread: &str, call: &str, text: &str| {
+        bridge_adapters::desktop::via_frontend(&path, (me.pid, me.start_time), thread, call, text)
+    };
+    // 16 KiB of `&` as core renders it: 80 KiB, over the former 64 KiB text cap.
+    let ampersands = "&amp;".repeat(16 * 1024);
+    // The largest framed manifest of backslashes with 256-byte ids of
+    // backslashes: every byte doubles in the private JSON frame.
+    let backslashes = "\\".repeat(MAX_FRAMED_BYTES);
+    let worst_id = "\\".repeat(256);
+    let cases = [
+        ("owned-thread", "bridge-amp", ampersands.as_str()),
+        (worst_id.as_str(), worst_id.as_str(), backslashes.as_str()),
+    ];
+    for (thread, call, text) in cases {
+        let result = deliver(thread, call, text);
+        assert!(
+            matches!(result, Outcome::NativeAccepted { .. }),
+            "{} bytes: {result:?}",
+            text.len()
+        );
+    }
+    let over = "a".repeat(MAX_FRAMED_BYTES + 1);
+    let refused = deliver("owned-thread", "bridge-over", &over);
+    assert!(
+        matches!(refused, Outcome::KnownUnsent { .. }),
+        "{refused:?}"
+    );
+    let after = deliver("owned-thread", "bridge-after", "marker");
+    assert!(matches!(after, Outcome::NativeAccepted { .. }), "{after:?}");
+    native.join().unwrap();
+    let prompts = prompts.lock().unwrap().clone();
+    let expected: Vec<(String, String, String)> = cases
+        .iter()
+        .chain([("owned-thread", "bridge-after", "marker")].iter())
+        .map(|(thread, call, text)| (thread.to_string(), call.to_string(), text.to_string()))
+        .collect();
+    assert!(
+        prompts == expected,
+        "the host saw other calls than expected"
+    );
+    drop(child.stdin.take());
+    assert!(child.wait().unwrap().success());
     stop.store(true, Ordering::Relaxed);
     drop(daemon.join().unwrap());
 }

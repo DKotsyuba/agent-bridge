@@ -29,7 +29,12 @@ producer ──► bridge-core service (SQLite custody, dispatch, recovery)
     including `Deserialize`, and every `u64` that reaches SQLite is range-checked
     before any signed conversion.
   - `schema` / `storage`: SQLite durable custody (WAL, `synchronous = FULL`, busy
-    timeout). See [Custody](#custody).
+    timeout). Validation and any supported migration hold an exclusive lock through enabling WAL.
+  A foreign, unknown or newer database is refused before Bridge makes any schema or
+  journal-mode change and without a close-time WAL checkpoint; SQLite's own recovery of
+  an interrupted rollback journal may restore committed content first, and ordinary WAL
+  reads or recovery may rewrite advisory `-shm` WAL-index metadata (the main and WAL
+  bytes of a refused WAL database are preserved). See [Custody](#custody).
   - `framing`: allowlisted source-tag wrappers with escaped, bounded manifests, a
     separate source block per member, forbidden-control rejection and a fixed
     external-data, no-authority statement. An event that could never be rendered is
@@ -58,7 +63,9 @@ Publication is idempotent: an identical replay returns the original receipt, and
 changed identity-content conflicts. Acceptance order is monotonic.
 
 - `latest` streams keep a watermark scoped by the full coalescing group; only older
-  pending snapshots are superseded.
+  pending snapshots are superseded. A lifetime-scoped stream is retained and read by its
+  full scoped key; an unscoped legacy key uses the legacy watermark, and a malformed or
+  mismatched lifetime key refuses.
 - Admission quotas: a non-terminal cap with at least one slot, a quarter of larger
   caps reserved for `keep_all`, a per-publisher cap, a per-recipient snapshot
   reserve (with `keep_all` exempt) and a hard cap on retained dedup history that is
@@ -89,7 +96,7 @@ changed identity-content conflicts. Acceptance order is monotonic.
   `unknown_handoff` incident, becomes a `review` event; every version-3 incident is
   carried into the live table with its number, kind, reason and dates; open ones stay
   open whatever their kind, and the old rows stay in `incidents_v3`. Unknown, newer
-  and foreign databases are refused untouched.
+  and foreign databases are refused before any Bridge schema or journal-mode change.
 
 ## Dispatch contract
 
@@ -154,7 +161,9 @@ Rules enforced by core:
 - Selection is `keep_all` first with age-based anti-starvation of snapshots. Independent
   traffic is never blocked behind a dependent. Batch siblings are frozen together in
   acceptance order only inside one scope (publisher, recipient, kind, mode, project,
-  task, group), and an in-flight manifest is immutable.
+  task, group), and an in-flight manifest is immutable. A late outcome of a batch keeps
+  its evidence for every frozen member but changes state and incidents only for members
+  still owned by that exact attempt; disposed or newer siblings are unchanged.
 
 ## Service and protocol
 
@@ -200,8 +209,19 @@ contract](../crates/bridge-core/docs/producer-core-v1.md).
 Socket ownership refuses a live endpoint, preserves every foreign path (regular file,
 symlink, directory, unprovable socket) and removes a stale socket only after a
 connection attempt was positively refused and the inode is unchanged. The socket is
-created `0600`, and only the service's own inode is removed at stop. Frames are limited
-incrementally *before* allocation; connections are capped; idle or stalled readers and
+created `0600` under a lifetime `.lock` file; a stale socket is removed only when it
+belongs to the same user, a connection was refused and its inode is unchanged. Readiness
+for lifecycle supervision requires both the core and the adapter-channel sockets from the
+spawned process, by its exact PID, each as a distinct OS socket (device and inode), so two
+names of one socket never count twice and an unreadable identity is not ready; a configuration whose adapter channel is the core
+socket's own endpoint (same directory and file name, including `.` and symlinked directory
+aliases) is refused before the process is spawned; other aliases (for example a case variant
+or a hard link) are not all recognized before spawning and fail readiness instead. A start whose required socket
+paths (the core and adapter-channel sockets for the core, the relay socket for the relay)
+include a final-component symlink, dangling or not, is also refused before spawning and the link is left unchanged. Only the service's own inode is removed at stop. Frames are limited
+incrementally *before* allocation; connections are capped; an idle connection and a
+request in progress have separate absolute deadlines, the request deadline starting at the
+first nonempty byte buffer (an interrupted read renews neither); stalled readers and
 non-reading writers time out. Stopping fences new work under the custody lock (nothing
 is accepted after the stop returned), wakes and drains in-flight connections, and is
 bounded even with a hung carrier. SIGTERM and SIGINT stop the daemon cleanly (a second

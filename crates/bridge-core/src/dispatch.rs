@@ -1472,9 +1472,14 @@ impl Storage {
     /// - `PermanentRefusal` opens an incident and blocks dependents until
     ///   an audited disposition;
     /// - `KnownUnsent` needs non-empty positive evidence, closes the
-    ///   attempt before any retry, applies the bounded retry delay (an
-    ///   exhausted budget refuses the event with an incident) and
-    ///   supersedes a snapshot that a newer revision has replaced.
+    ///   attempt before settling each member it still owns. Outside a retired
+    ///   lifetime, the bounded retry delay/budget applies, or a replaced
+    ///   snapshot is superseded. In a `retire_unhanded` lifetime, a member with
+    ///   any retained possible-effect history stays in review with an incident;
+    ///   only proved zero-effect work is disposed. Neither returns to rotation.
+    ///
+    /// Evidence is retained for every frozen member; disposed or newer-owned
+    /// members and their incidents are unchanged.
     ///
     /// A late outcome for an `outcome_unknown` attempt may only be positive
     /// (accepted, hook submitted, known-unsent with proof, refusal): it
@@ -1519,7 +1524,7 @@ impl Storage {
                 fence.attempt_seq
             )));
         }
-        apply_outcome(&tx, &record, outcome, late, now_ms)?;
+        apply_outcome(&tx, &record, outcome, now_ms)?;
         let updated = load_attempt(&tx, fence.attempt_seq)?
             .ok_or_else(|| corrupt("an attempt disappeared".into()))?;
         tx.commit()?;
@@ -1570,7 +1575,8 @@ impl Storage {
     /// event ages a recipient), which can reorder recipients between
     /// windows, so no exact coverage bound is promised for a changing
     /// workload. An `after` that no longer has work restarts from the
-    /// beginning.
+    /// beginning. Retired `retire_unhanded` lifetimes are excluded, including
+    /// unhanded rows left by older builds; diagnostics expose their fence.
     pub fn recipients_with_work(
         &self,
         now_ms: u64,
@@ -1585,6 +1591,9 @@ impl Storage {
                  LEFT JOIN recipient_holds h ON h.recipient = e.recipient
                  WHERE e.state = 'pending' AND e.delivery = 'unhanded' AND e.not_before_ms <= ?1
                    AND (e.expires_at_ms IS NULL OR e.expires_at_ms > ?1)
+                   AND NOT EXISTS (SELECT 1 FROM delivery_scopes s
+                       WHERE s.producer = e.publisher_id AND s.scope_key = e.delivery_scope_key
+                         AND s.closed_ms IS NOT NULL AND s.action = 'retire_unhanded')
                  GROUP BY e.recipient)
              SELECT recipient FROM work
              ORDER BY ((held, waiting_since, recipient) <=
@@ -1616,15 +1625,18 @@ impl Storage {
     /// keep_all priority and anti-starvation aging, for diagnostics.
     ///
     /// Ignores mode, lifecycle and path gating; superseded, expired,
-    /// reserved and handed-off events are never listed.
+    /// reserved and handed-off events and retired lifetimes are never listed.
     pub fn next_pending(
         &self,
         recipient: &str,
         limit: usize,
     ) -> Result<Vec<PendingEvent>, CoreError> {
         let mut statement = self.connection.prepare(&format!(
-            "SELECT publisher_id, event_id, policy_class FROM events
+            "SELECT publisher_id, event_id, policy_class FROM events e
              WHERE state = 'pending' AND delivery = 'unhanded' AND recipient = ?1
+               AND NOT EXISTS (SELECT 1 FROM delivery_scopes s
+                   WHERE s.producer = e.publisher_id AND s.scope_key = e.delivery_scope_key
+                     AND s.closed_ms IS NOT NULL AND s.action = 'retire_unhanded')
              ORDER BY accepted_at_ms
                       - CASE policy_class WHEN 'keep_all' THEN {KEEP_ALL_BOOST_MS} ELSE 0 END,
                       acceptance_seq
@@ -1646,16 +1658,14 @@ impl Storage {
 /// Applies an outcome to an attempt and its members inside the caller's
 /// transaction.
 ///
-/// `late` marks an outcome for an attempt that was already
-/// `outcome_unknown`; such an outcome changes member delivery state and
-/// raises incidents only while the attempt still owns its events, and only
+/// Every outcome changes each member's delivery state and raises incidents
+/// only while this attempt still owns that member, and only
 /// closes incidents that this attempt raised. The attempt row and its
 /// evidence tier are always recorded.
 pub(crate) fn apply_outcome(
     tx: &Transaction<'_>,
     record: &AttemptRecord,
     outcome: Outcome,
-    late: bool,
     now_ms: u64,
 ) -> Result<(), CoreError> {
     let seq = record.fence.attempt_seq;
@@ -1738,36 +1748,46 @@ pub(crate) fn apply_outcome(
         )?;
     }
 
-    // A late positive outcome may only change members this attempt still
-    // owns; otherwise a newer (manually authorized) attempt owns them and
-    // the evidence alone is kept.
-    let owned = |tx: &Connection| -> Result<bool, CoreError> {
-        let count: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM events WHERE attempt_seq = ?1",
-            params![to_sql(seq)?],
+    // Snapshot ownership before terminal transitions clear it. Evidence above
+    // covers every frozen member; state and incidents below cover only owners.
+    let mut owned_members = Vec::new();
+    for member in &record.members {
+        let owns: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM events WHERE publisher_id = ?1 AND event_id = ?2 AND attempt_seq = ?3)",
+            params![member.publisher, member.event_id, to_sql(seq)?],
             |row| row.get(0),
         )?;
-        Ok(count > 0)
-    };
+        if owns {
+            owned_members.push(member);
+        }
+    }
     match state {
         AttemptState::NativeAccepted => {
-            if !late || owned(tx)? {
-                set_member_delivery(tx, seq, delivery::ACCEPTED, false)?;
-            }
-            resolve_attempt_incidents(tx, record, "positive evidence: native accepted", now_ms)?;
+            set_member_delivery(tx, seq, delivery::ACCEPTED, false)?;
+            resolve_attempt_incidents(
+                tx,
+                record,
+                &owned_members,
+                "positive evidence: native accepted",
+                now_ms,
+            )?;
         }
         AttemptState::HookSubmitted => {
-            if !late || owned(tx)? {
-                set_member_delivery(tx, seq, delivery::HOOK_SUBMITTED, false)?;
-            }
-            resolve_attempt_incidents(tx, record, "positive evidence: hook emitted", now_ms)?;
+            set_member_delivery(tx, seq, delivery::HOOK_SUBMITTED, false)?;
+            resolve_attempt_incidents(
+                tx,
+                record,
+                &owned_members,
+                "positive evidence: hook emitted",
+                now_ms,
+            )?;
         }
         AttemptState::NativeHeld | AttemptState::WrittenNoReceipt => {
             set_member_delivery(tx, seq, delivery::HELD, true)?;
         }
         AttemptState::OutcomeUnknown => {
             set_member_delivery(tx, seq, delivery::REVIEW, true)?;
-            for member in &record.members {
+            for member in &owned_members {
                 open_incident_in(
                     tx,
                     &member.publisher,
@@ -1780,19 +1800,17 @@ pub(crate) fn apply_outcome(
             }
         }
         AttemptState::PermanentRefusal => {
-            let owns = !late || owned(tx)?;
-            if owns {
-                set_member_delivery(tx, seq, delivery::REFUSED, false)?;
-            }
+            set_member_delivery(tx, seq, delivery::REFUSED, false)?;
             resolve_attempt_incidents(
                 tx,
                 record,
+                &owned_members,
                 "positive evidence: refused before acceptance",
                 now_ms,
             )?;
             // A refusal of an attempt that no longer owns its events is
             // evidence only; it must not raise an incident on the newer one.
-            for member in record.members.iter().filter(|_| owns) {
+            for member in &owned_members {
                 open_incident_in(
                     tx,
                     &member.publisher,
@@ -1805,10 +1823,14 @@ pub(crate) fn apply_outcome(
             }
         }
         AttemptState::KnownUnsent => {
-            if !late || owned(tx)? {
-                return_unsent(tx, record, now_ms)?;
-            }
-            resolve_attempt_incidents(tx, record, "positive evidence: known unsent", now_ms)?;
+            return_unsent(tx, record, now_ms)?;
+            resolve_attempt_incidents(
+                tx,
+                record,
+                &owned_members,
+                "positive evidence: known unsent",
+                now_ms,
+            )?;
         }
         AttemptState::Reserved | AttemptState::Invoking | AttemptState::Closed => {
             return Err(corrupt("an outcome mapped to a non-outcome state".into()));
@@ -1828,6 +1850,7 @@ fn clamp_recheck(requested_ms: u64, now_ms: u64) -> u64 {
 /// Closes the open incidents that belong to one attempt's members with a
 /// positive resolution, for outcomes that settle the uncertainty.
 ///
+/// `members` is the ownership snapshot taken before terminal transitions.
 /// Only incidents raised by this attempt (or unattributed ones, such as a
 /// `migrated_unverified` incident that predates attempt numbering) close; a
 /// newer attempt's incident on the same event stays open, so a late outcome
@@ -1835,10 +1858,11 @@ fn clamp_recheck(requested_ms: u64, now_ms: u64) -> u64 {
 fn resolve_attempt_incidents(
     tx: &Connection,
     record: &AttemptRecord,
+    members: &[&MemberRef],
     resolution: &str,
     now_ms: u64,
 ) -> Result<(), CoreError> {
-    for member in &record.members {
+    for member in members {
         tx.execute(
             "UPDATE incidents SET state = 'resolved', resolution = ?1, updated_ms = ?2,
                  resolved_ms = ?2
@@ -1860,7 +1884,10 @@ fn resolve_attempt_incidents(
 
 /// Returns the members of a positively unsent attempt to rotation.
 ///
-/// The attempt is already closed. Each member gets the bounded retry delay;
+/// The attempt is already closed. Only members still owned by it change.
+/// Retired lifetimes dispose zero-effect members or retain all possible
+/// historical effects in review with an incident; they never reenter rotation.
+/// Other members get the bounded retry delay;
 /// one that has used its automatic budget is refused with an incident; a
 /// snapshot that a newer revision has meanwhile replaced is superseded
 /// instead of retried.
@@ -1870,12 +1897,69 @@ fn return_unsent(
     now_ms: u64,
 ) -> Result<(), CoreError> {
     for member in &record.members {
-        let (attempts, scope, revision): (i64, String, Option<i64>) = tx.query_row(
-            "SELECT attempts_made, scope_key, revision FROM events
-             WHERE publisher_id = ?1 AND event_id = ?2",
-            params![member.publisher, member.event_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
+        let row: Option<(i64, String, Option<i64>, bool)> = tx
+            .query_row(
+                "SELECT e.attempts_made, e.scope_key, e.revision, EXISTS (
+                 SELECT 1 FROM delivery_scopes s WHERE s.producer = e.publisher_id
+                 AND s.scope_key = e.delivery_scope_key AND s.closed_ms IS NOT NULL
+                 AND s.action = 'retire_unhanded') FROM events e
+             WHERE e.publisher_id = ?1 AND e.event_id = ?2 AND e.attempt_seq = ?3",
+                params![
+                    member.publisher,
+                    member.event_id,
+                    to_sql(record.fence.attempt_seq)?
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((attempts, scope, revision, retired)) = row else {
+            continue;
+        };
+        if retired {
+            // Clear this known-unsent attempt's current state before consulting
+            // the shared conservative history predicate; older effects remain.
+            tx.execute(
+                "UPDATE events SET delivery = 'unhanded', attempt_seq = NULL
+                        WHERE publisher_id = ?1 AND event_id = ?2 AND attempt_seq = ?3",
+                params![
+                    member.publisher,
+                    member.event_id,
+                    to_sql(record.fence.attempt_seq)?
+                ],
+            )?;
+            let possible: bool = tx.query_row(
+                &format!(
+                    "SELECT {} FROM events e WHERE e.publisher_id = ?1 AND e.event_id = ?2",
+                    crate::universal::POSSIBLE_EFFECT
+                ),
+                params![member.publisher, member.event_id],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "UPDATE events SET delivery = ?1 WHERE publisher_id = ?2 AND event_id = ?3",
+                params![
+                    if possible {
+                        delivery::REVIEW
+                    } else {
+                        delivery::DISPOSED
+                    },
+                    member.publisher,
+                    member.event_id
+                ],
+            )?;
+            if possible {
+                open_incident_in(
+                    tx,
+                    &member.publisher,
+                    &member.event_id,
+                    Some(record.fence.attempt_seq),
+                    "retired_possible_effect",
+                    "retired lifetime retains historical possible effects; automatic delivery is fenced",
+                    now_ms,
+                )?;
+            }
+            continue;
+        }
         let attempts = u32::try_from(from_sql(attempts)?).unwrap_or(u32::MAX);
         let newer: bool = match revision {
             Some(revision) => tx.query_row(

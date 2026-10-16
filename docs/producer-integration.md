@@ -143,7 +143,7 @@ in-flight operation cannot still commit.
 - `close_route` fences new custody only; accepted events keep their frozen destination and
   delivery policy. The optional `retire_delivery_scope` closes a producer lifetime:
   `retire_unhanded` also fences reservation and new invoking, including already reserved
-  manifests. If invoking committed first, the possible effect is retained and cannot be
+  manifests, and permanently rejects manual retry of the retired members. If invoking committed first, the possible effect is retained and cannot be
   recalled; later evidence changes event status, never the immutable retirement counts. A
   scope retired before its first publication stays a permanent tombstone.
 - A Bridge restart restores still-live recipient bindings and durable route receipts. It loses

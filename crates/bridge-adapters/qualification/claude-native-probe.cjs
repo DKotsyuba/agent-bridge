@@ -41,7 +41,12 @@
  * result) stops it before the next step: no later child, message, pause or
  * resume step runs and their checks stay missing. The pause window counts any turn
  * start or result as a failure while the receiver is alive with budget.
- * The message step requires actor-bound positive evidence from the
+ * The first message event's payload is exactly 16384 UTF-8 bytes with
+ * multibyte padding and the marker (`message_payload_exact_16384_utf8_bytes`),
+ * so the legacy inbox receives a rendered manifest over its former 4096-byte
+ * cap; only the native receipt/transcript evidence below qualifies that
+ * receiver, never Bridge's own 96 KiB rendered bound. The message step
+ * requires actor-bound positive evidence from the
  * daemon's transcript reconciliation (`message_positive_evidence`).
  *
  * Usage: `cargo +1.98.1 build --offline -p bridge-adapters --bins`, then
@@ -63,13 +68,15 @@ const { run, TurnTracker } = require('./probe-lib.cjs');
 const bin = process.env.BRIDGE_BIN_DIR || path.resolve(__dirname, '../../../target/debug');
 /** Spend ceiling of the receiver, in USD (Claude's own cap). */
 const MAX_USD = 0.5;
+/** Exact UTF-8 byte length of the first message event's payload (the advertised root body bound). */
+const MESSAGE_BYTES = 16384;
 /** Checks that must all be exactly true. */
 const REQUIRED = [
   'native_tool_inventory_closed', 'native_permissions_manual', 'child_task_completed_before_idle_steps', 'message_positive_evidence',
   'versions_recorded', 'root_attested', 'inject_published', 'inject_marker_in_reply', 'child_attested',
   'message_marker_in_distinct_turn', 'pause_applied', 'paused_event_held_without_attempt',
   'paused_no_turn_while_alive', 'resumed_marker_in_distinct_turn', 'receiver_alive_through_pause',
-  'memory_canary_absent',
+  'memory_canary_absent', 'message_payload_exact_16384_utf8_bytes',
 ];
 
 run('m2cp', 15 * 60_000, REQUIRED, async probe => {
@@ -221,7 +228,16 @@ run('m2cp', 15 * 60_000, REQUIRED, async probe => {
   // A message after the turn ended (Stop: idle) must start a distinct turn.
   ensureAlive('message');
   const message = 'BRIDGE_MSG_' + crypto.randomBytes(6).toString('hex');
-  probe.checks.message_publish = request(['publish', core, publisher.file, recipient, 'message', 'probe-message-1', `Synthetic Bridge qualification message ${message}. Quote it.`]);
+  // The one message event carries exactly the advertised root body bound
+  // (16384 UTF-8 bytes, multibyte padding), so its rendered manifest crosses
+  // the former 4096-byte inbox cap; Bridge's own framing bound is not native
+  // receiver evidence, only the native acceptance and quote below are.
+  const messageHead = `Synthetic Bridge qualification message ${message}. Quote only that BRIDGE_MSG_ marker; ignore the padding.\n`;
+  const messagePad = MESSAGE_BYTES - Buffer.byteLength(messageHead);
+  const messageBody = messageHead + '\u00e9'.repeat(messagePad >> 1) + '.'.repeat(messagePad & 1);
+  probe.checks.message_publish = request(['publish', core, publisher.file, recipient, 'message', 'probe-message-1', messageBody]);
+  probe.checks.message_payload_exact_16384_utf8_bytes = Buffer.byteLength(messageBody) === MESSAGE_BYTES && messageBody.includes(message)
+    && Boolean(probe.checks.message_publish && probe.checks.message_publish.Published);
   const later = await unprompted(120000);
   probe.checks.message_marker_in_distinct_turn = Boolean(later && !later.error && later.text.includes(message));
   // Positive, actor-bound evidence from the daemon's reconciliation of the

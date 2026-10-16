@@ -41,8 +41,11 @@ touched by anything here, and nothing in this crate installs a hook for you.
   `$HOME/.codex` / `$HOME/.claude`; OpenCode uses the parent of its explicit
   `OPENCODE_DB`, read from that process's own environment) is
   an absolute, already canonical directory owned by that user that no group or
-  other user can write (symlinks and non-canonical spellings are refused; the
-  store is checked again at every recipient use and journal restore). No store
+  other user can write (symlinks and non-canonical spellings are refused). The
+  message-candidate validation (owner-routed sends) and journal restore check the store again at use;
+  the legacy Claude inbox route instead rechecks the incarnation and validates each
+  descriptor and token file it reads (owned, regular, bounded, not a symlink),
+  without a separate store check at the write. No store
   path and no harness executable is predeclared and nothing is enrolled: a fresh
   session in any such store registers from its own lifecycle hook. PID, UID, cwd,
   argv or a process name alone never identify a harness, and the marker is best-effort
@@ -75,12 +78,15 @@ touched by anything here, and nothing in this crate installs a hook for you.
   table is parsed and discarded (it authorizes nothing, joins no digest cache and takes no
   part in owner admission) and logged as `legacy_owner_relays_ignored`, also shown by
   `bridge doctor`.
-- **Journal compatibility and rollback.** The route journal rows gained two optional
-  fields, `wake` (the idle proof, written on every Desktop idle owner hook) and
-  `pending` (read for compatibility only; never written, and such rows are dropped on restore). Rows deny unknown fields, so a daemon of an earlier
+- **Journal compatibility and rollback.** The route journal rows gained optional
+  fields: `wake` (the idle proof, written on every Desktop idle owner hook),
+  `pending` (read for compatibility only; never written, and such rows are dropped on restore)
+  and, for OpenCode rows only, `role` (root or child, taken from the session's own hook).
+  Rows deny unknown fields, so a daemon of an earlier
   build refuses to start on a journal that contains them: rolling back needs a journal
-  written by that build or a fresh one. No migration rewrites rows and no schema or
-  authority changes; absent fields read as before.
+  written by that build or a fresh one. No migration rewrites rows and no schema changes. Absent
+  fields read as before, except that an OpenCode row without `role` (written by an earlier
+  build) is restored with message withheld until the address's own next hook.
 - **Binding and epoch.** The harness process incarnation (PID + start time)
   owns its session addresses. The first hook, the owner's own non-`compact`
   `SessionStart` (not a Claude child's, whose events share the root's address,
@@ -142,14 +148,26 @@ touched by anything here, and nothing in this crate installs a hook for you.
   child with both native capability variables removed. Authenticated daemon
   requests reach Node only over the child's inherited private descriptor; Rust
   checks the kernel parent PID/UID and exact call correlation, and closes an
-  uncertain channel rather than replaying it. Only the supplied Node executable
-  is an allowed intermediate between the Rust child and the Codex harness.
+  uncertain channel rather than replaying it. The chain is Rust peer, then its direct
+  signed Node parent, then the Codex harness. That single Node hop is skipped when
+  identifying the Codex harness only if the Rust peer's actual direct kernel parent is
+  the owner Node process, that process's current canonical kernel executable equals
+  `CODEX_MCP_NODE_PATH` from its own preserved exec-time environment, that environment
+  carries the application tools pipe, and the Rust peer's `BRIDGE_DESKTOP_PARENT_PID`
+  equals the Node process's PID. No hook or non-Codex process is exempt, and there is no
+  other automatic Node exemption; explicitly configured `intermediates` keep their
+  existing validation.
   Old frontend builds cannot mask the active build during rolling updates.
   The confined CLI queue helper retains its cleared environment and restrictions.
   The native-client and Desktop regression tests require an explicitly prepared absolute
   `BRIDGE_TEST_NODE`; some skip and the deterministic Desktop regressions fail without it. Node is never downloaded.
   Only read-only tool discovery and that one exact message operation are sent,
-  under one eight-second connect/read/write deadline. A positive native success
+  under one eight-second connect/read/write deadline. The rendered message text is
+  at most 98304 bytes and the private frame between daemon and frontend at most
+  197696 bytes (one bound shared by the Rust and JavaScript sides); text may
+  contain only tab, newline and carriage-return control characters, and thread
+  and call ids are nonempty, at most 256 bytes and control-free. Anything larger
+  or malformed is refused before any write. A positive native success
   is acceptance only. Any failure after the message request starts is unknown,
   retained and never followed by a second ordinary-queue send.
 - **Codex CLI message**: `sandbox-exec -p '(version 1)(allow default)(deny
@@ -214,7 +232,10 @@ touched by anything here, and nothing in this crate installs a hook for you.
   this attempt's own callback and that contains the exact manifest records
   `context_observed`. The `queue-operation` `enqueue` is not evidence: it
   carries no attempt identity and a retry re-sends the same manifest. No
-  message id is assumed and absence never retries. A session descriptor
+  message id is assumed and absence never retries. One manifest is one inbox
+  message of at most 98304 bytes (the core framing bound; larger refuses before
+  any write, never chunked or truncated), so a core-admitted body, including a
+  full 16 KiB body whose escaping and wrapper fit that bound, is sent. A session descriptor
   without an inbox (restricted session) is positive disablement: the
   message capability is withdrawn and recorded in core, so later message
   publications refuse before acceptance; a missing descriptor is only a
@@ -229,8 +250,9 @@ touched by anything here, and nothing in this crate installs a hook for you.
   (publications refuse while message is withdrawn, so no dispatch would
   otherwise look). A daemon restart
   forgets callbacks; core's recheck deadlines then raise incidents, never
-  replays (a stopped carrier removes its own callback sockets). Manifests
-  over 4096 bytes are refused before any write.
+  replays (a stopped carrier removes its own callback sockets). A manifest
+  over 98304 bytes is refused before any write; native acceptance of larger
+  payloads is not qualified (see `docs/qualification.md`).
 
 ## Configuration
 
@@ -323,7 +345,7 @@ store, so run it deliberately and keep its logs and session identifiers private.
 | Probe | Model | Command | What a pass demonstrates |
 |---|---|---|---|
 | Q1 Codex helper classification | no | `BRIDGE_QUALIFY_CODEX_EXE=<codex> cargo +1.98.1 test --offline -p bridge-adapters --test qualify_codex -- --ignored --nocapture` | Conservative classification only: native errors after the write are never known-unsent, and any acceptance has a native readback. Not a positive queue qualification. |
-| Q2 Claude hooks, caller, inject, `later`, pause | small, low effort, budget-capped | `node qualification/claude-native-probe.cjs` | `checks.json` with no failures: closed native tool inventory and manual permissions; root and child attested from the real tool-use id; the hook-injected marker quoted while a planted project-memory canary is absent; a message answered in a distinct unprompted turn with actor-bound evidence; pause applied with the event held and no turn in the paused window; a distinct turn after resume. |
+| Q2 Claude hooks, caller, inject, `later`, pause | small, low effort, budget-capped | `node qualification/claude-native-probe.cjs` | `checks.json` with no failures: closed native tool inventory and manual permissions; root and child attested from the real tool-use id; the hook-injected marker quoted while a planted project-memory canary is absent; a message of exactly 16384 UTF-8 payload bytes (`message_payload_exact_16384_utf8_bytes`) answered in a distinct unprompted turn with actor-bound evidence; pause applied with the event held and no turn in the paused window; a distinct turn after resume. |
 | Q3 config control | no (fake App Server) | `node qualification/codex-native-probe.cjs --self-test-config` | The probe's own config subtree survives projection, its own hook is trusted and the foreign one disabled, the override warning is detected, and planted fake credentials appear in no retained file or console output, including after an interrupt. |
 | Q3 Codex gate only | no | `CODEX_PROBE_GATE_ONLY=1 node qualification/codex-native-probe.cjs` | Hooks isolated and exact-tool approval effective. Ends with `gate_only_run` by design. |
 | Q3 Codex hooks, caller, inject, child, queue | small, low effort | `node qualification/codex-native-probe.cjs` | `checks.json` with no failures: model in the build catalog, hooks isolated, the read-only `bridge_me` root join, the externally published marker in the reply, an unlisted tool refused by the host and never executed, a child attested on its own thread, the helper's correlated `native_accepted` with native readback, and the probe's own queue item removed. |
@@ -401,6 +423,13 @@ before serving. Lifecycle remains the last verified owner state: unknown and
 approval/input waits are never converted to idle. Retired, dead/reused-process,
 changed-store or policy-less routes cannot be restored. Caller records,
 sealed proofs, native inbox secrets and message payloads are never in the cache.
+An OpenCode root recorded as such keeps its message capability across a restart without
+a new hook. An OpenCode child, or an OpenCode row written by an earlier build (which does
+not say whether it is a root or a child), is restored with message withheld, so core
+refuses a message to it before acceptance. The address's own next hook renews it: a root
+regains message and a child stays withdrawn. For an idle OpenCode root restored from an
+earlier build's journal this is a one-time wait for its own hook; later restarts restore it
+automatically.
 
 An already observed live recipient can therefore receive an addressed message
 without any post-restart bridge_me or hook from the recipient. Recipient native

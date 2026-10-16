@@ -213,7 +213,11 @@ Retirement safely disposes only proved unhanded/reserved members with no
 unresolved possible-effect history. Operator-authorized retries of earlier
 unknown effects are not reclassified as never sent. Invoking, held, written,
 unknown and accepted effects and their late evidence remain retained; retirement
-is neither recall nor duplicate-risk retry authority. Source/product-generation
+is neither recall nor duplicate-risk retry authority. `retire_unhanded` permanently
+rejects manual retry of its members. A late known-unsent outcome closes a retired
+member only when the shared possible-effect check finds no historical risk; otherwise
+it keeps the review and a visible incident. A retired orphan row from an older build is
+excluded from selection and work listings and shows a scope-fence diagnostic. Source/product-generation
 validity remains with the producer.
 
 Coalescing, latest watermarks/lineage and batching include the delivery scope
@@ -234,9 +238,18 @@ Schema 5 to 6 is an additive transactional migration. Tables cover
 routes, random actor/destination mappings, registration-request fingerprints,
 global evidence uses, v1 publication intents, close requests, producer lifetime
 tombstones and retire receipts. Events gain a separate lifetime column; scoped
-watermark keys gain lifetime. Legacy blank lifetime rows retain their meaning.
+watermark keys gain lifetime. Legacy blank lifetime rows retain their meaning: a lifetime event uses its full nine-field
+scoped key (`scoped_watermarks`), an unscoped eight-field legacy key uses `watermarks`,
+and a malformed or mismatched lifetime refuses.
 Migrations preserve accepted payload bytes/hash/order/ids and unknown attempts.
-A newer/unknown schema refuses; no destructive rollback is invented.
+A newer/unknown schema refuses before Bridge makes any schema or journal-mode change and
+without a close-time WAL checkpoint; no destructive rollback is invented. SQLite's own
+recovery of an interrupted rollback journal may run first and restore the last committed
+content, which can write the main file or remove that journal; ordinary WAL reads or
+recovery may rewrite advisory `-shm` WAL-index metadata, while the main and WAL bytes of a
+refused WAL database are preserved. Rollback validation or any supported migration holds
+an exclusive lock through enabling WAL, then reopens for normal sharing; an existing WAL
+database validates normally.
 
 Before COMMIT, known validation/auth/capacity/fence failures have not_committed
 and leave no durable effect. Failure/ack loss at COMMIT is unknown with stable

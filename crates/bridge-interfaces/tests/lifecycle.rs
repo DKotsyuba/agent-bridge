@@ -52,7 +52,9 @@ impl Drop for Scratch {
 
 /// A home with one sealed-layout release holding a copy of the relay (and
 /// inert stand-ins for the other packaged binaries, all bound by a manifest),
-/// its interfaces configuration and state directory.
+/// its interfaces configuration and state directory. The `bridge-native-daemon`
+/// stand-in execs the relay copy (same PID) serving only the daemon's core
+/// socket, never its adapter channel: a daemon that is not fully started.
 struct Fixture {
     /// Scratch owner.
     scratch: Scratch,
@@ -66,6 +68,10 @@ struct Fixture {
     socket: PathBuf,
     /// The copied relay executable (unique per fixture).
     exe: PathBuf,
+    /// Daemon configuration naming the stand-in's core socket and a channel.
+    daemon_config: PathBuf,
+    /// The core socket the stand-in serves.
+    core_socket: PathBuf,
 }
 
 /// Builds a fixture.
@@ -83,7 +89,18 @@ fn fixture() -> Fixture {
     let mut files = Vec::new();
     for name in BINARIES {
         let path = bin.join(name);
-        if name != "bridge-root-relay" {
+        if name == "bridge-native-daemon" {
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\nexec \"{}\" \"{}\"\n",
+                    exe.display(),
+                    root.join("core-standin.toml").display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        } else if name != "bridge-root-relay" {
             std::fs::write(&path, format!("#!/bin/sh\necho {name}\n")).unwrap();
         }
         files.push(ReleaseFile {
@@ -139,7 +156,31 @@ fn fixture() -> Fixture {
         ),
     )
     .unwrap();
+    // The core stand-in is the relay serving the daemon's core socket only.
+    let core_socket = relay_dir.join("k.sock");
+    std::fs::write(
+        root.join("core-standin.toml"),
+        format!(
+            "core_socket = \"{core}\"\n[root]\nsocket = \"{socket}\"\ntoken_file = \"{token}\"\n[[root.callers]]\nhost_id = \"h\"\nharness = \"claude-code\"\nnative_store_namespace = \"n\"\nrecipients = []\nmodes = []\nkinds = []\n",
+            core = root.join("absent-core.sock").display(),
+            socket = core_socket.display(),
+            token = token.display(),
+        ),
+    )
+    .unwrap();
+    let daemon_config = root.join("daemon.toml");
+    std::fs::write(
+        &daemon_config,
+        format!(
+            "socket = \"{}\"\n[adapters]\nchannel = \"{}\"\n",
+            core_socket.display(),
+            relay_dir.join("c.sock").display()
+        ),
+    )
+    .unwrap();
     Fixture {
+        daemon_config,
+        core_socket,
         state: root.join("state"),
         home,
         config,
@@ -465,4 +506,190 @@ fn pid_file_named(fixture: &Fixture, name: &str) {
     let path = fixture.state.join(name);
     std::fs::write(&path, b"").unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+/// A core daemon that serves its core socket but never its adapter channel
+/// (a daemon about to exit after its channel failed) is never reported
+/// started: start fails, the spawned process is stopped and no pid record
+/// remains. A daemon configuration without a channel refuses before spawning.
+#[test]
+fn core_is_started_only_when_its_channel_is_served_too() {
+    let fixture = fixture();
+    let error = start(
+        &fixture.home,
+        &fixture.state,
+        Component::Core,
+        &fixture.daemon_config,
+    )
+    .unwrap_err();
+    assert!(error.contains("did not serve all its sockets"), "{error}");
+    assert!(
+        read_record(&fixture.state, Component::Core)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!running(&fixture.exe), "the partial daemon was stopped");
+    assert!(
+        std::os::unix::net::UnixStream::connect(&fixture.core_socket).is_err(),
+        "nothing serves the core socket afterwards"
+    );
+    let no_channel = fixture.scratch.0.join("no-channel.toml");
+    std::fs::write(
+        &no_channel,
+        format!("socket = \"{}\"\n", fixture.core_socket.display()),
+    )
+    .unwrap();
+    let error = start(&fixture.home, &fixture.state, Component::Core, &no_channel).unwrap_err();
+    assert!(error.contains("[adapters].channel"), "{error}");
+    assert!(!running(&fixture.exe));
+}
+
+/// A daemon configuration whose adapter channel names the core socket itself
+/// (literally, or through a `.` component or a symlinked directory) would let
+/// one endpoint answer both readiness probes while the real daemon then dies
+/// on the colliding channel bind: start refuses it before spawning anything.
+/// Distinct sockets (the ordinary case) are still waited for (see above).
+#[test]
+fn a_channel_coinciding_with_the_core_socket_is_refused_before_spawn() {
+    let fixture = fixture();
+    let rl = fixture.core_socket.parent().unwrap();
+    let alias = fixture.scratch.0.join("rl-alias");
+    std::os::unix::fs::symlink(rl, &alias).unwrap();
+    for channel in [
+        fixture.core_socket.clone(),
+        rl.join(".").join("k.sock"),
+        alias.join("k.sock"),
+    ] {
+        let config = fixture.scratch.0.join("coincident.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "socket = \"{}\"\n[adapters]\nchannel = \"{}\"\n",
+                fixture.core_socket.display(),
+                channel.display()
+            ),
+        )
+        .unwrap();
+        let result = start(&fixture.home, &fixture.state, Component::Core, &config);
+        // A wrongly started stand-in is stopped so a failed check leaves no process.
+        if let Ok(record) = &result {
+            let _ = Command::new("/bin/kill")
+                .arg(record.pid.to_string())
+                .status();
+        }
+        let error = result.unwrap_err();
+        assert!(
+            error.contains("same endpoint"),
+            "{}: {error}",
+            channel.display()
+        );
+        assert!(
+            read_record(&fixture.state, Component::Core)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!running(&fixture.exe), "nothing was spawned");
+    }
+}
+
+/// A configured socket path whose final component is a symlink (here the
+/// channel, dangling at the future core socket, so one core-only listener would
+/// answer both readiness probes; and the core socket itself, linked to a
+/// regular file) is refused before spawning. The link and its target are left
+/// exactly as they were: never removed, resolved, created or rewritten.
+#[test]
+fn a_symlinked_socket_path_is_refused_before_spawn() {
+    use std::os::unix::fs::MetadataExt;
+    let fixture = fixture();
+    let rl = fixture.core_socket.parent().unwrap().to_path_buf();
+    let link = rl.join("c.sock");
+    std::os::unix::fs::symlink("k.sock", &link).unwrap();
+    let file = rl.join("plain");
+    std::fs::write(&file, b"foreign").unwrap();
+    let file_inode = std::fs::metadata(&file).unwrap().ino();
+    let core_link = rl.join("j.sock");
+    std::os::unix::fs::symlink(&file, &core_link).unwrap();
+    for (socket, channel) in [
+        (fixture.core_socket.clone(), link.clone()),
+        (core_link.clone(), rl.join("d.sock")),
+    ] {
+        let config = fixture.scratch.0.join("linked.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "socket = \"{}\"\n[adapters]\nchannel = \"{}\"\n",
+                socket.display(),
+                channel.display()
+            ),
+        )
+        .unwrap();
+        let result = start(&fixture.home, &fixture.state, Component::Core, &config);
+        // A wrongly started stand-in is stopped so a failed check leaves no process.
+        if let Ok(record) = &result {
+            let _ = Command::new("/bin/kill")
+                .arg(record.pid.to_string())
+                .status();
+        }
+        let error = result.unwrap_err();
+        assert!(error.contains("symlink"), "{}: {error}", socket.display());
+        assert!(
+            read_record(&fixture.state, Component::Core)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!running(&fixture.exe), "nothing was spawned");
+    }
+    assert_eq!(std::fs::read_link(&link).unwrap(), PathBuf::from("k.sock"));
+    assert!(
+        !fixture.core_socket.exists(),
+        "the link target was never created"
+    );
+    assert_eq!(std::fs::read_link(&core_link).unwrap(), file);
+    assert_eq!(std::fs::metadata(&file).unwrap().ino(), file_inode);
+    assert_eq!(std::fs::read(&file).unwrap(), b"foreign");
+}
+
+/// Two configured names that are one OS socket (here `k.sock` and `K.sock`,
+/// one inode on a case-insensitive volume) must never count as two served
+/// endpoints: the core-only stand-in answers both names, so start must fail
+/// and stop it instead of reporting the daemon started. On a case-sensitive
+/// volume the names are distinct files and this case does not apply; the
+/// portable same-inode contract is the unit test `one_socket_under_two_names_is_not_ready`.
+#[test]
+fn case_variant_names_of_one_socket_are_never_ready() {
+    let fixture = fixture();
+    let rl = fixture.core_socket.parent().unwrap().to_path_buf();
+    let probe = rl.join("case-probe");
+    std::fs::write(&probe, b"").unwrap();
+    let insensitive = rl.join("CASE-PROBE").exists();
+    std::fs::remove_file(&probe).unwrap();
+    if !insensitive {
+        eprintln!("case-variant check not applicable: this volume is case-sensitive");
+        return;
+    }
+    let config = fixture.scratch.0.join("case.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "socket = \"{}\"\n[adapters]\nchannel = \"{}\"\n",
+            fixture.core_socket.display(),
+            rl.join("K.sock").display()
+        ),
+    )
+    .unwrap();
+    let result = start(&fixture.home, &fixture.state, Component::Core, &config);
+    // A wrongly started stand-in is stopped so a failed check leaves no process.
+    if let Ok(record) = &result {
+        let _ = Command::new("/bin/kill")
+            .arg(record.pid.to_string())
+            .status();
+    }
+    let error = result.unwrap_err();
+    assert!(error.contains("did not serve all its sockets"), "{error}");
+    assert!(
+        read_record(&fixture.state, Component::Core)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!running(&fixture.exe), "the partial daemon was stopped");
 }

@@ -34,7 +34,7 @@ export default {
     let pending = 0;
     /** @type {boolean} No new work after disposal or a native feed gap. */
     let active = true;
-    /** @type {boolean} One overflow invalidation replaces unbounded buffering. */
+    /** @type {boolean} One queued invalidation replaces unbounded buffering; re-armed once it settles. */
     let overflow = false;
 
     /** Invoke the existing bounded hook client without a shell or credentials.
@@ -73,14 +73,17 @@ export default {
       for (const [sessionID, actor] of sessions) await hook({ hook_event_name: 'OpenCodeUnknown', session_id: sessionID, ...(actor.child ? { agent_id: sessionID } : {}) });
     }
 
-    /** Queue one genuine observation; reject invalid ids and bound pending work.
+    /** Queue one genuine observation; reject invalid ids and bound pending work. A
+     * rejected excess observation queues one invalidation; every arrival is
+     * rejected until it settles, so nothing queues behind it and restores
+     * readiness it has just made unknown. A later separated overload may queue another.
      * @param {string} kind Normalized event. @param {string} sessionID Native actor id.
      * @param {{tool_use_id?:string,tool_name?:string}} [call={}] Native call metadata only.
      * @returns {Promise<void>} Fail-open observation, without an input effect. */
     function observe(kind, sessionID, call = {}) {
       if (!active || !identifier(sessionID)) return Promise.resolve();
-      if (pending >= MAX_PENDING) {
-        if (!overflow) { overflow = true; serial = serial.then(invalidate).catch(() => {}); }
+      if (overflow || pending >= MAX_PENDING) {
+        if (!overflow) { overflow = true; serial = serial.then(invalidate).catch(() => {}).finally(() => { overflow = false; }); }
         return Promise.resolve();
       }
       pending++;

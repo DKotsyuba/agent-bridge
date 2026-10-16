@@ -84,6 +84,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bridge_core::dispatch::{AttemptFence, AttemptRecord, Attestation, DispatchCarrier, Outcome};
+use bridge_core::framing::MAX_FRAMED_BYTES;
 use bridge_core::recovery::EvidenceTier;
 use bridge_core::service::{current_unix_millis, log_event};
 use bridge_core::{Harness, NativeAddress};
@@ -93,8 +94,17 @@ use crate::os;
 use crate::registry::{RecipientBinding, Registry};
 use crate::server::{Custody, lock_registry, with_custody};
 
-/// Largest manifest the native inbox accepts in one message, in bytes.
-pub const MAX_MESSAGE_BYTES: usize = 4096;
+/// Largest manifest this carrier writes in one inbox message, in bytes.
+///
+/// This is Bridge's own bound, the core framing bound ([`MAX_FRAMED_BYTES`]),
+/// not a measured native inbox limit: core never renders a larger manifest, so
+/// every manifest core admits and frames (including an advertised 16 KiB body,
+/// escaped and wrapped) is eligible for one bounded inbox hand-off; the same
+/// bound already guards the owner and desktop routes. Whether a native receiver
+/// accepts a message that large is a separate live qualification, not implied
+/// here. An over-bound manifest is a permanent refusal before any byte is
+/// written, never truncated.
+pub const MAX_MESSAGE_BYTES: usize = MAX_FRAMED_BYTES;
 
 /// Largest descriptor or key file read, in bytes.
 const MAX_DESCRIPTOR_BYTES: u64 = 16 * 1024;
@@ -1252,7 +1262,9 @@ impl DispatchCarrier for ClaudeLaterCarrier {
     /// receipt of the window contradicts it (another status, or a `held`
     /// after it), which is unknown; `held` alone
     /// holds until [`ClaudeTiming::held_recheck_ms`]; silence is written
-    /// without receipt. A hand-off is never repeated here.
+    /// without receipt. A hand-off is never repeated here. A manifest over
+    /// [`MAX_MESSAGE_BYTES`] is a permanent refusal before the inbox is
+    /// touched (core never frames one that large).
     ///
     /// For an owner-routed recipient (its environment names a native owner
     /// socket) the frozen manifest instead goes through the native owner
@@ -1283,7 +1295,7 @@ impl DispatchCarrier for ClaudeLaterCarrier {
         if attempt.manifest.len() > MAX_MESSAGE_BYTES {
             return Outcome::PermanentRefusal {
                 reason: format!(
-                    "manifest exceeds the native inbox bound of {MAX_MESSAGE_BYTES} bytes"
+                    "manifest exceeds the inbox carrier bound of {MAX_MESSAGE_BYTES} bytes"
                 ),
             };
         }
@@ -1691,5 +1703,82 @@ mod transcript_tests {
             "uds:/cb"
         ));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A manifest as large as core ever frames, full of multibyte text, is
+    /// still found byte-exact in a peer entry (JSON-escaped in the line).
+    #[test]
+    fn largest_framed_manifest_closes_from_the_transcript() {
+        let dir = std::env::temp_dir().join(format!("m2big{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+        let manifest = format!(
+            "\"\\\n{}",
+            "\u{e9}\u{1F600}".repeat((MAX_MESSAGE_BYTES - 16) / 6)
+        );
+        assert!(manifest.len() <= MAX_MESSAGE_BYTES && manifest.len() > 16 * 1024);
+        std::fs::write(
+            &path,
+            format!("{}\n", entry_line("sess", "uds:/cb", &manifest)),
+        )
+        .unwrap();
+        assert!(transcript_has_handoff(
+            &path,
+            &manifest,
+            own_uid(),
+            "sess",
+            "uds:/cb"
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod bound_tests {
+    //! The inbox size bound covers the advertised 16 KiB body.
+
+    use super::*;
+    use bridge_core::{
+        Envelope, EventId, Kind, Metadata, Mode, Payload, Policy, PublisherId,
+        framing::{MAX_TAG_BYTES, frame},
+    };
+
+    /// A 16 KiB UTF-8 payload rendered under the widest tag (ASCII `&` that
+    /// escapes to a 5-byte entity, or multibyte text), plus envelope and
+    /// provenance, fits the carrier bound. The bound is exactly core's framing
+    /// bound, so core refuses anything larger before it can reach this
+    /// carrier; a body of 16 KiB of `"` (a 6-byte entity each) already exceeds
+    /// that bound at core admission and is not a carrier case.
+    #[test]
+    fn a_full_16_kib_body_fits_the_carrier_bound() {
+        let address = NativeAddress::new("host", Harness::ClaudeCode, "default", "s").unwrap();
+        let envelope = |payload: String| {
+            Envelope::new(
+                PublisherId::new("p").unwrap(),
+                EventId::new("e").unwrap(),
+                address.clone(),
+                Kind::new("k").unwrap(),
+                Mode::Message,
+                Policy::KeepAll,
+                Payload::new(payload).unwrap(),
+                Metadata::new(),
+                None,
+            )
+            .unwrap()
+        };
+        let tag = "a".repeat(MAX_TAG_BYTES);
+        for payload in [
+            "&".repeat(16 * 1024),
+            "\u{1F600}".repeat(4 * 1024),
+            "\u{e9}".repeat(8 * 1024),
+        ] {
+            assert_eq!(payload.len(), 16 * 1024);
+            let framed = frame(&tag, &envelope(payload)).unwrap();
+            assert!(framed.len() > 4096 && framed.len() <= MAX_MESSAGE_BYTES);
+        }
+        assert_eq!(MAX_MESSAGE_BYTES, MAX_FRAMED_BYTES);
+        let over = "&".repeat(MAX_FRAMED_BYTES / 5 + 1);
+        assert!(frame(&tag, &envelope(over)).is_err());
+        assert!(frame(&tag, &envelope("\"".repeat(16 * 1024))).is_err());
     }
 }

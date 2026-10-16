@@ -115,7 +115,7 @@ direct_address = true
 
 ```toml
 [adapters]
-channel = "/ABS/state/ch/c.sock"        # socket inside a private 0700 directory
+channel = "/ABS/state/ch/c.sock"        # socket inside a private 0700 directory; must not be the core socket's own endpoint
 host_id = "this-host"                   # host component of every attested address
 # sandbox = "/usr/bin/sandbox-exec"     # confinement launcher; without it Codex message is refused
 # intermediates = ["/bin/sh", "/bin/bash", "/bin/zsh", "/bin/dash", "/usr/bin/env"]
@@ -153,7 +153,9 @@ since the process started, and its own store, taken from its environment (`CODEX
 `CLAUDE_CONFIG_DIR`, else `$HOME/.codex` or `$HOME/.claude`; OpenCode uses its private
 `OPENCODE_DB` parent), must be a canonical directory
 you own that no group or other user can write (a symlink or non-canonical spelling is
-refused, and the store is checked again at every use). A fresh session in any such store
+refused; message-candidate validation and journal restore check it again at use, while the
+legacy Claude inbox route rechecks the incarnation and each descriptor and token file it reads).
+A fresh session in any such store
 registers from its own lifecycle hook: there is nothing to enroll and no runtime
 operation to enroll with. Addresses use the policy's single namespace; an equal session id
 from a second live incarnation is refused as a conflict. The marker is best-effort

@@ -6,8 +6,10 @@
 //! <interfaces-config>`). Each start resolves the real release path,
 //! starts the process in its own process group with output appended to
 //! `<state>/<component>.log`, records `<state>/<component>.pid` (pid,
-//! kernel start time and executable) atomically and waits until its socket
-//! is served by that very process (kernel peer pid). Starts and stops of a
+//! kernel start time and executable) atomically and waits until every socket
+//! it serves (for `core` the core socket *and* the adapter channel) is served
+//! by that very process (kernel peer pid), each as a distinct OS socket
+//! (device and inode). Starts and stops of a
 //! component are serialized by `<state>/<component>.lock`; a failed start
 //! kills and reaps only the child it spawned.
 //!
@@ -93,6 +95,82 @@ impl Component {
                 .ok_or_else(|| "interfaces configuration has no [root]".to_string()),
         }
     }
+
+    /// Every socket the component serves once it is fully started: its
+    /// [`Component::socket`] and, for `core`, the adapter channel
+    /// (`[adapters].channel` of the daemon configuration), which the daemon
+    /// binds only after the core socket and without which it exits. A start
+    /// is ready only when all of them are served by the started process.
+    ///
+    /// # Errors
+    ///
+    /// As [`Component::socket`]; for `core` also a configuration without a
+    /// string `[adapters].channel` (parse errors are withheld), or one whose
+    /// channel is the core socket's own endpoint (see [`same_endpoint`]): one
+    /// listener would then answer both readiness probes while the real daemon
+    /// dies on the colliding channel bind; or any of these socket paths whose
+    /// final component is a symlink, dangling or not (see [`unlinked`]).
+    fn ready_sockets(self, config: &Path) -> Result<Vec<PathBuf>, String> {
+        let socket = self.socket(config)?;
+        if self == Component::Relay {
+            return unlinked(vec![socket]);
+        }
+        let text = std::fs::read_to_string(config).map_err(|error| error.to_string())?;
+        let value: toml::Value =
+            toml::from_str(&text).map_err(|_| "daemon configuration is invalid".to_string())?;
+        let channel = value
+            .get("adapters")
+            .and_then(|adapters| adapters.get("channel"))
+            .and_then(toml::Value::as_str)
+            .map(PathBuf::from)
+            .ok_or_else(|| "daemon configuration has no [adapters].channel".to_string())?;
+        if same_endpoint(&socket, &channel) {
+            return Err(
+                "daemon configuration names the same endpoint for socket and [adapters].channel"
+                    .into(),
+            );
+        }
+        unlinked(vec![socket, channel])
+    }
+}
+
+/// Returns `sockets` unchanged when no path's final component is a symlink
+/// (read with `lstat`, so a dangling link counts). A linked socket path would
+/// let the readiness probe, which follows links, reach another endpoint (a
+/// channel linked to the core socket is answered by the core listener alone),
+/// while the daemon itself refuses the link only after it started. Nothing is
+/// removed, resolved or rewritten; an absent path or another lstat failure is
+/// left to the daemon.
+///
+/// # Errors
+///
+/// A configured socket path whose final component is a symlink.
+fn unlinked(sockets: Vec<PathBuf>) -> Result<Vec<PathBuf>, String> {
+    match sockets.iter().find(|socket| {
+        std::fs::symlink_metadata(socket).is_ok_and(|meta| meta.file_type().is_symlink())
+    }) {
+        Some(socket) => Err(format!(
+            "configured socket {} is a symlink; it was left unchanged and nothing was started",
+            socket.display()
+        )),
+        None => Ok(sockets),
+    }
+}
+
+/// Whether two configured socket paths name one filesystem endpoint: equal
+/// file names in the same directory, the directories compared canonically
+/// (symlinked or `.`/`..` aliases resolve) when they exist and by their
+/// normalized components otherwise. Neither socket needs to exist yet.
+fn same_endpoint(left: &Path, right: &Path) -> bool {
+    let key = |path: &Path| {
+        let directory = path.parent().map(|parent| {
+            parent
+                .canonicalize()
+                .unwrap_or_else(|_| parent.components().collect())
+        });
+        (directory, path.file_name().map(std::ffi::OsStr::to_owned))
+    };
+    key(left) == key(right)
 }
 
 /// The pid record of a started component.
@@ -185,6 +263,27 @@ fn served_by(socket: &Path, pid: u32) -> bool {
         .is_some_and(|peer| peer.pid == pid)
 }
 
+/// Whether every one of `sockets` is served by process `pid` ([`served_by`])
+/// *and* they are pairwise distinct OS sockets: each path's file identity
+/// (device, inode; links followed, as the probe connects through them) differs
+/// from every other's. Two configured names of one socket (a case-variant name
+/// on a case-insensitive volume, a hard link, or any other alias) are answered
+/// by one listener and so never count as two ready endpoints. An unreadable
+/// identity is not ready.
+fn served_distinct(sockets: &[PathBuf], pid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let mut seen = Vec::with_capacity(sockets.len());
+    sockets.iter().all(|socket| {
+        let identity = std::fs::metadata(socket).map(|meta| (meta.dev(), meta.ino()));
+        served_by(socket, pid)
+            && identity.is_ok_and(|identity| {
+                let fresh = !seen.contains(&identity);
+                seen.push(identity);
+                fresh
+            })
+    })
+}
+
 /// A spawned child that is killed and reaped on drop unless released.
 struct ChildGuard(Option<Child>);
 
@@ -231,8 +330,13 @@ fn remove_record_if(state: &Path, component: Component, record: &PidRecord) {
 /// with no group/other write — a planted or modified executable is never run)
 /// and the active executable to be a sealed
 /// release executable of `home`; spawns it in its own process group, records it
-/// atomically and waits until the configured socket is served by *that*
-/// process (kernel peer pid). On every failure after the spawn the child
+/// atomically and waits until every configured socket of the component
+/// (`Component::ready_sockets`: for `core` the core socket and the adapter
+/// channel, so a daemon that serves core but then fails its channel is never
+/// reported started) is served by *that* process (kernel peer pid), each as a
+/// distinct OS socket (`served_distinct`: two names of one socket never
+/// count twice). On every
+/// failure after the spawn the child
 /// is killed and reaped and only its own record is removed; nothing else
 /// is signalled or removed.
 pub fn start(
@@ -275,7 +379,8 @@ pub fn start(
             exe.display()
         ));
     }
-    let socket = component.socket(config)?;
+    let ready = component.ready_sockets(config)?;
+    let socket = ready[0].clone();
     let log_path = state.join(format!("{}.log", component.name()));
     crate::config::private_file(&log_path)?;
     let log = OpenOptions::new()
@@ -314,14 +419,14 @@ pub fn start(
                 component.name()
             ));
         }
-        if served_by(&socket, pid) {
+        if served_distinct(&ready, pid) {
             guard.release();
             return Ok(record);
         }
         if Instant::now() > deadline {
             remove_record_if(state, component, &record);
             return Err(format!(
-                "{} did not serve its socket in time; it was stopped",
+                "{} did not serve all its sockets in time; it was stopped",
                 component.name()
             ));
         }
@@ -433,4 +538,35 @@ pub fn stop(home: &Path, state: &Path, component: Component) -> Result<bool, Str
     stop_record(&record)?;
     remove_record_if(state, component, &record);
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Readiness identity: one OS socket under two names is never two ready
+    //! endpoints, on any volume (a hard link gives one inode two names).
+    use super::*;
+    use crate::testdir::TestDir;
+    use std::os::unix::net::UnixListener;
+
+    /// Distinct listeners of this process are ready; a second name of the same
+    /// socket (hard link, same device and inode) is not, in either order, and
+    /// another process's PID or an absent path is never ready.
+    #[test]
+    fn one_socket_under_two_names_is_not_ready() {
+        let dir = TestDir::new("rd");
+        let me = std::process::id();
+        let (core, channel) = (dir.path().join("k.sock"), dir.path().join("c.sock"));
+        let _core = UnixListener::bind(&core).unwrap();
+        let _channel = UnixListener::bind(&channel).unwrap();
+        let alias = dir.path().join("K2.sock");
+        std::fs::hard_link(&core, &alias).unwrap();
+        assert!(served_distinct(&[core.clone(), channel.clone()], me));
+        assert!(!served_distinct(&[core.clone(), alias.clone()], me));
+        assert!(!served_distinct(&[alias.clone(), core.clone()], me));
+        assert!(!served_distinct(&[core.clone(), channel.clone()], me + 1));
+        assert!(!served_distinct(
+            &[core, dir.path().join("absent.sock")],
+            me
+        ));
+    }
 }
