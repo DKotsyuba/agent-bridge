@@ -284,7 +284,7 @@ pub enum ReconciliationKey {
     },
 }
 dto!(ApiError,"Bounded structured service error; detail never contains request/secret/body.",{class:ErrorClass=>"Closed service failure class.",reason:String=>"Bounded generic machine reason.",retry_hint:RetryHint=>"Safe same-identity recovery instruction.",effect:Option<MutationEffect> =>"Mutation effect, absent for reads.",reconciliation:Option<ReconciliationKey> =>"Required original identity for unknown mutation.",detail:String=>"Bounded static secret-safe explanation."});
-dto!(Features,"Optional implemented boundaries, never availability inferred from draft DTOs.",{consume_assertion:bool=>"Qualified configured audience assertions enabled.",delivery_scopes:bool=>"Durable producer lifetime retirement enabled.",host_observations:bool=>"False in this baseline; no observer operations."});
+dto!(Features,"Optional implemented boundaries, never availability inferred from draft DTOs.",{consume_assertion:bool=>"Qualified configured audience assertions enabled.",delivery_scopes:bool=>"Durable producer lifetime retirement enabled.",host_observations:bool=>"Exact observation/resolution enabled on this adapter endpoint and grant."});
 dto!(Retention,"Namespace identity/tombstone retention promises, not native exactly-once.",{durable_keys:bool=>"Accepted identities retained durably.",closed_tombstones:bool=>"Closed identities cannot become new operations.",credential_independent_identity:bool=>"Token rotation preserves configured identity."});
 dto!(Limits,"Effective bounded endpoint/grant admission limits.",{registration_request_bytes:u64=>"Positive registration frame byte ceiling.",core_request_bytes:u64=>"Positive core frame byte ceiling.",response_bytes:u64=>"Positive response frame byte ceiling.",payload_bytes:u64=>"Positive UTF-8 payload ceiling.",metadata_entries:u64=>"Nonnegative metadata entry ceiling.",rendered_manifest_bytes:u64=>"Positive rendered native manifest byte ceiling.",open_routes:u64=>"Nonnegative open-route capacity.",assertions:u64=>"Nonnegative assertion-cache capacity."});
 dto!(ProducerConstraints,"Only authenticated producer's configured limits; facts are not permissions.",{allowed_modes:Vec<Mode> =>"Configured native modes.",allowed_policies:Vec<PolicyKind> =>"Configured generic coalescing policies.",allowed_kinds:Vec<String> =>"Bounded configured opaque kinds/wildcard.",reply_policies:Vec<ReplyPolicy> =>"Configured self/shared-session policies.",direct_address:bool=>"Grant allows authorized explicit address publication.",native_scopes:Vec<String> =>"Bounded opaque configured native scope expressions."});
@@ -308,6 +308,10 @@ dto!(
 pub enum Operation {
     /// Authenticated capability read.
     Capabilities(CapabilitiesParams),
+    /// Content-free exact recipient read; consumes no native evidence.
+    ObserveRecipient(ObserveRecipientParams),
+    /// Protected exact native binding lookup; creates no identity authority.
+    ResolveRecipient(ResolveRecipientParams),
     /// Sole native-evidence-consuming registration.
     RegisterCall(RegisterCallParams),
     /// Immutable event custody admission/recovery.
@@ -332,6 +336,10 @@ pub enum Operation {
 pub enum OperationResult {
     /// Authenticated capability facts.
     Capabilities(Capabilities),
+    /// Sampled exact recipient lifecycle/capabilities or unavailable.
+    ObserveRecipient(RecipientObservation),
+    /// Sampled exact native address or unavailable; no private process facts.
+    ResolveRecipient(ResolveRecipientResult),
     /// Durable registration and explicit actual freshness.
     RegisterCall(RegistrationResult),
     /// Custody receipt, never inferred delivery.
@@ -344,4 +352,68 @@ pub enum OperationResult {
     ConsumeAssertion(ConsumeResult),
     /// Permanent lifetime fence acknowledgement.
     RetireDeliveryScope(RetireResult),
+}
+
+dto!(ObserveRecipientParams,"Exact native recipient read with no enumeration or side effects.",{address:String=>"Bounded native address; response uses its canonical encoding."});
+wire_enum!(RecipientLifecycle,"Latest protected owner-hook lifecycle; unknown never means idle or dead.",{Active=>"Owner is active.",Inactive=>"Owner was positively observed idle.",AwaitingInput=>"Owner awaits input or permission.",Unknown=>"No positive current lifecycle classification."});
+dto!(RecipientCapabilities,"Currently observed carrier support, never a promise of future delivery.",{inject:bool=>"Natural hook context injection is supported.",message:bool=>"Native message delivery is supported."});
+
+/// Content-free observation; unavailable does not imply inactivity or termination.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RecipientObservationState {
+    /// Current protected binding and live process were verified without mutation.
+    Observed {
+        /// Latest owner-hook lifecycle, not freshness inferred from read time.
+        lifecycle: RecipientLifecycle,
+        /// Support at sampling time, not delivery acceptance.
+        capabilities: RecipientCapabilities,
+    },
+    /// Binding or required process facts cannot currently be verified.
+    #[serde(deserialize_with = "unavailable_state")]
+    Unavailable,
+}
+dto!(RecipientObservation,"Exact-address observation sampled without consuming proof or sending.",{address:String=>"Canonical address matching the exact requested recipient.",sampled_at_ms:u64=>"Positive i64-range Unix read milliseconds, not last-hook freshness.",observation:RecipientObservationState=>"Verified content-free state or unavailable."});
+
+/// Exact expected process facts only filter an existing protected binding.
+/// Debug never discloses the private expected store, PID or birth tuple.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveRecipientParams {
+    /// Native harness product; host id and namespace come from daemon policy.
+    pub host: Host,
+    /// Exact native session id: 1..=256 control-free UTF-8 bytes.
+    pub native_session_id: String,
+    /// Absolute canonical UTF-8 store path: at most 4096 control-free bytes.
+    pub expected_store: String,
+    /// Exact existing harness PID, in 1..=i32::MAX.
+    pub expected_harness_pid: u32,
+    /// Exact process start seconds, in 1..=i64::MAX; not subsecond birth proof.
+    pub expected_harness_start_time_secs: u64,
+}
+impl std::fmt::Debug for ResolveRecipientParams {
+    /// Redacts all native lookup inputs, which are never diagnostic authority.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ResolveRecipientParams(<redacted>)")
+    }
+}
+/// Exact address resolution with no exposed process/store facts or fallback.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RecipientResolution {
+    /// Existing unchanged protected binding matches all expected live facts.
+    Resolved {
+        /// Canonical native address with the requested harness and session.
+        address: String,
+    },
+    /// Any binding, policy or process fact is absent, stale or mismatching.
+    #[serde(deserialize_with = "unavailable_state")]
+    Unavailable,
+}
+dto!(ResolveRecipientResult,"Read-only exact binding resolution; never caller authority or a birth proof.",{sampled_at_ms:u64=>"Positive i64-range Unix read milliseconds.",resolution:RecipientResolution=>"Exact canonical resolved address or unavailable."});
+
+/// Rejects every extra field on an internally tagged unavailable unit variant;
+/// Serde's ordinary unit handling otherwise ignores the remaining object fields.
+fn unavailable_state<'de, D: serde::Deserializer<'de>>(d: D) -> Result<(), D::Error> {
+    CapabilitiesParams::deserialize(d).map(|_| ())
 }

@@ -412,6 +412,8 @@ impl Operation {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         match self {
             Self::Capabilities(_) => Ok(()),
+            Self::ObserveRecipient(p) => p.validate(),
+            Self::ResolveRecipient(p) => p.validate(),
             Self::RegisterCall(p) => p.validate(),
             Self::Publish(p) => p.validate(),
             Self::Status(p) => p.selector.validate(),
@@ -426,6 +428,17 @@ impl OperationResult {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         match self {
             Self::Capabilities(c) => c.validate(),
+            Self::ObserveRecipient(r) => {
+                canonical_address(&r.address)?;
+                validate_positive("sampled_at_ms", r.sampled_at_ms)
+            }
+            Self::ResolveRecipient(r) => {
+                validate_positive("sampled_at_ms", r.sampled_at_ms)?;
+                if let RecipientResolution::Resolved { address } = &r.resolution {
+                    canonical_address(address)?;
+                }
+                Ok(())
+            }
             Self::RegisterCall(r) => r.validate(),
             Self::Publish(p) => p.receipt.validate(),
             Self::Status(s) => match s {
@@ -485,6 +498,16 @@ impl OperationResult {
     pub fn validate_binding(&self, request: &Request) -> Result<(), ProtocolError> {
         let good = match (&request.operation, self) {
             (Operation::Capabilities(_), Self::Capabilities(_)) => true,
+            (Operation::ObserveRecipient(p), Self::ObserveRecipient(r)) => {
+                r.address == NativeAddress::parse(&p.address)?.canonical()
+            }
+            (Operation::ResolveRecipient(p), Self::ResolveRecipient(r)) => match &r.resolution {
+                RecipientResolution::Resolved { address } => {
+                    let address = NativeAddress::parse(address)?;
+                    address.harness == p.host && address.session == p.native_session_id
+                }
+                RecipientResolution::Unavailable => true,
+            },
             (Operation::RegisterCall(p), Self::RegisterCall(r)) => {
                 r.receipt.request_id == request.request_id
                     && r.receipt.operation_key == p.operation_key
@@ -543,6 +566,54 @@ impl OperationResult {
         }
         Ok(())
     }
+}
+
+impl ObserveRecipientParams {
+    /// Validates bounded address syntax without looking up any native process.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        address(&self.address)
+    }
+}
+
+impl ResolveRecipientParams {
+    /// Validates expected facts without filesystem access or identity inference.
+    /// Canonical store equality is checked against the actual binding by the server.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        validate_id("native_session_id", &self.native_session_id, MAX_ID_BYTES)?;
+        validate_id("expected_store", &self.expected_store, 4096)?;
+        if !self.expected_store.starts_with('/')
+            || (self.expected_store != "/"
+                && self.expected_store[1..]
+                    .split('/')
+                    .any(|part| part.is_empty() || part == "." || part == ".."))
+        {
+            return Err(ProtocolError::new(
+                "expected_store",
+                "noncanonical absolute path",
+            ));
+        }
+        if self.expected_harness_pid == 0 || self.expected_harness_pid > i32::MAX as u32 {
+            return Err(ProtocolError::new(
+                "expected_harness_pid",
+                "invalid PID range",
+            ));
+        }
+        validate_positive(
+            "expected_harness_start_time_secs",
+            self.expected_harness_start_time_secs,
+        )
+    }
+}
+
+/// Requires canonical response encoding so consumers never receive alias addresses.
+fn canonical_address(value: &str) -> Result<(), ProtocolError> {
+    if NativeAddress::parse(value)?.canonical() != value {
+        return Err(ProtocolError::new(
+            "address",
+            "noncanonical response address",
+        ));
+    }
+    Ok(())
 }
 
 /// Rejects a returned route broader than explicit constraints/default message mode.

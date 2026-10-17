@@ -87,6 +87,104 @@ fn path(name: &str) -> PathBuf {
     assert!(base.is_absolute(), "TMPDIR must be an absolute directory");
     base.join(format!("sdk-{}-{name}.sock", std::process::id()))
 }
+
+/// Both read methods use only the adapter socket; lost ACK retries preserve the
+/// exact request and mismatched replies remain read failures without reconciliation.
+/// Calling this synchronous client inside a Tokio task must not nest block_on or
+/// panic while creating/releasing the private peer-credential driver.
+#[test]
+fn native_observation_sdk_boundary() {
+    let socket = path("observations");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let worker = thread::spawn(move || {
+        let mut original = String::new();
+        let (stream, _) = listener.accept().unwrap();
+        BufReader::new(stream).read_line(&mut original).unwrap();
+        for step in 0..4 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let request = decode_request(line.trim_end().as_bytes()).unwrap();
+            let result = if step == 0 {
+                assert_eq!(line, original, "lost read ACK must not change identity");
+                assert!(matches!(request.operation, Operation::ObserveRecipient(_)));
+                OperationResult::ObserveRecipient(RecipientObservation {
+                    address: "host/codex/store/session".into(),
+                    sampled_at_ms: 1,
+                    observation: RecipientObservationState::Unavailable,
+                })
+            } else {
+                assert!(matches!(request.operation, Operation::ResolveRecipient(_)));
+                OperationResult::ResolveRecipient(ResolveRecipientResult {
+                    sampled_at_ms: 1,
+                    resolution: RecipientResolution::Resolved {
+                        address: format!(
+                            "host/codex/store/{}",
+                            if step == 1 { "session" } else { "foreign" }
+                        ),
+                    },
+                })
+            };
+            let mut bytes = encode_response(&Response::ok(&request.request_id, result)).unwrap();
+            bytes.push(b'\n');
+            stream.write_all(&bytes).unwrap();
+        }
+    });
+    let client = Client::new(
+        Config::new(
+            &socket,
+            path("unused-core"),
+            Secret::new("fixture-secret"),
+            Duration::from_secs(2),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .unwrap();
+    assert_eq!(
+        runtime
+            .block_on(async {
+                client.observe_recipient(
+                    "observe",
+                    ObserveRecipientParams {
+                        address: "host/codex/store/session".into(),
+                    },
+                )
+            })
+            .unwrap()
+            .observation,
+        RecipientObservationState::Unavailable
+    );
+    let params = ResolveRecipientParams {
+        host: Host::Codex,
+        native_session_id: "session".into(),
+        expected_store: "/private/synthetic".into(),
+        expected_harness_pid: 23,
+        expected_harness_start_time_secs: 42,
+    };
+    assert!(matches!(
+        client
+            .resolve_recipient("resolve", params.clone())
+            .unwrap()
+            .resolution,
+        RecipientResolution::Resolved { .. }
+    ));
+    assert!(matches!(
+        client.resolve_recipient("foreign", params),
+        Err(ClientError::Transport {
+            outcome: TransportOutcome::ReadFailed,
+            reconciliation: None,
+            ..
+        })
+    ));
+    worker.join().unwrap();
+    fs::remove_file(socket).unwrap();
+}
 /// One reusable public control exercises real streams, not an artificial transport trait.
 #[test]
 fn public_sdk_boundary() {

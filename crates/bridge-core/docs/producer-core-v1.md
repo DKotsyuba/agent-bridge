@@ -23,7 +23,12 @@ parser, operation type or payload interpretation belongs in this boundary.
 
 `GrantConfig.producer_v1: Option<ProducerPolicy>` defaults to `None`; v1 mutation
 admission is opt-in and legacy grant behavior stays unchanged. ProducerPolicy
-contains only generic registration/reply-policy/lifetime/audience permissions.
+contains only generic registration/reply-policy/lifetime/audience permissions and
+the default-false `host_observations` read permission. Observation and resolution
+run only at the native adapter, using this same authority plus both recipient and
+native scope allowlists before binding/process lookup. Core capabilities always
+advertise `host_observations=false`; core refuses these operations as requiring
+native ingress and never attaches mutation reconciliation to them.
 Existing recipient, kind, mode and policy allowlists remain the publication
 constraints. Kind is bounded to the existing canonical core limit of 64 bytes;
 other opaque request/operation/event keys are at most 256 bytes.

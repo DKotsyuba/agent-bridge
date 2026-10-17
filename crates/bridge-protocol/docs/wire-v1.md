@@ -8,7 +8,39 @@ One UTF-8 NDJSON request and one response per protected Unix stream exchange. En
 
 The protocol exports `Request`, `Operation`, `Response`, `OperationResult`, each operation's `*Params` and `*Result`, receipts/status views and the enums named below at crate root. Public `decode_request`, `encode_request`, `decode_response`, `encode_response` and validation methods apply the same bounds; decoding rejects duplicate JSON keys recursively, unknown envelope/DTO fields, incomplete/non-object frames and trailing JSON. The bounded original host metadata object is the only open-map exception. Unknown metadata keys are not caller authority.
 
-Operations: `capabilities`, `register_call`, `publish`, `status`, `close_route`, `consume_assertion`, `retire_delivery_scope`. Last two are separately capability-gated. `host_observations` is false in this baseline and has no operation or implied capability.
+Operations: `capabilities`, `register_call`, `publish`, `status`, `close_route`, `consume_assertion`, `retire_delivery_scope`, `observe_recipient`, `resolve_recipient`. Assertion consumption, delivery scopes and host observations are separately capability-gated. Host observations are adapter-only and default off; core always advertises false.
+
+### Exact native reads
+
+`observe_recipient` takes `{address: String}` and returns
+`RecipientObservation {address, sampled_at_ms, observation}`. The address is the
+canonical encoding of exactly the requested recipient. `observation` is either
+`{state: "observed", lifecycle: "active"|"inactive"|"awaiting_input"|"unknown",
+capabilities: {inject: bool, message: bool}}` or `{state: "unavailable"}`.
+The positive i64-range Unix millisecond sample time is read time, not last-hook
+freshness. Unknown/unavailable never implies idle, finished or dead; capability
+flags never promise future native delivery.
+
+`resolve_recipient` takes `ResolveRecipientParams {host: Host, native_session_id:
+String, expected_store: String, expected_harness_pid: u32,
+expected_harness_start_time_secs: u64}`. Session ids are 1–256 control-free UTF-8
+bytes; stores are absolute canonical paths of at most 4096 control-free UTF-8
+bytes. PIDs are 1–i32::MAX; start seconds are 1–i64::MAX. It returns
+`ResolveRecipientResult {sampled_at_ms, resolution}`, where `resolution` is
+`{state: "resolved", address: String}` or `{state: "unavailable"}`. The SDK
+validates canonical encoding, the exact request/operation, and the requested
+harness/session. Host id and logical store namespace come from daemon policy.
+
+Both reads require `producer_v1.host_observations=true`, recipient permission and
+native namespace scope before binding/process lookup. They neither enumerate nor
+create bindings, spend evidence, send, write custody/journals or expose private
+process facts. Expected fields only filter an existing protected binding; any
+missing/mismatching/retired fact returns unavailable. Resolution checks the actual
+canonical store, live UID, executable, process-selected store environment, exact
+PID/start seconds and unchanged final binding snapshot. Seconds are Bridge's
+existing precision: consumers requiring stronger process ownership must validate
+their own birth proof before and after lookup. A resolved address cannot authenticate
+an invocation. Read errors carry no mutation effect or reconciliation key.
 
 ## Scalar values, canonicalization and secrets
 

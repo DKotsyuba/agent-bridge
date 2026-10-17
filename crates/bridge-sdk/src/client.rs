@@ -15,7 +15,8 @@ impl Client {
         Ok(Self { config })
     }
     /// Executes an explicit generic operation with caller-persisted identity.
-    /// Reads use core except capabilities, which queries adapter-composed host facts.
+    /// Native observations/resolution and capabilities use the adapter endpoint;
+    /// historical status reads use core. Reads have no mutation reconciliation.
     /// Mutations return custody/route facts only; producer admission remains local.
     pub fn execute(
         &self,
@@ -26,6 +27,8 @@ impl Client {
             .map_err(ClientError::InvalidRequest)?;
         let endpoint = match request.operation {
             Operation::Capabilities(_)
+            | Operation::ObserveRecipient(_)
+            | Operation::ResolveRecipient(_)
             | Operation::RegisterCall(_)
             | Operation::ConsumeAssertion(_) => &self.config.registration_socket,
             _ => &self.config.core_socket,
@@ -49,6 +52,33 @@ impl Client {
     pub fn capabilities(&self, request_id: impl Into<String>) -> Result<Capabilities, ClientError> {
         match self.execute(request_id, Operation::Capabilities(CapabilitiesParams {}))? {
             OperationResult::Capabilities(r) => Ok(r),
+            _ => unreachable!("validated result operation"),
+        }
+    }
+    /// Reads one granted recipient without enumeration, proof spending or delivery.
+    /// Unavailable/unknown never implies idle, finished or dead; read time is not
+    /// hook freshness. Transport/service/validation failures retain their classes.
+    pub fn observe_recipient(
+        &self,
+        request_id: impl Into<String>,
+        params: ObserveRecipientParams,
+    ) -> Result<RecipientObservation, ClientError> {
+        match self.execute(request_id, Operation::ObserveRecipient(params))? {
+            OperationResult::ObserveRecipient(r) => Ok(r),
+            _ => unreachable!("validated result operation"),
+        }
+    }
+    /// Resolves only an existing granted binding matching all expected live facts.
+    /// The returned address is correlated to the requested host/session and is
+    /// neither invocation authority nor a full-precision process ownership proof.
+    /// Failures never carry mutation reconciliation or private expected facts.
+    pub fn resolve_recipient(
+        &self,
+        request_id: impl Into<String>,
+        params: ResolveRecipientParams,
+    ) -> Result<ResolveRecipientResult, ClientError> {
+        match self.execute(request_id, Operation::ResolveRecipient(params))? {
+            OperationResult::ResolveRecipient(r) => Ok(r),
             _ => unreachable!("validated result operation"),
         }
     }

@@ -72,6 +72,7 @@ mod assertions;
 mod claims;
 mod executables;
 mod gateway;
+mod observations;
 pub(crate) use claims::EvidenceClaim;
 pub use executables::VendorSignature;
 #[cfg(test)]
@@ -1136,20 +1137,25 @@ impl MessageCandidate {
     ///
     /// The harness is gone or anything above changed.
     fn live_check(&self) -> Result<ProcessFacts, String> {
-        let binding = &self.binding;
-        let facts = os::process_facts(binding.harness.0).ok_or("harness is gone")?;
-        if facts.uid != Some(self.owner_uid)
-            || facts.start_time != binding.harness.1
-            || facts.exe.as_ref() != Some(&binding.executable)
-            || harness_store(&facts, binding.address.harness)
-                .is_none_or(|store| store != binding.store)
-            || private_store(&binding.store, self.owner_uid).is_err()
-            || executable_current(&binding.executable, &facts, self.owner_uid).is_err()
-        {
-            return Err("message harness/store changed".into());
-        }
-        Ok(facts)
+        live_binding(&self.binding, self.owner_uid)
     }
+}
+
+/// Revalidates one existing binding's exact live PID/start, UID, executable and
+/// process-selected canonical private store without modifying registry state.
+/// Returns current process facts; any absent or changed fact fails closed.
+fn live_binding(binding: &Binding, owner_uid: u32) -> Result<ProcessFacts, String> {
+    let facts = os::process_facts(binding.harness.0).ok_or("harness is gone")?;
+    if facts.uid != Some(owner_uid)
+        || facts.start_time != binding.harness.1
+        || facts.exe.as_ref() != Some(&binding.executable)
+        || harness_store(&facts, binding.address.harness).is_none_or(|store| store != binding.store)
+        || private_store(&binding.store, owner_uid).is_err()
+        || executable_current(&binding.executable, &facts, owner_uid).is_err()
+    {
+        return Err("message harness/store changed".into());
+    }
+    Ok(facts)
 }
 
 /// Returns device/inode only for the exact owned regular transcript inside the
@@ -3810,6 +3816,94 @@ mod tests {
             pending: false,
             role: None,
         }
+    }
+
+    /// Observation reads preserve the whole registry and journal, and a final
+    /// snapshot fence rejects epoch, lifecycle, retirement, store or policy races.
+    /// Live process checks reject a mismatching expected tuple and a dead process.
+    #[test]
+    fn observation_snapshot_is_read_only_and_fenced() {
+        use bridge_protocol::{Host, ResolveRecipientParams};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("obs");
+        let store = dir.join("store");
+        std::fs::create_dir(&store).unwrap();
+        let exe = dir.join("harness");
+        let child = live_child(&exe, "CLAUDE_CONFIG_DIR", &store);
+        let mut registry = claude_registry();
+        let address = registry
+            .observation_address(Host::ClaudeCode, "session")
+            .unwrap();
+        assert_eq!(address.to_canonical_string(), "h/claude-code/ns/session");
+        assert!(
+            registry
+                .observation_address(Host::Codex, "session")
+                .is_none()
+        );
+        let key = address.to_canonical_string();
+        let binding = unknown_binding(&address, &child, &store, &exe);
+        registry.bindings.insert(key.clone(), binding.clone());
+        let journal = dir.join("untouched.json");
+        registry.journal = Some(journal.clone());
+        let expected = ResolveRecipientParams {
+            host: Host::ClaudeCode,
+            native_session_id: "session".into(),
+            expected_store: store.to_str().unwrap().into(),
+            expected_harness_pid: binding.harness.0,
+            expected_harness_start_time_secs: binding.harness.1,
+        };
+        let candidate = registry.observation_candidate(&address).unwrap();
+        assert!(candidate.live(Some(&expected)));
+        assert!(registry.observation_current(&candidate));
+        assert!(candidate.live(None));
+        assert_eq!(registry.bindings[&key], binding);
+        assert!(
+            registry.calls.is_empty()
+                && registry.sealed.is_empty()
+                && registry.claims.is_empty()
+                && registry.assertions.is_empty()
+        );
+        assert!(!journal.exists(), "read must not persist a journal");
+        for case in 0..6 {
+            let changed = registry.bindings.get_mut(&key).unwrap();
+            match case {
+                0 => changed.epoch += 1,
+                1 => changed.lifecycle = Lifecycle::AwaitingInput,
+                2 => changed.retired = true,
+                3 => changed.store = dir.clone(),
+                4 => changed.capabilities.message = false,
+                _ => changed.pending = true,
+            }
+            assert!(
+                !registry.observation_current(&candidate),
+                "changed snapshot {case}"
+            );
+            if case == 2 || case == 5 {
+                assert!(registry.observation_candidate(&address).is_none());
+            }
+            registry.bindings.insert(key.clone(), binding.clone());
+        }
+        registry.policies[0].message = false;
+        assert!(!registry.observation_current(&candidate));
+        registry.policies[0].message = true;
+        registry.message_disabled.push(Harness::ClaudeCode);
+        assert!(!registry.observation_current(&candidate));
+        registry.message_disabled.clear();
+        let mut wrong = expected.clone();
+        wrong.expected_harness_start_time_secs += 1;
+        assert!(!candidate.live(Some(&wrong)));
+        wrong = expected.clone();
+        wrong.expected_store.push_str("-other");
+        assert!(!candidate.live(Some(&wrong)));
+        // A private store changing permissions is not a valid current binding.
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(!candidate.live(Some(&expected)));
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(candidate.live(Some(&expected)));
+        drop(child);
+        assert!(!candidate.live(Some(&expected)));
+        assert!(!journal.exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Writes a Claude session descriptor `<store>/sessions/<pid>.json` for

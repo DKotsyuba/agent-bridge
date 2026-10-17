@@ -555,6 +555,7 @@ impl Custody for CommitGate {
 
 /// While native registration is between claim and custody, a genuine sibling
 /// legacy frontend cannot spend the same observation; only commit finalizes it.
+/// The barrier is a complete parsed result, not file creation before its write.
 #[test]
 fn reservation_blocks_legacy_attestation_until_real_commit() {
     let mut lab = lab(false);
@@ -600,15 +601,21 @@ fn reservation_blocks_legacy_attestation_until_real_commit() {
         (source, outcome)
     });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
-    while !result_file.exists() && std::time::Instant::now() < deadline {
+    let legacy = loop {
+        let parsed = std::fs::read_to_string(&result_file)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+        if parsed.is_some() || std::time::Instant::now() >= deadline {
+            break parsed;
+        }
         std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    let legacy = std::fs::read_to_string(&result_file)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    };
     let _ = release.send(());
     let (mut source, outcome) = worker.join().unwrap();
-    assert_eq!(legacy.unwrap()["err"], "unavailable");
+    assert_eq!(
+        legacy.expect("complete legacy result before releasing the commit gate")["err"],
+        "unavailable"
+    );
     assert_eq!(outcome["first"]["success"], true);
     assert_eq!(
         source.mcp(

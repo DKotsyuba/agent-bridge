@@ -56,6 +56,12 @@ pub(super) fn serve_v1(
             return;
         }
     };
+    if !matches!(
+        request.operation,
+        Operation::ObserveRecipient(_) | Operation::ResolveRecipient(_)
+    ) {
+        crate::registry::refresh_stale(&state.registry);
+    }
     let outcome = handle(&request, peer, state);
     let response = match outcome {
         Ok(result) => Response::ok(&request.request_id, result),
@@ -91,12 +97,60 @@ fn handle(
             capabilities.evidence_variants = vec!["native".into(), "sealed".into()];
             capabilities.limits.registration_request_bytes = super::MAX_REQUEST_BYTES as u64;
             capabilities.limits.assertions = 1024;
-            capabilities.features.host_observations = false;
+            capabilities.features.host_observations = grant
+                .policy()
+                .is_some_and(|policy| policy.host_observations);
+            if capabilities.features.host_observations {
+                capabilities
+                    .operations
+                    .extend(["observe_recipient".into(), "resolve_recipient".into()]);
+            }
             capabilities.features.consume_assertion =
                 registry.has_audience(&producer, grant.assertion_audiences());
             Ok(OperationResult::Capabilities(capabilities))
         }
         Operation::RegisterCall(params) => register(request, params, peer, state, &producer),
+        Operation::ObserveRecipient(params) => {
+            observation_permission(request, grant)?;
+            let address = bridge_core::NativeAddress::parse(&params.address).map_err(|_| {
+                error(
+                    request,
+                    ErrorClass::Invalid,
+                    "invalid_recipient",
+                    RetryHint::Never,
+                    false,
+                )
+            })?;
+            observation_scope(request, grant, &address)?;
+            let observation =
+                observe(state, &address, None).unwrap_or(RecipientObservationState::Unavailable);
+            Ok(OperationResult::ObserveRecipient(RecipientObservation {
+                address: address.to_canonical_string(),
+                sampled_at_ms: current_unix_millis(),
+                observation,
+            }))
+        }
+        Operation::ResolveRecipient(params) => {
+            observation_permission(request, grant)?;
+            let address = lock_registry(&state.registry)
+                .observation_address(params.host, &params.native_session_id);
+            let resolution = if let Some(address) = address {
+                observation_scope(request, grant, &address)?;
+                if observe(state, &address, Some(params)).is_some() {
+                    RecipientResolution::Resolved {
+                        address: address.to_canonical_string(),
+                    }
+                } else {
+                    RecipientResolution::Unavailable
+                }
+            } else {
+                RecipientResolution::Unavailable
+            };
+            Ok(OperationResult::ResolveRecipient(ResolveRecipientResult {
+                sampled_at_ms: current_unix_millis(),
+                resolution,
+            }))
+        }
         Operation::ConsumeAssertion(params) => {
             if grant.assertion_audiences().is_empty() {
                 return Err(error(
@@ -127,6 +181,66 @@ fn handle(
             false,
         )),
     }
+}
+
+/// Requires explicit read permission before even reading native configuration.
+/// Rejection is a read error with no mutation or reconciliation fields.
+fn observation_permission(
+    request: &Request,
+    grant: &bridge_core::ProducerPolicyGrant,
+) -> Result<(), ApiError> {
+    if grant
+        .policy()
+        .is_some_and(|policy| policy.host_observations)
+    {
+        Ok(())
+    } else {
+        Err(error(
+            request,
+            ErrorClass::Forbidden,
+            "host_observations_disabled",
+            RetryHint::Never,
+            false,
+        ))
+    }
+}
+
+/// Requires both exact recipient and native namespace scope before binding or
+/// process lookup; a caller-controlled address never grants observation access.
+fn observation_scope(
+    request: &Request,
+    grant: &bridge_core::ProducerPolicyGrant,
+    address: &bridge_core::NativeAddress,
+) -> Result<(), ApiError> {
+    if grant.allows_recipient(&address.to_canonical_string()) && grant.allows_native_scope(address)
+    {
+        Ok(())
+    } else {
+        Err(error(
+            request,
+            ErrorClass::Forbidden,
+            "recipient_observation_forbidden",
+            RetryHint::Never,
+            false,
+        ))
+    }
+}
+
+/// Samples exactly one existing binding. Process/environment/filesystem reads
+/// run outside the registry lock; the complete snapshot is rechecked under it
+/// last. No evidence, journal, custody or carrier state is changed.
+fn observe(
+    state: &ChannelState,
+    address: &bridge_core::NativeAddress,
+    expected: Option<&ResolveRecipientParams>,
+) -> Option<RecipientObservationState> {
+    let snapshot = lock_registry(&state.registry).observation_candidate(address)?;
+    if !snapshot.live(expected) {
+        return None;
+    }
+    lock_registry(&state.registry)
+        .observation_current(&snapshot)
+        .then(|| snapshot.observation())
 }
 
 /// Recovers historical custody before native claims; new registration reserves,

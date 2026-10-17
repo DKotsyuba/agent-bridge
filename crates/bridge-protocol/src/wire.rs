@@ -94,7 +94,10 @@ impl Request {
             Operation::RetireDeliveryScope(_) => ReconciliationKey::Retire {
                 request_id: self.request_id.clone(),
             },
-            Operation::Capabilities(_) | Operation::Status(_) => return None,
+            Operation::Capabilities(_)
+            | Operation::Status(_)
+            | Operation::ObserveRecipient(_)
+            | Operation::ResolveRecipient(_) => return None,
         })
     }
 }

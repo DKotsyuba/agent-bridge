@@ -1,8 +1,8 @@
 # Universal Bridge producer SDK
 
 A synchronous Rust client for the Agent Bridge producer API v1. It depends on
-`bridge-protocol`, `serde`, `serde_json` and the locked `socket2` safe Unix connection
-API only. It has no core, SQLite, native carrier, MCP framework, producer repository,
+`bridge-protocol`, `serde`, `serde_json`, the locked `socket2` safe Unix connection
+API and the existing Tokio kernel peer-credential API. It has no core, SQLite, native carrier, MCP framework, producer repository,
 business outbox, background sender or connection pool. The legacy `bridge-client` and
 operator APIs are separate and unchanged. For the end-to-end onboarding sequence read
 [Producer integration](../../docs/producer-integration.md); the wire format is in the
@@ -45,8 +45,23 @@ This validates configuration without any I/O. Credentials may rotate while the c
 producer identity and retained keys stay stable. `capabilities` queries the registration
 endpoint and includes authenticated native path facts (the native adapter advertises an
 empty `native_contracts` list). Core handles publish, status,
-close and retire; the adapter handles registration and optional audience assertions.
+close and retire; the adapter handles registration, optional audience assertions
+and explicitly granted exact native observations.
 Unsupported paths and features are refused explicitly.
+
+`observe_recipient(id, ObserveRecipientParams { address })` returns a canonical
+address and `RecipientObservationState`, preserving unknown and unavailable as
+distinct from idle. `resolve_recipient(id, ResolveRecipientParams { host,
+native_session_id, expected_store, expected_harness_pid,
+expected_harness_start_time_secs })` returns `RecipientResolution::Resolved {
+address }` only for an existing protected binding matching the live expected facts.
+Both use `registration_socket` and require `producer_v1.host_observations=true`
+plus recipient/native scope grants. Neither enumerates or creates bindings,
+consumes proof or sends anything. Samples are read time, not hook freshness;
+resolution is not caller authority or full-precision process ownership proof.
+See [exact native reads](../bridge-protocol/docs/wire-v1.md#exact-native-reads)
+for limits and consumer responsibilities. Read failures have no mutation
+reconciliation key.
 
 ## Integration sequence
 
@@ -78,6 +93,13 @@ Unsupported paths and features are refused explicitly.
 ## Transport and errors
 
 The configuration is immutable and shareable; each exchange owns one bounded Unix stream.
+Before any credential or request byte is sent, the SDK compares the connected
+server's kernel UID with its own effective UID obtained from a fresh socket pair.
+Unreadable or mismatching credentials refuse as `NotSent`. This checks OS user
+identity, not the identity of an arbitrary process running under that same user;
+configured endpoint directories must remain protected. A private current-thread
+Tokio driver is used only for the safe credential call, starts no tasks and does
+not nest `block_on` when the synchronous SDK is called within another runtime.
 One absolute deadline covers connect, write, read and an optional single identical
 reconnect, and partial traffic never renews it. A retry preserves request and event ids
 and bytes. A lost, malformed or mismatched acknowledgement after any possible write is

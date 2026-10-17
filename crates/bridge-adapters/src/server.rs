@@ -532,7 +532,8 @@ fn write_response(stream: &mut UnixStream, response: &ChannelResponse) -> std::i
     stream.flush()
 }
 
-/// Serves one connection.
+/// Serves one protected connection. Native observation reads bypass executable
+/// digest refresh so authorization precedes registry access and reads stay pure.
 fn serve(stream: UnixStream, state: &ChannelState) {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
@@ -546,11 +547,6 @@ fn serve(stream: UnixStream, state: &ChannelState) {
     let Some(line) = read_line(&mut reader, IO_TIMEOUT) else {
         return;
     };
-    // A request line arrived: hash any configured relay, owner or audience
-    // executable whose file identity changed since the last hash (an application
-    // update) before any attestation, with the registry lock released; the common
-    // case only stats and returns.
-    crate::registry::refresh_stale(&state.registry);
     if serde_json::from_str::<serde_json::Value>(&line)
         .ok()
         .is_some_and(|value| value.get("api_version").is_some())
@@ -558,6 +554,9 @@ fn serve(stream: UnixStream, state: &ChannelState) {
         producer::serve_v1(&line, peer, state, &mut writer);
         return;
     }
+    // Refresh configured relay/audience builds before legacy attestation; v1
+    // registration/assertion paths refresh after decoding their operation.
+    crate::registry::refresh_stale(&state.registry);
     let request: ChannelRequest = match serde_json::from_str(&line) {
         Ok(request) => request,
         Err(_) => {

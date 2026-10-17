@@ -189,8 +189,21 @@ No credentials, raw proof strings or assertion keys enter ordinary Debug/log out
 Authenticated capabilities disclose only the producer's permitted boundary.
 Native host/build/digest facts are not advertised (the list is empty: no harness
 build is predeclared), so a consumer never reads a fake build. Harness-policy
-support is distinct from recorded native qualification. Initial
-host_observations is unsupported; existing lifecycle hooks/carriers remain intact.
+support is distinct from recorded native qualification. `host_observations` is
+advertised only for an explicitly enabled producer grant on this adapter endpoint.
+
+`observe_recipient` and `resolve_recipient` implement the
+[exact native reads](../../bridge-protocol/docs/wire-v1.md#exact-native-reads).
+Both require recipient and native namespace permission before binding or process
+lookup. The latter derives the one address from configured host id, harness policy
+namespace and requested native session, then compares expected store/PID/start
+seconds with the existing protected nonretired binding. Both check current UID,
+executable, private canonical store and actual process environment outside the
+registry lock, then compare the entire binding and policy under the lock last.
+No lookup starts executable digest refresh, spends a proof, writes a journal or
+custody, creates a binding or invokes a carrier. Missing or changed facts return
+unavailable without private expected facts in errors or results. This seconds-based
+process check is not caller authentication or a stronger birth/ownership proof.
 
 Decisive owned-process controls: direct/sealed reservation exclusivity versus
 legacy consumers; exact registration replay before evidence; same operation/new

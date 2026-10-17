@@ -6,6 +6,16 @@ source, and the crates are not published to crates.io.
 
 ## [Unreleased]
 
+### Added
+
+- Explicitly granted adapter-only `observe_recipient` and `resolve_recipient`
+  reads with typed SDK methods. Exact protected bindings, live process/store
+  checks and final snapshot fences return content-free observations or unavailable;
+  they create no caller authority and perform no delivery or custody mutation.
+- The producer SDK checks the connected Unix peer's kernel user identity before
+  transmitting a credential, using the already locked safe Tokio API. Missing or
+  foreign user credentials refuse without sending request bytes.
+
 ## [0.3.1] - 2026-10-16
 
 ### Fixed
