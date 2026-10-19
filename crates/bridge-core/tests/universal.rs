@@ -176,153 +176,161 @@ fn scoped_latest_retention_uses_the_lifetime_watermark() {
 fn retired_scope_unsent_preserves_history_and_rejects_retry() {
     use bridge_core::recovery::{DeliveryState, EvidenceTier};
     for history in [false, true] {
-        let dir = TempDir::new("retired-unsent");
-        let mut storage = store(&dir.path("state.db"));
-        let route = storage
-            .register_call(
-                TOKEN,
-                "register",
-                &registration("job"),
-                Some(&origin("use", "root")),
-                &|| 1000,
-            )
-            .unwrap();
-        storage
-            .publish_v1(
-                TOKEN,
-                &publication(&route.route_key, "event", Some("life")),
-                &|| 1001,
-            )
-            .unwrap();
-        let recipient = codex("caller");
-        let attestation = attest(&recipient, Lifecycle::Inactive, 1);
-        let Selection::Attempt(mut current) = storage
-            .reserve_next(
-                &attestation,
-                EffectiveMode::Message,
-                1002,
-                &DispatchTiming::default(),
-            )
-            .unwrap()
-        else {
-            panic!("reservation")
-        };
-        storage
-            .mark_invoking(&current.fence, &attestation, 1003)
-            .unwrap();
-        if history {
-            storage
-                .record_outcome(
-                    &current.fence,
-                    Outcome::OutcomeUnknown {
-                        reason: "fixture original unknown".into(),
-                    },
-                    1004,
+        for deferred in [false, true] {
+            let dir = TempDir::new("retired-unsent");
+            let mut storage = store(&dir.path("state.db"));
+            let route = storage
+                .register_call(
+                    TOKEN,
+                    "register",
+                    &registration("job"),
+                    Some(&origin("use", "root")),
+                    &|| 1000,
                 )
                 .unwrap();
             storage
-                .authorize_manual_retry(
-                    "report-maker",
-                    "event",
-                    "operator",
-                    "fixture deliberate duplicate risk",
-                    1005,
+                .publish_v1(
+                    TOKEN,
+                    &publication(&route.route_key, "event", Some("life")),
+                    &|| 1001,
                 )
                 .unwrap();
-            let Selection::Attempt(next) = storage
+            let recipient = codex("caller");
+            let attestation = attest(&recipient, Lifecycle::Inactive, 1);
+            let Selection::Attempt(mut current) = storage
                 .reserve_next(
                     &attestation,
                     EffectiveMode::Message,
-                    1006,
+                    1002,
                     &DispatchTiming::default(),
                 )
                 .unwrap()
             else {
-                panic!("retry reservation")
+                panic!("reservation")
             };
-            current = next;
             storage
-                .mark_invoking(&current.fence, &attestation, 1007)
+                .mark_invoking(&current.fence, &attestation, 1003)
                 .unwrap();
-        }
-        storage
-            .retire_delivery_scope(
-                TOKEN,
-                "retire",
-                &RetireDeliveryScopeParams {
-                    scope_key: "life".into(),
-                    action: RetirementAction::RetireUnhanded,
-                },
-                &|| 1008,
-            )
-            .unwrap();
-        storage
-            .record_outcome(
-                &current.fence,
-                Outcome::KnownUnsent {
-                    evidence: "fixture latest helper never wrote".into(),
-                },
-                1009,
-            )
-            .unwrap();
-        let evidence = storage
-            .delivery_evidence("report-maker", "event")
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            evidence.delivery,
             if history {
-                DeliveryState::Review
-            } else {
-                DeliveryState::Disposed
+                storage
+                    .record_outcome(
+                        &current.fence,
+                        Outcome::OutcomeUnknown {
+                            reason: "fixture original unknown".into(),
+                        },
+                        1004,
+                    )
+                    .unwrap();
+                storage
+                    .authorize_manual_retry(
+                        "report-maker",
+                        "event",
+                        "operator",
+                        "fixture deliberate duplicate risk",
+                        1005,
+                    )
+                    .unwrap();
+                let Selection::Attempt(next) = storage
+                    .reserve_next(
+                        &attestation,
+                        EffectiveMode::Message,
+                        1006,
+                        &DispatchTiming::default(),
+                    )
+                    .unwrap()
+                else {
+                    panic!("retry reservation")
+                };
+                current = next;
+                storage
+                    .mark_invoking(&current.fence, &attestation, 1007)
+                    .unwrap();
             }
-        );
-        if history {
+            storage
+                .retire_delivery_scope(
+                    TOKEN,
+                    "retire",
+                    &RetireDeliveryScopeParams {
+                        scope_key: "life".into(),
+                        action: RetirementAction::RetireUnhanded,
+                    },
+                    &|| 1008,
+                )
+                .unwrap();
+            storage
+                .record_outcome(
+                    &current.fence,
+                    if deferred {
+                        Outcome::DeferredKnownUnsent {
+                            evidence: "fixture current owner deferred before native effect".into(),
+                        }
+                    } else {
+                        Outcome::KnownUnsent {
+                            evidence: "fixture latest helper never wrote".into(),
+                        }
+                    },
+                    1009,
+                )
+                .unwrap();
+            let evidence = storage
+                .delivery_evidence("report-maker", "event")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                evidence.delivery,
+                if history {
+                    DeliveryState::Review
+                } else {
+                    DeliveryState::Disposed
+                }
+            );
+            if history {
+                assert!(
+                    evidence
+                        .tiers
+                        .iter()
+                        .any(|row| row.tier == EvidenceTier::Unknown)
+                );
+                assert!(
+                    evidence.incident.is_some(),
+                    "preserved uncertainty stays visible"
+                );
+            }
             assert!(
-                evidence
-                    .tiers
-                    .iter()
-                    .any(|row| row.tier == EvidenceTier::Unknown)
+                storage
+                    .authorize_manual_retry(
+                        "report-maker",
+                        "event",
+                        "operator",
+                        "fixture blocked retry",
+                        1010
+                    )
+                    .is_err()
             );
             assert!(
-                evidence.incident.is_some(),
-                "preserved uncertainty stays visible"
+                storage
+                    .recipients_with_work(100_000, 100, None)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                storage
+                    .reserve_next(
+                        &attestation,
+                        EffectiveMode::Message,
+                        100_000,
+                        &DispatchTiming::default()
+                    )
+                    .unwrap(),
+                Selection::Idle
+            );
+            assert!(
+                storage
+                    .next_pending(&recipient.to_canonical_string(), 100)
+                    .unwrap()
+                    .is_empty()
             );
         }
-        assert!(
-            storage
-                .authorize_manual_retry(
-                    "report-maker",
-                    "event",
-                    "operator",
-                    "fixture blocked retry",
-                    1010
-                )
-                .is_err()
-        );
-        assert!(
-            storage
-                .recipients_with_work(100_000, 100, None)
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            storage
-                .reserve_next(
-                    &attestation,
-                    EffectiveMode::Message,
-                    100_000,
-                    &DispatchTiming::default()
-                )
-                .unwrap(),
-            Selection::Idle
-        );
-        assert!(
-            storage
-                .next_pending(&recipient.to_canonical_string(), 100)
-                .unwrap()
-                .is_empty()
-        );
     }
 }
 

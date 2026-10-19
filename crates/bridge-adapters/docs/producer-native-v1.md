@@ -250,3 +250,16 @@ unsupported operation/version refusal, original assertion expiry, audience/RPC
 linkage, endpoint renewal and issuer boot loss. Existing native message/inject
 regression remains covered. Controlled implementation mutations must fail these
 public checks and restoration must pass again.
+
+## Native-owner busy delivery fences
+
+The owner-routed Codex, Claude Code and OpenCode message carriers hold a
+positively non-idle recipient before reserving work. An owner endpoint or idle
+state change proven before native input is a deferred known-unsent outcome.
+After writing the owner request, only a correlated strictly closed receipt with
+state `known_unsent`, null protocol/native-id and reason `not_idle`,
+`awaiting_input` or `capacity` permits this zero-effect deferral. Other valid
+known-unsent reasons keep ordinary bounded retries. Missing, malformed,
+uncorrelated and unknown receipts remain outcome-unknown, with no resend and no
+alternate route. These delivery outcomes grant no producer caller authority and
+never answer native permission or input requests.

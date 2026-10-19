@@ -3157,3 +3157,152 @@ fn disposing_the_expired_predecessor_closes_the_dependent_incident_without_reope
     );
     assert_eq!(released.members[0].event_id, "dep-d");
 }
+
+/// More than five proven busy deferrals retain the original event until a
+/// fresh idle endpoint accepts it once; no replacement event or refusal is made.
+#[test]
+fn deferred_known_unsent_waits_past_retry_budget_then_delivers() {
+    let shared = Mutex::new(store());
+    let recipient = codex("deferred-owner");
+    shared
+        .lock()
+        .unwrap()
+        .publish(
+            &keep_all("agent-run", "deferred-event", &recipient, Mode::Message),
+            1_000,
+        )
+        .unwrap();
+    let mut carrier = ScriptedCarrier::new(
+        Lifecycle::Inactive,
+        Outcome::DeferredKnownUnsent {
+            evidence: "fixture owner proved not_idle before native input".into(),
+        },
+    );
+    let mut now = 2_000;
+    for _ in 0..8 {
+        assert!(matches!(
+            drive(&shared, &mut carrier, &recipient, now),
+            DispatchReport::Sent {
+                state: AttemptState::KnownUnsent,
+                ..
+            }
+        ));
+        let storage = shared.lock().unwrap();
+        let evidence = storage
+            .delivery_evidence("agent-run", "deferred-event")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            evidence.delivery,
+            DeliveryState::Unhanded,
+            "temporary recipient state must not permanently refuse queued work"
+        );
+        assert!(storage.open_incidents(now, 10).unwrap().is_empty());
+        drop(storage);
+        now += 30_000;
+    }
+    carrier.outcome = ScriptedCarrier::accepted();
+    assert!(matches!(
+        drive(&shared, &mut carrier, &recipient, now),
+        DispatchReport::Sent {
+            state: AttemptState::NativeAccepted,
+            events: 1
+        }
+    ));
+    assert_eq!(carrier.sends.len(), 9);
+    assert!(
+        carrier
+            .sends
+            .iter()
+            .all(|attempt| attempt.manifest == carrier.sends[0].manifest)
+    );
+    let storage = shared.lock().unwrap();
+    let evidence = storage
+        .delivery_evidence("agent-run", "deferred-event")
+        .unwrap()
+        .unwrap();
+    assert_eq!(evidence.delivery, DeliveryState::Accepted);
+    assert_eq!(
+        evidence.attempts_made, 1,
+        "only the eligible handoff consumes the budget"
+    );
+}
+
+/// Busy deferrals preserve an earlier real failure charge, while subsequent
+/// ordinary failures still exhaust at five and uncertain sends never retry.
+#[test]
+fn deferred_known_unsent_preserves_failure_and_unknown_boundaries() {
+    for uncertain in [false, true] {
+        let shared = Mutex::new(store());
+        let recipient = codex("deferred-budget");
+        shared
+            .lock()
+            .unwrap()
+            .publish(
+                &keep_all(
+                    "agent-run",
+                    "deferred-budget-event",
+                    &recipient,
+                    Mode::Message,
+                ),
+                1_000,
+            )
+            .unwrap();
+        let mut carrier = ScriptedCarrier::new(
+            Lifecycle::Inactive,
+            Outcome::KnownUnsent {
+                evidence: "fixture transport failed before write".into(),
+            },
+        );
+        let mut now = 2_000;
+        drive(&shared, &mut carrier, &recipient, now);
+        carrier.outcome = Outcome::DeferredKnownUnsent {
+            evidence: "fixture correlated busy refusal before native effect".into(),
+        };
+        for _ in 0..8 {
+            now += 30_000;
+            drive(&shared, &mut carrier, &recipient, now);
+            let storage = shared.lock().unwrap();
+            let evidence = storage
+                .delivery_evidence("agent-run", "deferred-budget-event")
+                .unwrap()
+                .unwrap();
+            assert_eq!(evidence.attempts_made, 1);
+            assert_eq!(evidence.delivery, DeliveryState::Unhanded);
+        }
+        carrier.outcome = if uncertain {
+            Outcome::OutcomeUnknown {
+                reason: "fixture receipt lost after write".into(),
+            }
+        } else {
+            Outcome::KnownUnsent {
+                evidence: "fixture ordinary transport failure".into(),
+            }
+        };
+        for _ in 0..4 {
+            now += 30_000;
+            drive(&shared, &mut carrier, &recipient, now);
+        }
+        let sends = carrier.sends.len();
+        now += 300_000;
+        assert!(!matches!(
+            drive(&shared, &mut carrier, &recipient, now),
+            DispatchReport::Sent { .. }
+        ));
+        assert_eq!(carrier.sends.len(), sends);
+        let storage = shared.lock().unwrap();
+        let evidence = storage
+            .delivery_evidence("agent-run", "deferred-budget-event")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            evidence.delivery,
+            if uncertain {
+                DeliveryState::Review
+            } else {
+                DeliveryState::Refused
+            }
+        );
+        assert_eq!(evidence.attempts_made, if uncertain { 2 } else { 5 });
+    }
+}

@@ -46,9 +46,14 @@ impl OpenCodeOwnerCarrier {
 
 impl DispatchCarrier for OpenCodeOwnerCarrier {
     /// Attests only a genuine registered OpenCode actor and a positively proven
-    /// owner route. Core retains the observed lifecycle and capability policy.
+    /// owner route while positively idle. Busy/unknown/permission states hold
+    /// before reserving an attempt; an epoch race at send is a zero-effect deferral.
     fn attest(&mut self, recipient: &NativeAddress) -> Result<Attestation, String> {
-        self.route(recipient).map(|(attestation, _, _)| attestation)
+        let (attestation, _, _) = self.route(recipient)?;
+        if attestation.lifecycle() != Lifecycle::Inactive {
+            return Err("native owner recipient is not positively idle".into());
+        }
+        Ok(attestation)
     }
 
     /// Hands the frozen manifest once to the same epoch while positively idle.
@@ -74,7 +79,7 @@ impl DispatchCarrier for OpenCodeOwnerCarrier {
         if binding.epoch != attempt.fence.endpoint_epoch
             || attestation.lifecycle() != Lifecycle::Inactive
         {
-            return Outcome::KnownUnsent {
+            return Outcome::DeferredKnownUnsent {
                 evidence: "OpenCode epoch or idle lifecycle changed before handoff".into(),
             };
         }

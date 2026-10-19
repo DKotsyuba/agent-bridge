@@ -146,8 +146,15 @@ Rules enforced by core:
   idle.
 - An `invoking` attempt past its deadline, a lost carrier result or a panic becomes
   `outcome_unknown` with a retained incident and is **never retried automatically**.
-- A positively known-unsent attempt is closed before a bounded retry with doubling
-  delay; exhaustion refuses the event with an incident.
+- An ordinary positively known-unsent transport failure is closed before a bounded
+  retry with doubling delay; exhaustion refuses the event with an incident.
+- A positively busy native owner is held before reservation. A verified owner
+  epoch/lifecycle race, or its correlated closed zero-effect `not_idle`,
+  `awaiting_input` or `capacity` refusal, closes as known-unsent and refunds only
+  that attempt's budget charge. The original event waits for a fresh attestation
+  under the existing delay, expiry, coalescing and retirement fences. Immutable
+  attempt history is retained; no lost, malformed or uncorrelated receipt can
+  obtain this deferral.
 - Held and written-without-receipt hand-offs are non-terminal with recheck deadlines
   and overdue incidents.
 - Only an audited operator decision (`authorize_manual_retry` on the *same* event with

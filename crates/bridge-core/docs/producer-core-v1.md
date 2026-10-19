@@ -270,3 +270,17 @@ and late evidence; crash/ack windows; schema-five migration; legacy wire/hash
 compatibility; hard capacity/redaction; correct-pass, meaningful mutant-fail and
 restored-pass on the source under test. Owned core regression and generic fixture controls
 are part of the test suite; genuine native composition is a separate gate.
+
+## Temporary native-owner backpressure
+
+Busy recipients do not exhaust transport retries. The trusted native carrier can
+report `DeferredKnownUnsent` only with positive evidence of no native effect:
+a local pre-write owner epoch/lifecycle fence, or the owner's correlated closed
+zero-effect busy/capacity receipt. Core retains the ordinary `known_unsent`
+attempt/evidence state, refunds that current owned attempt's automatic budget
+charge, and leaves the same event unhanded until its next delay and fresh
+attestation. `attempts_made` is the consumed automatic attempt budget; immutable
+attempt sequence/history still records every deferral. Ordinary known-unsent
+transport failures retain the five-attempt bound. Unknown effects are never
+automatically retried; retirement, expiry and old-attempt ownership fences remain.
+No producer API v1 wire shape or storage schema changes.

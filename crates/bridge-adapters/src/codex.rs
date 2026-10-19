@@ -104,17 +104,32 @@ impl CodexQueueCarrier {
     /// exact live frontend on both attest and send and never select a CLI helper.
     /// A native owner route wakes only a positively idle recipient, whatever the
     /// requested mode; helper and application routes keep their lifecycle rules.
+    /// Typed pre-write outcomes defer only owner epoch/lifecycle races, keeping
+    /// ordinary route errors under the existing bounded transport-failure policy.
     fn binding_for(
         &self,
         attempt: &AttemptRecord,
-    ) -> Result<(NativeAddress, RecipientBinding, Route), String> {
-        let address = NativeAddress::parse(&attempt.fence.recipient).map_err(|e| e.to_string())?;
+    ) -> Result<(NativeAddress, RecipientBinding, Route), Outcome> {
+        let unsent = |reason: String| Outcome::KnownUnsent {
+            evidence: format!("no helper started: {reason}"),
+        };
+        let address = NativeAddress::parse(&attempt.fence.recipient)
+            .map_err(|error| unsent(error.to_string()))?;
         if address.harness != Harness::Codex {
-            return Err("not a Codex recipient".into());
+            return Err(unsent("not a Codex recipient".into()));
         }
-        let (attestation, binding, route) = self.message_recipient(&address)?;
+        let (attestation, binding, route) = self.message_recipient(&address).map_err(unsent)?;
+        let changed = |reason: &str| {
+            if matches!(route, Route::Owner(_)) {
+                Outcome::DeferredKnownUnsent {
+                    evidence: reason.into(),
+                }
+            } else {
+                unsent(reason.into())
+            }
+        };
         if binding.epoch != attempt.fence.endpoint_epoch {
-            return Err("the endpoint epoch changed since the reservation".into());
+            return Err(changed("the endpoint epoch changed since the reservation"));
         }
         let lifecycle = attestation.lifecycle();
         let allowed = if matches!(route, Route::Owner(_)) {
@@ -124,7 +139,9 @@ impl CodexQueueCarrier {
                 && (attempt.requested_mode != Mode::Auto || lifecycle == Lifecycle::Inactive)
         };
         if !allowed {
-            return Err("recipient lifecycle changed before message hand-off".into());
+            return Err(changed(
+                "recipient lifecycle changed before message hand-off",
+            ));
         }
         Ok((address, binding, route))
     }
@@ -237,7 +254,10 @@ impl DispatchCarrier for CodexQueueCarrier {
         if recipient.harness != Harness::Codex {
             return Err("not a Codex recipient".into());
         }
-        let (attestation, _, _) = self.message_recipient(recipient)?;
+        let (attestation, _, route) = self.message_recipient(recipient)?;
+        if matches!(route, Route::Owner(_)) && attestation.lifecycle() != Lifecycle::Inactive {
+            return Err("native owner recipient is not positively idle".into());
+        }
         Ok(attestation)
     }
 
@@ -265,11 +285,7 @@ impl DispatchCarrier for CodexQueueCarrier {
     fn send(&mut self, attempt: &AttemptRecord) -> Outcome {
         let (address, binding, route) = match self.binding_for(attempt) {
             Ok(found) => found,
-            Err(reason) => {
-                return Outcome::KnownUnsent {
-                    evidence: format!("no helper started: {reason}"),
-                };
-            }
+            Err(outcome) => return outcome,
         };
         let client_id = format!(
             "agent-bridge-{}-{}",

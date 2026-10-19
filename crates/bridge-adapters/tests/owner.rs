@@ -524,7 +524,11 @@ fn send_fences_epoch_and_remaining_budget_before_any_write() {
         for (label, attempt) in [("epoch", stale), ("short", short), ("expired", expired)] {
             let outcome = rig.carrier.send(&attempt);
             assert!(
-                matches!(outcome, Outcome::KnownUnsent { .. }),
+                if label == "epoch" {
+                    matches!(outcome, Outcome::DeferredKnownUnsent { .. })
+                } else {
+                    matches!(outcome, Outcome::KnownUnsent { .. })
+                },
                 "{harness:?} {label}: {outcome:?}"
             );
             assert_eq!(rig.frames(), 0, "{harness:?} {label}");
@@ -874,5 +878,71 @@ fn unsafe_or_changed_owner_executable_is_refused_with_no_effect() {
             assert_eq!(rig.legacy(), 0, "{harness:?} {label}: no fallback");
             rig.native.stop();
         }
+    }
+}
+
+/// A real private owner may repeatedly prove not_idle without accepting input.
+/// Eight such framed refusals keep the same event queued with no charged retry,
+/// then the same live owner accepts it exactly once for every supported harness.
+#[test]
+fn busy_owner_waits_beyond_five_attempts_then_accepts_same_event() {
+    for harness in [Harness::Codex, Harness::ClaudeCode, Harness::OpenCode] {
+        let mut rig = Rig::new("busy-owner", harness);
+        rig.script("known_unsent:not_idle");
+        rig.lab
+            .publish("busy-event", &rig.address, Mode::Message, "busy marker");
+        let mut clock = now();
+        for _ in 0..8 {
+            let report = dispatch_message(
+                &rig.lab.storage,
+                rig.carrier.as_mut(),
+                &rig.address,
+                &|| clock,
+                &DispatchTiming::default(),
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    report,
+                    DispatchReport::Sent {
+                        state: AttemptState::KnownUnsent,
+                        ..
+                    }
+                ),
+                "{harness:?}: {report:?}"
+            );
+            let storage = rig.lab.storage.lock().unwrap();
+            let evidence = storage
+                .delivery_evidence(PUBLISHER, "busy-event")
+                .unwrap()
+                .unwrap();
+            assert_eq!(evidence.attempts_made, 0);
+            assert_eq!(
+                evidence.delivery,
+                bridge_core::recovery::DeliveryState::Unhanded
+            );
+            drop(storage);
+            clock += 30_000;
+        }
+        assert_eq!(rig.frames(), 8);
+        rig.script(rig.accept());
+        let report = dispatch_message(
+            &rig.lab.storage,
+            rig.carrier.as_mut(),
+            &rig.address,
+            &|| clock,
+            &DispatchTiming::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            report,
+            DispatchReport::Sent {
+                state: AttemptState::NativeAccepted,
+                ..
+            }
+        ));
+        assert_eq!(rig.frames(), 9);
+        assert_eq!(rig.legacy(), 0);
+        rig.native.stop();
     }
 }

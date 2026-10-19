@@ -417,6 +417,14 @@ pub enum Outcome {
         /// How non-sending was established; must be non-empty.
         evidence: String,
     },
+    /// The verified recipient is temporarily busy or its endpoint changed,
+    /// with positive proof that no native effect occurred. The event remains
+    /// queued for a fresh attestation; this wait does not consume the ordinary
+    /// transport-failure budget. Never use for a missing or malformed receipt.
+    DeferredKnownUnsent {
+        /// Positive correlated refusal or local pre-write fence evidence.
+        evidence: String,
+    },
     /// Possible hand-off, unknown effect; retained for reconciliation.
     OutcomeUnknown {
         /// Why the outcome could not be established.
@@ -1478,6 +1486,10 @@ impl Storage {
     ///   any retained possible-effect history stays in review with an incident;
     ///   only proved zero-effect work is disposed. Neither returns to rotation.
     ///
+    /// - `DeferredKnownUnsent` requires the same positive zero-effect proof,
+    ///   but temporary busy/epoch changes refund the current budget charge and
+    ///   wait for a fresh attestation rather than exhausting transport retries.
+    ///
     /// Evidence is retained for every frozen member; disposed or newer-owned
     /// members and their incidents are unchanged.
     ///
@@ -1516,6 +1528,7 @@ impl Storage {
                 Outcome::NativeAccepted { .. }
                     | Outcome::HookSubmitted { .. }
                     | Outcome::KnownUnsent { .. }
+                    | Outcome::DeferredKnownUnsent { .. }
                     | Outcome::PermanentRefusal { .. }
             )
         {
@@ -1670,6 +1683,7 @@ pub(crate) fn apply_outcome(
 ) -> Result<(), CoreError> {
     let seq = record.fence.attempt_seq;
     let now = to_sql(now_ms)?;
+    let deferred = matches!(&outcome, Outcome::DeferredKnownUnsent { .. });
     let (state, tier, detail, recheck) = match &outcome {
         Outcome::NativeAccepted { evidence } => (
             AttemptState::NativeAccepted,
@@ -1698,7 +1712,7 @@ pub(crate) fn apply_outcome(
             evidence.clone(),
             None,
         ),
-        Outcome::KnownUnsent { evidence } => {
+        Outcome::KnownUnsent { evidence } | Outcome::DeferredKnownUnsent { evidence } => {
             if evidence.trim().is_empty() {
                 return Err(CoreError::InvalidEnvelope(
                     "known-unsent needs positive evidence that nothing was written".into(),
@@ -1707,7 +1721,11 @@ pub(crate) fn apply_outcome(
             (
                 AttemptState::KnownUnsent,
                 "known_unsent",
-                evidence.clone(),
+                if deferred {
+                    format!("deferred; {evidence}")
+                } else {
+                    evidence.clone()
+                },
                 None,
             )
         }
@@ -1823,7 +1841,7 @@ pub(crate) fn apply_outcome(
             }
         }
         AttemptState::KnownUnsent => {
-            return_unsent(tx, record, now_ms)?;
+            return_unsent(tx, record, now_ms, deferred)?;
             resolve_attempt_incidents(
                 tx,
                 record,
@@ -1887,14 +1905,17 @@ fn resolve_attempt_incidents(
 /// The attempt is already closed. Only members still owned by it change.
 /// Retired lifetimes dispose zero-effect members or retain all possible
 /// historical effects in review with an incident; they never reenter rotation.
+/// A positive temporary deferral refunds only this owned zero-effect attempt's
+/// budget charge; immutable attempt history and all retirement fences remain.
 /// Other members get the bounded retry delay;
-/// one that has used its automatic budget is refused with an incident; a
+/// one that has used its automatic transport-failure budget is refused with an incident; a
 /// snapshot that a newer revision has meanwhile replaced is superseded
 /// instead of retried.
 fn return_unsent(
     tx: &Transaction<'_>,
     record: &AttemptRecord,
     now_ms: u64,
+    deferred: bool,
 ) -> Result<(), CoreError> {
     for member in &record.members {
         let row: Option<(i64, String, Option<i64>, bool)> = tx
@@ -1914,6 +1935,25 @@ fn return_unsent(
             .optional()?;
         let Some((attempts, scope, revision, retired)) = row else {
             continue;
+        };
+        let attempts = if deferred {
+            let refunded = attempts
+                .checked_sub(1)
+                .filter(|value| *value >= 0)
+                .ok_or_else(|| corrupt("deferred attempt has no charged budget".into()))?;
+            tx.execute(
+                "UPDATE events SET attempts_made = ?1 WHERE publisher_id = ?2
+                 AND event_id = ?3 AND attempt_seq = ?4",
+                params![
+                    refunded,
+                    member.publisher,
+                    member.event_id,
+                    to_sql(record.fence.attempt_seq)?
+                ],
+            )?;
+            refunded
+        } else {
+            attempts
         };
         if retired {
             // Clear this known-unsent attempt's current state before consulting

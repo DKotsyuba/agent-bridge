@@ -1118,8 +1118,9 @@ impl ClaudeLaterCarrier {
 
     /// One native owner hand-off of the frozen manifest for an owner-routed
     /// recipient. The unchanged epoch and a positive idle lifecycle are
-    /// required, whatever the requested mode; anything else, and every failure
-    /// before the request is written, is known-unsent. No inbox frame, callback
+    /// required, whatever the requested mode. A proven epoch/idle change is
+    /// deferred without consuming transport retries; other pre-write failures
+    /// are ordinary known-unsent. No inbox frame, callback
     /// socket or second route is ever used after this route is selected.
     fn send_owner(&self, attempt: &AttemptRecord, address: &NativeAddress) -> Outcome {
         let (attestation, binding, socket) = match self.owner_route(address) {
@@ -1133,7 +1134,7 @@ impl ClaudeLaterCarrier {
         if binding.epoch != attempt.fence.endpoint_epoch
             || attestation.lifecycle() != bridge_core::dispatch::Lifecycle::Inactive
         {
-            return Outcome::KnownUnsent {
+            return Outcome::DeferredKnownUnsent {
                 evidence: "recipient epoch or idle lifecycle changed before owner hand-off".into(),
             };
         }
@@ -1245,7 +1246,11 @@ impl DispatchCarrier for ClaudeLaterCarrier {
             registry.attest_recipient(recipient)?
         };
         if crate::owner::locator(binding.harness.0)?.is_some() {
-            return Ok(self.owner_route(recipient)?.0);
+            let attestation = self.owner_route(recipient)?.0;
+            if attestation.lifecycle() != bridge_core::dispatch::Lifecycle::Inactive {
+                return Err("native owner recipient is not positively idle".into());
+            }
+            return Ok(attestation);
         }
         let changed = self.hub.sync_message(&self.registry, recipient, &binding)?;
         self.hub.callback_capacity()?;

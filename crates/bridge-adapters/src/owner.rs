@@ -220,7 +220,9 @@ fn valid_id(value: &str) -> bool {
 /// recipient `harness`. Only a correlated, exactly shaped acceptance carrying
 /// the protocol of that harness and a genuine native id is
 /// [`Outcome::NativeAccepted`]; a correlated, finitely coded refusal is
-/// [`Outcome::KnownUnsent`]; everything else, including bad bytes, extra,
+/// [`Outcome::KnownUnsent`], or [`Outcome::DeferredKnownUnsent`] only for
+/// `not_idle`, `awaiting_input` and `capacity` with the same zero-effect proof.
+/// Everything else, including bad bytes, extra,
 /// missing or duplicate keys, a mismatched call id or an unlisted code, is
 /// [`Outcome::OutcomeUnknown`] because the request was already written.
 fn classify(frame: &[u8], call_id: &str, harness: Harness) -> Outcome {
@@ -249,6 +251,11 @@ fn classify(frame: &[u8], call_id: &str, harness: Harness) -> Outcome {
                 evidence: format!(
                     "native owner {got} accepted {call_id} as native id {id} (native acceptance, not context or processing)"
                 ),
+            }
+        }
+        ("known_unsent", None, None, Some(code @ ("not_idle" | "awaiting_input" | "capacity"))) => {
+            Outcome::DeferredKnownUnsent {
+                evidence: format!("native owner deferred before any native effect: {code}"),
             }
         }
         ("known_unsent", None, None, Some(code)) if KNOWN_UNSENT.contains(&code) => {
@@ -459,10 +466,12 @@ mod tests {
             let bytes = frame(
                 json!({"call_id":"c","state":"known_unsent","protocol":null,"native_id":null,"reason":code}),
             );
-            assert!(matches!(
-                classify(&bytes, "c", Harness::Codex),
-                Outcome::KnownUnsent { .. }
-            ));
+            let outcome = classify(&bytes, "c", Harness::Codex);
+            if matches!(code, "not_idle" | "awaiting_input" | "capacity") {
+                assert!(matches!(outcome, Outcome::DeferredKnownUnsent { .. }));
+            } else {
+                assert!(matches!(outcome, Outcome::KnownUnsent { .. }));
+            }
         }
         for code in UNKNOWN {
             let bytes = frame(

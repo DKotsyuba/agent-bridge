@@ -6,6 +6,14 @@ source, and the crates are not published to crates.io.
 
 ## [Unreleased]
 
+### Fixed
+
+- Owner-routed native delivery holds busy recipients before dispatch and keeps
+  positively unsent busy/endpoint-change events queued without exhausting the
+  ordinary five-attempt transport budget. Fresh attestation, immutable attempt
+  history, retirement fences and unknown-outcome non-retry rules are preserved;
+  no producer wire or database migration is required.
+
 ### Added
 
 - Explicitly granted adapter-only `observe_recipient` and `resolve_recipient`
