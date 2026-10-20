@@ -322,7 +322,7 @@ test('no observation is accepted behind a queued overload invalidation', { timeo
 test('managed MCP context preserves original permissions, serializes calls and never replaces a committed result', { timeout: 5000 }, async () => {
   const net = await import('node:net');
   const { EventEmitter } = await import('node:events');
-  const controls = [], executed = [];
+  const controls = [], executed = [], observations = [], hooks = new Map();
   mock.method(net.default, 'createConnection', path => {
     const socket = new EventEmitter();
     socket.setTimeout = () => socket;
@@ -335,7 +335,7 @@ test('managed MCP context preserves original permissions, serializes calls and n
     queueMicrotask(() => socket.emit('connect'));
     return socket;
   });
-  mock.method(childProcess, 'execFile', (command, args, options, callback) => ({ stdin: new Writable({ write(bytes, encoding, done) { done(); callback(null, '', ''); } }) }));
+  mock.method(childProcess, 'execFile', (command, args, options, callback) => ({ stdin: new Writable({ write(bytes, encoding, done) { observations.push(JSON.parse(bytes.toString())); done(); callback(null, '', ''); } }) }));
   syncBuiltinESMExports();
   let releaseFirst, firstStarted;
   const gate = new Promise(resolve => { releaseFirst = resolve; });
@@ -351,12 +351,17 @@ test('managed MCP context preserves original permissions, serializes calls and n
   let finishFeed;
   const ctx = { app: { version: '2.0.28' }, options: { channel: '/owned/channel', hookCommand: '/owned/hook', contextDirectory: '/owned/context', mcpServers: ['pool'] },
     session: { get: async ({ sessionID }) => ({ id: sessionID }), hook: async () => ({ dispose: async () => {} }) },
-    tool: { transform: async callback => { callback({ list: () => [tool], update: (id, mutate) => { assert.equal(id, tool.id); mutate(tool); } }); return { dispose: async () => {} }; }, hook: async () => ({ dispose: async () => {} }) },
+    tool: { transform: async callback => { callback({ list: () => [tool], update: (id, mutate) => { assert.equal(id, tool.id); mutate(tool); } }); return { dispose: async () => {} }; }, hook: async (name, callback) => { hooks.set(name, callback); return { dispose: async () => {} }; } },
     event: { subscribe: async () => ({ [Symbol.asyncIterator]: () => ({ next: () => new Promise(resolve => { finishFeed = resolve; }), return: async () => { finishFeed({ done: true }); return { done: true }; } }) }) },
   };
   let dispose;
   try {
     const { default: plugin } = await import('./index.js'); dispose = await plugin.setup(ctx);
+    await hooks.get('execute.before')({ sessionID: 'ses-real', id: 'call-1', tool: tool.id });
+    assert.equal(observations.at(-1).tool_name, 'mcp__pool__probe');
+    assert.equal(observations.at(-1).tool_use_id, 'call-1');
+    await hooks.get('execute.before')({ sessionID: 'ses-real', id: 'call-shell', tool: 'shell' });
+    assert.equal(observations.at(-1).tool_name, 'shell');
     const first = tool.execute({ session_id: 'model-spoof', call_id: 'model-spoof' }, { sessionID: 'ses-real', id: 'call-1' });
     const second = tool.execute({ value: 2 }, { sessionID: 'ses-real', id: 'call-2' });
     await ready;

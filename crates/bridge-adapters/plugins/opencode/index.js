@@ -134,13 +134,19 @@ export default {
     }
     /** @type {Map<string,string>} Frozen configured namespaces indexed by native normalization. */
     const nativeServers = new Map(mcpServers.map(server => [server.replace(/[^a-zA-Z0-9_-]/g, '_'), server]));
+    /** @type {Map<string,string>} Actual native MCP registry IDs mapped to Bridge hook classification.
+     * The mapping uses protected definitions, never parses a model-supplied name. */
+    const nativeCalls = new Map();
     /** @type {WeakSet<Function>} Executor wrappers already projected by this plugin. */
     const wrapped = new WeakSet();
     /** @type {{dispose:()=>Promise<void>}|undefined} Owned native tool transformation subscription. */
     const transport = mcpServers.length ? await ctx.tool.transform(editor => {
+      nativeCalls.clear();
       for (const tool of editor.list()) {
         const server = nativeServers.get(tool.options?.namespace);
-        if (!server || wrapped.has(tool.execute)) continue;
+        if (!server) continue;
+        nativeCalls.set(tool.id, 'mcp__' + tool.options.namespace + '__' + tool.name.replace(/[^a-zA-Z0-9_-]/g, '_'));
+        if (wrapped.has(tool.execute)) continue;
         const original = tool.execute;
         /** Preserve original permission checks, schema, output and errors. Only the
          * actual executor's matching MCP wire request receives native metadata.
@@ -171,7 +177,7 @@ export default {
     }) : undefined;
     const prompt = await ctx.session.hook('prompt', event => observe('OpenCodeActivity', event.sessionID));
     const tool = await ctx.tool.hook('execute.before', event => identifier(event.id) && identifier(event.tool)
-      ? observe('PreToolUse', event.sessionID, { tool_use_id: event.id, tool_name: event.tool }) : observe('OpenCodeUnknown', event.sessionID));
+      ? observe('PreToolUse', event.sessionID, { tool_use_id: event.id, tool_name: nativeCalls.get(event.tool) ?? event.tool }) : observe('OpenCodeUnknown', event.sessionID));
     const events = await ctx.event.subscribe();
     const iterator = events[Symbol.asyncIterator]();
     /** @type {()=>void} Ends the one currently pending read, or a no-op between reads. */

@@ -122,6 +122,10 @@ remains uncertain and must never be replayed. Failed cleanup blocks further call
 Neither model arguments nor sibling processes can supply this context. The SDK
 parser, protected hook join and actor/audience checks are unchanged; no new caller
 authority is minted. A launcher must seal the matching component and proxy binary.
+OpenCode exposes MCP tool IDs as `<namespace>_<name>`. The component maps only
+actual configured native MCP definitions to Bridge's normalized `mcp__server__tool`
+hook classification; it never guesses MCP origin from an arbitrary name prefix.
+Actual native session and call IDs stay unchanged.
 Parsing these fields grants no authority. Standalone OpenCode
 root MCP registration, child message wake and context injection are unqualified.
 

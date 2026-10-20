@@ -12,6 +12,8 @@ source, and the crates are not published to crates.io.
   and persistent backend while forwarding genuine ToolContext metadata over a
   kernel-authenticated parent-only channel. Component ABI 2 refuses absent,
   mismatched or reused contexts without inventing identity or replaying effects.
+  Native MCP classification comes from the exact registered MCP definition;
+  OpenCode's unprefixed registry IDs no longer appear to be ordinary local tools.
 
 - Owner-routed native delivery holds busy recipients before dispatch and keeps
   positively unsent busy/endpoint-change events queued without exhausting the
