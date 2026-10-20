@@ -1,10 +1,12 @@
-//! Transparent OpenCode MCP transport. Only the kernel-verified direct parent
-//! supplies protected ToolContext; ordinary MCP arguments never identify callers.
+//! Transparent OpenCode MCP transport preserving the frontend direct native parent.
+//! Only that kernel-verified native process supplies protected ToolContext;
+//! ordinary MCP arguments never identify callers.
 
 use crate::{os, server};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::os::{fd::AsFd, unix::process::CommandExt};
 use std::{
     fs::{self, OpenOptions},
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
@@ -20,12 +22,12 @@ use std::{
         mpsc::{self, SyncSender},
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 /// The pinned native client's own complete NDJSON frame limit, including newline.
 const MAX_FRAME: usize = 16 * 1024 * 1024;
-/// Finite private control and direct-child shutdown allowance; never retries effects.
+/// Finite private control, bootstrap readiness and flush allowance; never retries effects.
 const IO_TIME: Duration = Duration::from_secs(5);
 
 /// Actual protected executor context, retained only until its original execution ends.
@@ -107,9 +109,10 @@ impl Drop for SocketGuard {
     }
 }
 
-/// Direct child guard prevents an early transport error from leaving a backend alive.
-struct Backend(Child);
-impl Drop for Backend {
+/// Bootstrap-owned transport worker; setup/exec failures kill and reap this child.
+/// Successful exec retains frontend ancestry; worker EOF ends its process lifetime.
+struct Sidecar(Child);
+impl Drop for Sidecar {
     /// Signal only the actual owned Child handle and always reap it.
     fn drop(&mut self) {
         if !matches!(self.0.try_wait(), Ok(Some(_))) {
@@ -326,7 +329,7 @@ fn endpoint(
     Ok((listener, lease, guard))
 }
 
-/// Admit control only from the exact current direct-parent PID/UID/birth.
+/// Admit control only from the frontend native parent PID/UID/birth.
 /// Descendants and same-user sibling processes cannot provide native context.
 fn control(mut stream: UnixStream, native: &os::ProcessFacts, send: &SyncSender<Event>) {
     let accepted = (|| -> io::Result<bool> {
@@ -355,44 +358,86 @@ fn control(mut stream: UnixStream, native: &os::ProcessFacts, send: &SyncSender<
     });
 }
 
-/// Runs the CLI-only persistent proxy. Arguments are private context directory,
-/// namespace, absolute backend executable and original arguments. MCP permissions,
-/// discovery and results stay owned by the unchanged native executor/backend.
-/// A failure/EOF closes the owned backend; no native request is replayed.
+/// Readiness handshake consumed before exec; never exposed as an MCP frame.
+const READY: &[u8] = b"bridge-mcp-ready-v1\n";
+
+/// Replace this bootstrap with the original absolute MCP backend, preserving its
+/// PID and direct native parent. Arguments are private context directory, namespace,
+/// backend and its original arguments. A private socket pair carries backend I/O
+/// through the owned worker, whose original stdin/stdout stay with the native client.
+/// Wait for actual endpoint readiness before exec; setup/exec failures reap the
+/// worker and return an error. No tool request or permission check is replayed.
 pub fn run(arguments: &[String]) -> io::Result<()> {
     if arguments.len() < 3 || !Path::new(&arguments[2]).is_absolute() || !identifier(&arguments[1])
     {
         return Err(io::Error::other("invalid native proxy arguments"));
     }
+    let (mut backend, worker) = UnixStream::pair()?;
+    let _worker = Sidecar(
+        Command::new(std::env::current_exe()?)
+            .arg("mcp-proxy-sidecar")
+            .args(&arguments[..2])
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::from(std::os::fd::OwnedFd::from(worker)))
+            .spawn()?,
+    );
+    backend.set_read_timeout(Some(IO_TIME))?;
+    let mut ready = [0_u8; READY.len()];
+    backend.read_exact(&mut ready)?;
+    if ready != READY {
+        return Err(io::Error::other("native MCP worker readiness refused"));
+    }
+    backend.set_read_timeout(None)?;
+    let input = backend.try_clone()?;
+    Err(Command::new(&arguments[2])
+        .args(&arguments[3..])
+        .stdin(Stdio::from(std::os::fd::OwnedFd::from(input)))
+        .stdout(Stdio::from(std::os::fd::OwnedFd::from(backend)))
+        .stderr(Stdio::inherit())
+        .exec())
+}
+
+/// Internal CLI worker, not a caller identity issuer. Arguments are private context
+/// directory and namespace. Descriptor2 is the bootstrap-created private socket;
+/// its kernel peer must be the same live frontend parent. Actual ToolContext is
+/// accepted only from that frontend's kernel-observed native parent PID/UID/birth.
+/// Native client stdin/stdout and backend socket stay bounded and persistent;
+/// failure/EOF closes the worker, never signals or retries its frontend parent.
+pub fn run_sidecar(arguments: &[String]) -> io::Result<()> {
+    if arguments.len() != 2 || !Path::new(&arguments[0]).is_absolute() || !identifier(&arguments[1])
+    {
+        return Err(io::Error::other("invalid native proxy arguments"));
+    }
     let own = os::process_facts(std::process::id())
         .ok_or_else(|| io::Error::other("missing ancestry"))?;
-    let parent = own
+    let frontend = own
+        .parent
+        .and_then(os::process_facts)
+        .ok_or_else(|| io::Error::other("missing frontend parent"))?;
+    let parent = frontend
         .parent
         .and_then(os::process_facts)
         .ok_or_else(|| io::Error::other("missing native parent"))?;
+    let mut transport = UnixStream::from(io::stderr().as_fd().try_clone_to_owned()?);
+    let peer = os::peer_identity(&transport)?;
+    if peer.pid != frontend.pid
+        || Some(peer.uid) != frontend.uid
+        || !os::incarnation_alive(frontend.pid, frontend.start_time)
+    {
+        return Err(io::Error::other(
+            "native MCP private transport ownership mismatch",
+        ));
+    }
     let stop = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&stop))?;
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&stop))?;
     let (listener, _lease, socket_guard) =
         endpoint(Path::new(&arguments[0]), &parent, &arguments[1])?;
-    let mut child = Backend(
-        Command::new(&arguments[2])
-            .args(&arguments[3..])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()?,
-    );
-    let input = child
-        .0
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::other("missing backend input"))?;
-    let output = child
-        .0
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("missing backend output"))?;
+    transport.write_all(READY)?;
+    transport.flush()?;
+    let input = transport.try_clone()?;
+    let output = transport;
     let (send, events) = mpsc::sync_channel(16);
     pump(io::stdin(), send.clone(), true);
     pump(output, send.clone(), false);
@@ -472,11 +517,6 @@ pub fn run(arguments: &[String]) -> io::Result<()> {
     drop(events);
     drop(backend);
     drop(client);
-    let end = Instant::now() + IO_TIME;
-    while !matches!(child.0.try_wait(), Ok(Some(_))) && Instant::now() < end {
-        thread::sleep(Duration::from_millis(10));
-    }
-    drop(child);
     let input_flushed = matches!(input_done.recv_timeout(IO_TIME), Ok(Ok(())));
     let output_flushed = matches!(output_done.recv_timeout(IO_TIME), Ok(Ok(())));
     if outcome.is_ok() && (!input_flushed || !output_flushed) {

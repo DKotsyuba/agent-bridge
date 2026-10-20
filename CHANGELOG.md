@@ -8,6 +8,11 @@ source, and the crates are not published to crates.io.
 
 ### Fixed
 
+- Preserve the MCP frontend's direct native parent while projecting OpenCode
+  ToolContext: exec the original backend after a private worker readiness
+  handshake. The transport worker validates its kernel peer and native origin;
+  registry ancestry and evidence checks remain unchanged.
+
 - Managed OpenCode MCP calls preserve the original permission-checked executor
   and persistent backend while forwarding genuine ToolContext metadata over a
   kernel-authenticated parent-only channel. Component ABI 2 refuses absent,

@@ -93,6 +93,13 @@ fn proxy_preserves_backend_and_verifies_native_parent() {
         accepted["result"]["params"]["arguments"],
         json!({"value":7})
     );
+    // The registered frontend must remain the native harness direct child.
+    let frontend = bridge_adapters::os::process_facts(child.0.id()).unwrap();
+    assert_eq!(frontend.parent, Some(std::process::id()));
+    assert_eq!(
+        frontend.exe.unwrap().canonicalize().unwrap(),
+        fixture_exe().canonicalize().unwrap()
+    );
     line.clear();
     writeln!(input, "{request}").unwrap();
     input.flush().unwrap();

@@ -58,7 +58,10 @@ producer ──► bridge-core service (SQLite custody, dispatch, recovery)
   it never drains injected context. Codex and Claude retain their hook paths.
   Its managed MCP transport preserves the original permission-checked executor and
   persistent backend, adding actual ToolContext metadata over a private channel
-  authenticated to the exact native parent process. It does not mint caller authority.
+  authenticated to the exact native parent process. The backend is execed in
+  place while a separate private transport worker retains the native stdio,
+  preserving the frontend's direct native ancestry and all registry checks.
+  It does not mint caller authority.
 
 ## Custody
 

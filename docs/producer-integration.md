@@ -89,7 +89,9 @@ and host observations are not.
 
 Managed OpenCode 2.0.28 uses the first-party component ABI 2 (`native-context`). Its
 original permission-checked MCP executor supplies actual ToolContext through a
-private parent-authenticated control channel; the persistent stdio proxy adds the
+private parent-authenticated control channel. The bootstrap execs the original
+backend in place, preserving its direct native parent; a separate worker moves
+bytes over a kernel-checked private socket pair. The persistent transport adds the
 missing native call ID only to the matching session, method and arguments, once.
 The SDK still receives protected metadata separately from model arguments and the
 normal hook, actor and audience checks remain required. An older lifecycle-only

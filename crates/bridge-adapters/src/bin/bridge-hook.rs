@@ -19,12 +19,23 @@ use bridge_core::Harness;
 /// Dispatches the protected MCP transport or the bounded fail-open lifecycle hook.
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1).peekable();
-    if args.peek().map(String::as_str) == Some("mcp-proxy") {
-        let arguments: Vec<_> = args.skip(1).collect();
-        return if bridge_adapters::native_mcp::run(&arguments).is_ok() {
+    if matches!(
+        args.peek().map(String::as_str),
+        Some("mcp-proxy" | "mcp-proxy-sidecar")
+    ) {
+        let sidecar = args.next().as_deref() == Some("mcp-proxy-sidecar");
+        let arguments: Vec<_> = args.collect();
+        let result = if sidecar {
+            bridge_adapters::native_mcp::run_sidecar(&arguments)
+        } else {
+            bridge_adapters::native_mcp::run(&arguments)
+        };
+        return if result.is_ok() {
             ExitCode::SUCCESS
         } else {
-            eprintln!("bridge-hook: native MCP transport refused");
+            if !sidecar {
+                eprintln!("bridge-hook: native MCP transport refused");
+            }
             ExitCode::FAILURE
         };
     }

@@ -113,8 +113,12 @@ The optional SDK metadata candidate requires both `ai.opencode/sessionID` and
 plugin contract: stock OpenCode MCP metadata supplies only the session ID and
 is insufficient. Managed component ABI 2 (`native-context`) wraps the original
 permission-checked MCP executor and keeps its backend persistent. A private stdio
-proxy accepts actual ToolContext from only its kernel-verified direct native
-parent PID, user and process incarnation. Per-server admission is bounded and
+transport worker accepts actual ToolContext from only the frontend's kernel-verified
+direct native parent PID, user and process incarnation. The bootstrap waits for a
+private socket-pair readiness handshake and execs the original backend in place,
+so the frontend remains the native harness's direct child. The worker validates
+its private transport peer against that frontend parent; it neither adds an
+ancestor nor needs a new registry intermediate allowlist. Per-server admission is bounded and
 serialized; exactly matching session, method and arguments receive the call ID
 once, before a possible backend write. Discovery and original results pass through.
 Missing or mismatched context is not forwarded; an already forwarded invocation
