@@ -56,6 +56,9 @@ producer ──► bridge-core service (SQLite custody, dispatch, recovery)
   restricted root MCP, operator CLI and packaging.
   OpenCode uses its lifecycle plugin and a message-only direct-parent owner route;
   it never drains injected context. Codex and Claude retain their hook paths.
+  Its managed MCP transport preserves the original permission-checked executor and
+  persistent backend, adding actual ToolContext metadata over a private channel
+  authenticated to the exact native parent process. It does not mint caller authority.
 
 ## Custody
 

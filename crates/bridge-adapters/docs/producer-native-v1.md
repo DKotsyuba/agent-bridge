@@ -111,7 +111,18 @@ uncertain outcomes retain their original identity without resend or fallback.
 The optional SDK metadata candidate requires both `ai.opencode/sessionID` and
 `ai.agent_bridge/toolCallID`. The second field belongs to the trusted first-party
 plugin contract: stock OpenCode MCP metadata supplies only the session ID and
-is insufficient. Parsing these fields grants no authority. Standalone OpenCode
+is insufficient. Managed component ABI 2 (`native-context`) wraps the original
+permission-checked MCP executor and keeps its backend persistent. A private stdio
+proxy accepts actual ToolContext from only its kernel-verified direct native
+parent PID, user and process incarnation. Per-server admission is bounded and
+serialized; exactly matching session, method and arguments receive the call ID
+once, before a possible backend write. Discovery and original results pass through.
+Missing or mismatched context is not forwarded; an already forwarded invocation
+remains uncertain and must never be replayed. Failed cleanup blocks further calls.
+Neither model arguments nor sibling processes can supply this context. The SDK
+parser, protected hook join and actor/audience checks are unchanged; no new caller
+authority is minted. A launcher must seal the matching component and proxy binary.
+Parsing these fields grants no authority. Standalone OpenCode
 root MCP registration, child message wake and context injection are unqualified.
 
 Synthetic plugin checks run with `node --expose-gc --test

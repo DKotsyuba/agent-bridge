@@ -21,7 +21,7 @@ producer API v1, storage schema 6, macOS on Apple silicon only.
 | v1 wire contract | `crates/bridge-protocol` | std + serde + sha2 only; fixtures in `tests/wire-v1.json` |
 | Producer SDK | `crates/bridge-sdk` | synchronous Unix-socket client; no core or native dependency |
 | Native adapters | `crates/bridge-adapters/src` | `registry`, `server`, `codex`, `claude`, `desktop`, hook binary, fixture harness |
-| OpenCode lifecycle plugin | `crates/bridge-adapters/plugins/opencode` | Pinned observation-only plugin; managed owner MESSAGE route; no context injection |
+| OpenCode lifecycle plugin | `crates/bridge-adapters/plugins/opencode` | Pinned lifecycle plugin and protected MCP transport; managed owner MESSAGE route; no context injection |
 | Root MCP, operator CLI, install | `crates/bridge-interfaces/src` | `mcp`, `root`, `operator`, `notify`, `telegram`, `install`, `lifecycle`, `doctor` |
 | Packaging and repo checks | `xtask`, `install.sh` | `cargo xtask package`, `qualify`, `check-public` |
 | Contracts | `crates/*/docs` | wire v1, core v1, native ingress v1 |

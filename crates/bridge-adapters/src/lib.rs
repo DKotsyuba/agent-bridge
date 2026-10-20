@@ -39,6 +39,7 @@ pub mod claude;
 pub mod client;
 pub mod codex;
 pub mod desktop;
+pub mod native_mcp;
 pub mod opencode;
 pub mod os;
 pub mod owner;

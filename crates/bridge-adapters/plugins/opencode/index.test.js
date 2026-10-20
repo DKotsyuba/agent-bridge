@@ -317,3 +317,57 @@ test('no observation is accepted behind a queued overload invalidation', { timeo
     syncBuiltinESMExports();
   }
 });
+
+// Protected context comes from the native callback, not identically named input fields.
+test('managed MCP context preserves original permissions, serializes calls and never replaces a committed result', { timeout: 5000 }, async () => {
+  const net = await import('node:net');
+  const { EventEmitter } = await import('node:events');
+  const controls = [], executed = [];
+  mock.method(net.default, 'createConnection', path => {
+    const socket = new EventEmitter();
+    socket.setTimeout = () => socket;
+    socket.destroy = () => socket;
+    socket.write = bytes => {
+      const request = JSON.parse(bytes); controls.push(request);
+      assert.ok(path.includes('mcp-' + process.pid + '-'));
+      queueMicrotask(() => socket.emit('data', Buffer.from(JSON.stringify({ ok: !(request.op === 'end' && request.call_id === 'call-cleanup-fail') }) + '\n')));
+    };
+    queueMicrotask(() => socket.emit('connect'));
+    return socket;
+  });
+  mock.method(childProcess, 'execFile', (command, args, options, callback) => ({ stdin: new Writable({ write(bytes, encoding, done) { done(); callback(null, '', ''); } }) }));
+  syncBuiltinESMExports();
+  let releaseFirst, firstStarted;
+  const gate = new Promise(resolve => { releaseFirst = resolve; });
+  const ready = new Promise(resolve => { firstStarted = resolve; });
+  const result = { output: 'unchanged result', content: [{ type: 'text', text: 'COMMITTED' }] };
+  const denied = new Error('original native permission refusal');
+  const tool = { id: 'pool_probe', name: 'probe', options: { namespace: 'pool' }, execute: async (input, context) => {
+    executed.push(context.id);
+    if (context.id === 'call-1') { firstStarted(); await gate; }
+    if (input.denied) throw denied;
+    return result;
+  } };
+  let finishFeed;
+  const ctx = { app: { version: '2.0.28' }, options: { channel: '/owned/channel', hookCommand: '/owned/hook', contextDirectory: '/owned/context', mcpServers: ['pool'] },
+    session: { get: async ({ sessionID }) => ({ id: sessionID }), hook: async () => ({ dispose: async () => {} }) },
+    tool: { transform: async callback => { callback({ list: () => [tool], update: (id, mutate) => { assert.equal(id, tool.id); mutate(tool); } }); return { dispose: async () => {} }; }, hook: async () => ({ dispose: async () => {} }) },
+    event: { subscribe: async () => ({ [Symbol.asyncIterator]: () => ({ next: () => new Promise(resolve => { finishFeed = resolve; }), return: async () => { finishFeed({ done: true }); return { done: true }; } }) }) },
+  };
+  let dispose;
+  try {
+    const { default: plugin } = await import('./index.js'); dispose = await plugin.setup(ctx);
+    const first = tool.execute({ session_id: 'model-spoof', call_id: 'model-spoof' }, { sessionID: 'ses-real', id: 'call-1' });
+    const second = tool.execute({ value: 2 }, { sessionID: 'ses-real', id: 'call-2' });
+    await ready;
+    assert.deepEqual(executed, ['call-1']);
+    assert.equal(controls[0].context.call_id, 'call-1'); assert.equal(controls[0].context.session_id, 'ses-real');
+    assert.equal(controls[0].context.arguments.call_id, 'model-spoof');
+    releaseFirst(); const answers = await Promise.all([first, second]); assert.ok(answers.every(answer => answer === result));
+    assert.deepEqual(controls.slice(0,4).map(value => [value.op, value.context?.call_id ?? value.call_id]), [['begin','call-1'],['end','call-1'],['begin','call-2'],['end','call-2']]);
+    await assert.rejects(tool.execute({ denied: true }, { sessionID: 'ses-real', id: 'call-denied' }), error => error === denied);
+    assert.equal(await tool.execute({}, { sessionID: 'ses-real', id: 'call-cleanup-fail' }), result);
+    await assert.rejects(tool.execute({}, { sessionID: 'ses-real', id: 'call-after-failed-cleanup' }), /unavailable/);
+    assert.ok(!executed.includes('call-after-failed-cleanup'));
+  } finally { await dispose?.(); mock.restoreAll(); syncBuiltinESMExports(); }
+});

@@ -192,7 +192,12 @@ Codex and Claude use their own hooks and a restricted MCP server for sending.
 Managed OpenCode 2.0.28 requires its first-party lifecycle plugin and an exact
 direct-parent native owner exposing `BRIDGE_NATIVE_OWNER_SOCKET`; the supervisor
 must load the installed `plugin_binding` path/hash from step 3, with absolute
-`channel` and `hookCommand` options. Its native store is a private canonical
+`channel` and `hookCommand` options. Component ABI 2 (`native-context`) also needs
+`contextDirectory` in the private owner directory and `mcpServers` with original
+configured server names. The launcher wraps those local command arrays as
+`bridge-hook mcp-proxy <contextDirectory> <server> <absolute-backend> [args]`,
+using the same sealed hook executable; the reserved private worker MCP stays
+direct. Matching launcher/component deployment is required. Its native store is a private canonical
 parent of `OPENCODE_DB`. OpenCode has no inject/context path or qualified standalone
 root MCP path; use the v1 producer API for publication. These integrations are
 deliberate manual steps; packaging does not activate them in working applications.

@@ -1390,6 +1390,28 @@ fn main() {
             v1_frontend(args.get(2).map(String::as_str).unwrap_or_default(), true)
         }
         Some("app-server") => app_server(),
+        Some("mcp-meta-echo") => {
+            for line in std::io::stdin().lock().lines() {
+                let value: Value =
+                    serde_json::from_str(&line.expect("fixture frame")).expect("fixture JSON");
+                println!(
+                    "{}",
+                    json!({"jsonrpc":"2.0","id":value["id"],"result":value})
+                );
+            }
+        }
+        Some("mcp-context") => {
+            let mut stream =
+                std::os::unix::net::UnixStream::connect(&args[2]).expect("fixture context socket");
+            let mut input = String::new();
+            std::io::stdin()
+                .read_line(&mut input)
+                .expect("fixture context input");
+            let _ = stream.write_all(format!("{input}\n").as_bytes());
+            let mut line = String::new();
+            let _ = std::io::BufReader::new(stream).read_line(&mut line);
+            print!("{line}");
+        }
         Some("publish") if args.len() == 8 => {
             println!(
                 "{}",

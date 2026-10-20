@@ -1,7 +1,10 @@
-/** First-party, observation-only OpenCode 2.0.28 lifecycle projection.
+/** First-party OpenCode 2.0.28 lifecycle and protected native MCP projection.
  * Native input remains owned by the launcher. No prompt rewriting, inference,
  * credentials or model-progress polling occurs here. */
 import { execFile } from 'node:child_process';
+import { createConnection } from 'node:net';
+import { createHash } from 'node:crypto';
+import { join } from 'node:path';
 
 /** @type {number} Maximum retained lifecycle operations before invalidation. */
 const MAX_PENDING = 64;
@@ -22,7 +25,8 @@ export default {
    * @returns {Promise<() => Promise<void>>} Disposer that makes readiness unknown.
    * @throws {Error} Before attaching for unsupported versions or component paths. */
   async setup(ctx) {
-    const { channel, hookCommand } = ctx.options;
+    const { channel, hookCommand, contextDirectory, mcpServers = [] } = ctx.options;
+    if (!Array.isArray(mcpServers) || mcpServers.some(name => !identifier(name)) || (mcpServers.length && (typeof contextDirectory !== 'string' || !contextDirectory.startsWith('/')))) throw new Error('Invalid managed native MCP projection');
     if (ctx.app.version !== '2.0.28' || typeof channel !== 'string' || !channel.startsWith('/') || typeof hookCommand !== 'string' || !hookCommand.startsWith('/')) {
       throw new Error('Agent Bridge requires the pinned lifecycle contract and absolute component paths');
     }
@@ -97,6 +101,74 @@ export default {
       return next;
     }
 
+    /** @type {Map<string,Promise<void>>} Per-server lanes preserve native executor permission checks. */
+    const lanes = new Map();
+    /** @type {Map<string,number>} Native calls admitted per server, including queued calls. */
+    const depth = new Map();
+    /** @type {Set<string>} An unresolved context cleanup fails later calls closed. */
+    const blocked = new Set();
+    /** Submit actual protected ToolContext from this native process; the proxy checks
+     * our kernel PID, UID and birth. Nothing comes from model identity arguments.
+     * @param {string} server Original namespace. @param {{op:'begin',context:{session_id:string,call_id:string,tool:string,arguments:Record<string,unknown>}}|{op:'end',call_id:string}} request Control payload.
+     * @returns {Promise<void>} Exact acknowledgement; refusal/timeout never starts a tool. */
+    function nativeContext(server, request) {
+      const digest = createHash('sha256').update(server).digest('hex').slice(0, 20);
+      const path = join(contextDirectory, 'mcp-' + process.pid + '-' + digest + '.sock');
+      const payload = JSON.stringify({ server, ...request }) + '\n';
+      if (Buffer.byteLength(payload) > 16 * 1024 * 1024) return Promise.reject(new Error('Native MCP frame exceeds the host limit'));
+      return new Promise((resolve, reject) => {
+        const socket = createConnection(path); let bytes = '';
+        socket.setTimeout(5000, () => socket.destroy(new Error('Native MCP control deadline')));
+        socket.on('error', () => reject(new Error('Native MCP control unavailable')));
+        socket.on('connect', () => socket.write(payload));
+        socket.on('data', chunk => {
+          bytes += chunk;
+          if (bytes.length > 1024) return socket.destroy(new Error('Native MCP control response exceeds bound'));
+          const end = bytes.indexOf('\n'); if (end < 0) return;
+          socket.destroy();
+          try { if (JSON.parse(bytes.slice(0, end)).ok !== true) throw new Error('Native MCP context refused'); resolve(); }
+          catch { reject(new Error('Native MCP context refused')); }
+        });
+        socket.on('end', () => { if (!bytes.includes('\n')) reject(new Error('Native MCP control closed without acknowledgement')); });
+      });
+    }
+    /** @type {Map<string,string>} Frozen configured namespaces indexed by native normalization. */
+    const nativeServers = new Map(mcpServers.map(server => [server.replace(/[^a-zA-Z0-9_-]/g, '_'), server]));
+    /** @type {WeakSet<Function>} Executor wrappers already projected by this plugin. */
+    const wrapped = new WeakSet();
+    /** @type {{dispose:()=>Promise<void>}|undefined} Owned native tool transformation subscription. */
+    const transport = mcpServers.length ? await ctx.tool.transform(editor => {
+      for (const tool of editor.list()) {
+        const server = nativeServers.get(tool.options?.namespace);
+        if (!server || wrapped.has(tool.execute)) continue;
+        const original = tool.execute;
+        /** Preserve original permission checks, schema, output and errors. Only the
+         * actual executor's matching MCP wire request receives native metadata.
+         * @param {Record<string,unknown>} input Original decoded arguments. @param {{sessionID:string,id:string}} context Protected ToolContext; all other native fields pass unchanged.
+         * @returns {Promise<object>} Unchanged original result; never re-executes a tool. */
+        const execute = async (input, context) => {
+          const pending = depth.get(server) ?? 0;
+          if (pending >= MAX_PENDING) throw new Error('Native MCP capacity unavailable');
+          depth.set(server, pending + 1);
+          const previous = lanes.get(server) ?? Promise.resolve(); let release;
+          const completed = new Promise(resolve => { release = resolve; });
+          const tail = previous.then(() => completed); lanes.set(server, tail);
+          await previous;
+          try {
+            if (!active || blocked.has(server) || !identifier(context.sessionID) || !identifier(context.id)) throw new Error('Native MCP context unavailable');
+            try {
+              await nativeContext(server, { op: 'begin', context: { session_id: context.sessionID, call_id: context.id, tool: tool.name, arguments: input ?? {} } });
+              return await original(input, context);
+            }
+            finally {
+              try { await nativeContext(server, { op: 'end', call_id: context.id }); }
+              catch { blocked.add(server); }
+            }
+          } finally { release(); const remaining = depth.get(server) - 1; if (remaining) depth.set(server, remaining); else depth.delete(server); if (lanes.get(server) === tail) lanes.delete(server); }
+        };
+        wrapped.add(execute); editor.update(tool.id, entry => { entry.execute = execute; });
+      }
+    }) : undefined;
     const prompt = await ctx.session.hook('prompt', event => observe('OpenCodeActivity', event.sessionID));
     const tool = await ctx.tool.hook('execute.before', event => identifier(event.id) && identifier(event.tool)
       ? observe('PreToolUse', event.sessionID, { tool_use_id: event.id, tool_name: event.tool }) : observe('OpenCodeUnknown', event.sessionID));
@@ -144,7 +216,7 @@ export default {
       stopFeed();
       /** @type {{error:unknown}|undefined} First cleanup failure, surfaced after all stages. */
       let failure;
-      for (const stage of [() => prompt.dispose(), () => tool.dispose(), () => iterator.return?.(), () => feed, finalize]) {
+      for (const stage of [() => transport?.dispose(), () => prompt.dispose(), () => tool.dispose(), () => iterator.return?.(), () => feed, finalize]) {
         try { await stage(); } catch (error) { failure ??= { error }; }
       }
       if (failure) throw failure.error;

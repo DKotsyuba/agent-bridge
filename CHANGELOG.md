@@ -8,6 +8,11 @@ source, and the crates are not published to crates.io.
 
 ### Fixed
 
+- Managed OpenCode MCP calls preserve the original permission-checked executor
+  and persistent backend while forwarding genuine ToolContext metadata over a
+  kernel-authenticated parent-only channel. Component ABI 2 refuses absent,
+  mismatched or reused contexts without inventing identity or replaying effects.
+
 - Owner-routed native delivery holds busy recipients before dispatch and keeps
   positively unsent busy/endpoint-change events queued without exhausting the
   ordinary five-attempt transport budget. Fresh attestation, immutable attempt

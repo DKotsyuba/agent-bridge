@@ -12,7 +12,7 @@ publish.workspace = true
 bridge-protocol.workspace = true
 bridge-core = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 sha2 = { workspace = true }
 signal-hook = { workspace = true }
 sysinfo = { workspace = true }

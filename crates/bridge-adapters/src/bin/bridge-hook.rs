@@ -3,9 +3,11 @@
 //!
 //! Usage (as the hook command of every relevant event):
 //! `bridge-hook <channel-socket> <claude-code|codex|opencode>` with the native hook
-//! JSON on stdin. The command always exits 0 and prints nothing unless the
+//! JSON on stdin. Hook mode always exits 0 and prints nothing unless the
 //! channel handed a context reply, so a missing or failing Bridge never
 //! blocks or breaks the harness; Bridge keeps undelivered events.
+//! `bridge-hook mcp-proxy <private-directory> <server> <absolute-backend> [args]`
+//! instead runs the protected persistent MCP transport and exits nonzero on failure.
 
 use std::io::Read;
 use std::process::ExitCode;
@@ -14,9 +16,18 @@ use std::time::Duration;
 use bridge_adapters::client::{ChannelClient, HookRun, MAX_HOOK_INPUT_BYTES};
 use bridge_core::Harness;
 
-/// Reads the bounded hook input and runs it through the channel.
+/// Dispatches the protected MCP transport or the bounded fail-open lifecycle hook.
 fn main() -> ExitCode {
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).peekable();
+    if args.peek().map(String::as_str) == Some("mcp-proxy") {
+        let arguments: Vec<_> = args.skip(1).collect();
+        return if bridge_adapters::native_mcp::run(&arguments).is_ok() {
+            ExitCode::SUCCESS
+        } else {
+            eprintln!("bridge-hook: native MCP transport refused");
+            ExitCode::FAILURE
+        };
+    }
     let (Some(socket), Some(harness)) = (args.next(), args.next()) else {
         eprintln!("usage: bridge-hook <channel-socket> <claude-code|codex|opencode>");
         return ExitCode::SUCCESS;

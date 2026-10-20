@@ -87,6 +87,14 @@ supplied by a model cannot substitute for that join. Direct MCP calls are suppor
 the host paths the adapter reports as supported; a nested inner call, an outer wrapper
 and host observations are not.
 
+Managed OpenCode 2.0.28 uses the first-party component ABI 2 (`native-context`). Its
+original permission-checked MCP executor supplies actual ToolContext through a
+private parent-authenticated control channel; the persistent stdio proxy adds the
+missing native call ID only to the matching session, method and arguments, once.
+The SDK still receives protected metadata separately from model arguments and the
+normal hook, actor and audience checks remain required. An older lifecycle-only
+component cannot supply this contract; deploy matching launcher and component.
+
 1. Persist a stable registration request id and an opaque operation incarnation
    *before* calling `register_call(id, RegisterCallParams { ... })` with
    `operation_key`, `evidence`, `reply_policy` and optional narrowed modes, kinds,
