@@ -8,6 +8,12 @@ source, and the crates are not published to crates.io.
 
 ### Fixed
 
+- The SDK no longer mistakes a received answer for a lost one when the service
+  answers and closes its connection before the client sets its read timeout
+  (macOS refuses `SO_RCVTIMEO` on a closed socket). The read falls back to a
+  nonblocking read, so the absolute deadline still holds; the request is no
+  longer replayed on a second connection. No wire, API or error-reason change.
+
 - Preserve the MCP frontend's direct native parent while projecting OpenCode
   ToolContext: exec the original backend after a private worker readiness
   handshake. The transport worker validates its kernel peer and native origin;
