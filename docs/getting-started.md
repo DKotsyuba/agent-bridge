@@ -44,13 +44,13 @@ cargo +1.98.1 xtask package
 
 This builds every binary in release mode (offline, locked) and writes a verified
 bundle, including exactly the OpenCode plugin's `index.js` and `package.json`,
-to `dist/agent-bridge-0.3.1+<label>`, where the label is the 12-digit Git
+to `dist/agent-bridge-0.3.2+<label>`, where the label is the 12-digit Git
 commit (`-dirty` when the tree has changes; pass `--label NAME` outside a Git
 checkout). It prints the manifest and `sums_sha256`. Install with that digest,
 passed exactly as printed:
 
 ```sh
-./install.sh --bundle "$PWD/dist/agent-bridge-0.3.1+<label>" --sums-sha256 <sums_sha256> \
+./install.sh --bundle "$PWD/dist/agent-bridge-0.3.2+<label>" --sums-sha256 <sums_sha256> \
   --home "$HOME/.agent-bridge" --bin-dir "$HOME/.local/bin"
 ```
 

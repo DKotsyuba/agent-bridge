@@ -303,7 +303,7 @@ authorized test delivery; none has happened.
 
 ```sh
 cargo xtask package                     # prints manifest + sums_sha256
-./install.sh --bundle /ABS/dist/agent-bridge-0.3.1+LABEL --sums-sha256 HEX \
+./install.sh --bundle /ABS/dist/agent-bridge-0.3.2+LABEL --sums-sha256 HEX \
   --home /ABS/home --bin-dir /ABS/bin
 bridge service start core  --home H --state S --config daemon.toml
 bridge service start relay --home H --state S --config interfaces.toml

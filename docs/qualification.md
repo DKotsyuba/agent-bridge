@@ -18,7 +18,7 @@ or a different configuration is unqualified until its probes are run again.
 
 | | |
 |---|---|
-| Source | Bridge 0.3.1, producer API v1 (wire, core and native contracts revision 3), storage schema 6 |
+| Source | Bridge 0.3.2, producer API v1 (wire, core and native contracts revision 3), storage schema 6 |
 | Platform | macOS, Apple silicon (`aarch64-apple-darwin`) |
 | Toolchain | Rust 1.98.1 |
 

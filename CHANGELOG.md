@@ -6,6 +6,8 @@ source, and the crates are not published to crates.io.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-22
+
 ### Fixed
 
 - The SDK no longer mistakes a received answer for a lost one when the service
