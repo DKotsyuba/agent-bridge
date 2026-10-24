@@ -1,6 +1,6 @@
 # Universal producer wire v1 — canonical boundary proposal
 
-Contract: `bridge-producer-wire-v1`, revision 3. Provider: `bridge-protocol` and `bridge-sdk`; consumers: the core and the native adapters. This document defines the exact DTO and wire boundary of the universal producer API v1; durable semantics are described in the [core contract](../../bridge-core/docs/producer-core-v1.md) and the [native ingress contract](../../bridge-adapters/docs/producer-native-v1.md), and the onboarding sequence in [Producer integration](../../../docs/producer-integration.md). All identifiers and payloads are product-independent.
+Contract: `bridge-producer-wire-v1`, revision 4. Provider: `bridge-protocol` and `bridge-sdk`; consumers: the core and the native adapters. This document defines the exact DTO and wire boundary of the universal producer API v1; durable semantics are described in the [core contract](../../bridge-core/docs/producer-core-v1.md) and the [native ingress contract](../../bridge-adapters/docs/producer-native-v1.md), and the onboarding sequence in [Producer integration](../../../docs/producer-integration.md). All identifiers and payloads are product-independent.
 
 ## Transport and typed envelope
 

@@ -114,6 +114,55 @@ record for this call (is bridge-hook installed for PreToolUse?)` or `zcode:
 store_env ZCODE_HOME and store_home both unresolvable`. `bridge doctor` lists
 every profile with its resolved defaults.
 
+## Connecting a harness: ZCode example
+
+ZCode runs Claude-compatible hooks and MCP servers from its own processes, so it
+needs no Bridge code: a profile, the hooks and the root MCP entry suffice.
+
+1. Daemon configuration (`[adapters]`), then restart the core service:
+
+   ```toml
+   [[adapters.harnesses]]
+   harness = "zcode"
+   namespace = "zcode-main"
+   inject = true
+   message = false            # no native owner for the desktop application
+   store_home = ".zcode"
+   ```
+
+2. Interfaces configuration, so the root relay accepts ZCode callers, then
+   restart the relay service:
+
+   ```toml
+   [[root.callers]]
+   host_id = "local"
+   harness = "zcode"
+   native_store_namespace = "zcode-main"
+   recipients = ["*"]
+   modes = ["inject", "message", "auto"]
+   kinds = ["bridge.message"]
+   ```
+
+3. In `~/.zcode/cli/config.json`, the hook command for every event ZCode
+   offers (`SessionStart`, `UserPromptSubmit`, `PreToolUse`,
+   `PermissionRequest`, `PostToolUse`, `PostToolUseFailure`, `Stop`), and the
+   root MCP server:
+
+   ```json
+   {"hooks": [{"type": "process", "command": "/ABS/bin/bridge-hook",
+               "args": ["/ABS/run/ch/c.sock", "zcode"], "timeoutMs": 5000}]}
+   ```
+
+   ```json
+   {"agent-bridge-root": {"type": "stdio", "command": "/ABS/bin/bridge-root-mcp",
+                          "args": ["/ABS/run/ch/c.sock", "/ABS/run/rl/r.sock"]}}
+   ```
+
+The ZCode processes that spawn hooks and MCP servers run from
+`ZCode.app/Contents/Frameworks/ZCode Helper.app`, so the default marker (the
+identifier `zcode`) matches them. ZCode's MCP `_meta` carries a session id but no
+call id, which is why its default proof is the hook token.
+
 ## Stages
 
 1. Open identifier and profile-driven registry; the three built-in harnesses

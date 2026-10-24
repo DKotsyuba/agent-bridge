@@ -6,6 +6,40 @@ source, and the crates are not published to crates.io.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-24
+
+### Added
+
+- Harness profiles: a harness Bridge ships no code for is connected by
+  configuration alone. An `[[adapters.harnesses]]` entry with a canonical
+  identifier, a store rule (`store_env` / `store_home`), child addressing and
+  accepted caller proofs serves its identity, Claude-compatible lifecycle hooks,
+  inject, and message through its native owner. See
+  [Harness profiles](docs/harness-profiles.md).
+- Hook-token caller proof: at the `PreToolUse` of a Bridge root tool call the
+  daemon issues a single-use token that `bridge-hook` writes into the call input
+  (`updatedInput`); the root frontend presents it instead of host `_meta`, and
+  the registry joins it to exactly that record under the existing ancestry,
+  epoch and single-use rules. It is the default for a profile-only harness and
+  makes caller attestation independent of host metadata keys.
+- `bridge doctor` reports each harness profile with its resolved defaults;
+  attestation refusals name the harness and the missing profile element.
+
+### Changed
+
+- The native harness of an address is an open canonical identifier
+  (`[a-z][a-z0-9-]{0,31}`). Built-in harnesses keep their canonical names and
+  historical serialized spellings, so stored envelopes, hashes, route journals
+  and configuration are unchanged. Wire contract revision 4 accepts any canonical
+  harness name in an address.
+- `bridge-protocol`: `NativeAddress::harness` is now `HarnessName` (open);
+  `HarnessName::host()` maps a built-in harness to its metadata `Host`. Rust
+  consumers that matched `address.harness` against `Host` values must compare
+  `address.harness.host()` instead.
+- The OpenCode owner carrier is now the owner-only carrier
+  (`bridge_adapters::owner_only::OwnerOnlyCarrier`) and also serves profile-only
+  harnesses; a profile-only harness's owner answers with `<harness>_input`.
+
 ## [0.3.2] - 2026-10-22
 
 ### Fixed
