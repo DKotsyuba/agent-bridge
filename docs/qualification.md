@@ -76,6 +76,25 @@ reports the exact resolved plugin entrypoint path and SHA-256 as `plugin_binding
 supervisors must use that binding. Package lifecycle checks are separate evidence
 and do not promote this installed plugin to native qualification.
 
+### ZCode connected by a profile only
+
+An owner-operated ZCode 3.16.3 session was connected to the installed local
+0.4.0 candidate `fe97a22eef8d` on 2026-10-24 with configuration only: a `zcode`
+harness profile (`store_home = ".zcode"`, default `hook-token` caller proof), a
+`zcode` root caller and `bridge-hook <channel> zcode` for ZCode's seven hook
+events. ZCode's CLI processes rename themselves, which had hidden `HOME` from the
+plain environment read; with the shifted-environment fix its hooks were admitted
+and its sessions bound. From the live session, `bridge_send` carried the hook
+token through ZCode's `updatedInput` to the restricted frontend, the registry
+attested the ZCode root caller (`sender_harness = zcode`), and one `keep_all`
+message reached a Claude Code session with `native_accepted` and
+`context_observed` evidence.
+
+This observes caller attestation and sending from that ZCode build. It does not
+qualify inject into a ZCode session, MESSAGE to an idle ZCode session (the profile
+declares no message carrier), ZCode subagent attestation, `bridge_status` from
+ZCode, other ZCode builds, or installation of the published artifact.
+
 ### IDE graph wake canaries
 
 Two isolated canaries ran on 2026-10-15 against the delivery path of source
