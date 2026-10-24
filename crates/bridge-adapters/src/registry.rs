@@ -3147,7 +3147,8 @@ fn next_lifecycle(
 /// Resolves the harness's store from its OS environment, never hook arguments:
 /// the fixed rule of a built-in harness ([`built_in_store`]), else the profile's
 /// `store_env` variable of the harness process, then its `$HOME` joined with
-/// `store_home`.
+/// `store_home`, both also found when a process-title rewrite shifted them
+/// ([`os::process_env_shifted`]).
 fn harness_store(facts: &ProcessFacts, policy: &HarnessPolicy) -> Option<PathBuf> {
     if policy.harness.is_built_in() {
         return built_in_store(facts, policy.harness);
@@ -3155,12 +3156,12 @@ fn harness_store(facts: &ProcessFacts, policy: &HarnessPolicy) -> Option<PathBuf
     if let Some(value) = policy
         .store_env
         .as_deref()
-        .and_then(|variable| os::process_env(facts.pid, variable))
+        .and_then(|variable| os::process_env_shifted(facts.pid, variable))
     {
         return Some(PathBuf::from(value));
     }
     let relative = policy.store_home.as_ref()?;
-    os::process_env(facts.pid, "HOME").map(|home| PathBuf::from(home).join(relative))
+    os::process_env_shifted(facts.pid, "HOME").map(|home| PathBuf::from(home).join(relative))
 }
 
 /// The fixed store rule of a built-in harness; `None` for any other harness.

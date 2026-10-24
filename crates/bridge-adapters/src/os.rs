@@ -201,11 +201,91 @@ pub fn process_env_checked(pid: u32, name: &str) -> std::io::Result<Option<OsStr
     }))
 }
 
+/// Like [`process_env`], but also finds an entry that a process-title rewrite
+/// shifted out of the environment block.
+///
+/// Node and Electron harnesses rename their processes (`process.title`) by
+/// overwriting the original argument area; the kernel's argument count is
+/// unchanged, so the first environment entries are then reported as arguments
+/// and seem absent (ZCode's `zcode-cli` loses `HOME` this way). When `name` is
+/// not in the environment, the reported arguments after the first are searched
+/// for an exact `name=` entry. Used only for a profile-only harness's store
+/// selection, whose result is still proven canonical, owned and private.
+pub fn process_env_shifted(pid: u32, name: &str) -> Option<OsString> {
+    use std::os::unix::ffi::OsStrExt;
+    if let Some(value) = process_env(pid, name) {
+        return Some(value);
+    }
+    let mut system = System::new();
+    let target = Pid::from_u32(pid);
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[target]),
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+    );
+    let key = name.as_bytes();
+    system
+        .process(target)?
+        .cmd()
+        .iter()
+        .skip(1)
+        .find_map(|entry| match entry.as_bytes().strip_prefix(key) {
+            Some([b'=', value @ ..]) => Some(OsStr::from_bytes(value).to_os_string()),
+            _ => None,
+        })
+}
+
 #[cfg(test)]
 mod tests {
     //! Facts about this very test process and a connected socket pair.
 
     use super::*;
+
+    /// A Node process that renames itself (`process.title`, as ZCode's CLI
+    /// does) shifts its first environment entries into the reported
+    /// arguments: the plain environment read misses `HOME`, the shifted read
+    /// finds the exact value, and an absent name stays absent. Needs an
+    /// explicitly prepared `BRIDGE_TEST_NODE`; skipped without it.
+    #[test]
+    fn retitled_process_environment_is_still_found() {
+        let Some(node) = std::env::var_os("BRIDGE_TEST_NODE") else {
+            eprintln!("skipped: BRIDGE_TEST_NODE is not set");
+            return;
+        };
+        let mut child = std::process::Command::new(node)
+            .args([
+                "-e",
+                "process.title = 't'; console.log('ready'); setTimeout(() => {}, 20000)",
+                "padding-one",
+                "padding-two",
+            ])
+            .env_clear()
+            .env("HOME", "/retitled/home")
+            .env("SECOND", "2")
+            .env("THIRD", "3")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.take().unwrap()),
+            &mut line,
+        )
+        .unwrap();
+        let pid = child.id();
+        let plain = process_env(pid, "HOME");
+        let shifted = process_env_shifted(pid, "HOME");
+        let absent = process_env_shifted(pid, "NOT_THERE");
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(line.trim(), "ready");
+        assert_eq!(
+            plain, None,
+            "the rewrite shifted HOME out of the environment"
+        );
+        assert_eq!(shifted.as_deref(), Some(OsStr::new("/retitled/home")));
+        assert_eq!(absent, None);
+    }
 
     /// Peer credentials of a socket pair name this process and leave the stream usable.
     #[test]

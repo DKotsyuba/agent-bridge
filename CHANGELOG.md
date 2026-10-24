@@ -40,6 +40,14 @@ source, and the crates are not published to crates.io.
   (`bridge_adapters::owner_only::OwnerOnlyCarrier`) and also serves profile-only
   harnesses; a profile-only harness's owner answers with `<harness>_input`.
 
+### Fixed
+
+- A profile-only harness whose processes rename themselves (Node/Electron
+  `process.title`, as ZCode's CLI does) no longer loses its store: the rewrite
+  shifts the first environment entries (such as `HOME`) into the reported
+  arguments, and the store variables are now found there too. The resolved store
+  is still proven canonical, owned and private.
+
 ## [0.3.2] - 2026-10-22
 
 ### Fixed
