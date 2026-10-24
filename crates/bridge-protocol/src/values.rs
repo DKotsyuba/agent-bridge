@@ -151,13 +151,66 @@ pub enum Host {
     OpenCode,
 }
 
+/// Largest canonical harness name, in bytes.
+pub const MAX_HARNESS_BYTES: usize = 32;
+
+/// Canonical harness name of a native address: 1 to [`MAX_HARNESS_BYTES`] bytes
+/// of `[a-z0-9-]` starting with a letter. The set is open (`codex`,
+/// `claude-code`, `opencode` and any profile-served harness); whether a harness
+/// is served is the service's decision. This is not a metadata contract
+/// ([`Host`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HarnessName(String);
+impl HarnessName {
+    /// Validates the canonical grammar; anything else refuses.
+    pub fn parse(value: &str) -> Result<Self, ProtocolError> {
+        let bytes = value.as_bytes();
+        let valid = !bytes.is_empty()
+            && bytes.len() <= MAX_HARNESS_BYTES
+            && bytes[0].is_ascii_lowercase()
+            && bytes
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-');
+        if !valid {
+            return Err(ProtocolError::new("address", "invalid native harness name"));
+        }
+        Ok(Self(value.to_string()))
+    }
+    /// Returns the canonical name.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    /// The built-in metadata contract of a built-in harness, if any.
+    pub fn host(&self) -> Option<Host> {
+        match self.0.as_str() {
+            "codex" => Some(Host::Codex),
+            "claude-code" => Some(Host::ClaudeCode),
+            "opencode" => Some(Host::OpenCode),
+            _ => None,
+        }
+    }
+}
+impl From<Host> for HarnessName {
+    /// The canonical harness name of a built-in metadata contract's harness.
+    fn from(host: Host) -> Self {
+        Self(
+            match host {
+                Host::Codex => "codex",
+                Host::ClaudeCode => "claude-code",
+                Host::OpenCode => "opencode",
+            }
+            .to_string(),
+        )
+    }
+}
+
 /// Canonical logical native recipient, containing no authority or kernel identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeAddress {
     /// Actual OS host namespace, bounded independently.
     pub host: String,
-    /// Native host product; not the message producer.
-    pub harness: Host,
+    /// Native harness of the session (open set); not the message producer.
+    pub harness: HarnessName,
     /// Actual native home/store namespace, never cwd/display name.
     pub store: String,
     /// Native thread/session identifier, independent of endpoint incarnation.
@@ -165,18 +218,13 @@ pub struct NativeAddress {
 }
 impl NativeAddress {
     /// Parses four encoded components with the existing core percent grammar.
-    /// Unknown native harness, malformed escapes/UTF-8 or invalid components refuse.
+    /// An invalid harness name, malformed escapes/UTF-8 or invalid components refuse.
     pub fn parse(value: &str) -> Result<Self, ProtocolError> {
         let parts: Vec<_> = value.split('/').collect();
         if parts.len() != 4 {
             return Err(ProtocolError::new("address", "expected four components"));
         }
-        let harness = match parts[1] {
-            "codex" => Host::Codex,
-            "claude-code" => Host::ClaudeCode,
-            "opencode" => Host::OpenCode,
-            _ => return Err(ProtocolError::new("address", "unsupported native harness")),
-        };
+        let harness = HarnessName::parse(parts[1])?;
         let address = Self {
             host: decode_component(parts[0])?,
             harness,
@@ -193,11 +241,7 @@ impl NativeAddress {
         format!(
             "{}/{}/{}/{}",
             encode_component(&self.host),
-            match self.harness {
-                Host::Codex => "codex",
-                Host::ClaudeCode => "claude-code",
-                Host::OpenCode => "opencode",
-            },
+            self.harness.as_str(),
             encode_component(&self.store),
             encode_component(&self.session)
         )

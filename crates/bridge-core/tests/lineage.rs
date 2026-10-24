@@ -29,7 +29,7 @@ const OPS_TOKEN: &str = "lin-operator-token-0000003";
 
 /// The shared recipient of the lineage.
 fn recipient() -> NativeAddress {
-    NativeAddress::new("host-1", Harness::Codex, "default", "thread-7").unwrap()
+    NativeAddress::new("host-1", Harness::CODEX, "default", "thread-7").unwrap()
 }
 
 /// A config with two producer grants (different publishers) and one
@@ -977,7 +977,7 @@ fn transfer_lineage_validates_scope_fields() {
 #[test]
 fn transfer_lineage_uses_the_canonical_recipient() {
     let mut storage = common::store();
-    let slashed = NativeAddress::new("host-1", Harness::Codex, "default", "thread/7").unwrap();
+    let slashed = NativeAddress::new("host-1", Harness::CODEX, "default", "thread/7").unwrap();
     let mut event = latest_envelope("agent-run", "run-slash", 3);
     event.recipient = slashed.clone();
     storage.publish(&event, 1_000).unwrap();

@@ -101,6 +101,8 @@ pub struct Lab {
     pub codex_store: PathBuf,
     /// OpenCode test database parent, isolated from both older harness stores.
     pub opencode_store: PathBuf,
+    /// Store of the profile-only [`GENERIC`] fixture harness.
+    pub generic_store: PathBuf,
     /// Channel socket.
     pub socket: PathBuf,
     /// Exact prepared fixture configuration for owned restart tests.
@@ -113,14 +115,26 @@ pub struct Lab {
     pub channel: Option<ChannelServer>,
 }
 
+/// Profile-only harness of the fixture lab: Bridge ships no code for it, so it
+/// exercises the generic profile path (its store comes from [`GENERIC_STORE_ENV`]).
+pub const GENERIC: Harness = Harness::from_static("zlab");
+
+/// Store variable of the profile-only [`GENERIC`] fixture harness.
+pub const GENERIC_STORE_ENV: &str = "ZLAB_HOME";
+
 /// The harness-level policy of the fixture lab: inject and message supported.
+/// A harness that is not built in gets the store rule [`GENERIC_STORE_ENV`].
 pub fn harness_policy(namespace: &str, harness: Harness) -> HarnessPolicy {
     HarnessPolicy {
         harness,
         namespace: namespace.into(),
-        inject: harness != Harness::OpenCode,
+        inject: harness != Harness::OPENCODE,
         message: true,
         executable_markers: vec!["bridge-fixture".into()],
+        store_env: (!harness.is_built_in()).then(|| GENERIC_STORE_ENV.into()),
+        store_home: None,
+        child_address: None,
+        caller_proof: Vec::new(),
     }
 }
 
@@ -138,9 +152,11 @@ impl Lab {
         let claude_store = dir.0.join("cs");
         let codex_store = dir.0.join("xs");
         let opencode_store = dir.0.join("os");
+        let generic_store = dir.0.join("zs");
         std::fs::create_dir_all(&claude_store).unwrap();
         std::fs::create_dir_all(&codex_store).unwrap();
         std::fs::create_dir_all(&opencode_store).unwrap();
+        std::fs::create_dir_all(&generic_store).unwrap();
         let channel_dir = dir.0.join("ch");
         let owner_uid = private_directory(&channel_dir).unwrap();
         let socket = channel_dir.join("c.sock");
@@ -149,9 +165,10 @@ impl Lab {
         let config = RegistryConfig {
             host_id: HOST.into(),
             harnesses: vec![
-                harness_policy("claude-lab", Harness::ClaudeCode),
-                harness_policy("codex-lab", Harness::Codex),
-                harness_policy("opencode-lab", Harness::OpenCode),
+                harness_policy("claude-lab", Harness::CLAUDE_CODE),
+                harness_policy("codex-lab", Harness::CODEX),
+                harness_policy("opencode-lab", Harness::OPENCODE),
+                harness_policy("zlab-lab", GENERIC),
             ],
             profiles: Vec::new(),
             intermediates: ["/bin/sh", "/bin/bash", "/bin/zsh", "/bin/dash"]
@@ -185,6 +202,7 @@ impl Lab {
             claude_store,
             codex_store,
             opencode_store,
+            generic_store,
             socket,
             registry,
             config,
@@ -200,16 +218,21 @@ impl Lab {
 
     /// The address of `session` in the Claude test store.
     pub fn claude_address(&self, session: &str) -> NativeAddress {
-        NativeAddress::new(HOST, Harness::ClaudeCode, "claude-lab", session).unwrap()
+        NativeAddress::new(HOST, Harness::CLAUDE_CODE, "claude-lab", session).unwrap()
     }
 
     /// The address of `thread` in the Codex test store.
     pub fn codex_address(&self, thread: &str) -> NativeAddress {
-        NativeAddress::new(HOST, Harness::Codex, "codex-lab", thread).unwrap()
+        NativeAddress::new(HOST, Harness::CODEX, "codex-lab", thread).unwrap()
     }
     /// The native address of an OpenCode fixture session in its own store.
     pub fn opencode_address(&self, session: &str) -> NativeAddress {
-        NativeAddress::new(HOST, Harness::OpenCode, "opencode-lab", session).unwrap()
+        NativeAddress::new(HOST, Harness::OPENCODE, "opencode-lab", session).unwrap()
+    }
+
+    /// The native address of a profile-only [`GENERIC`] fixture session.
+    pub fn generic_address(&self, session: &str) -> NativeAddress {
+        NativeAddress::new(HOST, GENERIC, "zlab-lab", session).unwrap()
     }
 
     /// Publishes one synthetic event.
@@ -320,13 +343,13 @@ impl Harnessed {
 
     /// Starts an owned Codex Desktop stand-in from the executable copy `exe`.
     pub fn start_desktop_from(exe: &Path, store: &Path, pipe: &Path) -> Harnessed {
-        Self::start_with_app(exe, Harness::Codex, store, Some(pipe), None)
+        Self::start_with_app(exe, Harness::CODEX, store, Some(pipe), None)
     }
 
     /// Starts an owned Codex Desktop stand-in with its own native pipe capability;
     /// no installed application, frontend, or caller evidence is fabricated.
     pub fn start_desktop(store: &Path, pipe: &Path) -> Harnessed {
-        Self::start_with_app(&fixture_exe(), Harness::Codex, store, Some(pipe), None)
+        Self::start_with_app(&fixture_exe(), Harness::CODEX, store, Some(pipe), None)
     }
 
     /// Starts a scripted stand-in native owner (a fixture process) whose direct
@@ -354,11 +377,12 @@ impl Harnessed {
             .create(directory)
             .unwrap();
         let variable = match harness {
-            Harness::Codex => "CODEX_HOME",
-            Harness::ClaudeCode => "CLAUDE_CONFIG_DIR",
-            Harness::OpenCode => "OPENCODE_DB",
+            Harness::CODEX => "CODEX_HOME",
+            Harness::CLAUDE_CODE => "CLAUDE_CONFIG_DIR",
+            Harness::OPENCODE => "OPENCODE_DB",
+            _ => GENERIC_STORE_ENV,
         };
-        let value = if harness == Harness::OpenCode {
+        let value = if harness == Harness::OPENCODE {
             store.join("opencode.db")
         } else {
             store.to_path_buf()
@@ -412,11 +436,12 @@ impl Harnessed {
         locator: Option<&std::ffi::OsStr>,
     ) -> Harnessed {
         let variable = match harness {
-            Harness::Codex => "CODEX_HOME",
-            Harness::ClaudeCode => "CLAUDE_CONFIG_DIR",
-            Harness::OpenCode => "OPENCODE_DB",
+            Harness::CODEX => "CODEX_HOME",
+            Harness::CLAUDE_CODE => "CLAUDE_CONFIG_DIR",
+            Harness::OPENCODE => "OPENCODE_DB",
+            _ => GENERIC_STORE_ENV,
         };
-        let value = if harness == Harness::OpenCode {
+        let value = if harness == Harness::OPENCODE {
             store.join("opencode.db")
         } else {
             store.to_path_buf()

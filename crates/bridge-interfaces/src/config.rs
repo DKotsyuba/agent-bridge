@@ -590,9 +590,9 @@ kinds = ["root.note"]
     fn caller_scope_matches_exactly() {
         let config: InterfacesConfig = toml::from_str(&sample("")).unwrap();
         let policy = &config.root.unwrap().callers[0];
-        let inside = NativeAddress::new("h", Harness::ClaudeCode, "ns", "s1").unwrap();
-        let other_store = NativeAddress::new("h", Harness::ClaudeCode, "ns2", "s1").unwrap();
-        let other_harness = NativeAddress::new("h", Harness::Codex, "ns", "s1").unwrap();
+        let inside = NativeAddress::new("h", Harness::CLAUDE_CODE, "ns", "s1").unwrap();
+        let other_store = NativeAddress::new("h", Harness::CLAUDE_CODE, "ns2", "s1").unwrap();
+        let other_harness = NativeAddress::new("h", Harness::CODEX, "ns", "s1").unwrap();
         assert!(policy.matches(&inside));
         assert!(!policy.matches(&other_store));
         assert!(!policy.matches(&other_harness));

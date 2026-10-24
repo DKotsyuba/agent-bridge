@@ -291,7 +291,8 @@ struct OwnerState {
 
 /// Renders the scripted receipt bytes for `mode` answering `request`, or
 /// `None` when the owner must stay silent. Modes: `codex_accept`,
-/// `claude_accept`, `opencode_accept`, `known_unsent:<reason>`, `unknown:<reason>`, `wrong_call`,
+/// `claude_accept`, `opencode_accept`, `zlab_accept` (a profile-only harness),
+/// `known_unsent:<reason>`, `unknown:<reason>`, `wrong_call`,
 /// `extra_key`, `dup_key`, `garbage`, `silent` and `stall`.
 fn owner_receipt(mode: &str, request: &Value) -> Option<Vec<u8>> {
     let call = request["call_id"].as_str().unwrap_or_default();
@@ -301,6 +302,7 @@ fn owner_receipt(mode: &str, request: &Value) -> Option<Vec<u8>> {
         ("codex_accept", _) => accept("codex_turn"),
         ("claude_accept", _) => accept("claude_input"),
         ("opencode_accept", _) => accept("opencode_input"),
+        ("zlab_accept", _) => accept("zlab_input"),
         ("known_unsent", reason) => refuse("known_unsent", reason),
         ("unknown", reason) => refuse("unknown", reason),
         ("wrong_call", _) => {
@@ -759,14 +761,26 @@ fn render(result: Result<(VerifiedCaller, Option<String>), CorrelationError>) ->
 }
 
 /// The MCP-server stand-in (a harness-launched frontend): attest native
-/// `_meta` from stdin through the registry, optionally sealing, and print.
+/// `_meta` (or a `bridge_call_token` hook token) from stdin through the
+/// registry, optionally sealing, and print.
 fn mcp(socket: &str, seal: bool) {
     let mut text = String::new();
     let _ = std::io::stdin().read_to_string(&mut text);
     let meta: serde_json::Map<String, Value> = serde_json::from_str(&text).unwrap_or_default();
     let now = bridge_core::service::current_unix_millis();
     let attestor = RegistryAttestor::new(Path::new(socket), Duration::from_secs(5), 600_000);
-    let result = PresentedMeta::from_mcp_meta(&meta).and_then(|meta| {
+    // Like the restricted frontend, a hook token in the presented object is
+    // preferred over `_meta`.
+    let presented = match meta
+        .get(bridge_adapters::registry::CALL_TOKEN_ARGUMENT)
+        .and_then(Value::as_str)
+    {
+        Some(token) => Ok(PresentedMeta::HookToken {
+            token: bridge_adapters::registry::CallToken::from_wire(token),
+        }),
+        None => PresentedMeta::from_mcp_meta(&meta),
+    };
+    let result = presented.and_then(|meta| {
         if seal {
             attestor
                 .attest_sealed(&meta, now)

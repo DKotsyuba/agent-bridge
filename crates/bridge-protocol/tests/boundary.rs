@@ -2,24 +2,32 @@
 use bridge_protocol::*;
 use serde_json::{Value, json};
 
-/// OpenCode adds one exact host spelling while retaining the common canonical
-/// component grammar and refusing unknown, case-folded or malformed addresses.
+/// OpenCode keeps its exact host spelling and the common canonical component
+/// grammar; any canonical harness name is accepted (the set is open), while
+/// case-folded or malformed names and components refuse.
 #[test]
-fn opencode_address_roundtrips_without_broadening_the_address_grammar() {
+fn opencode_address_roundtrips_and_harness_names_follow_the_open_grammar() {
     let address = NativeAddress::parse("local/opencode/main%2Fstore/ses_native").unwrap();
-    assert_eq!(address.harness, Host::OpenCode);
+    assert_eq!(address.harness.host(), Some(Host::OpenCode));
     assert_eq!(address.store, "main/store");
     assert_eq!(
         address.canonical(),
         "local/opencode/main%2Fstore/ses_native"
     );
+    // The harness set is open: a profile-only harness parses, carries no
+    // metadata contract and round-trips unchanged.
+    let profiled = NativeAddress::parse("local/zcode/main/session_ab").unwrap();
+    assert_eq!(profiled.harness.as_str(), "zcode");
+    assert_eq!(profiled.harness.host(), None);
+    assert_eq!(profiled.canonical(), "local/zcode/main/session_ab");
     for invalid in [
         "local/OpenCode/main/ses_native",
         "local/open_code/main/ses_native",
-        "local/unknown/main/ses_native",
+        "local/1code/main/ses_native",
+        "local//main/ses_native",
         "local/opencode/main/%ZZ",
     ] {
-        assert!(NativeAddress::parse(invalid).is_err());
+        assert!(NativeAddress::parse(invalid).is_err(), "{invalid}");
     }
 }
 

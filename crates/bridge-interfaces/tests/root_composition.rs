@@ -175,9 +175,9 @@ fn hook_role() {
     );
     let mut out = Vec::new();
     let run = if std::env::var_os("HOOK_LOST").is_some() {
-        client.run_hook(Harness::ClaudeCode, &input, &mut LostStdout)
+        client.run_hook(Harness::CLAUDE_CODE, &input, &mut LostStdout)
     } else {
-        client.run_hook(Harness::ClaudeCode, &input, &mut out)
+        client.run_hook(Harness::CLAUDE_CODE, &input, &mut out)
     };
     print!("@@HOOK{}@@{:?}", String::from_utf8_lossy(&out), run);
 }
@@ -292,7 +292,7 @@ impl Drop for Lab {
 
 /// Canonical address of a lab Claude session.
 fn claude(session: &str) -> NativeAddress {
-    NativeAddress::new(HOST, Harness::ClaudeCode, NAMESPACE, session).unwrap()
+    NativeAddress::new(HOST, Harness::CLAUDE_CODE, NAMESPACE, session).unwrap()
 }
 
 /// Structured recipient argument for a session.
@@ -424,11 +424,15 @@ fn lab_with_addresses(tag: &str, any: bool) -> Lab {
         RegistryConfig {
             host_id: HOST.into(),
             harnesses: vec![HarnessPolicy {
-                harness: Harness::ClaudeCode,
+                harness: Harness::CLAUDE_CODE,
                 namespace: NAMESPACE.into(),
                 inject: true,
                 message: false,
                 executable_markers: vec!["root_composition".into()],
+                store_env: None,
+                store_home: None,
+                child_address: None,
+                caller_proof: Vec::new(),
             }],
             profiles: Vec::new(),
             intermediates,

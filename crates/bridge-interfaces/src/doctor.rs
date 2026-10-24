@@ -314,6 +314,10 @@ fn adapters(path: &Path, release: Option<&Path>, push: &mut dyn FnMut(&str, &'st
                     "not_verified",
                     json!({"namespace": policy.namespace,
                            "declared_inject": policy.inject, "declared_message": policy.message,
+                           "built_in": policy.harness.is_built_in(),
+                           "store_env": policy.store_env, "store_home": policy.store_home,
+                           "child_address": policy.child_address(),
+                           "caller_proof": policy.caller_proofs(),
                            "note": "declared capability; host qualification evidence is separate"}),
                 );
             }

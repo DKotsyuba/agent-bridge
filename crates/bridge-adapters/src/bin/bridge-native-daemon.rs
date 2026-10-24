@@ -122,7 +122,7 @@ fn main() -> ExitCode {
         }
     }
     if !config.adapters.sandbox.is_file() {
-        registry.disable_message(Harness::Codex);
+        registry.disable_message(Harness::CODEX);
         service::log_event(
             "warn",
             "codex_message_unsupported",
@@ -167,7 +167,7 @@ fn main() -> ExitCode {
     )
     .with_desktop_directory(config.adapters.channel.parent().unwrap().to_path_buf());
     let terminate = Arc::new(AtomicBool::new(false));
-    let opencode = bridge_adapters::opencode::OpenCodeOwnerCarrier::new(Arc::clone(&registry));
+    let opencode = bridge_adapters::owner_only::OwnerOnlyCarrier::new(Arc::clone(&registry));
     for signal in [SIGTERM, SIGINT] {
         let registered =
             signal_hook::flag::register_conditional_shutdown(signal, 1, Arc::clone(&terminate))

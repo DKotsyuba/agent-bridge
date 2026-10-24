@@ -2,8 +2,8 @@
 //! adapter channel and prints Bridge context only when handed one.
 //!
 //! Usage (as the hook command of every relevant event):
-//! `bridge-hook <channel-socket> <claude-code|codex|opencode>` with the native hook
-//! JSON on stdin. Hook mode always exits 0 and prints nothing unless the
+//! `bridge-hook <channel-socket> <harness>` (`claude-code`, `codex`, `opencode` or
+//! a profile-only harness identifier) with the native hook JSON on stdin. Hook mode always exits 0 and prints nothing unless the
 //! channel handed a context reply, so a missing or failing Bridge never
 //! blocks or breaks the harness; Bridge keeps undelivered events.
 //! `bridge-hook mcp-proxy <private-directory> <server> <absolute-backend> [args]`
@@ -40,7 +40,7 @@ fn main() -> ExitCode {
         };
     }
     let (Some(socket), Some(harness)) = (args.next(), args.next()) else {
-        eprintln!("usage: bridge-hook <channel-socket> <claude-code|codex|opencode>");
+        eprintln!("usage: bridge-hook <channel-socket> <harness>");
         return ExitCode::SUCCESS;
     };
     let Ok(harness) = Harness::parse(&harness) else {
@@ -58,7 +58,7 @@ fn main() -> ExitCode {
     let client = ChannelClient::new(socket, Duration::from_secs(5));
     let mut stdout = std::io::stdout().lock();
     match client.run_hook(harness, &input, &mut stdout) {
-        HookRun::Admitted | HookRun::Injected => {}
+        HookRun::Admitted | HookRun::Injected | HookRun::Tokened => {}
         HookRun::Refused(class, _) => eprintln!("bridge-hook: refused ({class})"),
         HookRun::Failed(reason) => eprintln!("bridge-hook: {reason}"),
     }

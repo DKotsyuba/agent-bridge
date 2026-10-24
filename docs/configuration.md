@@ -133,6 +133,17 @@ namespace = "opencode-main"
 inject = false                          # no OpenCode context injection
 message = true                          # requires native owner + lifecycle plugin
 
+[[adapters.harnesses]]                  # a harness Bridge ships no code for (a profile)
+harness = "zcode"                       # canonical identifier: [a-z][a-z0-9-]{0,31}
+namespace = "zcode-main"
+inject = true                           # Claude-compatible hook context injection
+message = true                          # delivered only through a native owner
+store_home = ".zcode"                   # store under the harness process's $HOME ...
+# store_env = "ZCODE_HOME"              # ... or named by its own environment (tried first)
+# child_address = "shared"              # "own" when children have their own sessions
+# executable_markers = ["zcode"]        # default: the harness identifier
+# caller_proof = ["hook-token"]         # default for a profile-only harness
+
 [[adapters.relays]]                     # optional: the root relay build
 path = "/ABS/home/releases/<version>+<label>/bin/bridge-root-relay"
 sha256 = "<64 hex>"
@@ -147,11 +158,13 @@ No store path and no harness executable is declared. A hook counts as a hook of 
 only when its parent chain reaches a process of that harness product (through the
 allowlisted `intermediates`, as the same user) for a harness kind that has a policy. That
 process must be positively marked as the product (its resolved executable path names `codex`
-or `claude` (or `opencode` for the plugin), or matches an explicit `executable_markers` entry), run from a regular
+or `claude` (or `opencode` for the plugin, or the identifier of a profile-only harness), or
+matches an explicit `executable_markers` entry), run from a regular
 file owned by you or root that no group or other user can write and that was not changed
 since the process started, and its own store, taken from its environment (`CODEX_HOME`,
 `CLAUDE_CONFIG_DIR`, else `$HOME/.codex` or `$HOME/.claude`; OpenCode uses its private
-`OPENCODE_DB` parent), must be a canonical directory
+`OPENCODE_DB` parent; a profile-only harness uses `store_env`, else `$HOME/<store_home>`),
+must be a canonical directory
 you own that no group or other user can write (a symlink or non-canonical spelling is
 refused; message-candidate validation and journal restore check it again at use, while the
 legacy Claude inbox route rechecks the incarnation and each descriptor and token file it reads).
@@ -161,7 +174,8 @@ operation to enroll with. Addresses use the policy's single namespace; an equal 
 from a second live incarnation is refused as a conflict. The marker is best-effort
 identification, not authentication: same-user code that can fake the marker or the
 hook is the documented excluded hostile same-user case. The [adapter
-guide](../crates/bridge-adapters/README.md) explains the trust model.
+guide](../crates/bridge-adapters/README.md) explains the trust model, and [Harness
+profiles](harness-profiles.md) explains how a harness without built-in code is connected.
 
 Only Bridge's own privileged components keep digest qualification: the `relays` and
 `audiences` builds are hashed at daemon start and again, in the background, whenever a

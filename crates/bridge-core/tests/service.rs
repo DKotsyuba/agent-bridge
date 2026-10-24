@@ -26,7 +26,7 @@ const SECOND_TOKEN: &str = "6f6f-second-publisher-token-0003";
 
 /// The canonical recipient the grant allows.
 fn recipient_text() -> String {
-    NativeAddress::new("host-1", Harness::Codex, "default", "thread-7")
+    NativeAddress::new("host-1", Harness::CODEX, "default", "thread-7")
         .unwrap()
         .to_canonical_string()
 }
@@ -77,7 +77,7 @@ fn test_config(dir: &TempDir) -> Config {
 fn body(event: &str) -> PublishBody {
     PublishBody {
         event_id: event.to_string(),
-        recipient: NativeAddress::new("host-1", Harness::Codex, "default", "thread-7").unwrap(),
+        recipient: NativeAddress::new("host-1", Harness::CODEX, "default", "thread-7").unwrap(),
         kind: "worker.completed".to_string(),
         mode: Mode::Message,
         policy: Policy::KeepAll,
@@ -197,7 +197,7 @@ fn grant_allowlists_are_enforced_before_acceptance() {
 
     let mut wrong_recipient = body("evt-r");
     wrong_recipient.recipient =
-        NativeAddress::new("host-1", Harness::Codex, "default", "thread-999").unwrap();
+        NativeAddress::new("host-1", Harness::CODEX, "default", "thread-999").unwrap();
     assert_eq!(
         client
             .publish(GRANT_TOKEN, &wrong_recipient)
@@ -698,7 +698,7 @@ fn wildcard_recipient_grants_admit_new_addresses_without_widening_other_rights()
     let mut client = bridge_client::BridgeClient::connect(running.socket_path()).unwrap();
     let mut new = body("new-address");
     new.recipient =
-        NativeAddress::new("host-1", Harness::ClaudeCode, "new-store", "new-session").unwrap();
+        NativeAddress::new("host-1", Harness::CLAUDE_CODE, "new-store", "new-session").unwrap();
     assert!(!client.publish(GRANT_TOKEN, &new).unwrap().replayed);
     new.event_id = "wrong-kind".into();
     new.kind = "unlisted.kind".into();

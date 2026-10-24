@@ -576,7 +576,7 @@ fn version_four_databases_gain_lineages_additively() {
     let event = Envelope::new(
         PublisherId::new("agent-run").unwrap(),
         EventId::new("lin-1").unwrap(),
-        NativeAddress::new("host-1", Harness::Codex, "default", "thread-1").unwrap(),
+        NativeAddress::new("host-1", Harness::CODEX, "default", "thread-1").unwrap(),
         Kind::new("diagnostics.view").unwrap(),
         Mode::Message,
         Policy::Latest {
@@ -753,7 +753,7 @@ fn version_two_databases_backfill_lineage_authority() {
 
 /// The lineage fixtures of this file: one recipient, one stream.
 fn lineage_recipient() -> String {
-    NativeAddress::new("host-1", Harness::Codex, "default", "thread-7")
+    NativeAddress::new("host-1", Harness::CODEX, "default", "thread-7")
         .unwrap()
         .to_canonical_string()
 }
@@ -763,7 +763,7 @@ fn lineage_event(publisher: &str, event: &str, revision: u64) -> Envelope {
     Envelope::new(
         PublisherId::new(publisher).unwrap(),
         EventId::new(event).unwrap(),
-        NativeAddress::new("host-1", Harness::Codex, "default", "thread-7").unwrap(),
+        NativeAddress::new("host-1", Harness::CODEX, "default", "thread-7").unwrap(),
         Kind::new("diagnostics.view").unwrap(),
         Mode::Auto,
         Policy::Latest {
@@ -808,7 +808,7 @@ fn ambiguous_migrated_pending_work_is_held_not_dispatched() {
 
     let mut storage = Storage::open(&path, Limits::new(100)).unwrap();
     storage.register_source_tag("source-a", "source-a").unwrap();
-    let address = NativeAddress::new("host-1", Harness::Codex, "default", "thread-7").unwrap();
+    let address = NativeAddress::new("host-1", Harness::CODEX, "default", "thread-7").unwrap();
     let attestation = attest(&address, Lifecycle::Inactive, 1);
     let selection = storage
         .reserve_next(

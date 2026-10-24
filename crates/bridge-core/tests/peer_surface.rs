@@ -29,7 +29,7 @@ const ROOT_TOKEN: &str = "peer-root-backend-token-0004";
 
 /// The recipient every grant may use.
 fn recipient() -> NativeAddress {
-    NativeAddress::new("host-1", Harness::Codex, "default", "thread-7").unwrap()
+    NativeAddress::new("host-1", Harness::CODEX, "default", "thread-7").unwrap()
 }
 
 /// An isolated file store/socket with publisher, root-backend and operator grants.

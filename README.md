@@ -69,6 +69,7 @@ write private configuration, install the hooks and send a first message.
 
 - [Getting started](docs/getting-started.md): prerequisites, build, test, package, install, first run.
 - [Configuration](docs/configuration.md): daemon, adapter, producer-permission and interfaces files.
+- [Harness profiles](docs/harness-profiles.md): connecting a harness by configuration, without Bridge code changes.
 - [Architecture](docs/architecture.md): custody, dispatch contract, service and lifecycle rules.
 - [Producer integration](docs/producer-integration.md): onboarding a new producer with the protocol or SDK.
 - [Qualification and support matrix](docs/qualification.md): what was observed, on which builds.

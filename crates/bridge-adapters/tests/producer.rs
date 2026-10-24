@@ -115,15 +115,15 @@ fn registered(response: Response) -> RegistrationResult {
 #[test]
 fn registration_replay_and_actual_child_scope_are_independent() {
     let lab = lab(false);
-    let mut harness = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    let mut harness = Harnessed::start(Harness::CLAUDE_CODE, &lab.claude_store);
     harness.hook(
         &lab.socket,
-        Harness::ClaudeCode,
+        Harness::CLAUDE_CODE,
         hook("SessionStart", "session"),
     );
     harness.hook(
         &lab.socket,
-        Harness::ClaudeCode,
+        Harness::CLAUDE_CODE,
         tool_hook("PreToolUse", "session", "call1", None),
     );
     let request = registration("request1", "operation1", "call1");
@@ -142,7 +142,7 @@ fn registration_replay_and_actual_child_scope_are_independent() {
     );
     harness.hook(
         &lab.socket,
-        Harness::ClaudeCode,
+        Harness::CLAUDE_CODE,
         tool_hook("PreToolUse", "session", "call2", None),
     );
     let fresh = registered(call(
@@ -156,7 +156,7 @@ fn registration_replay_and_actual_child_scope_are_independent() {
     assert_eq!(fresh.receipt.caller_scope, initial.receipt.caller_scope);
     harness.hook(
         &lab.socket,
-        Harness::ClaudeCode,
+        Harness::CLAUDE_CODE,
         tool_hook("PreToolUse", "session", "child-call", Some("child-a")),
     );
     let mut child = registration("child-self", "child-operation", "child-call");
@@ -179,7 +179,7 @@ fn registration_replay_and_actual_child_scope_are_independent() {
 #[test]
 fn unsupported_host_paths_do_not_consume_native_observations() {
     let lab = lab(false);
-    let mut harness = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    let mut harness = Harnessed::start(Harness::CLAUDE_CODE, &lab.claude_store);
     for (index, name) in [Some("functions.exec"), Some("shell"), None]
         .into_iter()
         .enumerate()
@@ -187,7 +187,7 @@ fn unsupported_host_paths_do_not_consume_native_observations() {
         let id = format!("call-{index}");
         let mut payload = tool_hook("PreToolUse", "session", &id, None);
         payload["tool_name"] = name.map_or(Value::Null, |value| json!(value));
-        harness.hook(&lab.socket, Harness::ClaudeCode, payload);
+        harness.hook(&lab.socket, Harness::CLAUDE_CODE, payload);
         let response = call(
             &mut harness,
             &lab.socket,
@@ -208,10 +208,10 @@ fn unsupported_host_paths_do_not_consume_native_observations() {
 #[test]
 fn configured_audience_consumes_once_and_replay_never_renews() {
     let lab = lab(true);
-    let mut source = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    let mut source = Harnessed::start(Harness::CLAUDE_CODE, &lab.claude_store);
     source.hook(
         &lab.socket,
-        Harness::ClaudeCode,
+        Harness::CLAUDE_CODE,
         tool_hook("PreToolUse", "session", "assert-call", None),
     );
     let mut request = registration("assert-registration", "assert-operation", "assert-call");
@@ -221,7 +221,7 @@ fn configured_audience_consumes_once_and_replay_never_renews() {
     }
     let registered = registered(call(&mut source, &lab.socket, &request, false));
     let assertion = registered.assertion.expect("actual assertion issued");
-    let mut backend = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    let mut backend = Harnessed::start(Harness::CLAUDE_CODE, &lab.claude_store);
     let mut consume = Request::new(
         "consume-a",
         Secret::new(TOKEN),
@@ -249,7 +249,7 @@ fn configured_audience_consumes_once_and_replay_never_renews() {
     }
     source.hook(
         &lab.socket,
-        Harness::ClaudeCode,
+        Harness::CLAUDE_CODE,
         hook("SessionStart", "session"),
     );
     let historical = call(&mut backend, &lab.socket, &consume, true);
@@ -271,15 +271,15 @@ fn configured_audience_consumes_once_and_replay_never_renews() {
 #[test]
 fn sealed_registration_replay_does_not_redeem_twice() {
     let lab = lab(false);
-    let mut source = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    let mut source = Harnessed::start(Harness::CLAUDE_CODE, &lab.claude_store);
     source.hook(
         &lab.socket,
-        Harness::ClaudeCode,
+        Harness::CLAUDE_CODE,
         tool_hook("PreToolUse", "session", "sealed-call", None),
     );
     let issued = source.mcp_sealed(&lab.socket, json!({"claudecode/toolUseId": "sealed-call"}));
     let proof = issued["proof"].as_str().expect("owned sealed source");
-    let mut backend = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    let mut backend = Harnessed::start(Harness::CLAUDE_CODE, &lab.claude_store);
     let mut request = registration("sealed-registration", "sealed-operation", "unused");
     if let Operation::RegisterCall(params) = &mut request.operation {
         params.evidence = Some(CallEvidence::Sealed {
@@ -301,10 +301,10 @@ fn sealed_registration_replay_does_not_redeem_twice() {
 #[test]
 fn registry_restart_recovers_receipt_but_requires_fresh_source() {
     let mut lab = lab(false);
-    let mut source = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    let mut source = Harnessed::start(Harness::CLAUDE_CODE, &lab.claude_store);
     source.hook(
         &lab.socket,
-        Harness::ClaudeCode,
+        Harness::CLAUDE_CODE,
         tool_hook("PreToolUse", "session", "restart-call", None),
     );
     let request = registration("restart-registration", "restart-operation", "restart-call");
@@ -336,7 +336,7 @@ fn registry_restart_recovers_receipt_but_requires_fresh_source() {
     );
     source.hook(
         &lab.socket,
-        Harness::ClaudeCode,
+        Harness::CLAUDE_CODE,
         tool_hook("PreToolUse", "session", "fresh-call", None),
     );
     let fresh = registered(call(
@@ -370,11 +370,11 @@ fn assertion_expiry_and_boot_loss_do_not_reconstruct_authority() {
         )
         .unwrap(),
     );
-    let mut source = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
-    let mut backend = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    let mut source = Harnessed::start(Harness::CLAUDE_CODE, &lab.claude_store);
+    let mut backend = Harnessed::start(Harness::CLAUDE_CODE, &lab.claude_store);
     source.hook(
         &lab.socket,
-        Harness::ClaudeCode,
+        Harness::CLAUDE_CODE,
         tool_hook("PreToolUse", "session", "ttl-call", None),
     );
     let mut request = registration("ttl-registration", "ttl-operation", "ttl-call");
@@ -437,10 +437,10 @@ fn assertion_expiry_and_boot_loss_do_not_reconstruct_authority() {
 #[test]
 fn mixed_host_and_unknown_operation_refuse_without_source_use() {
     let lab = lab(false);
-    let mut source = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    let mut source = Harnessed::start(Harness::CLAUDE_CODE, &lab.claude_store);
     source.hook(
         &lab.socket,
-        Harness::ClaudeCode,
+        Harness::CLAUDE_CODE,
         tool_hook("PreToolUse", "session", "mixed-call", None),
     );
     let mut wrong = registration("mixed-registration", "mixed-operation", "mixed-call");
@@ -475,10 +475,10 @@ fn mixed_host_and_unknown_operation_refuse_without_source_use() {
 #[test]
 fn registration_ack_loss_recovers_original_custody() {
     let lab = lab(false);
-    let mut source = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    let mut source = Harnessed::start(Harness::CLAUDE_CODE, &lab.claude_store);
     source.hook(
         &lab.socket,
-        Harness::ClaudeCode,
+        Harness::CLAUDE_CODE,
         tool_hook("PreToolUse", "session", "ack-call", None),
     );
     let request = registration("ack-registration", "ack-operation", "ack-call");
@@ -579,10 +579,10 @@ fn reservation_blocks_legacy_attestation_until_real_commit() {
         )
         .unwrap(),
     );
-    let mut source = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    let mut source = Harnessed::start(Harness::CLAUDE_CODE, &lab.claude_store);
     source.hook(
         &lab.socket,
-        Harness::ClaudeCode,
+        Harness::CLAUDE_CODE,
         tool_hook("PreToolUse", "session", "reserved-call", None),
     );
     gate.countdown.store(3, std::sync::atomic::Ordering::SeqCst);
@@ -632,17 +632,17 @@ fn reservation_blocks_legacy_attestation_until_real_commit() {
 #[test]
 fn committed_replay_with_different_current_origin_conflicts() {
     let lab = lab(false);
-    let mut source = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    let mut source = Harnessed::start(Harness::CLAUDE_CODE, &lab.claude_store);
     source.hook(
         &lab.socket,
-        Harness::ClaudeCode,
+        Harness::CLAUDE_CODE,
         tool_hook("PreToolUse", "first-session", "origin-first", None),
     );
     let first = registration("origin-registration", "origin-operation", "origin-first");
     let initial = registered(call(&mut source, &lab.socket, &first, false));
     source.hook(
         &lab.socket,
-        Harness::ClaudeCode,
+        Harness::CLAUDE_CODE,
         tool_hook("PreToolUse", "other-session", "origin-other", None),
     );
     let different = registration("origin-registration", "origin-operation", "origin-other");
@@ -687,10 +687,10 @@ fn worker_death_before_and_after_commit_reconciles_without_reuse() {
             )
             .unwrap(),
         );
-        let mut source = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+        let mut source = Harnessed::start(Harness::CLAUDE_CODE, &lab.claude_store);
         source.hook(
             &lab.socket,
-            Harness::ClaudeCode,
+            Harness::CLAUDE_CODE,
             tool_hook("PreToolUse", "session", "crash-call", None),
         );
         gate.countdown.store(3, std::sync::atomic::Ordering::SeqCst);
@@ -769,11 +769,11 @@ fn sealed_transfer_does_not_extend_original_observation_validity() {
         )
         .unwrap(),
     );
-    let mut source = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
-    let mut backend = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    let mut source = Harnessed::start(Harness::CLAUDE_CODE, &lab.claude_store);
+    let mut backend = Harnessed::start(Harness::CLAUDE_CODE, &lab.claude_store);
     source.hook(
         &lab.socket,
-        Harness::ClaudeCode,
+        Harness::CLAUDE_CODE,
         tool_hook("PreToolUse", "session", "original-expiry", None),
     );
     // First protected observation created this epoch at its actual observation time.
@@ -846,10 +846,10 @@ fn hook_confirmation_preserves_each_configured_absolute_budget() {
             )
             .unwrap(),
         );
-        let mut source = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+        let mut source = Harnessed::start(Harness::CLAUDE_CODE, &lab.claude_store);
         source.hook(
             &lab.socket,
-            Harness::ClaudeCode,
+            Harness::CLAUDE_CODE,
             hook("SessionStart", "session"),
         );
         lab.publish(

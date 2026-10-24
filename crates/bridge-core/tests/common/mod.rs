@@ -96,7 +96,7 @@ pub fn wait_listening(socket: &std::path::Path, budget: std::time::Duration) -> 
 /// A Codex fixture recipient with the given native session id.
 #[allow(dead_code)]
 pub fn codex(session: &str) -> NativeAddress {
-    NativeAddress::new("host-1", Harness::Codex, "default", session).unwrap()
+    NativeAddress::new("host-1", Harness::CODEX, "default", session).unwrap()
 }
 
 /// A keep_all envelope for `publisher` addressed to `recipient`.

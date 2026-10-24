@@ -56,46 +56,159 @@ fn validate_field(field: &'static str, value: &str, max: usize) -> Result<(), Co
     Ok(())
 }
 
+/// Largest canonical harness identifier, in bytes.
+pub const MAX_HARNESS_BYTES: usize = 32;
+
 /// Harness (native host product) a recipient session lives in.
 ///
 /// The harness decides which native store namespace and session identifier
 /// kinds are meaningful; it is part of the recipient's canonical logical
 /// address and never implied by a transport or a display name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Harness {
-    /// A Codex installation; sessions are identified by thread id.
-    Codex,
-    /// A Claude Code installation; sessions are identified by session id.
-    ClaudeCode,
-    /// An OpenCode installation; sessions are identified by native session id.
-    OpenCode,
+///
+/// The set is open: any canonical identifier (1 to [`MAX_HARNESS_BYTES`] bytes
+/// of `[a-z0-9-]`, starting with a letter) names a harness, and whether a
+/// harness is served is decided by the adapter's harness profiles, never here.
+/// The built-in harnesses keep their canonical names ([`Harness::CODEX`],
+/// [`Harness::CLAUDE_CODE`], [`Harness::OPENCODE`]) and, in serde form, their
+/// historical spellings (`Codex`, `ClaudeCode`, `OpenCode`): those spellings are
+/// part of every stored canonical envelope and its frozen hash, so they never
+/// change. Any other harness serializes as its canonical identifier.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Harness {
+    /// Identifier length in bytes; at least one.
+    len: u8,
+    /// ASCII identifier bytes, zero-padded after `len`.
+    bytes: [u8; MAX_HARNESS_BYTES],
 }
 
 impl Harness {
+    /// A Codex installation; sessions are identified by thread id.
+    pub const CODEX: Harness = Harness::from_static("codex");
+    /// A Claude Code installation; sessions are identified by session id.
+    pub const CLAUDE_CODE: Harness = Harness::from_static("claude-code");
+    /// An OpenCode installation; sessions are identified by native session id.
+    pub const OPENCODE: Harness = Harness::from_static("opencode");
+
+    /// The built-in harnesses with their historical serde spellings.
+    const BUILT_IN: [(Harness, &'static str); 3] = [
+        (Harness::CODEX, "Codex"),
+        (Harness::CLAUDE_CODE, "ClaudeCode"),
+        (Harness::OPENCODE, "OpenCode"),
+    ];
+
+    /// Builds a harness from a compile-time identifier.
+    ///
+    /// # Panics
+    ///
+    /// When `name` is not a canonical identifier; in a constant this is a
+    /// compile-time error.
+    pub const fn from_static(name: &str) -> Harness {
+        match Harness::from_bytes(name.as_bytes()) {
+            Some(harness) => harness,
+            None => panic!("invalid harness identifier"),
+        }
+    }
+
+    /// Validates the canonical grammar and copies the identifier.
+    const fn from_bytes(name: &[u8]) -> Option<Harness> {
+        if name.is_empty() || name.len() > MAX_HARNESS_BYTES || !name[0].is_ascii_lowercase() {
+            return None;
+        }
+        let mut bytes = [0u8; MAX_HARNESS_BYTES];
+        let mut index = 0;
+        while index < name.len() {
+            let byte = name[index];
+            if !(byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-') {
+                return None;
+            }
+            bytes[index] = byte;
+            index += 1;
+        }
+        Some(Harness {
+            len: name.len() as u8,
+            bytes,
+        })
+    }
+
     /// Canonical wire name of this harness, stable across schema revisions.
     ///
     /// Never display-derived: the names are part of the canonical address.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Harness::Codex => "codex",
-            Harness::ClaudeCode => "claude-code",
-            Harness::OpenCode => "opencode",
-        }
+    pub fn as_str(&self) -> &str {
+        // Only validated ASCII is ever stored, so this never falls back.
+        std::str::from_utf8(&self.bytes[..usize::from(self.len)]).unwrap_or_default()
+    }
+
+    /// Whether this is one of the harnesses Bridge ships code for.
+    pub fn is_built_in(&self) -> bool {
+        Harness::BUILT_IN.iter().any(|(harness, _)| harness == self)
     }
 
     /// Parses a harness from its canonical wire name.
     ///
-    /// Returns [`CoreError::InvalidEnvelope`] for any other spelling; there
-    /// is no fuzzy matching and no default harness.
+    /// Returns [`CoreError::InvalidEnvelope`] for anything that is not a
+    /// canonical identifier; there is no fuzzy matching and no default harness.
     pub fn parse(value: &str) -> Result<Self, CoreError> {
-        match value {
-            "codex" => Ok(Harness::Codex),
-            "claude-code" => Ok(Harness::ClaudeCode),
-            "opencode" => Ok(Harness::OpenCode),
-            other => Err(CoreError::InvalidEnvelope(format!(
-                "unknown harness {other:?}"
-            ))),
+        Harness::from_bytes(value.as_bytes()).ok_or_else(|| {
+            CoreError::InvalidEnvelope(format!("invalid harness identifier {value:?}"))
+        })
+    }
+
+    /// The serde spelling: the historical name of a built-in harness, else the
+    /// canonical identifier.
+    fn serde_name(&self) -> &str {
+        Harness::BUILT_IN
+            .iter()
+            .find(|(harness, _)| harness == self)
+            .map_or_else(|| self.as_str(), |(_, legacy)| legacy)
+    }
+
+    /// Parses exactly the serde spelling written by [`Harness::serde_name`]: a
+    /// built-in harness only by its historical name, any other harness by its
+    /// canonical identifier. A built-in's canonical name is refused here so that
+    /// one harness never has two serialized forms inside canonical envelopes.
+    fn from_serde_name(value: &str) -> Result<Self, CoreError> {
+        if let Some((harness, _)) = Harness::BUILT_IN
+            .iter()
+            .find(|(_, legacy)| *legacy == value)
+        {
+            return Ok(*harness);
         }
+        let harness = Harness::parse(value)?;
+        if harness.is_built_in() {
+            return Err(CoreError::InvalidEnvelope(format!(
+                "harness {value:?} must use its historical serialized name"
+            )));
+        }
+        Ok(harness)
+    }
+}
+
+impl fmt::Debug for Harness {
+    /// Prints `Harness("<canonical id>")`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Harness").field(&self.as_str()).finish()
+    }
+}
+
+impl fmt::Display for Harness {
+    /// Prints the canonical identifier.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for Harness {
+    /// Writes the historical name of a built-in harness, else the canonical id.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.serde_name())
+    }
+}
+
+impl<'de> Deserialize<'de> for Harness {
+    /// Reads exactly the spelling [`Serialize`] writes; anything else refuses.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Harness::from_serde_name(&value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -1010,7 +1123,7 @@ mod tests {
 
     /// A minimal valid address for tests.
     fn address() -> NativeAddress {
-        NativeAddress::new("host-1", Harness::ClaudeCode, "default", "session-9").unwrap()
+        NativeAddress::new("host-1", Harness::CLAUDE_CODE, "default", "session-9").unwrap()
     }
 
     /// A minimal valid envelope for tests.
@@ -1095,7 +1208,7 @@ mod tests {
         assert!(EventId::new("").is_err());
         assert!(Kind::new("x".repeat(65)).is_err());
         assert!(Payload::new("x".repeat(MAX_PAYLOAD_BYTES + 1)).is_err());
-        assert!(NativeAddress::new("h", Harness::Codex, "ns", "").is_err());
+        assert!(NativeAddress::new("h", Harness::CODEX, "ns", "").is_err());
     }
 
     /// A relative TTL is normalized to an absolute expiry exactly once; the
@@ -1127,6 +1240,78 @@ mod tests {
         assert_eq!(address, parsed);
         assert!(NativeAddress::parse("host/codex").is_err());
         assert!(Harness::parse("Codex").is_err());
+    }
+
+    #[test]
+    /// The harness set is open: any canonical identifier parses and
+    /// round-trips through the canonical address, everything else refuses.
+    fn open_harness_identifiers_follow_the_canonical_grammar() {
+        for valid in [
+            "zcode",
+            "a",
+            "cursor-agent-2",
+            &"x".repeat(MAX_HARNESS_BYTES),
+        ] {
+            let harness = Harness::parse(valid).unwrap();
+            assert_eq!(harness.as_str(), valid);
+            assert!(!harness.is_built_in());
+            let address = NativeAddress::new("h", harness, "ns", "s/1").unwrap();
+            assert_eq!(
+                NativeAddress::parse(&address.to_canonical_string()).unwrap(),
+                address
+            );
+        }
+        for invalid in [
+            "",
+            "Zcode",
+            "1code",
+            "-code",
+            "z_code",
+            "z code",
+            "zcode/x",
+            "zcödе",
+            &"x".repeat(MAX_HARNESS_BYTES + 1),
+        ] {
+            assert!(Harness::parse(invalid).is_err(), "{invalid:?}");
+        }
+        assert_eq!(Harness::parse("claude-code").unwrap(), Harness::CLAUDE_CODE);
+        assert!(Harness::CODEX.is_built_in() && Harness::OPENCODE.is_built_in());
+    }
+
+    #[test]
+    /// Built-in harnesses keep their historical serde spellings, which are part
+    /// of every stored canonical envelope and its frozen hash; any other harness
+    /// serializes as its canonical identifier, and no harness has two forms.
+    fn harness_serde_form_is_frozen_for_built_ins_and_canonical_otherwise() {
+        for (harness, serialized) in [
+            (Harness::CODEX, "\"Codex\""),
+            (Harness::CLAUDE_CODE, "\"ClaudeCode\""),
+            (Harness::OPENCODE, "\"OpenCode\""),
+            (Harness::from_static("zcode"), "\"zcode\""),
+        ] {
+            assert_eq!(serde_json::to_string(&harness).unwrap(), serialized);
+            assert_eq!(
+                serde_json::from_str::<Harness>(serialized).unwrap(),
+                harness
+            );
+        }
+        for refused in [
+            "\"codex\"",
+            "\"claude-code\"",
+            "\"opencode\"",
+            "\"Zcode\"",
+            "\"\"",
+        ] {
+            assert!(
+                serde_json::from_str::<Harness>(refused).is_err(),
+                "{refused}"
+            );
+        }
+        let address = NativeAddress::new("h", Harness::CLAUDE_CODE, "ns", "s").unwrap();
+        assert_eq!(
+            serde_json::to_string(&address).unwrap(),
+            r#"{"host_id":"h","harness":"ClaudeCode","native_store_namespace":"ns","native_session_id":"s"}"#
+        );
     }
 
     #[test]

@@ -3,7 +3,10 @@
 //!
 //! The frontend holds no Bridge credential. For each `tools/call` it reads
 //! only the harness-owned request `_meta` (Claude `claudecode/toolUseId`,
-//! Codex `threadId` + `callId` + `x-codex-turn-metadata`), asks the adapter
+//! Codex `threadId` + `callId` + `x-codex-turn-metadata`), or, for a harness
+//! whose profile accepts hook tokens, the single-use `bridge_call_token` its
+//! protected `PreToolUse` hook wrote into the arguments (removed before anything
+//! else reads them, and preferred over `_meta` when present), asks the adapter
 //! registry to attest *this process's* caller and seal a single-use proof
 //! ([`bridge_adapters::RegistryAttestor::attest_sealed`]: the registry
 //! identifies the frontend by kernel peer credentials and requires it to
@@ -21,7 +24,9 @@
 use std::io::{BufRead, Write};
 use std::path::Path;
 
-use bridge_adapters::registry::{CorrelationError, PresentedMeta, SealedProof};
+use bridge_adapters::registry::{
+    CALL_TOKEN_ARGUMENT, CallToken, CorrelationError, PresentedMeta, SealedProof,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -150,13 +155,19 @@ fn initialize(params: &Value) -> Value {
 
 /// The closed tool definitions.
 pub fn tool_list() -> Value {
+    // Written by the harness's own Bridge hook, never by the model; a value the
+    // hook did not issue joins no record and refuses.
+    let token = json!({
+        "type": "string",
+        "description": "Set by the Bridge hook. Never set or invent it.",
+    });
     let address = json!({
         "type": "object",
         "additionalProperties": false,
         "required": ["host_id", "harness", "native_store_namespace", "native_session_id"],
         "properties": {
             "host_id": {"type": "string"},
-            "harness": {"type": "string", "enum": ["codex", "claude-code"]},
+            "harness": {"type": "string", "pattern": "^[a-z][a-z0-9-]{0,31}$"},
             "native_store_namespace": {"type": "string"},
             "native_session_id": {"type": "string"},
         },
@@ -165,7 +176,7 @@ pub fn tool_list() -> Value {
         {
             "name": TOOLS[0],
             "description": "Your attested native address and what you may send.",
-            "inputSchema": {"type": "object", "additionalProperties": false, "properties": {}},
+            "inputSchema": {"type": "object", "additionalProperties": false, "properties": {CALL_TOKEN_ARGUMENT: token.clone()}},
             "annotations": {"readOnlyHint": true, "openWorldHint": false},
         },
         {
@@ -176,6 +187,7 @@ pub fn tool_list() -> Value {
                 "additionalProperties": false,
                 "anyOf": [{"required": ["address", "message"]}, {"required": ["recipient", "body"]}],
                 "properties": {
+                    CALL_TOKEN_ARGUMENT: token.clone(),
                     "request_id": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$"},
                     "address": {"type": "string", "description": "Canonical native address from bridge_me"},
                     "message": {"type": "string"},
@@ -195,7 +207,10 @@ pub fn tool_list() -> Value {
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["request_id"],
-                "properties": {"request_id": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$"}},
+                "properties": {
+                    CALL_TOKEN_ARGUMENT: token,
+                    "request_id": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$"},
+                },
             },
             "annotations": {"readOnlyHint": true, "openWorldHint": false},
         },
@@ -231,63 +246,71 @@ fn call_tool(
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    if !arguments.is_object() {
+    let Some(object) = arguments.as_object_mut() else {
         return Err((-32602, "arguments must be an object"));
-    }
-    let answer = match params.get("_meta").and_then(Value::as_object) {
-        None => RelayResponse::error(
-            "caller_not_evidence",
-            "the request carries no harness _meta; arguments never identify a caller",
+    };
+    let token = match object.remove(CALL_TOKEN_ARGUMENT) {
+        None => None,
+        Some(Value::String(token)) => Some(CallToken::from_wire(token)),
+        Some(_) => return Err((-32602, "bridge_call_token must be a string")),
+    };
+    let presented = match (token, params.get("_meta").and_then(Value::as_object)) {
+        (Some(token), _) => Ok(PresentedMeta::HookToken { token }),
+        (None, Some(meta)) => PresentedMeta::from_mcp_meta(meta),
+        (None, None) => Err(CorrelationError::NotEvidence(
+            "the request carries no harness _meta or hook token; arguments never identify a caller"
+                .into(),
+        )),
+    };
+    let answer = match presented.and_then(|meta| {
+        seal(&meta, bridge_core::service::current_unix_millis()).map(|proof| (proof, meta))
+    }) {
+        Err(refusal) => RelayResponse::error(
+            format!("caller_{}", refusal.class().trim_start_matches("caller_")),
+            refusal.detail().to_string(),
         ),
-        Some(meta) => match PresentedMeta::from_mcp_meta(meta).and_then(|meta| {
-            seal(&meta, bridge_core::service::current_unix_millis()).map(|proof| (proof, meta))
-        }) {
-            Err(refusal) => RelayResponse::error(
-                format!("caller_{}", refusal.class().trim_start_matches("caller_")),
-                refusal.detail().to_string(),
-            ),
-            Ok((proof, native_meta)) => {
-                if name == TOOLS[1] && arguments.get("request_id").is_none() {
-                    let call_id = match &native_meta {
-                        PresentedMeta::Claude { tool_use_id } => tool_use_id,
-                        PresentedMeta::Codex { call_id, .. } => call_id,
-                        PresentedMeta::OpenCode { call_id, .. } => call_id,
-                        PresentedMeta::Sealed { .. } => {
-                            return Err((-32602, "native call identity missing"));
-                        }
-                    };
-                    arguments["request_id"] =
-                        Value::String(format!("call-{:x}", Sha256::digest(call_id.as_bytes())));
-                }
-                let request_id = arguments
-                    .get("request_id")
-                    .and_then(Value::as_str)
-                    .filter(|id| {
-                        id.len() <= 128
-                            && id
-                                .bytes()
-                                .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
-                    })
-                    .map(str::to_owned);
-                let mut answer = call_relay(
-                    relay_socket,
-                    &RelayRequest {
-                        proof,
-                        tool: name.to_string(),
-                        arguments,
-                    },
-                );
-                if let RelayResponse::Error { class, detail } = &mut answer
-                    && matches!(class.as_str(), "relay_outcome_unknown" | "custody_unknown")
-                    && let Some(id) = request_id
-                {
-                    detail.push_str(&format!(
-                        "; reconcile request_id={id}; never create a new id for this message"
-                    ));
-                }
-                answer
+        Ok((proof, native_meta)) => {
+            if name == TOOLS[1] && arguments.get("request_id").is_none() {
+                let call_id = match &native_meta {
+                    PresentedMeta::Claude { tool_use_id } => tool_use_id,
+                    PresentedMeta::Codex { call_id, .. } => call_id,
+                    PresentedMeta::OpenCode { call_id, .. } => call_id,
+                    PresentedMeta::HookToken { token } => token.as_str(),
+                    PresentedMeta::Sealed { .. } => {
+                        return Err((-32602, "native call identity missing"));
+                    }
+                };
+                arguments["request_id"] =
+                    Value::String(format!("call-{:x}", Sha256::digest(call_id.as_bytes())));
             }
-        },
+            let request_id = arguments
+                .get("request_id")
+                .and_then(Value::as_str)
+                .filter(|id| {
+                    id.len() <= 128
+                        && id
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+                })
+                .map(str::to_owned);
+            let mut answer = call_relay(
+                relay_socket,
+                &RelayRequest {
+                    proof,
+                    tool: name.to_string(),
+                    arguments,
+                },
+            );
+            if let RelayResponse::Error { class, detail } = &mut answer
+                && matches!(class.as_str(), "relay_outcome_unknown" | "custody_unknown")
+                && let Some(id) = request_id
+            {
+                detail.push_str(&format!(
+                    "; reconcile request_id={id}; never create a new id for this message"
+                ));
+            }
+            answer
+        }
     };
     Ok(tool_result(&answer))
 }
@@ -357,6 +380,10 @@ mod tests {
         assert_eq!(TOOLS.as_slice(), pinned.as_slice());
         for tool in tools.as_array().unwrap() {
             assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+            assert_eq!(
+                tool["inputSchema"]["properties"][CALL_TOKEN_ARGUMENT]["type"],
+                "string"
+            );
         }
     }
 
@@ -373,6 +400,66 @@ mod tests {
             answer["result"]["structuredContent"]["error"],
             "caller_not_evidence"
         );
+    }
+
+    /// A hook token in the arguments is removed before anything else reads
+    /// them and presented instead of `_meta` (a host `_meta` that is not a
+    /// contract, like ZCode's request context, is ignored); the relay receives
+    /// the arguments without it and a derived request id; a non-string token
+    /// refuses before sealing.
+    #[test]
+    fn hook_token_is_presented_and_never_relayed() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::fs::PermissionsExt;
+        let directory = std::env::temp_dir().join(format!("mt{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = directory.join("r.sock");
+        let _ = std::fs::remove_file(&socket);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let relay = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            (&stream)
+                .write_all(b"{\"result\":\"ok\",\"value\":{}}\n")
+                .unwrap();
+            serde_json::from_str::<Value>(&line).unwrap()
+        });
+        let presented = std::cell::RefCell::new(None);
+        let sealer = |meta: &PresentedMeta, _: u64| {
+            *presented.borrow_mut() = Some(meta.clone());
+            Ok(SealedProof::from_wire("p"))
+        };
+        let answer = handle_line(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"bridge_send","arguments":{"address":"a","message":"m","bridge_call_token":"t0"},"_meta":{"com.zcode/request-context":{"session_id":"s"}}}}"#,
+            &sealer,
+            &socket,
+        )
+        .unwrap();
+        assert_eq!(answer["result"]["isError"], false, "{answer}");
+        assert_eq!(
+            presented.into_inner(),
+            Some(PresentedMeta::HookToken {
+                token: CallToken::from_wire("t0")
+            })
+        );
+        let relayed = relay.join().unwrap();
+        assert!(relayed["arguments"].get("bridge_call_token").is_none());
+        assert_eq!(relayed["arguments"]["message"], "m");
+        assert!(
+            relayed["arguments"]["request_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("call-")
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let refused = run(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"bridge_me","arguments":{"bridge_call_token":7}}}"#,
+            &unreachable_sealer,
+        );
+        assert_eq!(refused["error"]["code"], -32602, "{refused}");
     }
 
     /// A sealer refusal is returned as a tool error carrying its class

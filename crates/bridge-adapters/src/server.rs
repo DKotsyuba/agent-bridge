@@ -186,6 +186,13 @@ pub(crate) enum ChannelResponse {
         #[serde(default)]
         proof: Option<crate::registry::SealedProof>,
     },
+    /// Admitted `PreToolUse` of a Bridge root tool call: write `token` into the
+    /// call's input (`hookSpecificOutput.updatedInput`). Unlike inject there is
+    /// no flush confirmation: a token that never reaches the call joins nothing.
+    CallToken {
+        /// The single-use hook token.
+        token: crate::registry::CallToken,
+    },
     /// Refused; nothing was admitted or disclosed.
     Refused {
         /// Correlation error class.
@@ -649,6 +656,10 @@ fn serve_hook(
                 &[("error", &error.to_string())],
             );
         }
+    }
+    if let Some(token) = admission.token {
+        let _ = write_response(writer, &ChannelResponse::CallToken { token });
+        return;
     }
     let Some(attestation) = admission.drain else {
         let _ = write_response(writer, &ChannelResponse::Ok);

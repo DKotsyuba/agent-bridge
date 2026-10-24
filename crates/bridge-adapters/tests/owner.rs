@@ -62,9 +62,10 @@ impl Rig {
     fn with_owner_exe(tag: &str, harness: Harness, owner_exe: Option<&Path>) -> Rig {
         let lab = Lab::new(tag);
         let store = match harness {
-            Harness::Codex => lab.codex_store.clone(),
-            Harness::ClaudeCode => lab.claude_store.clone(),
-            Harness::OpenCode => lab.opencode_store.clone(),
+            Harness::CODEX => lab.codex_store.clone(),
+            Harness::CLAUDE_CODE => lab.claude_store.clone(),
+            Harness::OPENCODE => lab.opencode_store.clone(),
+            _ => lab.generic_store.clone(),
         };
         let directory = lab.dir.0.join("ow");
         let mut native = match owner_exe {
@@ -72,15 +73,13 @@ impl Rig {
             None => Harnessed::start_owned(harness, &store, &directory),
         };
         let address = match harness {
-            Harness::Codex => lab.codex_address(SESSION),
-            Harness::ClaudeCode => lab.claude_address(SESSION),
-            Harness::OpenCode => lab.opencode_address(SESSION),
+            Harness::CODEX => lab.codex_address(SESSION),
+            Harness::CLAUDE_CODE => lab.claude_address(SESSION),
+            Harness::OPENCODE => lab.opencode_address(SESSION),
+            _ => lab.generic_address(SESSION),
         };
         let carrier: Box<dyn DispatchCarrier> = match harness {
-            Harness::OpenCode => Box::new(bridge_adapters::opencode::OpenCodeOwnerCarrier::new(
-                Arc::clone(&lab.registry),
-            )),
-            Harness::Codex => {
+            Harness::CODEX => {
                 std::fs::write(lab.codex_store.join("behavior"), "accept").unwrap();
                 std::fs::write(lab.codex_store.join("probe_port"), "9").unwrap();
                 Box::new(CodexQueueCarrier::new(
@@ -89,7 +88,7 @@ impl Rig {
                     Duration::from_secs(10),
                 ))
             }
-            Harness::ClaudeCode => {
+            Harness::CLAUDE_CODE => {
                 native.cmd(json!({"cmd": "inbox", "session_id": SESSION, "behavior": "delivered"}));
                 Box::new(
                     ClaudeLaterCarrier::new(
@@ -100,6 +99,9 @@ impl Rig {
                     .unwrap(),
                 )
             }
+            _ => Box::new(bridge_adapters::owner_only::OwnerOnlyCarrier::new(
+                Arc::clone(&lab.registry),
+            )),
         };
         let mut rig = Rig {
             socket: directory.join("o.sock"),
@@ -142,13 +144,13 @@ impl Rig {
     /// Claude inbox frames. Must stay zero whenever the owner route is selected.
     fn legacy(&mut self) -> usize {
         match self.harness {
-            Harness::Codex => std::fs::read_to_string(self.lab.codex_store.join("queue.jsonl"))
+            Harness::CODEX => std::fs::read_to_string(self.lab.codex_store.join("queue.jsonl"))
                 .map(|text| text.lines().count())
                 .unwrap_or(0),
-            Harness::ClaudeCode => self.native.cmd(json!({"cmd": "frames"}))["frames"]
+            Harness::CLAUDE_CODE => self.native.cmd(json!({"cmd": "frames"}))["frames"]
                 .as_array()
                 .map_or(0, Vec::len),
-            Harness::OpenCode => 0,
+            _ => 0,
         }
     }
 
@@ -173,9 +175,10 @@ impl Rig {
     /// The accepting script for this harness.
     fn accept(&self) -> &'static str {
         match self.harness {
-            Harness::Codex => "codex_accept",
-            Harness::ClaudeCode => "claude_accept",
-            Harness::OpenCode => "opencode_accept",
+            Harness::CODEX => "codex_accept",
+            Harness::CLAUDE_CODE => "claude_accept",
+            Harness::OPENCODE => "opencode_accept",
+            _ => "zlab_accept",
         }
     }
 }
@@ -187,9 +190,14 @@ impl Rig {
 /// is used, and Claude needs no inbox descriptor.
 #[test]
 fn idle_owner_receives_one_exact_frame_for_supported_harnesses() {
-    for harness in [Harness::Codex, Harness::ClaudeCode, Harness::OpenCode] {
+    for harness in [
+        Harness::CODEX,
+        Harness::CLAUDE_CODE,
+        Harness::OPENCODE,
+        GENERIC,
+    ] {
         let mut rig = Rig::new("ow1", harness);
-        if harness == Harness::ClaudeCode {
+        if harness == Harness::CLAUDE_CODE {
             // No descriptor may be needed: a descriptor-less Claude is held by
             // the legacy route but is woken through its owner.
             let sessions = rig.lab.claude_store.join("sessions");
@@ -294,18 +302,19 @@ fn receipts_after_the_write_map_conservatively_and_never_resend() {
         ("opencode_accept", false),
         ("known_unsent:", false),
     ];
-    for harness in [Harness::Codex, Harness::ClaudeCode, Harness::OpenCode] {
+    for harness in [Harness::CODEX, Harness::CLAUDE_CODE, Harness::OPENCODE] {
         for (mode, known_unsent) in cases {
             let wrong_protocol = match harness {
-                Harness::Codex => matches!(mode, "claude_accept" | "opencode_accept"),
-                Harness::ClaudeCode => matches!(mode, "codex_accept" | "opencode_accept"),
-                Harness::OpenCode => matches!(mode, "codex_accept" | "claude_accept"),
+                Harness::CODEX => matches!(mode, "claude_accept" | "opencode_accept"),
+                Harness::CLAUDE_CODE => matches!(mode, "codex_accept" | "opencode_accept"),
+                Harness::OPENCODE => matches!(mode, "codex_accept" | "claude_accept"),
+                _ => unreachable!("built-in harnesses only"),
             };
             let right_protocol = matches!(
                 (harness, mode),
-                (Harness::Codex, "codex_accept")
-                    | (Harness::ClaudeCode, "claude_accept")
-                    | (Harness::OpenCode, "opencode_accept")
+                (Harness::CODEX, "codex_accept")
+                    | (Harness::CLAUDE_CODE, "claude_accept")
+                    | (Harness::OPENCODE, "opencode_accept")
             );
             if right_protocol {
                 continue;
@@ -423,7 +432,7 @@ fn unprovable_or_non_idle_recipients_send_nothing_and_never_fall_back() {
         "symlinked",
         "loose_mode",
     ];
-    for harness in [Harness::Codex, Harness::ClaudeCode] {
+    for harness in [Harness::CODEX, Harness::CLAUDE_CODE] {
         for case in cases {
             let mut rig = Rig::new("ow3", harness);
             rig.script(rig.accept());
@@ -493,7 +502,7 @@ fn unprovable_or_non_idle_recipients_send_nothing_and_never_fall_back() {
 /// known-unsent with zero frames, while 35 seconds or more send exactly once.
 #[test]
 fn send_fences_epoch_and_remaining_budget_before_any_write() {
-    for harness in [Harness::Codex, Harness::ClaudeCode] {
+    for harness in [Harness::CODEX, Harness::CLAUDE_CODE] {
         let mut rig = Rig::new("ow4", harness);
         rig.script(rig.accept());
         let attestation = rig.carrier.attest(&rig.address).unwrap();
@@ -551,7 +560,7 @@ fn send_fences_epoch_and_remaining_budget_before_any_write() {
 #[test]
 fn escaped_large_manifest_round_trips_exactly() {
     let payload = "\"\\\n\t\u{e9}\u{1F600}".repeat(4_000);
-    for harness in [Harness::Codex, Harness::ClaudeCode] {
+    for harness in [Harness::CODEX, Harness::CLAUDE_CODE] {
         let mut rig = Rig::new("ow5", harness);
         rig.script(rig.accept());
         let report = rig.send("evt-big", Mode::Message, &payload);
@@ -580,11 +589,11 @@ fn escaped_large_manifest_round_trips_exactly() {
 #[test]
 fn absent_locator_preserves_legacy_routes() {
     let lab = Lab::new("ow6");
-    let mut codex = Harnessed::start(Harness::Codex, &lab.codex_store);
+    let mut codex = Harnessed::start(Harness::CODEX, &lab.codex_store);
     std::fs::write(lab.codex_store.join("behavior"), "accept").unwrap();
     std::fs::write(lab.codex_store.join("probe_port"), "9").unwrap();
-    codex.hook(&lab.socket, Harness::Codex, hook("SessionStart", SESSION));
-    codex.hook(&lab.socket, Harness::Codex, hook("Stop", SESSION));
+    codex.hook(&lab.socket, Harness::CODEX, hook("SessionStart", SESSION));
+    codex.hook(&lab.socket, Harness::CODEX, hook("Stop", SESSION));
     let address = lab.codex_address(SESSION);
     let mut carrier = CodexQueueCarrier::new(
         Arc::clone(&lab.registry),
@@ -613,14 +622,14 @@ fn absent_locator_preserves_legacy_routes() {
     let queued = std::fs::read_to_string(lab.codex_store.join("queue.jsonl")).unwrap();
     assert_eq!(queued.lines().count(), 1);
 
-    let mut claude = Harnessed::start(Harness::ClaudeCode, &lab.claude_store);
+    let mut claude = Harnessed::start(Harness::CLAUDE_CODE, &lab.claude_store);
     claude.cmd(json!({"cmd": "inbox", "session_id": SESSION, "behavior": "delivered"}));
     claude.hook(
         &lab.socket,
-        Harness::ClaudeCode,
+        Harness::CLAUDE_CODE,
         hook("SessionStart", SESSION),
     );
-    claude.hook(&lab.socket, Harness::ClaudeCode, hook("Stop", SESSION));
+    claude.hook(&lab.socket, Harness::CLAUDE_CODE, hook("Stop", SESSION));
     let address = lab.claude_address(SESSION);
     let mut carrier = ClaudeLaterCarrier::new(
         Arc::clone(&lab.registry),
@@ -699,22 +708,17 @@ fn unreadable_environment_is_not_positive_absence() {
 /// `absent_locator_preserves_legacy_routes`) still delivers through them.
 #[test]
 fn present_non_utf8_locator_holds_and_never_falls_back() {
-    for harness in [Harness::Codex, Harness::ClaudeCode] {
+    for harness in [Harness::CODEX, Harness::CLAUDE_CODE] {
         let lab = Lab::new("ow7");
         let store = match harness {
-            Harness::Codex => lab.codex_store.clone(),
-            Harness::ClaudeCode => lab.claude_store.clone(),
-            Harness::OpenCode => lab.opencode_store.clone(),
+            Harness::CODEX => lab.codex_store.clone(),
+            Harness::CLAUDE_CODE => lab.claude_store.clone(),
+            Harness::OPENCODE => lab.opencode_store.clone(),
+            _ => lab.generic_store.clone(),
         };
         let mut native = Harnessed::start_with_locator(harness, &store, b"/not-utf8-\xff\xfe.sock");
         let (address, mut carrier): (NativeAddress, Box<dyn DispatchCarrier>) = match harness {
-            Harness::OpenCode => (
-                lab.opencode_address(SESSION),
-                Box::new(bridge_adapters::opencode::OpenCodeOwnerCarrier::new(
-                    Arc::clone(&lab.registry),
-                )),
-            ),
-            Harness::Codex => {
+            Harness::CODEX => {
                 std::fs::write(lab.codex_store.join("behavior"), "accept").unwrap();
                 std::fs::write(lab.codex_store.join("probe_port"), "9").unwrap();
                 (
@@ -726,7 +730,7 @@ fn present_non_utf8_locator_holds_and_never_falls_back() {
                     )),
                 )
             }
-            Harness::ClaudeCode => {
+            Harness::CLAUDE_CODE => {
                 native.cmd(json!({"cmd": "inbox", "session_id": SESSION, "behavior": "delivered"}));
                 (
                     lab.claude_address(SESSION),
@@ -740,6 +744,7 @@ fn present_non_utf8_locator_holds_and_never_falls_back() {
                     ),
                 )
             }
+            _ => unreachable!("built-in legacy routes only"),
         };
         for event in ["SessionStart", "Stop"] {
             let reply = native.hook(&lab.socket, harness, hook(event, SESSION));
@@ -767,13 +772,13 @@ fn present_non_utf8_locator_holds_and_never_falls_back() {
             "{harness:?}: {report:?}"
         );
         let legacy = match harness {
-            Harness::Codex => std::fs::read_to_string(lab.codex_store.join("queue.jsonl"))
+            Harness::CODEX => std::fs::read_to_string(lab.codex_store.join("queue.jsonl"))
                 .map(|text| text.lines().count())
                 .unwrap_or(0),
-            Harness::ClaudeCode => native.cmd(json!({"cmd": "frames"}))["frames"]
+            Harness::CLAUDE_CODE => native.cmd(json!({"cmd": "frames"}))["frames"]
                 .as_array()
                 .map_or(0, Vec::len),
-            Harness::OpenCode => 0,
+            _ => 0,
         };
         assert_eq!(legacy, 0, "{harness:?}: no legacy fallback");
         native.stop();
@@ -788,15 +793,15 @@ fn present_non_utf8_locator_holds_and_never_falls_back() {
 /// fence can refuse it; the forged owner must receive no request frame.
 #[test]
 fn non_parent_owner_is_refused_with_no_effect() {
-    for harness in [Harness::Codex, Harness::ClaudeCode] {
+    for harness in [Harness::CODEX, Harness::CLAUDE_CODE] {
         let forged_dir = TempDir::new("ow8");
         let lab_store = TempDir::new("ow8s");
         let forged_directory = forged_dir.0.join("fo");
         let mut forged = Harnessed::start_owned(harness, &lab_store.0, &forged_directory);
         forged.cmd(json!({"cmd": "owner_script", "mode": match harness {
-            Harness::Codex => "codex_accept",
-            Harness::ClaudeCode => "claude_accept",
-            Harness::OpenCode => "opencode_accept",
+            Harness::CODEX => "codex_accept",
+            Harness::CLAUDE_CODE => "claude_accept",
+            _ => unreachable!("built-in harnesses only"),
         }}));
         std::thread::sleep(Duration::from_millis(1100));
         let mut rig = Rig::new("ow8", harness);
@@ -838,7 +843,7 @@ fn non_parent_owner_is_refused_with_no_effect() {
 #[test]
 fn unsafe_or_changed_owner_executable_is_refused_with_no_effect() {
     use std::os::unix::fs::PermissionsExt;
-    for harness in [Harness::Codex, Harness::ClaudeCode] {
+    for harness in [Harness::CODEX, Harness::CLAUDE_CODE] {
         for (label, mode) in [("group-writable", 0o775), ("status change only", 0o755)] {
             let dir = TempDir::new("ow9");
             let owner_exe = dir.0.join("bridge-fixture-owner");
@@ -886,7 +891,7 @@ fn unsafe_or_changed_owner_executable_is_refused_with_no_effect() {
 /// then the same live owner accepts it exactly once for every supported harness.
 #[test]
 fn busy_owner_waits_beyond_five_attempts_then_accepts_same_event() {
-    for harness in [Harness::Codex, Harness::ClaudeCode, Harness::OpenCode] {
+    for harness in [Harness::CODEX, Harness::CLAUDE_CODE, Harness::OPENCODE] {
         let mut rig = Rig::new("busy-owner", harness);
         rig.script("known_unsent:not_idle");
         rig.lab

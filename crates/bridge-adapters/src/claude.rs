@@ -700,7 +700,7 @@ impl Hub {
     /// disabled or absent inbox, a gone process or a failed core write
     /// leaves the binding for the next pass.
     fn refresh_withdrawn(&self, registry: &Mutex<Registry>) {
-        let withdrawn = lock_registry(registry).message_withdrawn(Harness::ClaudeCode);
+        let withdrawn = lock_registry(registry).message_withdrawn(Harness::CLAUDE_CODE);
         for address in withdrawn {
             let attested = lock_registry(registry).attest_recipient(&address);
             if let Ok((_, snapshot)) = attested {
@@ -1142,7 +1142,7 @@ impl ClaudeLaterCarrier {
             &self.registry,
             &socket,
             binding.harness,
-            Harness::ClaudeCode,
+            Harness::CLAUDE_CODE,
             &crate::owner::Handoff {
                 thread_id: &address.native_session_id,
                 call_id: &format!(
@@ -1237,7 +1237,7 @@ impl DispatchCarrier for ClaudeLaterCarrier {
     /// (a hold) with no fallback to the inbox route. Only a positively idle
     /// lifecycle may then be woken; an absent locator keeps the behavior above.
     fn attest(&mut self, recipient: &NativeAddress) -> Result<Attestation, String> {
-        if recipient.harness != Harness::ClaudeCode {
+        if recipient.harness != Harness::CLAUDE_CODE {
             return Err("not a Claude recipient".into());
         }
         let (attestation, binding) = {
@@ -1756,7 +1756,7 @@ mod bound_tests {
     /// that bound at core admission and is not a carrier case.
     #[test]
     fn a_full_16_kib_body_fits_the_carrier_bound() {
-        let address = NativeAddress::new("host", Harness::ClaudeCode, "default", "s").unwrap();
+        let address = NativeAddress::new("host", Harness::CLAUDE_CODE, "default", "s").unwrap();
         let envelope = |payload: String| {
             Envelope::new(
                 PublisherId::new("p").unwrap(),

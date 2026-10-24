@@ -32,11 +32,12 @@ impl ObservationCandidate {
         }) {
             return false;
         }
-        let Ok(facts) = live_binding(&self.binding, self.owner_uid) else {
+        let Ok(facts) = live_binding(&self.binding, &self.policy, self.owner_uid) else {
             return false;
         };
         product_marked(&facts, &self.policy)
-            && live_binding(&self.binding, self.owner_uid).is_ok_and(|last| last == facts)
+            && live_binding(&self.binding, &self.policy, self.owner_uid)
+                .is_ok_and(|last| last == facts)
     }
 
     /// Returns only owner lifecycle and currently bounded carrier support.
@@ -65,9 +66,9 @@ impl Registry {
     /// Unsupported harness policy or malformed identity returns absence.
     pub(crate) fn observation_address(&self, host: Host, session: &str) -> Option<NativeAddress> {
         let harness = match host {
-            Host::Codex => Harness::Codex,
-            Host::ClaudeCode => Harness::ClaudeCode,
-            Host::OpenCode => Harness::OpenCode,
+            Host::Codex => Harness::CODEX,
+            Host::ClaudeCode => Harness::CLAUDE_CODE,
+            Host::OpenCode => Harness::OPENCODE,
         };
         let policy = self.policy(harness)?;
         NativeAddress::new(&self.config.host_id, harness, &policy.namespace, session).ok()

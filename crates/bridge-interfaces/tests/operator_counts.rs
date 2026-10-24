@@ -32,7 +32,7 @@ const OPERATOR: &str = "operator-token-for-counts-01";
 
 /// The one synthetic recipient.
 fn recipient() -> NativeAddress {
-    NativeAddress::new("lab", Harness::ClaudeCode, "store", "session").unwrap()
+    NativeAddress::new("lab", Harness::CLAUDE_CODE, "store", "session").unwrap()
 }
 
 /// An exclusively created scratch tree removed (only it) on drop.

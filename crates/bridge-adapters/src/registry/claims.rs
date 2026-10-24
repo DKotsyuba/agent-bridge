@@ -358,6 +358,7 @@ mod tests {
             consumed: false,
             claimed,
             tool_name: Some("mcp__new_producer__make_report".into()),
+            token_digest: None,
         }
     }
 

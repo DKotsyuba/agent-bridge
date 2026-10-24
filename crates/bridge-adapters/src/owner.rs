@@ -235,11 +235,7 @@ fn classify(frame: &[u8], call_id: &str, harness: Harness) -> Outcome {
     if receipt.call_id != call_id {
         return unknown("call id mismatch");
     }
-    let protocol = match harness {
-        Harness::Codex => "codex_turn",
-        Harness::ClaudeCode => "claude_input",
-        Harness::OpenCode => "opencode_input",
-    };
+    let protocol = protocol_label(harness);
     match (
         receipt.state.as_str(),
         receipt.protocol.as_deref(),
@@ -267,6 +263,17 @@ fn classify(frame: &[u8], call_id: &str, harness: Harness) -> Outcome {
             reason: format!("native owner reported an unknown outcome: {code}"),
         },
         _ => unknown("state, protocol, native id or reason not agreed"),
+    }
+}
+
+/// The native protocol a correlated receipt of `harness` must name: the
+/// historical labels of Codex and Claude Code, else `<harness>_input` with `-`
+/// written as `_` (OpenCode's `opencode_input` follows this rule).
+fn protocol_label(harness: Harness) -> String {
+    match harness {
+        Harness::CODEX => "codex_turn".into(),
+        Harness::CLAUDE_CODE => "claude_input".into(),
+        other => format!("{}_input", other.as_str().replace('-', "_")),
     }
 }
 
@@ -445,17 +452,17 @@ mod tests {
             )
         };
         assert!(matches!(
-            classify(&accepted("codex_turn"), "c", Harness::Codex),
+            classify(&accepted("codex_turn"), "c", Harness::CODEX),
             Outcome::NativeAccepted { .. }
         ));
         assert!(matches!(
-            classify(&accepted("claude_input"), "c", Harness::ClaudeCode),
+            classify(&accepted("claude_input"), "c", Harness::CLAUDE_CODE),
             Outcome::NativeAccepted { .. }
         ));
         for (bytes, harness) in [
-            (accepted("claude_input"), Harness::Codex),
-            (accepted("codex_turn"), Harness::ClaudeCode),
-            (accepted("other"), Harness::Codex),
+            (accepted("claude_input"), Harness::CODEX),
+            (accepted("codex_turn"), Harness::CLAUDE_CODE),
+            (accepted("other"), Harness::CODEX),
         ] {
             assert!(matches!(
                 classify(&bytes, "c", harness),
@@ -466,7 +473,7 @@ mod tests {
             let bytes = frame(
                 json!({"call_id":"c","state":"known_unsent","protocol":null,"native_id":null,"reason":code}),
             );
-            let outcome = classify(&bytes, "c", Harness::Codex);
+            let outcome = classify(&bytes, "c", Harness::CODEX);
             if matches!(code, "not_idle" | "awaiting_input" | "capacity") {
                 assert!(matches!(outcome, Outcome::DeferredKnownUnsent { .. }));
             } else {
@@ -478,7 +485,7 @@ mod tests {
                 json!({"call_id":"c","state":"unknown","protocol":null,"native_id":null,"reason":code}),
             );
             assert!(matches!(
-                classify(&bytes, "c", Harness::Codex),
+                classify(&bytes, "c", Harness::CODEX),
                 Outcome::OutcomeUnknown { .. }
             ));
         }
@@ -510,7 +517,7 @@ mod tests {
         for value in bad {
             assert!(
                 matches!(
-                    classify(&frame(value.clone()), "c", Harness::Codex),
+                    classify(&frame(value.clone()), "c", Harness::CODEX),
                     Outcome::OutcomeUnknown { .. }
                 ),
                 "{value}"
@@ -525,7 +532,7 @@ mod tests {
             &[0xff, 0xfe],
         ] {
             assert!(matches!(
-                classify(bytes, "c", Harness::Codex),
+                classify(bytes, "c", Harness::CODEX),
                 Outcome::OutcomeUnknown { .. }
             ));
         }
@@ -564,7 +571,7 @@ mod tests {
                 &mut client,
                 b"{}",
                 "c",
-                Harness::Codex,
+                Harness::CODEX,
                 Instant::now() + Duration::from_secs(2),
                 u64::MAX,
             );
@@ -593,7 +600,7 @@ mod tests {
             &mut client,
             b"{}",
             "c",
-            Harness::Codex,
+            Harness::CODEX,
             started + Duration::from_millis(100),
             u64::MAX,
         );
@@ -625,7 +632,7 @@ mod tests {
                 &mut client,
                 b"{}",
                 "c",
-                Harness::Codex,
+                Harness::CODEX,
                 Instant::now() + Duration::from_millis(300),
                 handoff,
             );

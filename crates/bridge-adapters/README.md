@@ -22,7 +22,7 @@ touched by anything here, and nothing in this crate installs a hook for you.
 | `server` / `client` | the private adapter channel and its clients (`RegistryAttestor`) |
 | `codex` | `message` via one `thread/queue/add` in an OS-confined queue-only App Server helper |
 | `claude` | `message` via the authenticated native peer send with `priority = "later"` |
-| `opencode` / `plugins/opencode` | message-only `opencode_input` via the exact native owner; plugin lifecycle observations, no inject/context path |
+| `owner_only` / `plugins/opencode` | message-only `<harness>_input` via the exact native owner, for OpenCode and every profile-only harness; OpenCode plugin lifecycle observations, no OpenCode inject/context path |
 
 ## Trust model
 
@@ -31,15 +31,16 @@ touched by anything here, and nothing in this crate installs a hook for you.
   the daemon's user, a harness-level policy serves that harness product, and its
   nearest ancestor that is not an allowlisted shell (`intermediates`) is a
   process of that product: it runs as the same user, its resolved executable
-  path carries the product marker (the product name `codex` / `claude` / `opencode` or a
-  configured `executable_markers` entry; an environment variable never counts,
+  path carries the product marker (the product name `codex` / `claude` / `opencode`, the
+  harness identifier of a profile-only harness, or a configured `executable_markers` entry; an environment variable never counts,
   because every descendant of a harness inherits its store variables), the file
   is a regular file owned by that user or root that no group or other user can
   write and was last modified *and* last changed (kernel ctime, which `cp -p` /
   `install -p` / `touch` cannot restore) strictly before the whole second the
   process started, and its own store (`CODEX_HOME` / `CLAUDE_CONFIG_DIR`, else
   `$HOME/.codex` / `$HOME/.claude`; OpenCode uses the parent of its explicit
-  `OPENCODE_DB`, read from that process's own environment) is
+  `OPENCODE_DB`; a profile-only harness uses its profile's `store_env`, else
+  `$HOME/<store_home>` — all read from that process's own environment) is
   an absolute, already canonical directory owned by that user that no group or
   other user can write (symlinks and non-canonical spellings are refused). The
   message-candidate validation (owner-routed sends) and journal restore check the store again at use;
@@ -108,7 +109,13 @@ touched by anything here, and nothing in this crate installs a hook for you.
   (`agent_id` or the session's root). A caller is attested by joining the MCP
   request's `_meta` call id to exactly one fresh, unconsumed record of the
   current epoch from the same harness incarnation; the join consumes it
-  (replay = duplicate). `VerifiedCaller` scope is (address, role, native id):
+  (replay = duplicate). A harness whose profile accepts `hook-token` (the
+  default for a profile-only harness) instead gets a single-use token at the
+  `PreToolUse` of a Bridge root tool call: `bridge-hook` writes it into the
+  call's input (`hookSpecificOutput.updatedInput`, the original input plus
+  `bridge_call_token`), the restricted frontend removes it from the arguments
+  and presents it, and the registry joins it to exactly that record (only its
+  SHA-256 is kept) under the same ancestry, epoch and single-use rules. `VerifiedCaller` scope is (address, role, native id):
   Claude subagents share the address but never `may_act_as_address`; a Codex
   child thread has its own address.
 - **Relay.** A process that is not a harness descendant (the restricted MCP's
@@ -278,6 +285,14 @@ namespace = "opencode-main"
 inject = false                              # no OpenCode context injection
 message = true                              # owner + lifecycle plugin required
 # executable_markers = ["opencode"]         # optional; default is the product name
+
+[[adapters.harnesses]]                      # a harness Bridge ships no code for
+harness = "zcode"                           # canonical identifier
+namespace = "zcode-main"
+inject = true
+message = true                              # only through a native owner (owner route)
+store_home = ".zcode"                       # and/or store_env = "ZCODE_HOME"
+# child_address = "shared"                  # or "own"; see docs/harness-profiles.md
 
 [[adapters.relays]]                          # optional: root MCP daemon build
 path = "/abs/root-mcp-daemon"

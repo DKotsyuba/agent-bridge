@@ -40,9 +40,9 @@ pub mod client;
 pub mod codex;
 pub mod desktop;
 pub mod native_mcp;
-pub mod opencode;
 pub mod os;
 pub mod owner;
+pub mod owner_only;
 pub mod registry;
 pub mod server;
 

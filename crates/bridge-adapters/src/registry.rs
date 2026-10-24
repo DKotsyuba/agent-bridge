@@ -138,15 +138,18 @@ pub struct Profile {
     pub executables: Vec<QualifiedExecutable>,
 }
 
-/// Harness-level policy: which native harness product this daemon serves, the
-/// default `native_store_namespace` of its addresses and the capabilities its
-/// bindings carry. It names no store path and no executable: a fresh session of
-/// the harness in any canonical owner-only store registers from its genuine
-/// lifecycle hook.
+/// Harness-level policy (the harness *profile*): which native harness product
+/// this daemon serves, the default `native_store_namespace` of its addresses, the
+/// capabilities its bindings carry and, for a harness Bridge ships no code for,
+/// where its store lives and how its children are addressed. It names no store
+/// path and no executable: a fresh session of the harness in any canonical
+/// owner-only store registers from its genuine lifecycle hook. A profile only
+/// says where to look; every kernel check of the registry still applies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessPolicy {
-    /// The harness product (`Codex`, `ClaudeCode` or `OpenCode`).
+    /// The harness product: `Codex`, `ClaudeCode`, `OpenCode` (historical
+    /// spellings of the built-in harnesses) or any other canonical identifier.
     pub harness: Harness,
     /// Default `native_store_namespace` component of this harness's addresses.
     pub namespace: String,
@@ -156,11 +159,162 @@ pub struct HarnessPolicy {
     pub message: bool,
     /// Case-insensitive substrings of the harness process's resolved executable
     /// path that positively mark it as this product. Empty means the product name
-    /// (`codex`, `claude` or `opencode`). An unrelated ancestor (a terminal, a build tool, a
-    /// generic wrapper) matches none and is never a harness. Best-effort
-    /// identification, not authentication.
+    /// (`codex`, `claude` or `opencode`) of a built-in harness, else the harness
+    /// identifier. An unrelated ancestor (a terminal, a build tool, a generic
+    /// wrapper) matches none and is never a harness. Best-effort identification,
+    /// not authentication.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub executable_markers: Vec<String>,
+    /// Environment variable of the harness process that names its store; read
+    /// from that process's own environment. Only for a harness that is not
+    /// built in (whose store rule is fixed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_env: Option<String>,
+    /// Store relative to the harness process's own `$HOME`, used when
+    /// `store_env` is unset or absent. Only for a harness that is not built in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_home: Option<PathBuf>,
+    /// How a child actor (an event with an `agent_id`) is addressed. Only for a
+    /// harness that is not built in; absent means [`ChildAddress::Shared`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_address: Option<ChildAddress>,
+    /// Accepted caller proofs ([`CallerProof`]); empty means the harness
+    /// default ([`HarnessPolicy::caller_proofs`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub caller_proof: Vec<CallerProof>,
+}
+
+/// How an MCP call that reached Bridge is joined to the protected `PreToolUse`
+/// record a hook of the same harness incarnation made for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CallerProof {
+    /// Claude Code `_meta["claudecode/toolUseId"]`.
+    ClaudeMeta,
+    /// Codex `_meta.threadId` + `_meta.callId` + `x-codex-turn-metadata`.
+    CodexMeta,
+    /// OpenCode plugin-stamped `_meta` session and call identifiers.
+    OpencodeMeta,
+    /// A single-use token the daemon issues at the `PreToolUse` hook of a Bridge
+    /// root tool call and the hook writes into the call's input
+    /// (`hookSpecificOutput.updatedInput`); independent of host `_meta`.
+    HookToken,
+}
+
+/// How the child actors of a harness are addressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildAddress {
+    /// A child acts inside its root session's address and never owns it: its
+    /// events never make the address idle (Claude Code subagents).
+    Shared,
+    /// A child has its own address and owns it (Codex child threads).
+    Own,
+}
+
+impl HarnessPolicy {
+    /// The marker used when `executable_markers` is empty: the product name of
+    /// a built-in harness, else the harness identifier.
+    fn default_marker(&self) -> &str {
+        match self.harness {
+            Harness::CODEX => "codex",
+            Harness::CLAUDE_CODE => "claude",
+            Harness::OPENCODE => "opencode",
+            _ => self.harness.as_str(),
+        }
+    }
+
+    /// Effective child addressing: fixed for the built-in harnesses (Claude
+    /// children share the root address; Codex threads and OpenCode sessions have
+    /// their own), configured or shared for any other harness.
+    pub fn child_address(&self) -> ChildAddress {
+        match self.harness {
+            Harness::CLAUDE_CODE => ChildAddress::Shared,
+            Harness::CODEX | Harness::OPENCODE => ChildAddress::Own,
+            _ => self.child_address.unwrap_or(ChildAddress::Shared),
+        }
+    }
+
+    /// Effective accepted caller proofs: the configured list, else the harness
+    /// default (the built-in `_meta` contract of a built-in harness, the hook
+    /// token for any other harness).
+    pub fn caller_proofs(&self) -> Vec<CallerProof> {
+        if !self.caller_proof.is_empty() {
+            return self.caller_proof.clone();
+        }
+        vec![self.native_meta_proof().unwrap_or(CallerProof::HookToken)]
+    }
+
+    /// The `_meta` contract a built-in harness's host presents, if any.
+    fn native_meta_proof(&self) -> Option<CallerProof> {
+        match self.harness {
+            Harness::CODEX => Some(CallerProof::CodexMeta),
+            Harness::CLAUDE_CODE => Some(CallerProof::ClaudeMeta),
+            Harness::OPENCODE => Some(CallerProof::OpencodeMeta),
+            _ => None,
+        }
+    }
+
+    /// Whether this profile accepts `proof`.
+    pub fn accepts(&self, proof: CallerProof) -> bool {
+        self.caller_proofs().contains(&proof)
+    }
+
+    /// Checks the profile fields that only a harness without built-in code may
+    /// carry: a built-in harness has a fixed store rule and child addressing; any
+    /// other harness needs a store rule (`store_env` and/or a relative,
+    /// `..`-free `store_home`).
+    ///
+    /// # Errors
+    ///
+    /// The violated rule, naming the harness.
+    fn validate_profile(&self) -> Result<(), String> {
+        let id = self.harness.as_str();
+        if let Some(foreign) = self.caller_proof.iter().find(|proof| {
+            **proof != CallerProof::HookToken && Some(**proof) != self.native_meta_proof()
+        }) {
+            return Err(format!(
+                "{id}: caller_proof {foreign:?} is another host's _meta contract"
+            ));
+        }
+        if self.harness.is_built_in() {
+            if self.store_env.is_some() || self.store_home.is_some() || self.child_address.is_some()
+            {
+                return Err(format!(
+                    "{id}: store_env, store_home and child_address are fixed for a built-in harness"
+                ));
+            }
+            return Ok(());
+        }
+        if let Some(variable) = &self.store_env {
+            let valid = !variable.is_empty()
+                && variable.len() <= 128
+                && variable
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+                && !variable.as_bytes()[0].is_ascii_digit();
+            if !valid {
+                return Err(format!(
+                    "{id}: store_env is not an environment variable name"
+                ));
+            }
+        }
+        if let Some(relative) = &self.store_home {
+            let valid = !relative.as_os_str().is_empty()
+                && relative
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)));
+            if !valid {
+                return Err(format!(
+                    "{id}: store_home must be a relative path without `.` or `..`"
+                ));
+            }
+        }
+        if self.store_env.is_none() && self.store_home.is_none() {
+            return Err(format!("{id}: a profile needs store_env or store_home"));
+        }
+        Ok(())
+    }
 }
 
 /// Registry configuration, normally the `[adapters]` table of the daemon
@@ -411,6 +565,9 @@ pub enum CallerChannel {
     /// Trusted OpenCode Bridge plugin context joined to its exact native hook call.
     #[serde(rename = "opencode_call")]
     OpenCodeCall,
+    /// A single-use hook token ([`CallerProof::HookToken`]) joined to its exact
+    /// `PreToolUse` record.
+    HookToken,
 }
 
 /// Protected native MCP request metadata presented for caller attestation.
@@ -466,6 +623,55 @@ pub enum PresentedMeta {
         /// The opaque proof text.
         proof: SealedProof,
     },
+    /// A single-use hook token the frontend took out of the call's arguments
+    /// (see [`CallerProof::HookToken`]); it names one protected `PreToolUse`
+    /// record and still needs the presenting process's own kernel ancestry.
+    HookToken {
+        /// The opaque token text.
+        token: CallToken,
+    },
+}
+
+/// An opaque, unguessable, single-use hook token issued for one protected
+/// `PreToolUse` record. It carries no caller facts; `Debug` never prints it and
+/// the registry keeps only its SHA-256.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CallToken(String);
+
+impl CallToken {
+    /// Wraps token text received from a hook reply or an MCP argument; validity
+    /// is decided only by the registry join.
+    pub fn from_wire(text: impl Into<String>) -> Self {
+        CallToken(text.into())
+    }
+
+    /// The token text (treat as a secret; never log).
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for CallToken {
+    /// Prints a placeholder instead of the token.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CallToken(<redacted>)")
+    }
+}
+
+/// The MCP argument a hook token travels in: the `PreToolUse` reply adds it to
+/// the call's input and the restricted frontend removes it before anything else
+/// reads the arguments.
+pub const CALL_TOKEN_ARGUMENT: &str = "bridge_call_token";
+
+/// Whether `tool_name` is a Bridge root tool call in the native MCP grammar
+/// (`mcp__<server>__bridge_me|bridge_send|bridge_status`), the only calls a
+/// hook token is issued for, so no other MCP server ever receives one.
+fn is_bridge_root_tool(tool_name: &str) -> bool {
+    tool_name.starts_with("mcp__")
+        && ["__bridge_me", "__bridge_send", "__bridge_status"]
+            .iter()
+            .any(|suffix| tool_name.ends_with(suffix))
 }
 
 /// An opaque, unguessable, single-use caller proof issued by the registry.
@@ -566,14 +772,22 @@ impl PresentedMeta {
         PresentedMeta::Sealed { proof }
     }
 
-    /// The per-call identifier and harness of native metadata; `None` for
-    /// a sealed proof.
-    fn native(&self) -> Option<(&str, Harness)> {
+    /// The per-call identifier, harness and caller channel of native metadata;
+    /// `None` for a sealed proof.
+    fn native(&self) -> Option<(&str, Harness, CallerChannel)> {
         match self {
-            PresentedMeta::Claude { tool_use_id } => Some((tool_use_id, Harness::ClaudeCode)),
-            PresentedMeta::Codex { call_id, .. } => Some((call_id, Harness::Codex)),
-            PresentedMeta::OpenCode { call_id, .. } => Some((call_id, Harness::OpenCode)),
-            PresentedMeta::Sealed { .. } => None,
+            PresentedMeta::Claude { tool_use_id } => Some((
+                tool_use_id,
+                Harness::CLAUDE_CODE,
+                CallerChannel::ClaudeToolUse,
+            )),
+            PresentedMeta::Codex { call_id, .. } => {
+                Some((call_id, Harness::CODEX, CallerChannel::CodexCall))
+            }
+            PresentedMeta::OpenCode { call_id, .. } => {
+                Some((call_id, Harness::OPENCODE, CallerChannel::OpenCodeCall))
+            }
+            PresentedMeta::Sealed { .. } | PresentedMeta::HookToken { .. } => None,
         }
     }
 }
@@ -850,6 +1064,10 @@ pub struct HookAdmission {
     /// At a context point of the addressed root actor with qualified
     /// inject: the attestation under which the hook may drain.
     pub drain: Option<Attestation>,
+    /// At the `PreToolUse` of a Bridge root tool call of a harness whose profile
+    /// accepts [`CallerProof::HookToken`]: the token the hook writes into the
+    /// call's input.
+    pub token: Option<CallToken>,
 }
 
 /// One binding of an address to a harness incarnation. Only daemon-verified
@@ -955,6 +1173,8 @@ struct CallRecord {
     claimed: bool,
     /// Bounded protected native tool classification, never producer meaning.
     tool_name: Option<String>,
+    /// SHA-256 of the hook token issued for this record, if any.
+    token_digest: Option<String>,
 }
 
 /// The harness a peer belongs to.
@@ -1073,7 +1293,7 @@ impl MessageCandidate {
         let facts = self.live_check()?;
         let lifecycle = if binding.retired {
             if !binding.desktop_idle_message
-                || binding.address.harness != Harness::Codex
+                || binding.address.harness != Harness::CODEX
                 || os::process_env(facts.pid, "CODEX_APP_TOOLS_PIPE_PATH").is_none()
                 || retained_transcript(binding, self.owner_uid) != binding.desktop_idle_transcript
                 || binding.desktop_idle_transcript.is_none()
@@ -1101,10 +1321,10 @@ impl MessageCandidate {
             },
             proof(format!(
                 "{}-message:{}@{}:epoch{}",
-                match binding.address.harness {
-                    Harness::Codex => "codex",
-                    Harness::ClaudeCode => "claude",
-                    Harness::OpenCode => "opencode",
+                match &binding.address.harness {
+                    &Harness::CODEX => "codex",
+                    &Harness::CLAUDE_CODE => "claude",
+                    other => other.as_str(),
                 },
                 binding.harness.0,
                 binding.harness.1,
@@ -1137,19 +1357,23 @@ impl MessageCandidate {
     ///
     /// The harness is gone or anything above changed.
     fn live_check(&self) -> Result<ProcessFacts, String> {
-        live_binding(&self.binding, self.owner_uid)
+        live_binding(&self.binding, &self.policy, self.owner_uid)
     }
 }
 
 /// Revalidates one existing binding's exact live PID/start, UID, executable and
 /// process-selected canonical private store without modifying registry state.
 /// Returns current process facts; any absent or changed fact fails closed.
-fn live_binding(binding: &Binding, owner_uid: u32) -> Result<ProcessFacts, String> {
+fn live_binding(
+    binding: &Binding,
+    policy: &HarnessPolicy,
+    owner_uid: u32,
+) -> Result<ProcessFacts, String> {
     let facts = os::process_facts(binding.harness.0).ok_or("harness is gone")?;
     if facts.uid != Some(owner_uid)
         || facts.start_time != binding.harness.1
         || facts.exe.as_ref() != Some(&binding.executable)
-        || harness_store(&facts, binding.address.harness).is_none_or(|store| store != binding.store)
+        || harness_store(&facts, policy).is_none_or(|store| store != binding.store)
         || private_store(&binding.store, owner_uid).is_err()
         || executable_current(&binding.executable, &facts, owner_uid).is_err()
     {
@@ -1331,6 +1555,7 @@ impl Registry {
     ) -> Result<(Vec<HarnessPolicy>, Vec<String>), String> {
         for policy in &config.harnesses {
             checked_id(&policy.namespace, "namespace")?;
+            policy.validate_profile()?;
         }
         if !config.harnesses.is_empty() && !config.profiles.is_empty() {
             return Err(
@@ -1377,10 +1602,14 @@ impl Registry {
                     inject: capability(|e| e.inject),
                     message: capability(|e| e.message),
                     executable_markers: Vec::new(),
+                    store_env: None,
+                    store_home: None,
+                    child_address: None,
+                    caller_proof: Vec::new(),
                 }),
             }
             notes.push(format!(
-                "legacy profile {} migrated to the {:?} harness policy: its store path, {} executable path(s), digests and vendor signatures no longer authorize anything",
+                "legacy profile {} migrated to the {} harness policy: its store path, {} executable path(s), digests and vendor signatures no longer authorize anything",
                 profile.namespace,
                 profile.harness,
                 profile.executables.len()
@@ -1388,7 +1617,7 @@ impl Registry {
         }
         if policies
             .iter()
-            .any(|policy| policy.harness == Harness::OpenCode && policy.inject)
+            .any(|policy| policy.harness == Harness::OPENCODE && policy.inject)
         {
             return Err("OpenCode hook context injection is not qualified".into());
         }
@@ -1548,7 +1777,7 @@ impl Registry {
                     // ordinary route attests it, and every gateway fact is proven
                     // again at use against the live gateway.
                     if self.policy(binding.address.harness).is_some()
-                        && binding.address.harness == Harness::Codex
+                        && binding.address.harness == Harness::CODEX
                         && private_store(&binding.store, self.owner_uid).is_ok()
                         && let Some(wake) = binding.wake.as_mut()
                     {
@@ -1562,18 +1791,17 @@ impl Registry {
                     }
                     continue;
                 };
+                let Some(policy) = self.policy(binding.address.harness).cloned() else {
+                    continue;
+                };
                 if facts.uid != Some(self.owner_uid)
                     || facts.exe.as_ref() != Some(&binding.executable)
-                    || harness_store(&facts, binding.address.harness).as_ref()
-                        != Some(&binding.store)
+                    || harness_store(&facts, &policy).as_ref() != Some(&binding.store)
                     || private_store(&binding.store, self.owner_uid).is_err()
                     || executable_current(&binding.executable, &facts, self.owner_uid).is_err()
                 {
                     continue;
                 }
-                let Some(policy) = self.policy(binding.address.harness).cloned() else {
-                    continue;
-                };
                 binding.epoch = now_ms.max(binding.epoch + 1);
                 self.apply_policy(&mut binding, &policy);
                 if binding
@@ -1623,7 +1851,7 @@ impl Registry {
     /// MESSAGE withheld, so core refuses messages to it before acceptance until
     /// its own next hook records the actor (see [`Registry::admit_hook`]).
     fn apply_policy(&self, binding: &mut Binding, policy: &HarnessPolicy) {
-        let opencode = binding.address.harness == Harness::OpenCode;
+        let opencode = binding.address.harness == Harness::OPENCODE;
         binding.qualified = Capabilities {
             inject: policy.inject,
             message: policy.message
@@ -1705,11 +1933,11 @@ impl Registry {
             || known.pending
             || known.lifecycle != Lifecycle::Unknown
             || address.host_id != self.config.host_id
-            || address.harness != Harness::ClaudeCode
+            || address.harness != Harness::CLAUDE_CODE
         {
             return Ok(());
         }
-        let Some(policy) = self.policy(Harness::ClaudeCode).cloned() else {
+        let Some(policy) = self.policy(Harness::CLAUDE_CODE).cloned() else {
             return Ok(());
         };
         let Some(hint) =
@@ -1724,7 +1952,7 @@ impl Registry {
             || (facts.pid, facts.start_time) != known.harness
             || i128::from(hint.written_at) < i128::from(facts.start_time)
             || facts.exe.as_ref() != Some(&known.executable)
-            || harness_store(&facts, Harness::ClaudeCode).as_ref() != Some(&known.store)
+            || harness_store(&facts, &policy).as_ref() != Some(&known.store)
             || private_store(&known.store, self.owner_uid).is_err()
             || !product_marked(&facts, &policy)
             || executable_current(&known.executable, &facts, self.owner_uid).is_err()
@@ -1793,7 +2021,7 @@ impl Registry {
             return Err(CorrelationError::NotEvidence("peer process is gone".into()));
         };
         let hop = frontend
-            && harness == Harness::Codex
+            && harness == Harness::CODEX
             && ancestors
                 .first()
                 .is_some_and(|parent| signed_node_hop(peer.pid, parent, self.owner_uid));
@@ -1812,20 +2040,25 @@ impl Registry {
             ));
         }
         let policy = self.policy(harness).cloned().ok_or_else(|| {
-            CorrelationError::NotEvidence("this harness is not enabled by the policy".into())
+            CorrelationError::NotEvidence(format!(
+                "{harness}: this harness is not enabled by any harness profile"
+            ))
         })?;
         if !product_marked(facts, &policy) {
-            return Err(CorrelationError::NotEvidence(
-                "the ancestor is not a marked harness process".into(),
-            ));
+            return Err(CorrelationError::NotEvidence(format!(
+                "{harness}: the ancestor is not a marked harness process (executable_markers)"
+            )));
         }
         let exe = facts
             .exe
             .clone()
             .ok_or_else(|| CorrelationError::NotEvidence("harness executable unreadable".into()))?;
         executable_current(&exe, facts, self.owner_uid).map_err(CorrelationError::NotEvidence)?;
-        let store = harness_store(facts, harness)
-            .ok_or_else(|| CorrelationError::NotEvidence("harness store unresolvable".into()))?;
+        let store = harness_store(facts, &policy).ok_or_else(|| {
+            CorrelationError::NotEvidence(format!(
+                "{harness}: harness store unresolvable (store_env / store_home)"
+            ))
+        })?;
         private_store(&store, self.owner_uid).map_err(CorrelationError::NotEvidence)?;
         Ok(HarnessMatch {
             incarnation: (facts.pid, facts.start_time),
@@ -2020,7 +2253,7 @@ impl Registry {
     ) -> Result<HookAdmission, CorrelationError> {
         let kind = HookKind::parse(&payload.hook_event_name)
             .ok_or_else(|| CorrelationError::NotEvidence("unsupported hook event".into()))?;
-        if harness != Harness::OpenCode
+        if harness != Harness::OPENCODE
             && matches!(kind, HookKind::OpenCodeActivity | HookKind::OpenCodeUnknown)
         {
             return Err(CorrelationError::NotEvidence(
@@ -2040,15 +2273,14 @@ impl Registry {
         }
         let matched = self.harness_of(peer, harness, false)?;
         // Claude children share the root session's address; Codex children
-        // are their own threads with their own addresses.
-        let (role, native_id, address_session) = match (&agent, harness) {
+        // are their own threads with their own addresses; any other harness
+        // follows its profile.
+        let (role, native_id, address_session) = match (&agent, matched.policy.child_address()) {
             (None, _) => (ActorRole::Root, session.clone(), session.clone()),
-            (Some(agent), Harness::ClaudeCode) => {
+            (Some(agent), ChildAddress::Shared) => {
                 (ActorRole::Child, agent.clone(), session.clone())
             }
-            (Some(agent), Harness::Codex | Harness::OpenCode) => {
-                (ActorRole::Child, agent.clone(), agent.clone())
-            }
+            (Some(agent), ChildAddress::Own) => (ActorRole::Child, agent.clone(), agent.clone()),
         };
         let address = NativeAddress::new(
             self.config.host_id.clone(),
@@ -2062,7 +2294,7 @@ impl Registry {
         // wakeable session), so no MESSAGE to it could ever be delivered: its
         // binding never advertises the capability and core refuses such a
         // publication before acceptance instead of holding it forever.
-        let opencode_child = harness == Harness::OpenCode && role == ActorRole::Child;
+        let opencode_child = harness == Harness::OPENCODE && role == ActorRole::Child;
         let capabilities = Capabilities {
             inject: matched.policy.inject,
             message: matched.policy.message
@@ -2089,10 +2321,10 @@ impl Registry {
             // build's row, restored with MESSAGE withheld) is renewed from the
             // address's own hook, so core records the actor's true capability.
             Some(binding) => (
-                starts_own_session(kind, role, harness, payload)
+                starts_own_session(kind, role, &matched.policy, payload)
                     || binding.retired
                     || binding.pending
-                    || (harness == Harness::OpenCode && binding.role != Some(role)),
+                    || (harness == Harness::OPENCODE && binding.role != Some(role)),
                 Some(binding.epoch),
             ),
             None => (true, None),
@@ -2124,7 +2356,7 @@ impl Registry {
                     desktop_idle_transcript: None,
                     wake: None,
                     pending: false,
-                    role: (harness == Harness::OpenCode).then_some(role),
+                    role: (harness == Harness::OPENCODE).then_some(role),
                 },
             );
         }
@@ -2138,7 +2370,7 @@ impl Registry {
             binding.transcript = transcript;
         }
         if kind == HookKind::SessionEnd && role == ActorRole::Root {
-            binding.desktop_idle_transcript = if harness == Harness::Codex
+            binding.desktop_idle_transcript = if harness == Harness::CODEX
                 && binding.lifecycle == Lifecycle::Inactive
                 && retained_path
                 && os::process_env(binding.harness.0, "CODEX_APP_TOOLS_PIPE_PATH").is_some()
@@ -2154,18 +2386,18 @@ impl Registry {
             // retire it truthfully; there is no idle exception for a child.
             binding.retired = true;
         }
-        binding.lifecycle = next_lifecycle(binding.lifecycle, kind, role, harness, payload);
+        binding.lifecycle = next_lifecycle(binding.lifecycle, kind, role, &matched.policy, payload);
         // ponytail: one bounded transcript read per idle hook under the lock (head line up to 1 MiB, last 64 KiB); stamp from a worker if hook rates ever matter.
         // The proof is re-stamped only by a positive owner idle event, never by an
         // event that merely leaves an earlier `Inactive` in place (a subagent stop,
         // a Claude child's stop, an unrelated notification): those keep the proof
         // stamped at the real idle, and any non-idle lifecycle clears it.
-        binding.wake = if harness != Harness::Codex
+        binding.wake = if harness != Harness::CODEX
             || binding.retired
             || binding.lifecycle != Lifecycle::Inactive
         {
             None
-        } else if is_positive_idle_event(kind, role, harness, payload) {
+        } else if is_positive_idle_event(kind, role, &matched.policy, payload) {
             os::process_env(binding.harness.0, "CODEX_APP_TOOLS_PIPE_PATH")
                 .and_then(|_| gateway::read_stamp(binding, owner_uid))
         } else {
@@ -2189,10 +2421,23 @@ impl Registry {
             return Err(CorrelationError::Unavailable(error));
         }
 
+        let mut token = None;
         if kind == HookKind::PreToolUse
             && let Some(call) = payload.tool_use_id.as_deref()
         {
             let call = checked_id(call, "tool_use_id").map_err(CorrelationError::NotEvidence)?;
+            let tool_name = payload
+                .tool_name
+                .as_deref()
+                .and_then(|name| checked_id(name, "tool_name").ok());
+            // A token is issued only for a Bridge root tool call of a profile that
+            // accepts it; an unavailable random source issues none (the call then
+            // simply cannot be attested by token).
+            token = (matched.policy.accepts(CallerProof::HookToken)
+                && tool_name.as_deref().is_some_and(is_bridge_root_tool))
+            .then(os::random_bytes)
+            .and_then(Result::ok)
+            .map(|random| CallToken(random.iter().map(|byte| format!("{byte:02x}")).collect()));
             self.record_call(
                 call,
                 CallRecord {
@@ -2204,10 +2449,10 @@ impl Registry {
                     observed_ms: now_ms,
                     consumed: false,
                     claimed: false,
-                    tool_name: payload
-                        .tool_name
-                        .as_deref()
-                        .and_then(|name| checked_id(name, "tool_name").ok()),
+                    tool_name,
+                    token_digest: token
+                        .as_ref()
+                        .map(|token| crate::server::sha256_hex(token.as_str().as_bytes())),
                 },
             );
         }
@@ -2262,6 +2507,7 @@ impl Registry {
             native_id,
             renewed,
             drain,
+            token,
         })
     }
 
@@ -2345,6 +2591,39 @@ impl Registry {
         Ok(caller)
     }
 
+    /// Resolves a hook token to the native call it was issued for, the harness
+    /// of that call's binding and the hook-token channel. Only the token's
+    /// SHA-256 is compared; the refusal never repeats the token.
+    ///
+    /// # Errors
+    ///
+    /// No retained record carries this token (never issued, evicted, or the
+    /// `PreToolUse` hook that would issue it did not run), or its binding is gone.
+    fn token_call(
+        &self,
+        token: &CallToken,
+    ) -> Result<(String, Harness, CallerChannel), CorrelationError> {
+        let digest = crate::server::sha256_hex(token.as_str().as_bytes());
+        // ponytail: bounded linear scan (at most max_calls records); index if measured hot.
+        let found = self.calls.iter().find_map(|(call, records)| {
+            records
+                .iter()
+                .find(|record| record.token_digest.as_deref() == Some(digest.as_str()))
+                .map(|record| (call.clone(), record.address.clone()))
+        });
+        let Some((call, address)) = found else {
+            return Err(CorrelationError::Missing(
+                "no protected PreToolUse record carries this hook token (is bridge-hook installed for PreToolUse of this harness?)".into(),
+            ));
+        };
+        let harness = self
+            .bindings
+            .get(&address)
+            .map(|binding| binding.address.harness)
+            .ok_or_else(|| CorrelationError::Missing("the hook token's binding is gone".into()))?;
+        Ok((call, harness, CallerChannel::HookToken))
+    }
+
     /// Validates a native source without spending it. `allow_spent` is only
     /// historical replay origin inspection; it never returns fresh permission.
     /// Result fixes caller, actual incarnation, native call and host tool name.
@@ -2355,17 +2634,31 @@ impl Registry {
         now_ms: u64,
         allow_spent: bool,
     ) -> Result<NativeInspection, CorrelationError> {
-        let (call, harness) = match meta {
+        let (call, harness, channel) = match meta {
             PresentedMeta::Sealed { .. } => {
                 return Err(CorrelationError::NotEvidence(
                     "native metadata required".into(),
                 ));
             }
-            native => native.native().expect("native metadata"),
+            PresentedMeta::HookToken { token } => self.token_call(token)?,
+            native => {
+                let (call, harness, channel) = native.native().expect("native metadata");
+                (call.to_string(), harness, channel)
+            }
         };
-        let call = call.to_string();
         checked_id(&call, "call id").map_err(CorrelationError::NotEvidence)?;
         let matched = self.harness_of(peer, harness, true)?;
+        let proof = match channel {
+            CallerChannel::ClaudeToolUse => CallerProof::ClaudeMeta,
+            CallerChannel::CodexCall => CallerProof::CodexMeta,
+            CallerChannel::OpenCodeCall => CallerProof::OpencodeMeta,
+            CallerChannel::HookToken => CallerProof::HookToken,
+        };
+        if !matched.policy.accepts(proof) {
+            return Err(CorrelationError::NotEvidence(format!(
+                "{harness}: the profile does not accept {proof:?} caller proof"
+            )));
+        }
         let max_age = self.config.max_call_age_ms;
         let records = self
             .calls
@@ -2427,11 +2720,7 @@ impl Registry {
                 record.native_id.clone(),
                 binding.epoch,
                 record.observed_ms,
-                match harness {
-                    Harness::ClaudeCode => CallerChannel::ClaudeToolUse,
-                    Harness::Codex => CallerChannel::CodexCall,
-                    Harness::OpenCode => CallerChannel::OpenCodeCall,
-                },
+                channel,
             ),
             matched.incarnation,
             call,
@@ -2754,10 +3043,15 @@ impl Registry {
 }
 
 /// Whether the actor is the owner of the address its event belongs to: the
-/// root, or a Codex child thread (which has its own address). A Claude
-/// child shares the root's address and is not its owner.
-fn owns_address(role: ActorRole, harness: Harness) -> bool {
-    role == ActorRole::Root || (harness == Harness::Codex && role == ActorRole::Child)
+/// root, or a child with its own address ([`ChildAddress::Own`], such as a Codex
+/// child thread). A Claude child shares the root's address and is not its
+/// owner; an OpenCode child session never becomes positively idle, so it is
+/// never treated as one either.
+fn owns_address(role: ActorRole, policy: &HarnessPolicy) -> bool {
+    role == ActorRole::Root
+        || (role == ActorRole::Child
+            && policy.child_address() == ChildAddress::Own
+            && policy.harness != Harness::OPENCODE)
 }
 
 /// Whether one hook event is the address owner's own real session start
@@ -2768,11 +3062,11 @@ fn owns_address(role: ActorRole, harness: Harness) -> bool {
 fn starts_own_session(
     kind: HookKind,
     role: ActorRole,
-    harness: Harness,
+    policy: &HarnessPolicy,
     payload: &HookPayload,
 ) -> bool {
     kind == HookKind::SessionStart
-        && owns_address(role, harness)
+        && owns_address(role, policy)
         && payload.source.as_deref() != Some("compact")
 }
 
@@ -2783,16 +3077,16 @@ fn starts_own_session(
 fn is_positive_idle_event(
     kind: HookKind,
     role: ActorRole,
-    harness: Harness,
+    policy: &HarnessPolicy,
     payload: &HookPayload,
 ) -> bool {
     match kind {
         HookKind::SessionStart => {
-            harness != Harness::OpenCode && starts_own_session(kind, role, harness, payload)
+            policy.harness != Harness::OPENCODE && starts_own_session(kind, role, policy, payload)
         }
-        HookKind::Stop => owns_address(role, harness),
+        HookKind::Stop => owns_address(role, policy),
         HookKind::Notification => {
-            owns_address(role, harness)
+            owns_address(role, policy)
                 && payload.notification_type.as_deref() == Some("idle_prompt")
         }
         _ => false,
@@ -2813,15 +3107,16 @@ fn next_lifecycle(
     current: Lifecycle,
     kind: HookKind,
     role: ActorRole,
-    harness: Harness,
+    policy: &HarnessPolicy,
     payload: &HookPayload,
 ) -> Lifecycle {
-    let owner = owns_address(role, harness);
+    let harness = policy.harness;
+    let owner = owns_address(role, policy);
     match kind {
         HookKind::OpenCodeActivity => Lifecycle::Active,
         HookKind::OpenCodeUnknown => Lifecycle::Unknown,
-        HookKind::SessionStart if harness == Harness::OpenCode => Lifecycle::Unknown,
-        HookKind::SessionStart if starts_own_session(kind, role, harness, payload) => {
+        HookKind::SessionStart if harness == Harness::OPENCODE => Lifecycle::Unknown,
+        HookKind::SessionStart if starts_own_session(kind, role, policy, payload) => {
             Lifecycle::Inactive
         }
         HookKind::SessionStart => current,
@@ -2844,20 +3139,39 @@ fn next_lifecycle(
         HookKind::Stop if owner => Lifecycle::Inactive,
         HookKind::Stop | HookKind::SubagentStop => current,
         // An OpenCode child's end is its own address ending (it is retired).
-        HookKind::SessionEnd if owner || harness == Harness::OpenCode => Lifecycle::Unknown,
+        HookKind::SessionEnd if owner || harness == Harness::OPENCODE => Lifecycle::Unknown,
         HookKind::SessionEnd => current,
     }
 }
 
-/// Resolves the harness's store from its OS environment, never hook arguments.
+/// Resolves the harness's store from its OS environment, never hook arguments:
+/// the fixed rule of a built-in harness ([`built_in_store`]), else the profile's
+/// `store_env` variable of the harness process, then its `$HOME` joined with
+/// `store_home`.
+fn harness_store(facts: &ProcessFacts, policy: &HarnessPolicy) -> Option<PathBuf> {
+    if policy.harness.is_built_in() {
+        return built_in_store(facts, policy.harness);
+    }
+    if let Some(value) = policy
+        .store_env
+        .as_deref()
+        .and_then(|variable| os::process_env(facts.pid, variable))
+    {
+        return Some(PathBuf::from(value));
+    }
+    let relative = policy.store_home.as_ref()?;
+    os::process_env(facts.pid, "HOME").map(|home| PathBuf::from(home).join(relative))
+}
+
+/// The fixed store rule of a built-in harness; `None` for any other harness.
 /// Codex/Claude retain their existing home defaults. Supported owned OpenCode
 /// launches explicitly name OPENCODE_DB; its absolute parent is the store, with
 /// no guessed fallback for arbitrary unowned installations.
-fn harness_store(facts: &ProcessFacts, harness: Harness) -> Option<PathBuf> {
+fn built_in_store(facts: &ProcessFacts, harness: Harness) -> Option<PathBuf> {
     let (variable, default) = match harness {
-        Harness::Codex => ("CODEX_HOME", ".codex"),
-        Harness::ClaudeCode => ("CLAUDE_CONFIG_DIR", ".claude"),
-        Harness::OpenCode => {
+        Harness::CODEX => ("CODEX_HOME", ".codex"),
+        Harness::CLAUDE_CODE => ("CLAUDE_CONFIG_DIR", ".claude"),
+        Harness::OPENCODE => {
             let database = PathBuf::from(os::process_env(facts.pid, "OPENCODE_DB")?);
             return if database.is_absolute() {
                 database.parent().map(Path::to_path_buf)
@@ -2865,6 +3179,7 @@ fn harness_store(facts: &ProcessFacts, harness: Harness) -> Option<PathBuf> {
                 None
             };
         }
+        _ => return None,
     };
     if let Some(value) = os::process_env(facts.pid, variable) {
         return Some(PathBuf::from(value));
@@ -2894,7 +3209,7 @@ const POLICY_LABEL: &str = "harness-policy";
 
 /// Whether `facts` is positively a process of the product `policy` serves: its
 /// resolved executable path contains, case-insensitively, one of the policy's
-/// `executable_markers`, or the product name (`codex` or `claude`) when none is
+/// `executable_markers`, or [`HarnessPolicy::default_marker`] when none is
 /// configured. An environment variable never counts: every descendant of a
 /// harness inherits the harness's store variables. An unrelated ancestor such as
 /// a terminal, a build tool or a generic wrapper that is not an allowlisted
@@ -2902,11 +3217,7 @@ const POLICY_LABEL: &str = "harness-policy";
 /// marker, not authentication: same-user code can fake it (the documented
 /// excluded hostile same-user case).
 fn product_marked(facts: &ProcessFacts, policy: &HarnessPolicy) -> bool {
-    let default = match policy.harness {
-        Harness::Codex => "codex",
-        Harness::ClaudeCode => "claude",
-        Harness::OpenCode => "opencode",
-    };
+    let default = policy.default_marker();
     let Some(exe) = facts.exe.as_ref() else {
         return false;
     };
@@ -3047,7 +3358,7 @@ mod tests {
     #[test]
     fn codex_message_stamp_rejects_same_epoch_changes_and_legacy_facts() {
         let mut registry = registry_with(&[]);
-        let address = NativeAddress::new("h", Harness::Codex, "ns", "idle").unwrap();
+        let address = NativeAddress::new("h", Harness::CODEX, "ns", "idle").unwrap();
         let binding = Binding {
             address: address.clone(),
             harness: (1, 2),
@@ -3076,11 +3387,15 @@ mod tests {
             binding: binding.clone(),
             owner_uid: 0,
             policy: HarnessPolicy {
-                harness: Harness::Codex,
+                harness: Harness::CODEX,
                 namespace: "ns".into(),
                 inject: true,
                 message: true,
                 executable_markers: Vec::new(),
+                store_env: None,
+                store_home: None,
+                child_address: None,
+                caller_proof: Vec::new(),
             },
         };
         let key = address.to_canonical_string();
@@ -3137,7 +3452,7 @@ mod tests {
             assert!(registry.message_current(&candidate).is_err());
         }
         registry.bindings.insert(key, binding.clone());
-        registry.message_disabled.push(Harness::Codex);
+        registry.message_disabled.push(Harness::CODEX);
         assert!(registry.message_current(&candidate).is_err());
         let mut legacy = serde_json::to_value(binding).unwrap();
         legacy
@@ -3164,11 +3479,15 @@ mod tests {
         let config = RegistryConfig {
             host_id: "h".into(),
             harnesses: vec![HarnessPolicy {
-                harness: Harness::ClaudeCode,
+                harness: Harness::CLAUDE_CODE,
                 namespace: "ns".into(),
                 inject: true,
                 message: true,
                 executable_markers: Vec::new(),
+                store_env: None,
+                store_home: None,
+                child_address: None,
+                caller_proof: Vec::new(),
             }],
             profiles: Vec::new(),
             intermediates: Vec::new(),
@@ -3766,11 +4085,15 @@ mod tests {
             RegistryConfig {
                 host_id: "h".into(),
                 harnesses: vec![HarnessPolicy {
-                    harness: Harness::ClaudeCode,
+                    harness: Harness::CLAUDE_CODE,
                     namespace: "ns".into(),
                     inject: true,
                     message: true,
                     executable_markers: vec!["harness".into()],
+                    store_env: None,
+                    store_home: None,
+                    child_address: None,
+                    caller_proof: Vec::new(),
                 }],
                 profiles: Vec::new(),
                 intermediates: Vec::new(),
@@ -3886,7 +4209,7 @@ mod tests {
         registry.policies[0].message = false;
         assert!(!registry.observation_current(&candidate));
         registry.policies[0].message = true;
-        registry.message_disabled.push(Harness::ClaudeCode);
+        registry.message_disabled.push(Harness::CLAUDE_CODE);
         assert!(!registry.observation_current(&candidate));
         registry.message_disabled.clear();
         let mut wrong = expected.clone();
@@ -3944,7 +4267,7 @@ mod tests {
         let exe = dir.join("harness");
         let child = live_child(&exe, "CLAUDE_CONFIG_DIR", &store);
         let mut registry = claude_registry();
-        let address = NativeAddress::new("h", Harness::ClaudeCode, "ns", "sess").unwrap();
+        let address = NativeAddress::new("h", Harness::CLAUDE_CODE, "ns", "sess").unwrap();
         let key = address.to_canonical_string();
         let pid = child.id();
         let lifecycle = |registry: &Registry| registry.bindings[&key].lifecycle;
@@ -4112,7 +4435,7 @@ mod tests {
         let executable = dir.join("claude-harness");
         let mut child = live_child(&executable, "CLAUDE_CONFIG_DIR", &store);
         let facts = os::process_facts(child.id()).unwrap();
-        let address = NativeAddress::new("h", Harness::ClaudeCode, "ns", "session").unwrap();
+        let address = NativeAddress::new("h", Harness::CLAUDE_CODE, "ns", "session").unwrap();
         let candidate = MessageCandidate {
             binding: Binding {
                 address,
@@ -4139,11 +4462,15 @@ mod tests {
                 role: None,
             },
             policy: HarnessPolicy {
-                harness: Harness::ClaudeCode,
+                harness: Harness::CLAUDE_CODE,
                 namespace: "ns".into(),
                 inject: true,
                 message: true,
                 executable_markers: Vec::new(),
+                store_env: None,
+                store_home: None,
+                child_address: None,
+                caller_proof: Vec::new(),
             },
             owner_uid: facts.uid.unwrap(),
         };
@@ -4171,9 +4498,13 @@ mod tests {
             inject: true,
             message: true,
             executable_markers: markers.iter().map(|m| (*m).to_string()).collect(),
+            store_env: None,
+            store_home: None,
+            child_address: None,
+            caller_proof: Vec::new(),
         };
-        let codex = policy(Harness::Codex, &[]);
-        let claude = policy(Harness::ClaudeCode, &[]);
+        let codex = policy(Harness::CODEX, &[]);
+        let claude = policy(Harness::CLAUDE_CODE, &[]);
         // An unrelated executable that inherited the product store variable.
         let mut child = std::process::Command::new("/bin/sleep")
             .arg("30")
@@ -4193,7 +4524,7 @@ mod tests {
         named.exe = Some(PathBuf::from("/Applications/ChatGPT.app/codex-cli/codex"));
         assert!(product_marked(&named, &codex));
         // A configured marker replaces the product name; an empty marker matches nothing.
-        let custom = policy(Harness::Codex, &["wrapper-x", ""]);
+        let custom = policy(Harness::CODEX, &["wrapper-x", ""]);
         named.exe = Some(PathBuf::from("/opt/Wrapper-X/run"));
         assert!(product_marked(&named, &custom));
         named.exe = Some(PathBuf::from("/opt/codex/run"));
@@ -4227,19 +4558,19 @@ mod tests {
         for (peer, harness, why, reason) in [
             (
                 me(uid.wrapping_add(1)),
-                Harness::ClaudeCode,
+                Harness::CLAUDE_CODE,
                 "foreign user",
                 "another user",
             ),
             (
                 me(uid),
-                Harness::Codex,
+                Harness::CODEX,
                 "harness not served by the policy",
                 "not enabled",
             ),
             (
                 me(uid),
-                Harness::ClaudeCode,
+                Harness::CLAUDE_CODE,
                 "no marked harness ancestor",
                 "no harness ancestor",
             ),
@@ -4298,20 +4629,24 @@ mod tests {
 
         let mut legacy = base();
         legacy.profiles = vec![
-            profile("claude-main", Harness::ClaudeCode, "/s/one", true, false),
-            profile("claude-main", Harness::ClaudeCode, "/s/two", false, true),
-            profile("codex-main", Harness::Codex, "/s/x", false, true),
+            profile("claude-main", Harness::CLAUDE_CODE, "/s/one", true, false),
+            profile("claude-main", Harness::CLAUDE_CODE, "/s/two", false, true),
+            profile("codex-main", Harness::CODEX, "/s/x", false, true),
         ];
         let (policies, notes) = legacy.harness_policies().unwrap();
         assert_eq!(policies.len(), 2);
         assert_eq!(
             policies[0],
             HarnessPolicy {
-                harness: Harness::ClaudeCode,
+                harness: Harness::CLAUDE_CODE,
                 namespace: "claude-main".into(),
                 inject: true,
                 message: true,
-                executable_markers: Vec::new()
+                executable_markers: Vec::new(),
+                store_env: None,
+                store_home: None,
+                child_address: None,
+                caller_proof: Vec::new(),
             }
         );
         assert!(!policies[1].inject && policies[1].message);
@@ -4319,12 +4654,12 @@ mod tests {
         assert!(notes.iter().all(|n| n.contains("no longer authorize")));
         let registry = Registry::new(legacy.clone(), 0).unwrap();
         assert_eq!(registry.migration_notes().len(), 3);
-        assert!(registry.policy(Harness::Codex).is_some());
+        assert!(registry.policy(Harness::CODEX).is_some());
 
         let mut ambiguous = legacy.clone();
         ambiguous.profiles.push(profile(
             "claude-other",
-            Harness::ClaudeCode,
+            Harness::CLAUDE_CODE,
             "/s/three",
             true,
             true,
@@ -4338,11 +4673,15 @@ mod tests {
         assert!(Registry::new(ambiguous, 0).is_err());
 
         let policy = HarnessPolicy {
-            harness: Harness::Codex,
+            harness: Harness::CODEX,
             namespace: "codex-main".into(),
             inject: false,
             message: true,
             executable_markers: Vec::new(),
+            store_env: None,
+            store_home: None,
+            child_address: None,
+            caller_proof: Vec::new(),
         };
         let mut both = legacy.clone();
         both.harnesses = vec![policy.clone()];
@@ -4358,9 +4697,129 @@ mod tests {
         let mut bad = base();
         bad.harnesses = vec![HarnessPolicy {
             namespace: String::new(),
-            ..policy
+            ..policy.clone()
         }];
         assert!(bad.harness_policies().is_err());
+
+        // Profile fields: a built-in harness has a fixed store rule and child
+        // addressing; a profile-only harness needs a safe store rule.
+        let zcode = HarnessPolicy {
+            harness: Harness::from_static("zcode"),
+            namespace: "zcode-main".into(),
+            store_home: Some(".zcode".into()),
+            ..policy.clone()
+        };
+        let accepted = |policy: HarnessPolicy| {
+            let mut config = base();
+            config.harnesses = vec![policy];
+            config.harness_policies().map(|_| ())
+        };
+        assert!(accepted(zcode.clone()).is_ok());
+        assert!(
+            accepted(HarnessPolicy {
+                store_env: Some("ZCODE_HOME".into()),
+                store_home: None,
+                child_address: Some(ChildAddress::Own),
+                caller_proof: Vec::new(),
+                ..zcode.clone()
+            })
+            .is_ok()
+        );
+        for (refused, why) in [
+            (
+                HarnessPolicy {
+                    store_home: Some(".claude".into()),
+                    ..policy.clone()
+                },
+                "fixed for a built-in",
+            ),
+            (
+                HarnessPolicy {
+                    child_address: Some(ChildAddress::Shared),
+                    caller_proof: Vec::new(),
+                    ..policy.clone()
+                },
+                "fixed for a built-in",
+            ),
+            (
+                HarnessPolicy {
+                    store_home: None,
+                    ..zcode.clone()
+                },
+                "needs store_env or store_home",
+            ),
+            (
+                HarnessPolicy {
+                    store_home: Some("../elsewhere".into()),
+                    ..zcode.clone()
+                },
+                "relative path",
+            ),
+            (
+                HarnessPolicy {
+                    store_home: Some("/abs/store".into()),
+                    ..zcode.clone()
+                },
+                "relative path",
+            ),
+            (
+                HarnessPolicy {
+                    store_env: Some("zcode-home".into()),
+                    ..zcode.clone()
+                },
+                "environment variable name",
+            ),
+        ] {
+            let error = accepted(refused).unwrap_err();
+            assert!(error.contains(why), "{error}");
+        }
+    }
+
+    /// Child addressing and address ownership follow the profile: fixed for the
+    /// built-in harnesses, configured (default shared) for any other.
+    #[test]
+    fn child_addressing_follows_the_profile() {
+        let policy = |harness: Harness, child_address| HarnessPolicy {
+            harness,
+            namespace: "ns".into(),
+            inject: true,
+            message: true,
+            executable_markers: Vec::new(),
+            store_env: None,
+            store_home: (!harness.is_built_in()).then(|| ".store".into()),
+            child_address,
+            caller_proof: Vec::new(),
+        };
+        let zcode = Harness::from_static("zcode");
+        for (policy, child, owns) in [
+            (
+                policy(Harness::CLAUDE_CODE, None),
+                ChildAddress::Shared,
+                false,
+            ),
+            (policy(Harness::CODEX, None), ChildAddress::Own, true),
+            (policy(Harness::OPENCODE, None), ChildAddress::Own, false),
+            (policy(zcode, None), ChildAddress::Shared, false),
+            (
+                policy(zcode, Some(ChildAddress::Own)),
+                ChildAddress::Own,
+                true,
+            ),
+        ] {
+            assert_eq!(policy.child_address(), child, "{:?}", policy.harness);
+            assert_eq!(
+                owns_address(ActorRole::Child, &policy),
+                owns,
+                "{:?}",
+                policy.harness
+            );
+            assert!(owns_address(ActorRole::Root, &policy));
+        }
+        assert_eq!(policy(zcode, None).default_marker(), "zcode");
+        assert_eq!(
+            policy(Harness::CLAUDE_CODE, None).default_marker(),
+            "claude"
+        );
     }
 
     /// A configuration written for the removed store and build trust still parses
@@ -4388,11 +4847,15 @@ signature = { identifier = "codex", team_id = "ABCDE12345" }
         assert_eq!(
             policies,
             vec![HarnessPolicy {
-                harness: Harness::Codex,
+                harness: Harness::CODEX,
                 namespace: "codex-main".into(),
                 inject: false,
                 message: true,
                 executable_markers: Vec::new(),
+                store_env: None,
+                store_home: None,
+                child_address: None,
+                caller_proof: Vec::new(),
             }]
         );
         assert!(notes[0].contains("vendor signatures no longer authorize"));
@@ -4444,7 +4907,7 @@ signature = { identifier = "codex", team_id = "ABCDE12345" }
             registry.configured_paths().is_empty(),
             "no owner path joins the digest cache"
         );
-        assert!(registry.policy(Harness::Codex).is_some());
+        assert!(registry.policy(Harness::CODEX).is_some());
         // The one explicit migration note, with its log/check code.
         assert_eq!(registry.migration_notes().len(), 1);
         assert!(

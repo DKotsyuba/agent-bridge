@@ -145,7 +145,7 @@ impl MessageCandidate {
     /// blanket; anything else uses no route.
     pub(crate) fn needs_gateway(&self) -> bool {
         let binding = &self.binding;
-        binding.address.harness == Harness::Codex
+        binding.address.harness == Harness::CODEX
             && binding.wake.as_ref().is_some_and(|wake| {
                 !binding.retired
                     || (binding.desktop_idle_message
@@ -159,7 +159,7 @@ impl MessageCandidate {
     /// and carrying the proof, with its recorded incarnation alive.
     pub(crate) fn needs_idle_proof(&self) -> bool {
         let binding = &self.binding;
-        binding.address.harness == Harness::Codex
+        binding.address.harness == Harness::CODEX
             && !binding.retired
             && binding.lifecycle == Lifecycle::Unknown
             && binding.wake.is_some()
@@ -188,7 +188,7 @@ impl MessageCandidate {
             && facts.start_time == gateway.1
             && facts.start_time > binding.harness.1
             && facts.exe.as_ref() == Some(&binding.executable)
-            && harness_store(&facts, Harness::Codex).is_some_and(|store| store == binding.store)
+            && built_in_store(&facts, Harness::CODEX).is_some_and(|store| store == binding.store)
             && private_store(&binding.store, self.owner_uid).is_ok()
             && executable_current(&binding.executable, &facts, self.owner_uid).is_ok()
             && os::process_env(facts.pid, "CODEX_APP_TOOLS_PIPE_PATH").is_some()
@@ -267,7 +267,7 @@ impl MessageCandidate {
                     && binding.desktop_idle_transcript == Some(proof.transcript)))
                 && self.qualifies_gateway(gateway)
         };
-        if binding.address.harness != Harness::Codex
+        if binding.address.harness != Harness::CODEX
             || binding.epoch != epoch
             || binding.wake.is_some()
             || !route_holds
@@ -486,7 +486,7 @@ mod tests {
     /// A Codex binding over a canonical scratch store with `transcript` retained.
     fn binding_for(store: &Path, thread: &str, transcript: &Path) -> Binding {
         Binding {
-            address: NativeAddress::new("h", Harness::Codex, "ns", thread).unwrap(),
+            address: NativeAddress::new("h", Harness::CODEX, "ns", thread).unwrap(),
             harness: (1, 2),
             epoch: 3,
             capabilities: Capabilities {
@@ -700,7 +700,7 @@ mod tests {
             profiles: if configured {
                 vec![Profile {
                     namespace: "ns".into(),
-                    harness: Harness::Codex,
+                    harness: Harness::CODEX,
                     store: store.clone(),
                     executables: vec![QualifiedExecutable {
                         path: "/tmp/executable".into(),
@@ -822,7 +822,7 @@ mod tests {
             harnesses: Vec::new(),
             profiles: vec![Profile {
                 namespace: "ns".into(),
-                harness: Harness::Codex,
+                harness: Harness::CODEX,
                 store: store.clone(),
                 executables: vec![QualifiedExecutable {
                     path: "/tmp/executable".into(),
@@ -843,7 +843,7 @@ mod tests {
         let restored = cold.attach_journal(&file, 9_000).unwrap();
         assert!(restored.is_empty(), "no gone route is attested");
         for (n, thread) in [(1, "w1"), (2, "w2"), (3, "w3")] {
-            let address = NativeAddress::new("h", Harness::Codex, "ns", thread).unwrap();
+            let address = NativeAddress::new("h", Harness::CODEX, "ns", thread).unwrap();
             let kept = cold
                 .bindings
                 .get(&address.to_canonical_string())
@@ -856,9 +856,9 @@ mod tests {
             assert!(!kept.pending && !kept.retired);
             assert!(cold.attest_recipient(&address).is_err(), "{thread}: inert");
         }
-        let plain = NativeAddress::new("h", Harness::Codex, "ns", "plain").unwrap();
+        let plain = NativeAddress::new("h", Harness::CODEX, "ns", "plain").unwrap();
         assert!(!cold.bindings.contains_key(&plain.to_canonical_string()));
-        let tomb = NativeAddress::new("h", Harness::Codex, "ns", "tomb").unwrap();
+        let tomb = NativeAddress::new("h", Harness::CODEX, "ns", "tomb").unwrap();
         let tomb = &cold.bindings[&tomb.to_canonical_string()];
         assert!(tomb.retired && tomb.epoch == 1_792_010_500);
         assert!(tomb.desktop_idle_message && tomb.wake.is_none());
@@ -921,7 +921,7 @@ mod tests {
             harnesses: Vec::new(),
             profiles: vec![Profile {
                 namespace: "ns".into(),
-                harness: Harness::Codex,
+                harness: Harness::CODEX,
                 store: store.clone(),
                 executables: vec![QualifiedExecutable {
                     path: exe.clone(),

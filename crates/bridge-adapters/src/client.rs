@@ -44,6 +44,8 @@ pub enum HookRun {
     Admitted,
     /// A Bridge context reply was printed, flushed and confirmed.
     Injected,
+    /// A `PreToolUse` reply carrying a hook token was printed and flushed.
+    Tokened,
     /// Nothing printed: the channel refused (class, detail).
     Refused(String, String),
     /// Nothing printed or confirmed because of a local failure.
@@ -110,7 +112,10 @@ impl ChannelClient {
 
     /// Runs one hook event: forwards the native payload, and when the
     /// channel hands a context reply, writes it to `out`, flushes, and only
-    /// then confirms with the digest of exactly what was written.
+    /// then confirms with the digest of exactly what was written. When it hands
+    /// a hook token instead, writes the `PreToolUse` reply whose
+    /// `updatedInput` is the payload's own `tool_input` plus the token (built
+    /// here, so the daemon never receives or echoes tool input).
     ///
     /// A write or flush failure is never confirmed (Bridge records an
     /// unknown outcome). The payload must be a JSON object of at most
@@ -123,6 +128,8 @@ impl ChannelClient {
             Ok(value @ serde_json::Value::Object(_)) => value,
             _ => return HookRun::Failed("hook payload is not a JSON object".into()),
         };
+        // Kept locally for a hook-token reply; never sent back to the daemon.
+        let tool_input = payload.get("tool_input").cloned();
         let (response, mut stream, _reader) =
             match self.exchange(&ChannelRequest::Hook { harness, payload }) {
                 Ok(exchange) => exchange,
@@ -151,6 +158,31 @@ impl ChannelClient {
                 match stream.write_all(&line).and_then(|()| stream.flush()) {
                     Ok(()) => HookRun::Injected,
                     Err(error) => HookRun::Failed(error.to_string()),
+                }
+            }
+            ChannelResponse::CallToken { token } => {
+                let mut input = match tool_input {
+                    None => serde_json::Map::new(),
+                    Some(serde_json::Value::Object(input)) => input,
+                    Some(_) => return HookRun::Failed("tool_input is not an object".into()),
+                };
+                input.insert(
+                    crate::registry::CALL_TOKEN_ARGUMENT.into(),
+                    serde_json::Value::String(token.as_str().into()),
+                );
+                let reply = serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "updatedInput": input,
+                    }
+                });
+                match out
+                    .write_all(reply.to_string().as_bytes())
+                    .and_then(|()| out.write_all(b"\n"))
+                    .and_then(|()| out.flush())
+                {
+                    Ok(()) => HookRun::Tokened,
+                    Err(_) => HookRun::Failed("stdout write or flush failed".into()),
                 }
             }
             ChannelResponse::Caller { .. } => HookRun::Failed("unexpected channel response".into()),

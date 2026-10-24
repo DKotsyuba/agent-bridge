@@ -129,19 +129,19 @@ fn observation_exact_native_binding() {
     );
     for (harness, host, store, address) in [
         (
-            Harness::Codex,
+            Harness::CODEX,
             Host::Codex,
             &lab.codex_store,
             lab.codex_address("session"),
         ),
         (
-            Harness::ClaudeCode,
+            Harness::CLAUDE_CODE,
             Host::ClaudeCode,
             &lab.claude_store,
             lab.claude_address("session"),
         ),
         (
-            Harness::OpenCode,
+            Harness::OPENCODE,
             Host::OpenCode,
             &lab.opencode_store,
             lab.opencode_address("session"),
@@ -197,7 +197,7 @@ fn observation_exact_native_binding() {
                 }))
             ));
         }
-        if harness == Harness::ClaudeCode {
+        if harness == Harness::CLAUDE_CODE {
             process.hook(
                 &lab.socket,
                 harness,

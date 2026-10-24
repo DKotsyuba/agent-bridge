@@ -15,7 +15,7 @@ fn event(publisher: &str, recipient: &str, id: &str, revision: u64) -> Envelope 
     Envelope::new(
         PublisherId::new(publisher).unwrap(),
         EventId::new(id).unwrap(),
-        NativeAddress::new("host", Harness::Codex, "namespace", recipient).unwrap(),
+        NativeAddress::new("host", Harness::CODEX, "namespace", recipient).unwrap(),
         Kind::new("diagnostics").unwrap(),
         Mode::Inject,
         Policy::Latest {
@@ -115,7 +115,7 @@ fn serialized_components_are_revalidated() {
 #[test]
 fn native_path_namespace_roundtrips() {
     let address =
-        NativeAddress::new("host", Harness::Codex, "/synthetic/native/store", "session").unwrap();
+        NativeAddress::new("host", Harness::CODEX, "/synthetic/native/store", "session").unwrap();
     assert_eq!(
         NativeAddress::parse(&address.to_canonical_string()).unwrap(),
         address
@@ -125,15 +125,15 @@ fn native_path_namespace_roundtrips() {
 /// F07: distinct component tuples have distinct canonical text identities.
 #[test]
 fn native_component_boundaries_are_lossless() {
-    let left = NativeAddress::new("host", Harness::Codex, "a/b", "c").unwrap();
-    let right = NativeAddress::new("host", Harness::Codex, "a", "b/c").unwrap();
+    let left = NativeAddress::new("host", Harness::CODEX, "a/b", "c").unwrap();
+    let right = NativeAddress::new("host", Harness::CODEX, "a", "b/c").unwrap();
     assert_ne!(
         left.to_canonical_string(),
         right.to_canonical_string(),
         "slash concatenation must not be lossy"
     );
     // Percent signs themselves must not corrupt round trips.
-    let tricky = NativeAddress::new("host", Harness::Codex, "a%2Fb", "c%25").unwrap();
+    let tricky = NativeAddress::new("host", Harness::CODEX, "a%2Fb", "c%25").unwrap();
     assert_eq!(
         NativeAddress::parse(&tricky.to_canonical_string()).unwrap(),
         tricky

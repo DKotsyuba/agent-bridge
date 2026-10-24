@@ -504,7 +504,8 @@ impl OperationResult {
             (Operation::ResolveRecipient(p), Self::ResolveRecipient(r)) => match &r.resolution {
                 RecipientResolution::Resolved { address } => {
                     let address = NativeAddress::parse(address)?;
-                    address.harness == p.host && address.session == p.native_session_id
+                    address.harness == HarnessName::from(p.host)
+                        && address.session == p.native_session_id
                 }
                 RecipientResolution::Unavailable => true,
             },

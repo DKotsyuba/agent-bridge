@@ -115,7 +115,7 @@ impl CodexQueueCarrier {
         };
         let address = NativeAddress::parse(&attempt.fence.recipient)
             .map_err(|error| unsent(error.to_string()))?;
-        if address.harness != Harness::Codex {
+        if address.harness != Harness::CODEX {
             return Err(unsent("not a Codex recipient".into()));
         }
         let (attestation, binding, route) = self.message_recipient(&address).map_err(unsent)?;
@@ -251,7 +251,7 @@ impl DispatchCarrier for CodexQueueCarrier {
     /// frontend is considered; it must be positively idle, and an unprovable,
     /// unreadable or malformed locator is an error (a hold) with no fallback.
     fn attest(&mut self, recipient: &NativeAddress) -> Result<Attestation, String> {
-        if recipient.harness != Harness::Codex {
+        if recipient.harness != Harness::CODEX {
             return Err("not a Codex recipient".into());
         }
         let (attestation, _, route) = self.message_recipient(recipient)?;
@@ -298,7 +298,7 @@ impl DispatchCarrier for CodexQueueCarrier {
                     &self.registry,
                     &socket,
                     binding.harness,
-                    Harness::Codex,
+                    Harness::CODEX,
                     &crate::owner::Handoff {
                         thread_id: &address.native_session_id,
                         call_id: &client_id,

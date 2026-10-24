@@ -33,7 +33,7 @@ const OPS_TOKEN: &str = "life-operator-token-000003";
 
 /// The recipient every grant may use.
 fn recipient() -> NativeAddress {
-    NativeAddress::new("host-1", Harness::Codex, "default", "thread-7").unwrap()
+    NativeAddress::new("host-1", Harness::CODEX, "default", "thread-7").unwrap()
 }
 
 /// A config with two publisher grants and one operator grant.
@@ -1204,7 +1204,7 @@ fn credentials_never_appear_in_debug_output_or_error_details() {
 
 /// A canonical Codex address for the multi-recipient service checks.
 fn thread(name: &str) -> NativeAddress {
-    NativeAddress::new("host-1", Harness::Codex, "default", name).unwrap()
+    NativeAddress::new("host-1", Harness::CODEX, "default", name).unwrap()
 }
 
 /// Waits until `event` reports `native_accepted` or the budget runs out.
