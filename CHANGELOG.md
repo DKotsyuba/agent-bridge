@@ -6,6 +6,8 @@ source, and the crates are not published to crates.io.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-31
+
 ### Added
 
 - Returning senders can inspect retained failure reports through paginated

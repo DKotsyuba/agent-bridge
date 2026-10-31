@@ -22,9 +22,9 @@ or a different configuration is unqualified until its probes are run again.
 | Platform | macOS, Apple silicon (`aarch64-apple-darwin`) |
 | Toolchain | Rust 1.98.1 |
 
-The snapshot above describes released 0.4.0 with storage schema 6. The unreleased
-bounded-delivery changes use schema 7 and synthetic regression checks; native host
-and installed-package qualification have not been repeated for that feature.
+The snapshot above describes released 0.4.0 with storage schema 6. Release 0.5.0
+adds opt-in bounded delivery with schema 7 and synthetic regression checks; native
+host qualification has not been repeated for that feature.
 The historical native observations below do not qualify the new delivery policy.
 
 ## Platform
