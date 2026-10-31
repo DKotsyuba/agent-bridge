@@ -12,7 +12,7 @@ automatically.
 |---|---|
 | Version | 0.4.0 (not published to crates.io; build from source) |
 | Producer API | v1 (`bridge-protocol` / `bridge-sdk`), plus the legacy publisher and operator socket API |
-| Database | storage schema 6, forward migration only |
+| Database | storage schema 7, forward migration only |
 | Platform | **macOS on Apple silicon (`aarch64-apple-darwin`) only** |
 | Toolchain | Rust 1.98.1, pinned by `rust-toolchain.toml` |
 | License | [MIT](LICENSE) |

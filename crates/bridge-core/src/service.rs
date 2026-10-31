@@ -120,6 +120,9 @@ pub struct GrantConfig {
     /// Opt-in v1 permissions; absence preserves all legacy grant behavior.
     #[serde(default)]
     pub producer_v1: Option<crate::ProducerPolicy>,
+    /// Trust this relay to bind attested native origins for bounded root delivery.
+    #[serde(default)]
+    pub managed_feedback: bool,
 }
 
 impl std::fmt::Debug for GrantConfig {
@@ -134,6 +137,7 @@ impl std::fmt::Debug for GrantConfig {
             .field("policies", &self.policies)
             .field("admin", &self.admin)
             .field("producer_v1", &self.producer_v1)
+            .field("managed_feedback", &self.managed_feedback)
             .finish()
     }
 }
@@ -148,6 +152,11 @@ impl GrantConfig {
     /// operator grant must have empty allowlists. Returns the first
     /// problem as [`CoreError::InvalidEnvelope`].
     pub fn validate(&self) -> Result<(), CoreError> {
+        if self.admin && self.managed_feedback {
+            return Err(CoreError::InvalidEnvelope(
+                "operator grants cannot bind managed senders".into(),
+            ));
+        }
         if let Some(policy) = &self.producer_v1 {
             if self.admin {
                 return Err(CoreError::InvalidEnvelope(
@@ -315,6 +324,25 @@ pub enum Request {
         token: Token,
         /// The event body; publisher is stamped from the grant.
         event: Box<PublishBody>,
+    },
+    /// Publish with grant-authorized attested origin and fixed delivery bounds.
+    PublishManaged {
+        /// Publisher-grant credential; managed_feedback must be enabled.
+        token: Token,
+        /// Exact immutable event, unchanged by the separate policy association.
+        event: Box<PublishBody>,
+        /// Trusted relay origin, never inferred from metadata.
+        sender: crate::managed::ManagedSender,
+    },
+    /// Read retained reports for an exact sender through a trusted relay grant.
+    SenderReports {
+        /// Managed-relay credential; never an operator or ordinary publisher.
+        token: Token,
+        /// Relay-attested native sender, never accepted from root tool arguments.
+        sender: NativeAddress,
+        /// Exclusive completion cursor; zero begins a fresh scan.
+        #[serde(default)]
+        after_seq: u64,
     },
     /// Look up the caller's own publication status.
     Status {
@@ -484,6 +512,11 @@ pub enum Response {
         /// The durable custody receipt.
         receipt: CustodyReceipt,
     },
+    /// Read-only sender-scoped retained delivery reports.
+    SenderReports {
+        /// Bounded ascending completion page without payload content.
+        page: crate::managed::SenderReportPage,
+    },
     /// Status of the caller's own event.
     Status {
         /// The custody receipt, or `None` when never accepted.
@@ -545,6 +578,7 @@ impl Response {
                 incidents.iter().try_for_each(IncidentView::validate)
             }
             Response::IncidentsPage { page } => page.validate(),
+            Response::SenderReports { page } => page.validate(),
             Response::Retention { retention } => {
                 retention.as_ref().map_or(Ok(()), |view| view.validate())
             }
@@ -1285,7 +1319,37 @@ fn respond(
 /// invalid input/storage failures become structured refusals.
 fn serve(state: &ServiceState, request: Request) -> Result<Response, Refusal> {
     match request {
-        Request::Publish { token, event } => serve_publish(state, &token, &event),
+        Request::Publish { token, event } => serve_publish(state, &token, &event, None),
+        Request::PublishManaged {
+            token,
+            event,
+            sender,
+        } => serve_publish(state, &token, &event, Some(&sender)),
+        Request::SenderReports {
+            token,
+            sender,
+            after_seq,
+        } => {
+            let grant = publisher(state, &token)?;
+            let address = sender.to_canonical_string();
+            if !grant.managed_feedback
+                || !grant
+                    .recipients
+                    .iter()
+                    .any(|entry| entry == "*" || entry == &address)
+            {
+                return Err(Refusal::new(
+                    "forbidden",
+                    "grant cannot read this sender's reports",
+                ));
+            }
+            let page = lock_storage(&state.storage).sender_reports(
+                &grant.publisher,
+                &sender,
+                after_seq,
+            )?;
+            Ok(Response::SenderReports { page })
+        }
         Request::Status { token, event_id } => serve_status(state, &token, &event_id),
         Request::Shutdown { token } => {
             let grant = operator(state, &token)?;
@@ -1564,8 +1628,24 @@ fn serve_publish(
     state: &ServiceState,
     token: &str,
     body: &PublishBody,
+    sender: Option<&crate::managed::ManagedSender>,
 ) -> Result<Response, Refusal> {
     let grant = publisher(state, token)?;
+    if let Some(sender) = sender {
+        sender.address.validate()?;
+        let address = sender.address.to_canonical_string();
+        if !grant.managed_feedback
+            || !grant
+                .recipients
+                .iter()
+                .any(|entry| entry == "*" || entry == &address)
+        {
+            return Err(Refusal::new(
+                "forbidden",
+                "grant cannot bind this managed feedback origin",
+            ));
+        }
+    }
 
     let recipient_text = body.recipient.to_canonical_string();
     let authorize = |allowed: bool, what: &str| -> Result<(), Refusal> {
@@ -1623,7 +1703,10 @@ fn serve_publish(
     if !state.running.load(Ordering::SeqCst) {
         return Err(stopping());
     }
-    let outcome = storage.publish(&envelope, current_unix_millis())?;
+    let outcome = match sender {
+        Some(sender) => storage.publish_managed(&envelope, sender, current_unix_millis())?,
+        None => storage.publish(&envelope, current_unix_millis())?,
+    };
     log_event(
         "info",
         "publish",

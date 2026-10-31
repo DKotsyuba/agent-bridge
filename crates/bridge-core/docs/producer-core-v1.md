@@ -19,6 +19,34 @@ projects, native proof algorithms, protocol/SDK algorithms, workspace/dependency
 changes, installed state and releases are excluded. No product name, tool-name
 parser, operation type or payload interpretation belongs in this boundary.
 
+## Bounded root delivery beside producer v1
+
+The legacy authenticated socket additionally supports `publish_managed`, gated
+by default-false `GrantConfig.managed_feedback`. It binds `ManagedSender`
+(full protected-relay caller address and root request id) to new keep-all
+custody in the same transaction, outside its immutable envelope/hash. The
+callback address must be within the grant's recipient allowlist. This is a
+trust delegation to the relay, never sender authority from metadata or a
+producer v1 route's destination. Ordinary legacy and all v1 publication forms
+are unchanged; there is no automatic enrollment of older events.
+
+Schema 7 stores the fixed five-invocation/five-minute lifetime, actual invocation
+counter, retained completion report and bounded feedback intent. Selection and
+pre-invoking fencing stop further automated sends; in-flight originals archive as unconfirmed at the lifetime deadline while
+their native attempts keep the existing handoff fence for late receipts. Completion atomically
+records `failed` or `unconfirmed` and an audited `disposed` delivery state,
+without erasing possible-effect history or asserting native recall. Positive
+late receipts remain evidence and may improve native delivery state, but never
+reopen the completed automatic policy. Legacy `status.delivery.report` is
+additive, durable and publisher-scoped; the existing v1 status DTO is unchanged.
+
+A separate bounded keep-all MESSAGE to the trusted sender is best effort. Its
+fixed body never includes the original payload or native diagnostic text, and
+its policy has no feedback origin. Admission failures cannot roll back original
+completion; pending notice admission expires after five minutes, and accepted
+notice custody never proves native acceptance or reading. See
+[configuration](../../../docs/configuration.md#bounded-root-messages).
+
 ## Shared per-boot authority
 
 `GrantConfig.producer_v1: Option<ProducerPolicy>` defaults to `None`; v1 mutation
@@ -284,3 +312,14 @@ attempt sequence/history still records every deferral. Ordinary known-unsent
 transport failures retain the five-attempt bound. Unknown effects are never
 automatically retried; retirement, expiry and old-attempt ownership fences remain.
 No producer API v1 wire shape or storage schema changes.
+
+
+Retained failure reports are also available through the existing root
+`bridge_me` tool when bounded delivery is enabled. Its optional
+`reports_after` cursor follows `next_after_seq`; omit it or use zero to
+start a scan. Each read returns at most twenty completed reports for the exact
+attested sender and authenticated publisher. Completion ordering preserves
+failures of older messages that finish later. Reading never acknowledges,
+deletes or retries a report, so an expired native notification remains visible
+when the sender returns. A failed backend read is explicitly unavailable,
+rather than an empty mailbox. This adds no fourth root tool or native retry.

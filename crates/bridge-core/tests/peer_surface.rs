@@ -44,6 +44,7 @@ fn config(dir: &TempDir) -> Config {
         limits: Limits::new(1_000),
         grants: vec![
             GrantConfig {
+                managed_feedback: false,
                 producer_v1: None,
                 token: RUN_TOKEN.to_string(),
                 publisher: "agent-run".to_string(),
@@ -54,6 +55,7 @@ fn config(dir: &TempDir) -> Config {
                 admin: false,
             },
             GrantConfig {
+                managed_feedback: false,
                 producer_v1: None,
                 token: ROOT_TOKEN.to_string(),
                 publisher: "bridge-root".into(),
@@ -64,6 +66,7 @@ fn config(dir: &TempDir) -> Config {
                 admin: false,
             },
             GrantConfig {
+                managed_feedback: false,
                 producer_v1: None,
                 token: OPS_TOKEN.to_string(),
                 publisher: "bridge-ops".to_string(),

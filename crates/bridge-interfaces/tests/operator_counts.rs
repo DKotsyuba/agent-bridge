@@ -126,6 +126,7 @@ fn lab() -> Lab {
         modes: vec!["inject".into(), "message".into()],
         policies: vec!["latest".into(), "keep_all".into()],
         admin: false,
+        managed_feedback: false,
         producer_v1: None,
     };
     let core = start_with_carriers(
@@ -145,6 +146,7 @@ fn lab() -> Lab {
                     modes: vec![],
                     policies: vec![],
                     admin: true,
+                    managed_feedback: false,
                     producer_v1: None,
                 },
             ],

@@ -445,6 +445,8 @@ pub struct DeliveryEvidence {
     pub hold_reason: Option<String>,
     /// Predecessor this event still waits for.
     pub blocked_by: Option<String>,
+    /// Retained bounded-delivery result and best-effort notice evidence.
+    pub report: Option<crate::managed::DeliveryReport>,
 }
 
 /// Unvalidated wire shape of [`DeliveryEvidence`].
@@ -477,6 +479,9 @@ struct RawDeliveryEvidence {
     /// Awaited predecessor as received.
     #[serde(default)]
     blocked_by: Option<String>,
+    /// Additive bounded result; absent on old daemons and unmanaged events.
+    #[serde(default)]
+    report: Option<crate::managed::DeliveryReport>,
 }
 
 impl TryFrom<RawDeliveryEvidence> for DeliveryEvidence {
@@ -518,6 +523,9 @@ impl TryFrom<RawDeliveryEvidence> for DeliveryEvidence {
             numbers.extend(incident.review_deadline_ms);
         }
         check_ranges(&numbers)?;
+        if let Some(report) = &raw.report {
+            report.validate()?;
+        }
         Ok(DeliveryEvidence {
             attempt_state: raw.attempt_state,
             effective_mode: raw.effective_mode,
@@ -529,6 +537,7 @@ impl TryFrom<RawDeliveryEvidence> for DeliveryEvidence {
             incident: raw.incident,
             hold_reason: raw.hold_reason,
             blocked_by: raw.blocked_by,
+            report: raw.report,
         })
     }
 }
@@ -739,7 +748,7 @@ pub struct AuditEntry {
 }
 
 /// Appends an operator audit row.
-fn audit(
+pub(crate) fn audit(
     tx: &Connection,
     now_ms: u64,
     actor: &str,
@@ -1166,8 +1175,8 @@ impl Storage {
     /// Reads the delivery evidence of an event for its publisher.
     ///
     /// Returns `None` when the event was never accepted. Reports distinct
-    /// tiers, the newest attempt, the open incident, the visible hold and
-    /// the predecessor still awaited; none of it is a delivered flag. An old
+    /// tiers, the newest attempt, the open incident, the visible hold,
+    /// bounded completion report and predecessor still awaited; none of it is a delivered flag. An old
     /// unhanded row in a retired lifetime reports a visible scope fence even
     /// when no recipient-wide hold exists; it cannot reenter dispatch.
     pub fn delivery_evidence(
@@ -1289,7 +1298,9 @@ impl Storage {
             }
             _ => None,
         };
-        if attempt.is_none()
+        let report = crate::managed::report_in(&self.connection, publisher, event_id)?;
+        if report.is_none()
+            && attempt.is_none()
             && tiers.is_empty()
             && incident.is_none()
             && hold_reason.is_none()
@@ -1314,6 +1325,7 @@ impl Storage {
             incident,
             hold_reason,
             blocked_by,
+            report,
         }))
     }
 
@@ -1392,11 +1404,19 @@ impl Storage {
             return Ok(EvidenceEffect::AlreadyRecorded);
         }
         let (current, owner) = event_state(&tx, publisher, event_id)?;
+        let completed_managed: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM managed_deliveries
+            WHERE publisher_id=?1 AND event_id=?2 AND outcome!='active')",
+            params![publisher, event_id],
+            |row| row.get(0),
+        )?;
         let settles = owner == Some(attempt_seq)
-            && matches!(
+            && (matches!(
                 current,
                 DeliveryState::Invoking | DeliveryState::Held | DeliveryState::Review
-            )
+            ) || (owner == Some(attempt_seq)
+                && completed_managed
+                && current == DeliveryState::Disposed))
             && matches!(
                 record.state,
                 AttemptState::Invoking
@@ -1436,6 +1456,17 @@ impl Storage {
         operator_text("operator", operator)?;
         operator_text("note", note)?;
         let tx = self.begin()?;
+        let completed: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM managed_deliveries
+            WHERE publisher_id=?1 AND event_id=?2 AND outcome!='active')",
+            params![publisher, event_id],
+            |r| r.get(0),
+        )?;
+        if completed {
+            return Err(CoreError::Fence(
+                "bounded delivery has already completed".into(),
+            ));
+        }
         let (current, owner) = event_state(&tx, publisher, event_id)?;
         if !matches!(current, DeliveryState::Review | DeliveryState::Held) {
             return Err(CoreError::Fence(format!(
@@ -1826,8 +1857,9 @@ impl Storage {
     /// hand-off deadline may have handed off: it becomes `outcome_unknown`
     /// with a retained incident and is never retried automatically. A held
     /// or unreceipted attempt past its recheck deadline becomes an overdue
-    /// incident (the event stays held; nothing is resent). Returns
-    /// `(reclaimed, unknown, overdue)`.
+    /// incident (the event stays held; nothing is resent). A late hold whose
+    /// managed members already completed becomes retained unknown evidence without
+    /// reopening incidents or renewing rechecks. Returns `(reclaimed, unknown, overdue)`.
     pub fn expire_attempt_leases(
         &mut self,
         now_ms: u64,
@@ -1892,7 +1924,32 @@ impl Storage {
                     "the native side still holds the event past its recheck deadline",
                 )
             };
+            let mut waiting = Vec::new();
             for member in &record.members {
+                let completed: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM managed_deliveries
+                     WHERE publisher_id=?1 AND event_id=?2 AND outcome!='active')",
+                    params![member.publisher, member.event_id],
+                    |row| row.get(0),
+                )?;
+                if !completed {
+                    waiting.push(member);
+                }
+            }
+            if waiting.is_empty() {
+                // A callback can report a hold after the original's policy deadline.
+                // Keep that evidence/fence, but never recreate completed recovery work.
+                apply_outcome(
+                    &tx,
+                    &record,
+                    Outcome::OutcomeUnknown {
+                        reason: "bounded delivery completed before late native hold receipt".into(),
+                    },
+                    now_ms,
+                )?;
+                continue;
+            }
+            for member in waiting {
                 open_incident_in(
                     &tx,
                     &member.publisher,
@@ -1920,9 +1977,11 @@ impl Storage {
     /// lease and recheck handling, and escalation of long recipient holds,
     /// missing predecessors and expired predecessors to incidents.
     pub fn run_maintenance(&mut self, now_ms: u64) -> Result<MaintenanceReport, CoreError> {
+        self.maintain_managed(now_ms)?;
         let expired_events = self.expire_due(now_ms)?;
         let (reclaimed_reservations, unknown_handoffs, overdue_rechecks) =
             self.expire_attempt_leases(now_ms)?;
+        self.maintain_managed(now_ms)?;
         let escalated_holds = self.escalate_holds(now_ms)?;
         Ok(MaintenanceReport {
             expired_events,

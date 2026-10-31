@@ -6,6 +6,18 @@ source, and the crates are not published to crates.io.
 
 ## [Unreleased]
 
+### Added
+
+- Returning senders can inspect retained failure reports through paginated
+  bridge_me reads even after their native notification could not be delivered.
+
+- Opt-in bounded root delivery: five native sends and five minutes including
+  busy/unavailable recipients; stop automatically without losing original
+  payloads, custody identity or uncertain handoff evidence. A durable status
+  report and a bounded best-effort MESSAGE return to the attested sender,
+  without recursive failure notices. Storage schema 7 adds policy associations
+  outside immutable envelope hashes; old events/replays remain unchanged.
+
 ## [0.4.0] - 2026-10-24
 
 ### Added

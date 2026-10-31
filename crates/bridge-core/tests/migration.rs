@@ -162,7 +162,7 @@ fn version_two_databases_migrate_without_touching_accepted_bytes_or_identity() {
         .collect();
 
     let mut storage = Storage::open(&path, Limits::new(100)).unwrap();
-    assert_eq!(version(&path), "6");
+    assert_eq!(version(&path), "7");
     let after: Vec<(String, Vec<u8>, String)> = Connection::open(&path)
         .unwrap()
         .prepare("SELECT event_id, envelope_json, envelope_hash FROM events ORDER BY event_id")
@@ -318,7 +318,8 @@ fn version_three_attempts_that_may_have_reached_a_carrier_are_never_redispatched
 #[test]
 fn unknown_versions_and_foreign_files_are_refused_untouched() {
     let dir = TempDir::new("migrate-refuse");
-    for stored in ["1", "7", "garbage"] {
+    let future = (bridge_core::schema::SCHEMA_VERSION + 1).to_string();
+    for stored in ["1", future.as_str(), "garbage"] {
         let path = dir.path(&format!("v{stored}.db"));
         {
             let connection = Connection::open(&path).unwrap();
@@ -571,7 +572,7 @@ fn version_four_databases_gain_lineages_additively() {
             .unwrap();
     }
     let mut storage = Storage::open(&path, Limits::new(10)).unwrap();
-    assert_eq!(version(&path), "6");
+    assert_eq!(version(&path), "7");
     // Lineage fencing is live on the migrated database.
     let event = Envelope::new(
         PublisherId::new("agent-run").unwrap(),
@@ -1144,4 +1145,45 @@ fn every_open_version_three_incident_stays_visible_and_uncertain_events_stay_und
             ["evt-hist", "evt-lifecycle", "evt-note", "evt-plain"]
         );
     }
+}
+
+/// Schema six upgrades add only an empty managed-policy table; custody stays legacy.
+#[test]
+fn version_six_adds_bounded_policy_without_enrolling_existing_messages() {
+    let dir = TempDir::new("v6-managed");
+    let path = dir.path("bridge.db");
+    let recipient = codex("legacy-root");
+    let original = keep_all("agent-run", "legacy-v6", &recipient, Mode::Message);
+    {
+        let mut storage = Storage::open(&path, Limits::new(100)).unwrap();
+        storage
+            .register_source_tag("agent-run", "agent-run")
+            .unwrap();
+        storage.publish(&original, 1000).unwrap();
+    }
+    {
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("DROP TABLE managed_deliveries; UPDATE schema_meta SET value='6' WHERE key='schema_version';").unwrap();
+    }
+    let mut storage = Storage::open(&path, Limits::new(100)).unwrap();
+    assert_eq!(version(&path), "7");
+    storage.run_maintenance(900_000).unwrap();
+    assert!(
+        storage
+            .delivery_evidence("agent-run", "legacy-v6")
+            .unwrap()
+            .and_then(|d| d.report)
+            .is_none()
+    );
+    let replay = storage.publish(&original, 900_001).unwrap();
+    assert!(replay.receipt.replayed);
+    assert_eq!(replay.receipt.envelope_hash, original.envelope_hash());
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM managed_deliveries", [], |r| r
+                .get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
 }

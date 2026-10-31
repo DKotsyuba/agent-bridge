@@ -1289,6 +1289,7 @@ mod tests {
             modes: vec!["message".into()],
             policies: vec!["keep_all".into()],
             admin: false,
+            managed_feedback: false,
             producer_v1: Some(crate::ProducerPolicy {
                 direct_address: true,
                 ..crate::ProducerPolicy::default()

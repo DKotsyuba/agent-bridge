@@ -72,6 +72,10 @@ pub struct OperatorConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RootConfig {
+    /// Opt in to five sends/five minutes and durable best-effort sender reports.
+    /// Requires the core publisher grant managed_feedback capability.
+    #[serde(default)]
+    pub bounded_delivery: bool,
     /// Relay socket path; its directory must be private (0700, owner).
     pub socket: PathBuf,
     /// Protected file holding the relay's core *publisher* grant token.

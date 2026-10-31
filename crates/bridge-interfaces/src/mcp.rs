@@ -175,8 +175,11 @@ pub fn tool_list() -> Value {
     json!([
         {
             "name": TOOLS[0],
-            "description": "Your attested native address and what you may send.",
-            "inputSchema": {"type": "object", "additionalProperties": false, "properties": {CALL_TOKEN_ARGUMENT: token.clone()}},
+            "description": "Your attested native address, permitted sends and retained delivery failure reports. Use reports_after from next_after_seq to read another page; reading preserves all reports.",
+            "inputSchema": {"type": "object", "additionalProperties": false, "properties": {
+                CALL_TOKEN_ARGUMENT: token.clone(),
+                "reports_after": {"type":"integer","minimum":0,"maximum":bridge_core::MAX_SQLITE_INT,"description":"Exclusive completed-report cursor; omit or use 0 to begin."}
+            }},
             "annotations": {"readOnlyHint": true, "openWorldHint": false},
         },
         {

@@ -154,10 +154,14 @@ impl RelayResponse {
     }
 }
 
-/// `bridge_me` arguments: none.
+/// `bridge_me` arguments: optional retained-report page cursor.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct MeArgs {}
+struct MeArgs {
+    /// Exclusive completed-report cursor; omitted or zero starts the sender's scan.
+    #[serde(default)]
+    reports_after: u64,
+}
 
 /// `bridge_send` arguments.
 #[derive(Deserialize)]
@@ -319,7 +323,8 @@ impl RootRelay {
             request.arguments["request_id"] = Value::String(compatibility_id);
         }
         let outcome = match request.tool.as_str() {
-            "bridge_me" => parse::<MeArgs>(request.arguments).map(|_| self.me(&caller, policy)),
+            "bridge_me" => parse::<MeArgs>(request.arguments)
+                .map(|args| self.me(&caller, policy, args.reports_after)),
             "bridge_send" => parse::<SendArgs>(request.arguments)
                 .and_then(|args| self.send(&caller, policy, args, now_ms)),
             "bridge_status" => {
@@ -347,20 +352,38 @@ impl RootRelay {
         )
     }
 
-    /// `bridge_me`: the attested caller and its permitted capabilities.
-    fn me(&self, caller: &VerifiedCaller, policy: &CallerPolicy) -> RelayResponse {
-        RelayResponse::Ok {
-            value: json!({
-                "caller": caller_view(caller),
-                "permitted": {
-                    "recipients": policy.canonical_recipients().unwrap_or_default(),
-                    "modes": policy.modes,
-                    "kinds": policy.kinds,
-                    "policy": "keep_all",
-                    "max_body_bytes": self.config.max_body_bytes,
-                },
-            }),
+    /// Returns caller capabilities and, when enabled, retained reports for that exact sender.
+    /// Reads never acknowledge reports; a failed backend read is explicitly unavailable.
+    fn me(
+        &self,
+        caller: &VerifiedCaller,
+        policy: &CallerPolicy,
+        reports_after: u64,
+    ) -> RelayResponse {
+        let mut value = json!({
+            "caller": caller_view(caller),
+            "permitted": {
+                "recipients": policy.canonical_recipients().unwrap_or_default(),
+                "modes": policy.modes,
+                "kinds": policy.kinds,
+                "policy": "keep_all",
+                "max_body_bytes": self.config.max_body_bytes,
+            },
+        });
+        if self.config.bounded_delivery {
+            value["delivery_reports"] = match self.with_client(|client, token| {
+                client.sender_reports(token, caller.address(), reports_after)
+            }) {
+                Ok(page) => {
+                    json!({"state":"available","reports":page.reports,"next_after_seq":page.next_after_seq})
+                }
+                Err(RelayResponse::Error { class, .. }) => {
+                    json!({"state":"unavailable","error_class":class})
+                }
+                Err(_) => json!({"state":"unavailable"}),
+            };
         }
+        RelayResponse::Ok { value }
     }
 
     /// Validates and publishes one exact-grant keep_all event at Unix epoch
@@ -441,7 +464,18 @@ impl RootRelay {
                     detail: "expires_at_ms is not in the future; nothing was sent".into(),
                 });
             }
-            client.publish(token, &body)
+            if self.config.bounded_delivery {
+                client.publish_managed(
+                    token,
+                    &body,
+                    &bridge_core::managed::ManagedSender {
+                        address: caller.address().clone(),
+                        request_id: args.request_id.clone(),
+                    },
+                )
+            } else {
+                client.publish(token, &body)
+            }
         })?;
         Ok(RelayResponse::Ok {
             value: json!({
@@ -729,6 +763,14 @@ pub fn status_view(delivery: Option<&DeliveryEvidence>) -> Value {
         DeliveryState::Accepted => "native_accepted",
         DeliveryState::HookSubmitted => "hook_emitted",
         DeliveryState::Refused => unresolved_hand_off(delivery).unwrap_or("refused"),
+        DeliveryState::Disposed
+            if delivery
+                .report
+                .as_ref()
+                .is_some_and(|r| r.outcome == "failed") =>
+        {
+            "not_handed"
+        }
         DeliveryState::Disposed => disposed_native(delivery),
     };
     let observed = |tier| {
@@ -770,6 +812,8 @@ pub fn status_view(delivery: Option<&DeliveryEvidence>) -> Value {
             "the event was refused, but an earlier attempt may have reached the recipient and its outcome was never established"
         } else if !disposed {
             "an earlier attempt may have reached the recipient and its outcome was never established; a manually authorized duplicate-risk retry may follow"
+        } else if delivery.report.is_some() {
+            "automatic bounded delivery stopped; the original native hand-off remains unconfirmed and its evidence is retained"
         } else if unresolved_hand_off(delivery).is_some() {
             "closed by an operator disposition; whether an earlier hand-off reached the recipient was never established"
         } else {
@@ -797,6 +841,7 @@ pub fn status_view(delivery: Option<&DeliveryEvidence>) -> Value {
         "context": observed(EvidenceTier::ContextObserved),
         "processed": observed(EvidenceTier::ApplicationProcessed),
         "uncertainty": uncertainty,
+        "report": delivery.report,
         "tiers": delivery.tiers.iter().map(|entry| json!({
             "tier": entry.tier.as_str(),
             "attempt": entry.attempt_seq,

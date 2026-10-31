@@ -40,6 +40,7 @@ fn test_config(dir: &TempDir) -> Config {
         limits: Limits::new(100),
         grants: vec![
             GrantConfig {
+                managed_feedback: false,
                 producer_v1: None,
                 token: GRANT_TOKEN.to_string(),
                 publisher: "agent-run".to_string(),
@@ -50,6 +51,7 @@ fn test_config(dir: &TempDir) -> Config {
                 admin: false,
             },
             GrantConfig {
+                managed_feedback: false,
                 producer_v1: None,
                 token: ADMIN_TOKEN.to_string(),
                 publisher: "bridge-ops".to_string(),
@@ -60,6 +62,7 @@ fn test_config(dir: &TempDir) -> Config {
                 admin: true,
             },
             GrantConfig {
+                managed_feedback: false,
                 producer_v1: None,
                 token: SECOND_TOKEN.to_string(),
                 publisher: "agent-ide".to_string(),
@@ -708,4 +711,98 @@ fn wildcard_recipient_grants_admit_new_addresses_without_widening_other_rights()
     );
     running.shutdown();
     running.join();
+}
+
+/// Grant-authorized managed ingress is enforced before custody and real maintenance
+/// creates the retained report/notice without a caller polling a recovery operation.
+#[test]
+fn managed_ingress_requires_capability_and_callback_scope_and_runs_in_service() {
+    for enabled in [false, true] {
+        let dir = TempDir::new("svc-managed");
+        let mut config = test_config(&dir);
+        config.grants[0].managed_feedback = enabled;
+        let running = service::start(config).unwrap();
+        let mut client = bridge_client::BridgeClient::connect(running.socket_path()).unwrap();
+        let sender = bridge_core::managed::ManagedSender {
+            address: body("x").recipient,
+            request_id: "managed-1".into(),
+        };
+        let mut request = body("managed-1");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        request.expires_at = Some(ExpiresAt::from_unix_millis(now + 100).unwrap());
+        let mut foreign = sender.clone();
+        foreign.address = common::codex("foreign-sender");
+        assert_eq!(
+            client
+                .publish_managed(GRANT_TOKEN, &request, &foreign)
+                .unwrap_err()
+                .class,
+            "forbidden"
+        );
+        assert!(client.status(GRANT_TOKEN, "managed-1").unwrap().0.is_none());
+        assert_eq!(
+            client
+                .sender_reports(GRANT_TOKEN, &foreign.address, 0)
+                .unwrap_err()
+                .class,
+            "forbidden"
+        );
+        if enabled {
+            client
+                .publish_managed(GRANT_TOKEN, &request, &sender)
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let report = loop {
+                let (_, delivery) = client.status(GRANT_TOKEN, "managed-1").unwrap();
+                if let Some(report) = delivery.and_then(|d| d.report) {
+                    break report;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "real maintenance did not complete the bounded event"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert_eq!(report.outcome, "failed");
+            assert!(matches!(
+                report.feedback_state.as_str(),
+                "pending" | "queued"
+            ));
+            let page = client
+                .sender_reports(GRANT_TOKEN, &sender.address, 0)
+                .unwrap();
+            assert_eq!(page.reports.len(), 1);
+            assert_eq!(page.reports[0].request_id, "managed-1");
+            assert_eq!(
+                client
+                    .sender_reports(SECOND_TOKEN, &sender.address, 0)
+                    .unwrap_err()
+                    .class,
+                "forbidden"
+            );
+            let foreign_status = client.status(SECOND_TOKEN, "managed-1").unwrap();
+            assert!(foreign_status.0.is_none());
+        } else {
+            assert_eq!(
+                client
+                    .sender_reports(GRANT_TOKEN, &sender.address, 0)
+                    .unwrap_err()
+                    .class,
+                "forbidden"
+            );
+            assert_eq!(
+                client
+                    .publish_managed(GRANT_TOKEN, &request, &sender)
+                    .unwrap_err()
+                    .class,
+                "forbidden"
+            );
+            assert!(client.status(GRANT_TOKEN, "managed-1").unwrap().0.is_none());
+        }
+        running.shutdown();
+        running.join();
+    }
 }

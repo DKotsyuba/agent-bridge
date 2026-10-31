@@ -42,6 +42,14 @@ while the caller's binding epoch is unchanged. Then the relay requires:
 2. a configured `[[root.callers]]` scope;
 3. valid closed arguments.
 
+With `[root].bounded_delivery=true` and core relay grant
+`managed_feedback=true`, new root sends stop after at most five actual sends
+or five minutes (a shorter explicit expiry still applies). The attested sender
+gets one bounded best-effort native MESSAGE on failure/unconfirmed outcome;
+`bridge_status` retains the authoritative report and original evidence even if
+that sender is unavailable. Existing configurations default to the legacy
+policy; see [bounded root messages](../../docs/configuration.md#bounded-root-messages).
+
 For address-based personal messaging, set `recipients = ["*"]` in the root
 publisher grant and its root caller policies. This permits every well-formed
 native address without per-session edits or service restarts; exact lists
@@ -351,9 +359,10 @@ bridge service stop relay|core --home H --state S
 - Rollback switches program code only. The custody database, incidents,
   audit and configuration stay; a release with an older core schema than
   one already activated is refused (no live-schema downgrade, no snapshot
-  restore). This composition's core writes storage schema 6 (producer v1 routes,
-  lifetimes and stream lineage authority); once a schema-6 release has been activated, the
-  floor is 6 and any older-schema release is refused for install and rollback.
+  restore). This composition's core writes storage schema 7 (bounded root
+  reports, producer v1 routes, lifetimes and stream lineage authority); once
+  a schema-7 release has been activated, the floor is 7 and any older-schema
+  release is refused for install and rollback.
 - `doctor` exit codes: 0 no failed check, 2 a check failed, 3 invalid
   invocation. Declared adapter capabilities and Telegram are always
   `not_verified`; the overall qualification is `not_verified`.
@@ -405,3 +414,14 @@ bridge service stop relay|core --home H --state S
   the exact Codex per-tool `approval_mode` semantics, real Telegram delivery
   and installed-host operation on your machine. See the
   [qualification matrix](../../docs/qualification.md) for what was observed.
+
+
+Retained failure reports are also available through the existing root
+`bridge_me` tool when bounded delivery is enabled. Its optional
+`reports_after` cursor follows `next_after_seq`; omit it or use zero to
+start a scan. Each read returns at most twenty completed reports for the exact
+attested sender and authenticated publisher. Completion ordering preserves
+failures of older messages that finish later. Reading never acknowledges,
+deletes or retries a report, so an expired native notification remains visible
+when the sender returns. A failed backend read is explicitly unavailable,
+rather than an empty mailbox. This adds no fourth root tool or native retry.

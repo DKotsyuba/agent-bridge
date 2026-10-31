@@ -341,6 +341,7 @@ max_admitted_events = 1000
 [[grant]]
 token = "{root_token}"
 publisher = "bridge-root"
+managed_feedback = true
 recipients = ["qual-host/claude-code/qual-store/qual-session"]
 kinds = ["root.note"]
 modes = ["inject", "auto"]
@@ -540,6 +541,7 @@ token_file = "{secrets}/operator"
 [notify]
 ledger = "{run}/notify-ledger.json"
 [root]
+bounded_delivery = true
 socket = "{run}/rl/relay.sock"
 token_file = "{secrets}/root"
 channel = "{run}/ch/c.sock"

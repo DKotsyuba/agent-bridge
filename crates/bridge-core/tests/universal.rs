@@ -24,6 +24,7 @@ fn grant(token: &str, producer: &str) -> GrantConfig {
         modes: vec!["message".into(), "inject".into(), "auto".into()],
         policies: vec!["keep_all".into(), "latest".into(), "batch".into()],
         admin: false,
+        managed_feedback: false,
         producer_v1: Some(ProducerPolicy {
             registration: true,
             native_scopes: vec!["*".into()],
@@ -1185,7 +1186,7 @@ fn exact_schema_five_migration_preserves_unknown_and_legacy_identity() {
             |r| r.get::<_, String>(0)
         )
         .unwrap(),
-        "6"
+        bridge_core::schema::SCHEMA_VERSION.to_string()
     );
     let after:(Vec<u8>,String,String,String)=sql.query_row("SELECT envelope_json,envelope_hash,delivery,delivery_scope_key FROM events WHERE event_id='legacy-v5'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
     assert_eq!(

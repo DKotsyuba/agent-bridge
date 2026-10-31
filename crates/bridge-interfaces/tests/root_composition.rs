@@ -343,6 +343,11 @@ fn lab(tag: &str) -> Lab {
 /// a marked harness process with an owned canonical store. A different selected
 /// frontend or unavailable executable panics before starting the registry.
 fn lab_with_addresses(tag: &str, any: bool) -> Lab {
+    lab_with_delivery(tag, any, false)
+}
+
+/// Opts in to bounded delivery only for its dedicated synthetic composition check.
+fn lab_with_delivery(tag: &str, any: bool, bounded: bool) -> Lab {
     let dir = scratch(tag);
     let store = dir.join("cs");
     std::fs::create_dir_all(&store).unwrap();
@@ -373,6 +378,7 @@ fn lab_with_addresses(tag: &str, any: bool) -> Lab {
             },
             policies: vec!["keep_all".into()],
             admin: false,
+            managed_feedback: bounded,
             producer_v1: None,
         },
         GrantConfig {
@@ -383,6 +389,7 @@ fn lab_with_addresses(tag: &str, any: bool) -> Lab {
             modes: vec![],
             policies: vec![],
             admin: true,
+            managed_feedback: false,
             producer_v1: None,
         },
     ];
@@ -427,7 +434,7 @@ fn lab_with_addresses(tag: &str, any: bool) -> Lab {
                 harness: Harness::CLAUDE_CODE,
                 namespace: NAMESPACE.into(),
                 inject: true,
-                message: false,
+                message: bounded,
                 executable_markers: vec!["root_composition".into()],
                 store_env: None,
                 store_home: None,
@@ -475,6 +482,7 @@ socket = "{relay}"
 token_file = "{token}"
 channel = "{channel}"
 max_body_bytes = 64
+bounded_delivery = {bounded}
 [[root.callers]]
 host_id = "{HOST}"
 harness = "claude-code"
@@ -1242,4 +1250,168 @@ fn address_message_send_needs_no_per_session_configuration() {
         json!({"address":"broken","message":"hi"}),
     );
     assert_eq!(class(&bad), "invalid");
+}
+
+/// Root sender routing is stamped from verified caller identity, not send arguments.
+/// Real daemon maintenance archives an expired target and queues one MESSAGE to the attested sender.
+#[test]
+fn bounded_root_delivery_uses_attested_sender_and_retains_status_report() {
+    let lab = lab_with_delivery("bounded", true, true);
+    let mut harness = Harnessed::start(&lab.store);
+    lab.hook(
+        &mut harness,
+        json!({"hook_event_name":"SessionStart","session_id":"s1","cwd":"/ignored"}),
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let sent = lab.call(
+        &mut harness,
+        "s1",
+        "bounded-send",
+        None,
+        "bridge_send",
+        json!({
+        "request_id":"bounded-request","address":claude("offline").to_canonical_string(),
+        "message":"synthetic original payload","expires_at_ms":now+1000}),
+    );
+    assert_eq!(class(&sent), "ok", "{sent}");
+    let spoof = lab.call(
+        &mut harness,
+        "s1",
+        "bounded-spoof",
+        None,
+        "bridge_send",
+        json!({
+        "request_id":"spoof","address":claude("offline").to_canonical_string(),"message":"x",
+        "sender":claude("other").to_canonical_string()}),
+    );
+    assert_eq!(class(&spoof), "invalid");
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    let mut call = 0;
+    let report = loop {
+        call += 1;
+        let status = lab.call(
+            &mut harness,
+            "s1",
+            &format!("bounded-status-{call}"),
+            None,
+            "bridge_status",
+            json!({"request_id":"bounded-request"}),
+        );
+        let view = &status["structuredContent"];
+        if view["report"].is_object() {
+            break view.clone();
+        }
+        assert!(std::time::Instant::now() < deadline, "{status}");
+        std::thread::sleep(Duration::from_millis(30));
+    };
+    assert_eq!(report["report"]["outcome"], "failed");
+    assert_eq!(report["native"], "not_handed");
+    assert_eq!(report["delivery"]["state"], "disposed");
+    assert_eq!(report["report"]["feedback_state"], "queued");
+    let own = lab.call(
+        &mut harness,
+        "s1",
+        "bounded-me",
+        None,
+        "bridge_me",
+        json!({}),
+    );
+    assert_eq!(class(&own), "ok");
+    assert_eq!(
+        own["structuredContent"]["delivery_reports"]["state"],
+        "available"
+    );
+    assert_eq!(
+        own["structuredContent"]["delivery_reports"]["reports"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        own["structuredContent"]["delivery_reports"]["reports"][0]["request_id"],
+        "bounded-request"
+    );
+    let after = own["structuredContent"]["delivery_reports"]["reports"][0]["completion_seq"]
+        .as_u64()
+        .unwrap();
+    let finished = lab.call(
+        &mut harness,
+        "s1",
+        "bounded-me-after",
+        None,
+        "bridge_me",
+        json!({"reports_after":after}),
+    );
+    assert!(
+        finished["structuredContent"]["delivery_reports"]["reports"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let spoofed = lab.call(
+        &mut harness,
+        "s1",
+        "bounded-me-spoof",
+        None,
+        "bridge_me",
+        json!({"sender":claude("other").to_canonical_string()}),
+    );
+    assert_eq!(class(&spoofed), "invalid");
+    let mut other = Harnessed::start(&lab.store);
+    lab.hook(
+        &mut other,
+        json!({"hook_event_name":"SessionStart","session_id":"s2","cwd":"/ignored"}),
+    );
+    let foreign_me = lab.call(
+        &mut other,
+        "s2",
+        "bounded-other-me",
+        None,
+        "bridge_me",
+        json!({}),
+    );
+    assert_eq!(class(&foreign_me), "ok", "{foreign_me}");
+    assert_eq!(
+        foreign_me["structuredContent"]["delivery_reports"]["state"],
+        "available"
+    );
+    assert!(
+        foreign_me["structuredContent"]["delivery_reports"]["reports"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let storage =
+        bridge_core::Storage::open(lab.dir.join("bridge.db"), bridge_core::Limits::new(1000))
+            .unwrap();
+    let waiting = storage
+        .next_pending(&claude("s1").to_canonical_string(), 10)
+        .unwrap();
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(
+        waiting[0].event_id,
+        report["report"]["feedback_event_id"].as_str().unwrap()
+    );
+    assert!(
+        storage
+            .next_pending(&claude("offline").to_canonical_string(), 10)
+            .unwrap()
+            .is_empty()
+    );
+    let foreign = lab.call(
+        &mut harness,
+        "s1",
+        "bounded-foreign",
+        None,
+        "bridge_status",
+        json!({"request_id":"spoof"}),
+    );
+    assert_eq!(
+        foreign["structuredContent"]["custody"]["state"],
+        "not_found"
+    );
 }

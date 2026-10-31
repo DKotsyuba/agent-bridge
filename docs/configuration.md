@@ -74,6 +74,42 @@ policies = []
 - Publisher allowlists are the constraints on any publication, including v1.
   An operator grant must have empty allowlists and cannot enable `producer_v1`.
 
+### Bounded root messages
+
+Set `[root].bounded_delivery = true` in the interfaces configuration and
+`managed_feedback = true` on the relay's core publisher grant. Both default to
+false so existing configurations retain their prior behavior. This capability
+trusts the protected relay to supply the full authenticated caller address;
+never enable it for an untrusted backend. The grant's recipient allowlist must
+also permit that sender address. Original kinds/modes/policies remain checked;
+the capability separately permits core-generated `bridge.delivery_report`
+MESSAGE events back to that permitted address.
+
+New managed messages allow at most five actual native invocations and five
+minutes from initial custody, including busy or unavailable recipients. An
+explicit shorter expiry shortens that window. An in-flight invocation is archived as unconfirmed at that deadline while
+its native attempt/fence remains intact for a later receipt; time never proves
+a possible native effect absent. Only positive unsent
+outcomes retry. At completion the original leaves admission/delivery rotation
+with its full payload, immutable hash, identity and evidence retained. Its
+status includes a durable `report`: `failed` for a known no-effect history or
+`unconfirmed` when any handoff may have occurred. Late positive evidence may
+improve current native status; the report describes the outcome at completion.
+
+One best-effort native MESSAGE reports the failure/unconfirmed outcome to the
+attested sender. It contains identifiers and fixed wording, never the original
+payload or arbitrary carrier diagnostics. That notice has the same bounded
+policy and has no feedback origin, so it cannot create another notice. If
+notice admission cannot proceed, its intent is retained for at most five
+minutes; status then reports `unavailable`. A queued/accepted notice is never
+proof of reading. An offline sender can miss this native notice; the original
+`bridge_status(request_id)` remains authoritative across restarts.
+
+Policy/origin associations use storage schema 7 outside immutable envelopes.
+Pre-upgrade replays keep their original custody/hash without acquiring a policy
+or guessed sender. Legacy and universal producer publications retain their
+existing behavior; a v1 return destination is not treated as its sender.
+
 ### Producer v1 permissions
 
 v1 mutations are opt-in per grant. Without `[grant.producer_v1]` a grant keeps
@@ -252,6 +288,7 @@ socket = "/ABS/state/rl/relay.sock"     # directory must be 0700 and yours
 token_file = "/ABS/state/secrets/relay-token"        # holds the relay's publisher grant token
 channel = "/ABS/state/ch/c.sock"        # adapter channel; absent: every request refuses
 # max_caller_age_ms = 600000
+# bounded_delivery = false             # set true with core grant managed_feedback=true
 # max_body_bytes = 16384                # at most the core payload bound
 
 [[root.callers]]                        # at least one

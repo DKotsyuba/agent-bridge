@@ -136,6 +136,44 @@ impl BridgeClient {
         }
     }
 
+    /// Publishes with a trusted relay origin and fixed five-send/five-minute policy.
+    /// The separate association does not change the immutable envelope hash.
+    pub fn publish_managed(
+        &mut self,
+        token: &str,
+        body: &PublishBody,
+        sender: &bridge_core::managed::ManagedSender,
+    ) -> Result<CustodyReceipt, ProtocolError> {
+        let request = Request::PublishManaged {
+            token: Token::new(token),
+            event: Box::new(body.clone()),
+            sender: sender.clone(),
+        };
+        match self.round_trip(&request, true)? {
+            Response::Published { receipt } => Ok(receipt),
+            other => Err(ProtocolError::unexpected("publish_managed", &other)),
+        }
+    }
+
+    /// Reads one producer-scoped failure page for the trusted relay's exact sender.
+    /// A read does not acknowledge, retry or remove any notification.
+    pub fn sender_reports(
+        &mut self,
+        token: &str,
+        sender: &NativeAddress,
+        after_seq: u64,
+    ) -> Result<bridge_core::managed::SenderReportPage, ProtocolError> {
+        let request = Request::SenderReports {
+            token: Token::new(token),
+            sender: sender.clone(),
+            after_seq,
+        };
+        match self.round_trip(&request, true)? {
+            Response::SenderReports { page } => Ok(page),
+            other => Err(ProtocolError::unexpected("sender_reports", &other)),
+        }
+    }
+
     /// Looks up the caller's own event status: custody receipt plus the
     /// delivery evidence tiers (never another publisher's).
     ///
@@ -502,7 +540,20 @@ impl BridgeClient {
 /// must not release the caller's intent.
 fn validate_request_binding(request: &Request, response: &Response) -> Result<(), CoreError> {
     match (request, response) {
-        (Request::Publish { event, .. }, Response::Published { receipt }) => {
+        (Request::SenderReports { after_seq, .. }, Response::SenderReports { page })
+            if page
+                .reports
+                .iter()
+                .any(|item| item.completion_seq <= *after_seq) =>
+        {
+            return Err(CoreError::InvalidEnvelope(
+                "sender report page does not follow the requested cursor".into(),
+            ));
+        }
+        (
+            Request::Publish { event, .. } | Request::PublishManaged { event, .. },
+            Response::Published { receipt },
+        ) => {
             let expected = Envelope::new(
                 PublisherId::new(receipt.publisher.clone())?,
                 EventId::new(event.event_id.clone())?,
@@ -777,6 +828,51 @@ mod tests {
             request("evt-46", "ok")
                 .with_metadata("predecessor", "")
                 .into_body()
+                .is_err()
+        );
+    }
+
+    /// Sender-report reads reject malformed pages and rows preceding the requested cursor.
+    #[test]
+    fn sender_report_pages_revalidate_wire_and_request_cursor() {
+        use bridge_core::managed::{DeliveryReport, SenderReport, SenderReportPage};
+        let row = SenderReport {
+            completion_seq: 7,
+            event_id: "event".into(),
+            request_id: "request".into(),
+            report: DeliveryReport {
+                outcome: "failed".into(),
+                reason: "fixture no send".into(),
+                completed_at_ms: 1000,
+                sends_made: 0,
+                feedback_event_id: None,
+                feedback_state: "unavailable".into(),
+            },
+        };
+        let page = SenderReportPage {
+            reports: vec![row.clone()],
+            next_after_seq: None,
+        };
+        let response = Response::SenderReports { page: page.clone() };
+        response.validate().unwrap();
+        let request = Request::SenderReports {
+            token: Token::new("fixture"),
+            sender: NativeAddress::new("host", Harness::CODEX, "default", "sender").unwrap(),
+            after_seq: 7,
+        };
+        assert!(validate_request_binding(&request, &response).is_err());
+        let mut malformed = page.clone();
+        malformed.reports.push(row);
+        assert!(
+            Response::SenderReports { page: malformed }
+                .validate()
+                .is_err()
+        );
+        let mut malformed = page;
+        malformed.next_after_seq = Some(8);
+        assert!(
+            Response::SenderReports { page: malformed }
+                .validate()
                 .is_err()
         );
     }

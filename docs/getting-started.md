@@ -108,6 +108,7 @@ max_admitted_events = 10000
 [[grant]]                        # restricted root MCP backend (publisher realm)
 token = "<contents of secrets/relay-token>"
 publisher = "bridge-root"
+managed_feedback = true          # trusted relay only; permits bounded sender MESSAGE reports
 recipients = ["*"]               # or exact canonical addresses
 kinds = ["bridge.message"]
 modes = ["message", "inject", "auto"]
@@ -152,6 +153,7 @@ core_socket = "/ABS/state/core.sock"
 token_file = "/ABS/state/secrets/operator-token"
 
 [root]
+bounded_delivery = true          # enable with the core grant capability above
 socket = "/ABS/state/rl/relay.sock"
 token_file = "/ABS/state/secrets/relay-token"
 channel = "/ABS/state/ch/c.sock"

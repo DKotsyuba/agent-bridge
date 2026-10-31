@@ -582,6 +582,9 @@ pub fn lock_storage(storage: &Mutex<Storage>) -> MutexGuard<'_, Storage> {
 /// disposition, or an operator waiver — never time alone).
 const ELIGIBLE: &str = "e.state = 'pending' AND e.delivery = 'unhanded' AND e.recipient = ?1
     AND e.not_before_ms <= ?2 AND (e.expires_at_ms IS NULL OR e.expires_at_ms > ?2)
+    AND NOT EXISTS (SELECT 1 FROM managed_deliveries m
+        WHERE m.publisher_id=e.publisher_id AND m.event_id=e.event_id
+          AND (m.outcome!='active' OR m.deadline_ms<=?2 OR m.sends_made>=5))
     AND (e.predecessor IS NULL OR e.predecessor_waived = 1 OR EXISTS (
         SELECT 1 FROM events p
         WHERE p.publisher_id = e.publisher_id AND p.event_id = e.predecessor
@@ -986,7 +989,9 @@ fn verified_attempt(
     Ok(record)
 }
 
-/// Sets the delivery state of every member still owned by an attempt.
+/// Sets the delivery state of members still owned by an attempt.
+/// Completed managed policies accept positive delivery updates only; other
+/// late outcomes stay as evidence and cannot restore admission or rotation.
 fn set_member_delivery(
     tx: &Connection,
     attempt_seq: u64,
@@ -996,7 +1001,11 @@ fn set_member_delivery(
     tx.execute(
         "UPDATE events SET delivery = ?1,
              attempt_seq = CASE WHEN ?2 THEN attempt_seq ELSE NULL END
-         WHERE attempt_seq = ?3 AND (publisher_id, event_id) IN
+         WHERE attempt_seq = ?3
+           AND (?1 IN ('accepted','hook_submitted') OR NOT EXISTS(
+               SELECT 1 FROM managed_deliveries m WHERE m.publisher_id=events.publisher_id
+               AND m.event_id=events.event_id AND m.outcome!='active'))
+           AND (publisher_id, event_id) IN
                (SELECT publisher_id, event_id FROM attempt_members WHERE attempt_seq = ?3)",
         params![new_delivery, keep_owner, to_sql(attempt_seq)?],
     )?;
@@ -1246,6 +1255,21 @@ fn invoke_in(tx: &Connection, attempt_seq: u64, now_ms: u64) -> Result<(), CoreE
             "producer delivery scope retired before invoking".into(),
         ));
     }
+    let bounded: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM attempt_members a
+        JOIN managed_deliveries m USING(publisher_id,event_id) WHERE a.attempt_seq=?1
+        AND (m.outcome!='active' OR m.deadline_ms<=?2 OR m.sends_made>=5))",
+        params![to_sql(attempt_seq)?, to_sql(now_ms)?],
+        |r| r.get(0),
+    )?;
+    if bounded {
+        return Err(CoreError::Fence(
+            "bounded delivery no longer permits invocation".into(),
+        ));
+    }
+    tx.execute("UPDATE managed_deliveries SET sends_made=sends_made+1 WHERE EXISTS(
+        SELECT 1 FROM attempt_members a WHERE a.attempt_seq=?1 AND a.publisher_id=managed_deliveries.publisher_id
+        AND a.event_id=managed_deliveries.event_id)",params![to_sql(attempt_seq)?])?;
     tx.execute(
         "UPDATE attempts SET state = 'invoking', lease_expires_ms = NULL, updated_ms = ?1
          WHERE attempt_seq = ?2 AND state = 'reserved'",
@@ -1346,7 +1370,9 @@ impl Storage {
     /// pending and unexpired. If a condition changed since the reservation
     /// the attempt is released untouched and [`Invoked::Released`] explains
     /// why; nothing was invoked. A forged or stale fence, a wrong state or
-    /// an expired lease is a [`CoreError::Fence`] refusal.
+    /// an expired lease or completed/exhausted managed policy is a
+    /// [`CoreError::Fence`] refusal. Managed native-call budget is charged in
+    /// the same transaction as the possible-effect transition.
     pub fn mark_invoking(
         &mut self,
         fence: &AttemptFence,
@@ -1771,7 +1797,9 @@ pub(crate) fn apply_outcome(
     let mut owned_members = Vec::new();
     for member in &record.members {
         let owns: bool = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM events WHERE publisher_id = ?1 AND event_id = ?2 AND attempt_seq = ?3)",
+            "SELECT EXISTS (SELECT 1 FROM events e WHERE publisher_id = ?1 AND event_id = ?2 AND attempt_seq = ?3
+                AND NOT EXISTS(SELECT 1 FROM managed_deliveries m WHERE m.publisher_id=e.publisher_id
+                    AND m.event_id=e.event_id AND m.outcome!='active'))",
             params![member.publisher, member.event_id, to_sql(seq)?],
             |row| row.get(0),
         )?;
@@ -1854,6 +1882,7 @@ pub(crate) fn apply_outcome(
             return Err(corrupt("an outcome mapped to a non-outcome state".into()));
         }
     }
+    crate::managed::complete_in(tx, now_ms)?;
     Ok(())
 }
 
@@ -1905,6 +1934,7 @@ fn resolve_attempt_incidents(
 /// The attempt is already closed. Only members still owned by it change.
 /// Retired lifetimes dispose zero-effect members or retain all possible
 /// historical effects in review with an incident; they never reenter rotation.
+/// Completed managed policies retain late no-send evidence without reactivation.
 /// A positive temporary deferral refunds only this owned zero-effect attempt's
 /// budget charge; immutable attempt history and all retirement fences remain.
 /// Other members get the bounded retry delay;
@@ -1924,7 +1954,9 @@ fn return_unsent(
                  SELECT 1 FROM delivery_scopes s WHERE s.producer = e.publisher_id
                  AND s.scope_key = e.delivery_scope_key AND s.closed_ms IS NOT NULL
                  AND s.action = 'retire_unhanded') FROM events e
-             WHERE e.publisher_id = ?1 AND e.event_id = ?2 AND e.attempt_seq = ?3",
+             WHERE e.publisher_id = ?1 AND e.event_id = ?2 AND e.attempt_seq = ?3
+               AND NOT EXISTS(SELECT 1 FROM managed_deliveries m WHERE m.publisher_id=e.publisher_id
+                 AND m.event_id=e.event_id AND m.outcome!='active')",
                 params![
                     member.publisher,
                     member.event_id,

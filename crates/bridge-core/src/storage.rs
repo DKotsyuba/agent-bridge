@@ -611,12 +611,16 @@ impl Storage {
     /// unreserved event past its absolute expiry becomes `expired`, an
     /// explicit disposition — never a claim that a possible native effect
     /// was recalled. Reserved, invoking, held and uncertain events are never
-    /// touched here. `now_ms` above the SQLite-safe bound is refused.
+    /// touched here. Managed delivery owns its separate deadline/report policy and
+    /// is excluded, so legacy expiry cannot make its original payload compactable.
+    /// `now_ms` above the SQLite-safe bound is refused.
     pub fn expire_due(&self, now_ms: u64) -> Result<usize, CoreError> {
         let changed = self.connection.execute(
             "UPDATE events SET state = 'expired'
              WHERE state = 'pending' AND delivery = 'unhanded'
-               AND expires_at_ms IS NOT NULL AND expires_at_ms <= ?1",
+               AND expires_at_ms IS NOT NULL AND expires_at_ms <= ?1
+               AND NOT EXISTS(SELECT 1 FROM managed_deliveries m
+                   WHERE m.publisher_id=events.publisher_id AND m.event_id=events.event_id)",
             params![to_sql(now_ms)?],
         )?;
         Ok(changed)
@@ -629,14 +633,17 @@ impl Storage {
     /// dispositions) beyond the newest `keep_newest` lose their envelope
     /// bytes; the row, frozen hash and state remain so an identical replay
     /// still returns the original receipt and dedup history is never
-    /// evicted. Delivered, held and uncertain events always keep their
-    /// bytes. Returns how many payloads were compacted.
+    /// evicted. Delivered, held, uncertain and managed events always keep their
+    /// bytes, including managed custody that was already expired at admission.
+    /// Returns how many payloads were compacted.
     pub fn compact_payloads(&mut self, keep_newest: usize) -> Result<usize, CoreError> {
         let tx = self.begin()?;
         let compacted = tx.execute(
             "UPDATE events SET envelope_json = x''
              WHERE state IN ('superseded','expired') AND length(envelope_json) > 0
                AND delivery = 'unhanded'
+               AND NOT EXISTS(SELECT 1 FROM managed_deliveries m
+                   WHERE m.publisher_id=events.publisher_id AND m.event_id=events.event_id)
                AND acceptance_seq < COALESCE((
                  SELECT MIN(s.acceptance_seq) FROM (
                    SELECT acceptance_seq FROM events e

@@ -46,6 +46,7 @@ fn config(dir: &TempDir, tag: &str) -> Config {
         limits: Limits::new(1_000),
         grants: vec![
             GrantConfig {
+                managed_feedback: false,
                 producer_v1: None,
                 token: RUN_TOKEN.to_string(),
                 publisher: "agent-run".to_string(),
@@ -56,6 +57,7 @@ fn config(dir: &TempDir, tag: &str) -> Config {
                 admin: false,
             },
             GrantConfig {
+                managed_feedback: false,
                 producer_v1: None,
                 token: IDE_TOKEN.to_string(),
                 publisher: "agent-ide".to_string(),
@@ -66,6 +68,7 @@ fn config(dir: &TempDir, tag: &str) -> Config {
                 admin: false,
             },
             GrantConfig {
+                managed_feedback: false,
                 producer_v1: None,
                 token: OPS_TOKEN.to_string(),
                 publisher: "bridge-ops".to_string(),
@@ -1169,6 +1172,7 @@ fn credentials_never_appear_in_debug_output_or_error_details() {
     };
     assert!(!format!("{request:?}").contains(secret));
     let grant = GrantConfig {
+        managed_feedback: false,
         producer_v1: None,
         token: secret.to_string(),
         publisher: "agent-run".into(),
