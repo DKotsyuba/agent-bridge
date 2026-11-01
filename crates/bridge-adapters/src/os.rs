@@ -25,6 +25,36 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 /// chain is not a hook of a registered harness.
 pub const MAX_ANCESTRY: usize = 8;
 
+/// Connects a Unix socket before an absolute monotonic deadline, returning a
+/// blocking stream. An expired deadline, socket failure or reactor error refuses
+/// without a retry; a full listen backlog cannot block the caller indefinitely.
+pub fn connect_unix(
+    path: &std::path::Path,
+    deadline: std::time::Instant,
+) -> std::io::Result<UnixStream> {
+    if std::time::Instant::now() >= deadline {
+        return Err(std::io::ErrorKind::TimedOut.into());
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()?;
+    let stream = runtime.block_on(async {
+        tokio::time::timeout(
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            tokio::net::UnixStream::connect(path),
+        )
+        .await
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?
+    })?;
+    if std::time::Instant::now() >= deadline {
+        return Err(std::io::ErrorKind::TimedOut.into());
+    }
+    let stream = stream.into_std()?;
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+
 /// The kernel-reported identity of a connected Unix-socket peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerIdentity {
@@ -242,6 +272,60 @@ mod tests {
 
     use super::*;
 
+    /// An elapsed deadline refuses before connecting, even to a live listener.
+    #[test]
+    fn connect_refuses_an_expired_deadline() {
+        let error = connect_unix(
+            std::path::Path::new("/unused-socket"),
+            std::time::Instant::now(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    /// Linux's full Unix accept queue returns within the same bounded budget;
+    /// all queued connections and the exclusively created socket are test-owned.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn connect_to_a_full_listen_queue_is_bounded() {
+        use std::os::unix::net::UnixListener;
+        use std::time::{Duration, Instant};
+
+        let name = format!(
+            "bq-{}",
+            random_bytes().unwrap()[0..8]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let directory = std::env::temp_dir().join(name);
+        std::fs::create_dir(&directory).unwrap();
+        let socket = directory.join("s");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut queued = Vec::new();
+        let mut full = false;
+        for _ in 0..8192 {
+            match connect_unix(&socket, Instant::now() + Duration::from_millis(20)) {
+                Ok(stream) => queued.push(stream),
+                Err(_) => {
+                    full = true;
+                    break;
+                }
+            }
+        }
+        let started = Instant::now();
+        let result = connect_unix(&socket, started + Duration::from_millis(50));
+        drop(queued);
+        drop(listener);
+        std::fs::remove_dir_all(directory).unwrap();
+        assert!(full, "fixture did not fill the listen queue");
+        assert!(
+            result.is_err(),
+            "an unaccepted full queue admitted a connection"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
     /// A Node process that renames itself (`process.title`, as ZCode's CLI
     /// does) shifts its first environment entries into the reported
     /// arguments: the plain environment read misses `HOME`, the shifted read
@@ -280,10 +364,13 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         assert_eq!(line.trim(), "ready");
+        #[cfg(target_os = "macos")]
         assert_eq!(
             plain, None,
             "the rewrite shifted HOME out of the environment"
         );
+        #[cfg(not(target_os = "macos"))]
+        assert!(plain.is_none() || plain.as_deref() == Some(OsStr::new("/retitled/home")));
         assert_eq!(shifted.as_deref(), Some(OsStr::new("/retitled/home")));
         assert_eq!(absent, None);
     }

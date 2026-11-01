@@ -156,7 +156,13 @@ touched by anything here, and nothing in this crate installs a hook for you.
   requests reach Node only over the child's inherited private descriptor; Rust
   checks the kernel parent PID/UID and exact call correlation, and closes an
   uncertain channel rather than replaying it. The chain is Rust peer, then its direct
-  signed Node parent, then the Codex harness. That single Node hop is skipped when
+  signed Node parent, then the Codex harness.
+  On Linux, the private FD3 socket is adopted through pinned `listenfd` 1.0.2:
+  `/dev/fd` cannot reopen a socket there. The child-only environment fixes one
+  descriptor and removes ambient PID/descriptor offsets. Adoption validates
+  AF_UNIX/SOCK_STREAM and sets CLOEXEC at single-threaded startup; environment
+  fields grant no authority and the same kernel parent checks still apply.
+  That single Node hop is skipped when
   identifying the Codex harness only if the Rust peer's actual direct kernel parent is
   the owner Node process, that process's current canonical kernel executable equals
   `CODEX_MCP_NODE_PATH` from its own preserved exec-time environment, that environment
@@ -215,7 +221,9 @@ touched by anything here, and nothing in this crate installs a hook for you.
   attempt after a manual retry, so each attempt has its own. A receipt counts only on the attempt's own
   callback, when it names that attempt's unguessable message id *and* its sender's kernel
   identity, read first thing after accept, is the attested recipient PID as
-  this user; a sender that already closed (its PID is no longer readable) is
+  this user. Before writing and before accepting a receipt, the frozen binding
+  also revalidates process birth, executable and private store. Changed or missing
+  evidence cannot settle the handoff. A sender whose peer PID is unreadable is
   ignored and logged `claude_receipt_unverifiable` — fail closed, the
   attempt stays held/unreceipted until core's overdue incident. `held` is non-terminal, `delivered` is acceptance, any other
   native status after the write (a refusal included, with or without a hold)

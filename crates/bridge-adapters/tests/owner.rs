@@ -9,7 +9,7 @@
 mod common;
 
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -189,7 +189,10 @@ impl Rig {
 fn daemon_without_codex_helper_preserves_verified_owner_delivery() {
     let dir = TempDir::new("ownh");
     let store = dir.0.join("xs");
-    std::fs::create_dir(&store).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&store)
+        .unwrap();
     let channel_dir = dir.0.join("ch");
     bridge_adapters::server::private_directory(&channel_dir).unwrap();
     let channel = channel_dir.join("c.sock");

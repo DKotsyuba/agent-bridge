@@ -24,6 +24,8 @@ use serde_json::{Value, json};
 
 use crate::os;
 
+pub(crate) use crate::os::connect_unix as connect;
+
 /// Maximum native-host frame bytes, matching the application's contract (the
 /// signed client enforces it on the host pipe; the mock host reads with it).
 #[cfg(test)]
@@ -71,27 +73,6 @@ fn private_request(thread_id: &str, call_id: &str, text: &str) -> Option<Vec<u8>
 }
 /// Total delivery deadline, including the read-only inventory request.
 const HOST_TIMEOUT: Duration = Duration::from_secs(8);
-
-/// Connects a native Unix pipe under `deadline`, canceling a stalled connect.
-/// Returns a blocking stream after removing it from the temporary reactor.
-/// I/O, runtime creation and elapsed-deadline failures return an error.
-pub(crate) fn connect(pipe: &Path, deadline: Instant) -> std::io::Result<UnixStream> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
-        .build()?;
-    let stream = runtime.block_on(async {
-        tokio::time::timeout(
-            deadline.saturating_duration_since(Instant::now()),
-            tokio::net::UnixStream::connect(pipe),
-        )
-        .await
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?
-    })?;
-    let stream = stream.into_std()?;
-    stream.set_nonblocking(false)?;
-    Ok(stream)
-}
 
 /// Reads exactly `bytes.len()` bytes without renewing the absolute deadline.
 /// EOF, socket failure or expiration refuses the frame; partial bytes are not used.
@@ -594,11 +575,43 @@ pub fn exec_frontend() -> std::io::Result<()> {
         .exec())
 }
 
+/// Takes the Node parent's one inherited FD3 socket at single-threaded startup.
+/// Linux cannot open sockets through `/dev/fd`; the approved wrapper validates
+/// AF_UNIX/SOCK_STREAM (both 1 in Linux's ABI) and sets CLOEXEC before ownership
+/// transfer. Exact environment shape prevents ambient descriptor redirection.
+/// Call only before starting threads: `ListenFd::from_env` consumes environment
+/// variables. Kernel parent credentials are verified separately by the caller.
+#[cfg(target_os = "linux")]
+fn inherited_frontend_stream() -> std::io::Result<UnixStream> {
+    if std::env::var_os("LISTEN_FDS").as_deref() != Some(std::ffi::OsStr::new("1"))
+        || std::env::var_os("LISTEN_PID").is_some()
+        || std::env::var_os("LISTEN_FDS_FIRST_FD").is_some()
+    {
+        return Err(std::io::ErrorKind::PermissionDenied.into());
+    }
+    listenfd::ListenFd::from_env()
+        .take_custom::<UnixStream>(0, 1, 1, "unix stream")?
+        .ok_or_else(|| std::io::ErrorKind::NotFound.into())
+}
+
+/// Duplicates the inherited private descriptor on platforms whose `/dev/fd`
+/// supports opening a socket; the original macOS path remains unchanged.
+#[cfg(not(target_os = "linux"))]
+fn inherited_frontend_stream() -> std::io::Result<UnixStream> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/fd/3")?;
+    let fd: std::os::fd::OwnedFd = file.into();
+    Ok(UnixStream::from(fd))
+}
+
 /// Starts a typed message-only relay inside the harness-launched MCP frontend
 /// when it receives the application's native pipe capability. The native host
 /// sees the registered frontend as its caller, rather than the resident daemon.
 /// A missing pipe returns None (ordinary CLI host); missing signed Node or binding failures error.
 /// The listener receives no arbitrary host methods, namespace or identity fields.
+/// Invoke at single-threaded process startup, before other workers are launched.
 pub fn start_frontend(channel: &Path) -> std::io::Result<Option<FrontendRelay>> {
     let Some(parent) = std::env::var_os("BRIDGE_DESKTOP_PARENT_PID") else {
         return Ok(None);
@@ -610,12 +623,7 @@ pub fn start_frontend(channel: &Path) -> std::io::Result<Option<FrontendRelay>> 
     if os::process_facts(std::process::id()).and_then(|p| p.parent) != Some(parent) {
         return Err(std::io::ErrorKind::PermissionDenied.into());
     }
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/fd/3")?;
-    let fd: std::os::fd::OwnedFd = file.into();
-    let stream = UnixStream::from(fd);
+    let stream = inherited_frontend_stream()?;
     let peer = os::peer_identity(&stream)?;
     if peer.pid != parent
         || os::process_facts(std::process::id()).and_then(|p| p.uid) != Some(peer.uid)
@@ -733,7 +741,7 @@ const RETIRE_POLL: Duration = Duration::from_millis(500);
 /// ever asked, never a scan, so a live or foreign endpoint is never touched.
 fn dead_socket(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_socket())
-        && UnixStream::connect(path)
+        && connect(path, Instant::now() + Duration::from_secs(3))
             .is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionRefused)
 }
 
@@ -786,13 +794,13 @@ fn start_frontend_with_delivery(
                 break;
             };
             let outcome = (|| -> std::io::Result<Outcome> {
+                let deadline = Instant::now() + HOST_TIMEOUT;
                 let peer = os::peer_identity(&stream)?;
-                let daemon = UnixStream::connect(&channel)?;
+                let daemon = connect(&channel, deadline)?;
                 let owner = os::peer_identity(&daemon)?;
                 if peer != owner {
                     return Err(std::io::ErrorKind::PermissionDenied.into());
                 }
-                let deadline = Instant::now() + HOST_TIMEOUT;
                 let mut header = [0; 4];
                 read_exact(&mut stream, &mut header, deadline)?;
                 let n = u32::from_le_bytes(header) as usize;

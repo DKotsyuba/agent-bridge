@@ -62,7 +62,8 @@ impl ChannelClient {
     }
 
     /// Connects and verifies the channel: private directory owned by this
-    /// user, listener running as this user.
+    /// user, listener running as this user. Connect uses the operation timeout,
+    /// including when the Unix listener's accept queue is full.
     fn connect(&self) -> std::io::Result<UnixStream> {
         let own = os::process_facts(std::process::id())
             .and_then(|facts| facts.uid)
@@ -75,7 +76,7 @@ impl ChannelClient {
         if !metadata.is_dir() || metadata.uid() != own || metadata.mode() & 0o077 != 0 {
             return Err(std::io::Error::other("channel directory is not private"));
         }
-        let stream = UnixStream::connect(&self.socket)?;
+        let stream = os::connect_unix(&self.socket, std::time::Instant::now() + self.timeout)?;
         let peer = os::peer_identity(&stream)?;
         if peer.uid != own {
             return Err(std::io::Error::other(

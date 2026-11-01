@@ -34,11 +34,12 @@ The historical native observations below do not qualify the new delivery policy.
 | macOS Apple silicon | Supported target. Source checks and the isolated package lifecycle run here. |
 | macOS Intel | Not a target and not exercised. |
 | Linux ARM64 | Development candidate: offline release build, protected native MCP process/IPC and synthetic owner-boundary checks are exercised. OpenCode 2.2.5 native plugin setup is separate evidence. The legacy Codex helper is unavailable; automatic delivery needs a genuine native owner. Real host attribution, native wake and processing remain Tool Test qualification, not PASS. See the [handoff](linux-agent-ide.md). |
+| Linux x86_64 | Development candidate: local source checks, protected native IPC fixtures and 30 isolated package/install/lifecycle checks are exercised on Ubuntu 24.04 with Rust 1.98.1. Install, upgrade, rollback, database preservation and final socket cleanup passed. These are local observations, not a GitHub CI result or live native-host qualification. Real owner wake and same-session processing remain unqualified; ARM64 receipts are separate. |
 | Windows | Not supported. |
 
 ## Source checks (no host, no model)
 
-These need no native harness and are what CI runs on macOS Apple silicon (see
+These need no native harness and are configured in CI for macOS and Linux (see
 [Contributing](../CONTRIBUTING.md#build-and-check)): formatting, strict Clippy over all
 targets, the workspace tests, private-item Rustdoc and `cargo xtask check-public`. The
 tests exercise real service, adapter-channel, hook, relay and CLI executables with

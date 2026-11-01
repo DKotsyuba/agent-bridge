@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bridge_adapters::registry::{
     ActorRole, CallerAttestor, CorrelationError, PresentedMeta, SealedProof, VerifiedCaller,
@@ -921,7 +921,7 @@ fn claim_stale(path: &Path) -> std::io::Result<()> {
             "relay socket path exists and is not a socket",
         ));
     }
-    match UnixStream::connect(path) {
+    match bridge_adapters::os::connect_unix(path, Instant::now() + Duration::from_secs(3)) {
         Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
             std::fs::remove_file(path)
         }
@@ -1018,7 +1018,7 @@ pub fn call_relay(socket: &Path, request: &RelayRequest) -> RelayResponse {
         if !metadata.is_dir() || metadata.uid() != own || metadata.mode() & 0o077 != 0 {
             return Err(std::io::Error::other("relay directory is not private"));
         }
-        let mut stream = UnixStream::connect(socket)?;
+        let mut stream = bridge_adapters::os::connect_unix(socket, Instant::now() + IO_TIMEOUT)?;
         if bridge_adapters::os::peer_identity(&stream)?.uid != own {
             return Err(std::io::Error::other("relay runs as another user"));
         }

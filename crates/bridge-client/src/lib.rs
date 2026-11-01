@@ -125,7 +125,8 @@ impl BridgeClient {
 
     /// Connects to the daemon's socket.
     ///
-    /// Fails with the underlying I/O error when no daemon is listening.
+    /// Fails with the underlying I/O error when no daemon is listening or its
+    /// accept queue cannot admit a connection within the write budget.
     pub fn connect(socket: impl AsRef<Path>) -> std::io::Result<Self> {
         let socket = socket.as_ref().to_path_buf();
         let connection = open(&socket)?;
@@ -650,9 +651,14 @@ fn validate_request_binding(request: &Request, response: &Response) -> Result<()
     Ok(())
 }
 
-/// Opens a connection and its buffered read half.
+/// Opens a connection and its buffered read half within the write budget,
+/// including Linux listeners whose accept queue is full. No request is sent
+/// until the connection succeeds.
 fn open(socket: &Path) -> std::io::Result<Connection> {
-    let stream = UnixStream::connect(socket)?;
+    let connection = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+    connection.connect_timeout(&socket2::SockAddr::unix(socket)?, WRITE_TIMEOUT)?;
+    let descriptor: std::os::fd::OwnedFd = connection.into();
+    let stream = UnixStream::from(descriptor);
     let reader = BufReader::new(stream.try_clone()?);
     Ok(Connection { stream, reader })
 }

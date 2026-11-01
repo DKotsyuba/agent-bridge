@@ -410,18 +410,26 @@ impl Drop for Services {
     }
 }
 
-/// Runs the isolated install/lifecycle qualification.
+/// Runs the isolated install/lifecycle qualification in exclusively created
+/// private directories, including under inherited Linux default ACLs.
 fn qualify(prefix: &Path) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt;
     if !prefix.is_absolute() {
         return Err("--prefix must be an absolute path".into());
     }
     // Exclusive creation: an existing path (file, directory or link) is
     // refused untouched; only this new tree is ever written.
-    std::fs::create_dir(prefix).map_err(|error| {
-        format!("--prefix must be a new path in an existing directory: {error}")
-    })?;
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(prefix)
+        .map_err(|error| {
+            format!("--prefix must be a new path in an existing directory: {error}")
+        })?;
     for dir in ["dist", "etc", "run", "state", "bin", "secrets"] {
-        std::fs::create_dir(prefix.join(dir)).map_err(|error| error.to_string())?;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(prefix.join(dir))
+            .map_err(|error| error.to_string())?;
     }
     let prefix = prefix.canonicalize().map_err(|error| error.to_string())?;
     let home = prefix.join("home");

@@ -47,7 +47,13 @@ fn bundle(root: &std::path::Path) -> String {
 
 /// Whether this host is one `install.sh` supports (it refuses others).
 fn supported() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+    cfg!(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))
 }
 
 /// Exclusively creates `bii<12 random hex>` under the configured temporary root

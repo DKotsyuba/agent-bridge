@@ -80,7 +80,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bridge_core::dispatch::{AttemptFence, AttemptRecord, Attestation, DispatchCarrier, Outcome};
 use bridge_core::framing::MAX_FRAMED_BYTES;
@@ -90,7 +90,7 @@ use bridge_core::{Harness, NativeAddress};
 use serde_json::{Value, json};
 
 use crate::os;
-use crate::registry::{RecipientBinding, Registry};
+use crate::registry::{MessageCandidate, RecipientBinding, Registry};
 use crate::server::{Custody, lock_registry, with_custody};
 
 /// Largest manifest this carrier writes in one inbox message, in bytes.
@@ -187,12 +187,12 @@ enum Waiting {
 }
 
 /// One correlated hand-off.
-#[derive(Debug)]
 struct Pending {
     /// The attempt's fence.
     fence: AttemptFence,
-    /// The only PID whose receipts count.
-    recipient_pid: u32,
+    /// Frozen recipient proof; late receipts revalidate the exact process,
+    /// executable and store without requiring its old lifecycle to stay current.
+    recipient: Arc<MessageCandidate>,
     /// What it waits for.
     waiting: Waiting,
 }
@@ -234,8 +234,8 @@ struct Hub {
 struct Frame<'a> {
     /// Inbox socket of the recipient.
     socket: &'a Path,
-    /// Attested harness PID that must own the socket.
-    pid: u32,
+    /// Frozen recipient proof that must still own the connected socket.
+    recipient: &'a MessageCandidate,
     /// The recipient's own peer token (never logged).
     token: &'a str,
     /// Recipient session id.
@@ -736,7 +736,9 @@ impl Hub {
     /// The sender's kernel identity is read before anything else. A sender
     /// whose identity is unreadable (already closed) or of another user is
     /// ignored without reading: a receipt never counts without the
-    /// recipient PID. Receipts naming any other message id are ignored.
+    /// exact recipient incarnation, executable and store. Receipts naming any
+    /// other message id are ignored. Missing current identity leaves the existing
+    /// uncertain hand-off unresolved; it never proves that nothing was written.
     fn accept_receipt(&self, stream: UnixStream, expected: &str) {
         let peer = match os::peer_identity(&stream) {
             Ok(peer) if peer.uid == self.uid => peer,
@@ -776,10 +778,23 @@ impl Hub {
     /// are always seen together (and judged by `send` as one window).
     /// Otherwise each goes through [`Hub::route`] separately.
     fn route_batch(&self, msg_id: &str, statuses: &[String], pid: u32) {
+        let recipient = {
+            let pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(entry) = pending.get(msg_id) else {
+                return;
+            };
+            Arc::clone(&entry.recipient)
+        };
+        if !recipient
+            .validate()
+            .is_ok_and(|(_, binding)| binding.harness.0 == pid)
+        {
+            return;
+        }
         {
             let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(entry) = pending.get_mut(msg_id)
-                && pid == entry.recipient_pid
+                && Arc::ptr_eq(&recipient, &entry.recipient)
                 && let Waiting::First(sender) = &entry.waiting
             {
                 for status in statuses {
@@ -789,12 +804,12 @@ impl Hub {
             }
         }
         for status in statuses {
-            self.route(msg_id, status, pid);
+            self.route(msg_id, status, &recipient);
         }
     }
 
-    /// Routes one correlated receipt from the kernel-identified sender
-    /// `pid`, which must be the attempt's recipient PID.
+    /// Routes one correlated receipt after [`Hub::route_batch`] revalidated the
+    /// sender against this exact frozen recipient proof outside the pending lock.
     ///
     /// While `send` is inside its window the status is queued for it (under
     /// the pending lock, in arrival order; [`Hub::route_batch`] queues a
@@ -802,12 +817,12 @@ impl Hub {
     /// acceptance, a `held` after silence holds until
     /// [`ClaudeTiming::held_recheck_ms`] from now, and any other status is
     /// an unknown outcome.
-    fn route(&self, msg_id: &str, status: &str, pid: u32) {
+    fn route(&self, msg_id: &str, status: &str, recipient: &Arc<MessageCandidate>) {
         let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
         let Some(entry) = pending.get_mut(msg_id) else {
             return;
         };
-        if pid != entry.recipient_pid {
+        if !Arc::ptr_eq(recipient, &entry.recipient) {
             return;
         }
         let late = match &entry.waiting {
@@ -1157,11 +1172,13 @@ impl ClaudeLaterCarrier {
 
     /// Writes the authenticated `later` frame of `frame`. On failure
     /// returns the outcome: known-unsent while no byte can have left,
-    /// unknown once the write started.
+    /// unknown once the write started. Connect has a five-second deadline;
+    /// exact process/executable/store and registry stamp are revalidated after
+    /// connecting, immediately before authenticated native input.
     fn write_frames(&self, frame: &Frame<'_>) -> Result<(), Outcome> {
         let Frame {
             socket,
-            pid,
+            recipient,
             token,
             session,
             msg_id,
@@ -1169,11 +1186,15 @@ impl ClaudeLaterCarrier {
             manifest,
         } = *frame;
         let unsent = |evidence: String| Outcome::KnownUnsent { evidence };
-        let mut stream = UnixStream::connect(socket)
-            .map_err(|error| unsent(format!("inbox connect failed: {}", error.kind())))?;
+        let mut stream =
+            crate::desktop::connect(socket, Instant::now() + Duration::from_secs(5))
+                .map_err(|error| unsent(format!("inbox connect failed: {}", error.kind())))?;
         let peer = os::peer_identity(&stream)
             .map_err(|_| unsent("inbox peer identity unreadable".into()))?;
-        if peer.pid != pid || peer.uid != self.hub.uid {
+        let (_, binding) = recipient
+            .validate()
+            .map_err(|reason| unsent(format!("inbox recipient changed before write: {reason}")))?;
+        if peer.pid != binding.harness.0 || peer.uid != self.hub.uid {
             return Err(unsent(
                 "inbox endpoint is not the attested harness process".into(),
             ));
@@ -1191,6 +1212,9 @@ impl ClaudeLaterCarrier {
                 "message": {"role": "user", "content": manifest}
             })
         );
+        lock_registry(&self.registry)
+            .message_current(recipient)
+            .map_err(|reason| unsent(format!("inbox binding changed before write: {reason}")))?;
         // Once a byte may have left, failure is a possible hand-off.
         stream
             .write_all(frames.as_bytes())
@@ -1212,8 +1236,11 @@ impl Drop for ClaudeLaterCarrier {
 }
 
 impl DispatchCarrier for ClaudeLaterCarrier {
-    /// Attests Claude recipients from the registry; anything else is not
-    /// this carrier's.
+    /// Attests Claude recipients from a current registry snapshot, revalidating
+    /// exact process, executable and private store outside the lock; anything
+    /// else is not this carrier's. An explicitly host-disabled carrier returns
+    /// the ordinary no-message attestation, allowing core to report no queued
+    /// work as idle without selecting or validating a delivery route.
     ///
     /// The attested process's session descriptor decides the message path
     /// (`Hub::sync_message`): a positively disabled inbox withdraws the
@@ -1239,11 +1266,17 @@ impl DispatchCarrier for ClaudeLaterCarrier {
         if recipient.harness != Harness::CLAUDE_CODE {
             return Err("not a Claude recipient".into());
         }
-        let (attestation, binding) = {
+        let candidate = {
             let mut registry = lock_registry(&self.registry);
             registry.discover_claude_recipient(recipient)?;
-            registry.attest_recipient(recipient)?
+            if registry.message_is_disabled(recipient.harness) {
+                return registry
+                    .attest_recipient(recipient)
+                    .map(|(attestation, _)| attestation);
+            }
+            registry.message_candidate(recipient)?
         };
+        let (_, binding) = candidate.validate()?;
         if crate::owner::locator(binding.harness.0)?.is_some() {
             let attestation = self.owner_route(recipient)?.0;
             if attestation.lifecycle() != bridge_core::dispatch::Lifecycle::Inactive {
@@ -1251,9 +1284,14 @@ impl DispatchCarrier for ClaudeLaterCarrier {
             }
             return Ok(attestation);
         }
-        let changed = self.hub.sync_message(&self.registry, recipient, &binding)?;
+        self.hub.sync_message(&self.registry, recipient, &binding)?;
         self.hub.callback_capacity()?;
-        Ok(changed.unwrap_or(attestation))
+        // Capability synchronization can change the snapshot, so close selection
+        // with fresh validation and an in-memory stamp check.
+        let candidate = lock_registry(&self.registry).message_candidate(recipient)?;
+        let (attestation, _) = candidate.validate()?;
+        lock_registry(&self.registry).message_current(&candidate)?;
+        Ok(attestation)
     }
 
     /// One `later` hand-off of the frozen manifest.
@@ -1284,7 +1322,11 @@ impl DispatchCarrier for ClaudeLaterCarrier {
         let Ok(address) = NativeAddress::parse(&attempt.fence.recipient) else {
             return unsent("unparseable recipient".into());
         };
-        let binding = match lock_registry(&self.registry).attest_recipient(&address) {
+        let candidate = match lock_registry(&self.registry).message_candidate(&address) {
+            Ok(candidate) => Arc::new(candidate),
+            Err(reason) => return unsent(format!("recipient not attested: {reason}")),
+        };
+        let binding = match candidate.validate() {
             Ok((_, binding)) => binding,
             Err(reason) => return unsent(format!("recipient not attested: {reason}")),
         };
@@ -1343,13 +1385,13 @@ impl DispatchCarrier for ClaudeLaterCarrier {
                 msg_id.clone(),
                 Pending {
                     fence: attempt.fence.clone(),
-                    recipient_pid: pid,
+                    recipient: Arc::clone(&candidate),
                     waiting: Waiting::First(sender),
                 },
             );
         let frame = Frame {
             socket: &socket,
-            pid,
+            recipient: &candidate,
             token: &token,
             session,
             msg_id: &msg_id,
@@ -1460,118 +1502,28 @@ impl DispatchCarrier for ClaudeLaterCarrier {
 
 #[cfg(test)]
 mod tests {
-    //! Receipt authentication at the callback.
+    //! Receipt shape parsing; callback identity uses native fixture integration tests.
 
     use super::*;
-    use bridge_core::Storage;
 
-    /// A hub with one pending first-receipt wait for `recipient_pid`.
-    fn hub_waiting(recipient_pid: u32) -> (Hub, Receiver<String>) {
-        let limits = serde_json::from_value(json!({"max_admitted_events": 10})).unwrap();
-        let custody: Arc<dyn Custody> =
-            Arc::new(Mutex::new(Storage::open_in_memory(limits).unwrap()));
-        let (sender, receiver) = mpsc::channel();
-        let mut pending = HashMap::new();
-        pending.insert(
-            "msg-known".to_string(),
-            Pending {
-                fence: AttemptFence {
-                    attempt_seq: 1,
-                    recipient: "r".into(),
-                    endpoint_epoch: 1,
-                    manifest_hash: "h".into(),
-                },
-                recipient_pid,
-                waiting: Waiting::First(sender),
-            },
-        );
-        let hub = Hub {
-            custody,
-            pending: Mutex::new(pending),
-            callbacks: Mutex::new(HashMap::new()),
-            max_callbacks: MAX_CALLBACKS,
-            held_recheck_ms: 10 * 60_000,
-            sync: Mutex::new(()),
-            uid: os::process_facts(std::process::id()).unwrap().uid.unwrap(),
-            secret: [7; 32],
-        };
-        (hub, receiver)
-    }
-
-    /// Writes one receipt naming the known message id and returns the
-    /// accepted server end; with `close_first` the sender is gone before
-    /// the server accepts (its PID is no longer readable).
-    fn receipt_stream(close_first: bool) -> (UnixStream, Option<UnixStream>) {
-        let dir = std::env::temp_dir().join(format!(
-            "m2rcpt{}{}",
-            std::process::id(),
-            &crate::server::sha256_hex(&os::random_bytes().unwrap())[..8]
-        ));
-        std::fs::create_dir(&dir).unwrap();
-        let path = dir.join("c.sock");
-        let listener = UnixListener::bind(&path).unwrap();
-        let mut client = UnixStream::connect(&path).unwrap();
-        let line = json!({"type":"control","action":"peer_message_status","orig_msg_id":"msg-known","status":"delivered"});
-        writeln!(client, "{line}").unwrap();
-        let kept = if close_first {
-            drop(client);
-            None
-        } else {
-            client.shutdown(std::net::Shutdown::Write).unwrap();
-            Some(client)
-        };
-        let (server, _) = listener.accept().unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
-        (server, kept)
-    }
-
-    /// A receipt arriving on one attempt's own callback but naming another
-    /// attempt's message id is ignored, even from the recipient PID.
+    /// Malformed, unrelated and unknown-status frames are never native receipts.
     #[test]
-    fn receipt_for_another_attempt_on_this_callback_is_ignored() {
-        let (hub, receiver) = hub_waiting(std::process::id());
-        let (server, _kept) = receipt_stream(false);
-        hub.accept_receipt(server, "msg-other-attempt");
-        assert!(
-            receiver.try_recv().is_err(),
-            "a foreign attempt's receipt was routed"
+    fn malformed_or_unrelated_frames_are_not_receipts() {
+        for line in [
+            "not json",
+            r#"{"type":"user","action":"peer_message_status","orig_msg_id":"m","status":"delivered"}"#,
+            r#"{"type":"control","action":"other","orig_msg_id":"m","status":"delivered"}"#,
+            r#"{"type":"control","action":"peer_message_status","orig_msg_id":"m","status":"accepted"}"#,
+            r#"{"type":"control","action":"peer_message_status","status":"delivered"}"#,
+        ] {
+            assert!(receipt(line).is_none(), "{line}");
+        }
+        assert_eq!(
+            receipt(
+                r#"{"type":"control","action":"peer_message_status","orig_msg_id":"m","status":"delivered"}"#
+            ),
+            Some(("m".into(), "delivered".into()))
         );
-    }
-
-    /// EOF cannot replace kernel proof: macOS may lose the peer PID after close,
-    /// while Linux SO_PEERCRED retains it. Route only a still-proven exact sender.
-    #[test]
-    fn closed_sender_requires_positive_kernel_identity() {
-        let (hub, receiver) = hub_waiting(std::process::id());
-        let (server, _) = receipt_stream(true);
-        let proven = os::peer_identity(&server).is_ok_and(|peer| peer.pid == std::process::id());
-        hub.accept_receipt(server, "msg-known");
-        let routed = receiver.try_recv().is_ok();
-        assert!(
-            !routed || proven,
-            "closed receipts require actual kernel identity"
-        );
-        // Linux retains SO_PEERCRED after EOF. Other kernels may revoke the earlier
-        // observation before the hub independently rechecks it, which must fail closed.
-        #[cfg(target_os = "linux")]
-        assert!(
-            proven && routed,
-            "Linux closed-peer credentials remain positive"
-        );
-    }
-
-    /// A connected sender with the known id but another PID is ignored;
-    /// the same receipt from the recipient PID is routed.
-    #[test]
-    fn connected_sender_must_be_the_recipient_pid() {
-        let (hub, receiver) = hub_waiting(std::process::id() + 1);
-        let (server, _kept) = receipt_stream(false);
-        hub.accept_receipt(server, "msg-known");
-        assert!(receiver.try_recv().is_err(), "a foreign PID was routed");
-        let (hub, receiver) = hub_waiting(std::process::id());
-        let (server, _kept) = receipt_stream(false);
-        hub.accept_receipt(server, "msg-known");
-        assert_eq!(receiver.try_recv().unwrap(), "delivered");
     }
 }
 

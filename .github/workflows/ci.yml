@@ -1,6 +1,6 @@
 name: ci
 
-# Ordinary source checks on the supported platform. No native harness, model,
+# Ordinary source checks on macOS and Linux. No native harness, model,
 # credential or network access beyond the locked dependency fetch is used.
 on:
   push:
@@ -12,7 +12,11 @@ permissions:
 
 jobs:
   check:
-    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0

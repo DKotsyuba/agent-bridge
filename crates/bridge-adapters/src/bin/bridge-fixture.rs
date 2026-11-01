@@ -34,7 +34,8 @@
 //!     session descriptor without any inbox (messaging disabled).
 //!   - `{"cmd":"receipt","msg_id":..,"status":..,"close":bool}` sends a late
 //!     receipt to the frame's callback from this process, staying connected
-//!     until read unless `close` (disconnect at once: unverifiable sender).
+//!     until read unless `close`; optional `orig_msg_id` changes only the wire id
+//!     to exercise correlation while the callback still comes from `msg_id`.
 //!   - `{"cmd":"mcp_server","args":[channel,core,token,evidence],"requests":[..]}`
 //!     runs `bridge-fixture mcp-server` as its child, sends the JSON-RPC
 //!     requests and answers the responses of those with an id.
@@ -109,7 +110,7 @@ struct Inbox {
 ///
 /// By default the sender half-closes and stays connected until the
 /// receiver closes, so its kernel identity stays readable. With `close`
-/// it disconnects immediately after writing (an unverifiable sender).
+/// it disconnects immediately after writing (some kernels retain credentials).
 /// `status` may be a comma-separated sequence (`held,delivered`), sent as
 /// consecutive frames of the one connection, so ordered receipts reach the
 /// carrier back to back.
@@ -264,7 +265,8 @@ fn harness() {
                     .find(|(id, _)| id == msg_id)
                     .map(|(_, from)| from.clone())
                     .unwrap_or_default();
-                json!({"sent": send_receipt(&from, msg_id, command["status"].as_str().unwrap_or_default(), command["close"].as_bool() == Some(true))})
+                let orig_msg_id = command["orig_msg_id"].as_str().unwrap_or(msg_id);
+                json!({"sent": send_receipt(&from, orig_msg_id, command["status"].as_str().unwrap_or_default(), command["close"].as_bool() == Some(true))})
             }
             "exit" => break,
             _ => json!({"error": "unknown command"}),

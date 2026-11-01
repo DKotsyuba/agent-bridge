@@ -13,7 +13,7 @@ automatically.
 | Version | 0.5.0 (not published to crates.io; build from source) |
 | Producer API | v1 (`bridge-protocol` / `bridge-sdk`), plus the legacy publisher and operator socket API |
 | Database | storage schema 7, forward migration only |
-| Platform | **macOS on Apple silicon (`aarch64-apple-darwin`) only** |
+| Platform | macOS Apple silicon; Linux x86_64 and ARM64 candidates (see qualification limits below) |
 | Toolchain | Rust 1.98.1, pinned by `rust-toolchain.toml` |
 | License | [MIT](LICENSE) |
 
@@ -40,11 +40,12 @@ automatically.
 
 ## Support and limits
 
-Bridge supports macOS on Apple silicon only. The core and library crates use
-Unix sockets and Unix file semantics. A separate [Linux ARM64 development
-candidate](docs/linux-agent-ide.md) has bounded build/process evidence and explicit
-remaining native owner/wake qualification; it is not a supported release. Windows
-is unsupported. Native-host
+The core and library crates use Unix sockets and Unix file semantics. The
+installer accepts macOS Apple silicon and Linux x86_64/ARM64 bundles, while the
+native verifier requires the bundle target to match the executing binary.
+Linux remains a [development candidate](docs/linux-agent-ide.md): historical
+ARM64 build/process evidence does not qualify x86_64 or native owner/wake delivery.
+Windows is unsupported. Native-host
 support is per exact build and is explicit in the [qualification
 matrix](docs/qualification.md): configuring a harness policy enables a harness, it
 is not a qualification result. Nested inner-call MCP paths, host observations and
@@ -53,7 +54,8 @@ not been qualified.
 
 ## Quick start
 
-Prerequisites: macOS on Apple silicon, Xcode command line tools, and
+Prerequisites: a C compiler/linker (Xcode command line tools on macOS, or a Linux
+build toolchain for a candidate build) and
 [rustup](https://rustup.rs). The pinned toolchain installs from
 `rust-toolchain.toml`.
 
@@ -69,7 +71,7 @@ write private configuration, install the hooks and send a first message.
 
 ## Documentation
 
-- [Linux ARM64 Agent IDE integration candidate](docs/linux-agent-ide.md): runnable paths, native configuration and remaining owner/wake qualification.
+- [Linux Agent Bridge and Agent IDE integration candidate](docs/linux-agent-ide.md): runnable paths, native configuration and remaining owner/wake qualification.
 
 - [Getting started](docs/getting-started.md): prerequisites, build, test, package, install, first run.
 - [Configuration](docs/configuration.md): daemon, adapter, producer-permission and interfaces files.

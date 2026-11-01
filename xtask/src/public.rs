@@ -9,7 +9,7 @@
 //! - no text file names an owner-specific path, a private documentation
 //!   directory or a private tracker identifier;
 //! - the changelog covers the workspace version, and the CI workflow runs on
-//!   macOS, installs the pinned toolchain, runs this checker, pins every action
+//!   macOS and Linux, installs the pinned toolchain, runs this checker, pins every action
 //!   to a full commit SHA and runs no native probe.
 //!
 //! It is not a secret scanner; use a dedicated tool for credentials.
@@ -390,8 +390,12 @@ fn release_rules(root: &Path, findings: &mut Vec<Finding>) {
         .is_some_and(|c| workflow.contains(c.as_str()));
     for (ok, message) in [
         (
-            workflow.contains("runs-on: macos-"),
-            "CI must run on a macOS runner",
+            workflow.contains("macos-"),
+            "CI must include a macOS runner",
+        ),
+        (
+            workflow.contains("ubuntu-"),
+            "CI must include a Linux runner",
         ),
         (
             workflow.contains("xtask check-public"),
@@ -426,7 +430,7 @@ mod tests {
     /// The smallest tree that satisfies every rule, as `(path, content)`.
     fn good() -> Vec<(String, String)> {
         let ci = format!(
-            "runs-on: macos-15\n- uses: actions/checkout@{SHA} # v4\n- run: cargo +1.98.1 xtask check-public\n"
+            "os: [macos-15, ubuntu-24.04]\nruns-on: ${{{{ matrix.os }}}}\n- uses: actions/checkout@{SHA} # v4\n- run: cargo +1.98.1 xtask check-public\n"
         );
         [
             ("README.md", "# Bridge\n[g](docs/guide.md#start) [c](CONTRIBUTING.md) [s](SECURITY.md) [l](CHANGELOG.md) [a](agent.md) [b](AGENTS.md)\n"),
@@ -483,6 +487,24 @@ mod tests {
     #[test]
     fn valid_tree_passes() {
         assert_eq!(mutated(|_| {}), Vec::<String>::new());
+    }
+
+    /// Dropping either platform from CI fails the portability check.
+    #[test]
+    fn both_platform_runners_are_required() {
+        for (runner, message) in [
+            ("macos-15", "CI must include a macOS runner"),
+            ("ubuntu-24.04", "CI must include a Linux runner"),
+        ] {
+            let found = mutated(|files| {
+                let (_, workflow) = files
+                    .iter_mut()
+                    .find(|(path, _)| path == ".github/workflows/ci.yml")
+                    .unwrap();
+                *workflow = workflow.replace(runner, "unavailable");
+            });
+            expect(&found, message);
+        }
     }
 
     /// Removing a linked document breaks the link that named it.

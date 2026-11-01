@@ -1986,6 +1986,13 @@ impl Registry {
         }
     }
 
+    /// Whether the host explicitly disabled this harness's message carrier.
+    /// This verdict grants no delivery authority; enabled routes still require
+    /// a fully validated message candidate.
+    pub(crate) fn message_is_disabled(&self, harness: Harness) -> bool {
+        self.message_disabled.contains(&harness)
+    }
+
     /// The only user id this registry accepts (the daemon's own user).
     pub(crate) fn owner_uid(&self) -> u32 {
         self.owner_uid
@@ -3359,6 +3366,7 @@ mod tests {
     //! The executable digest cache: warmed before serving, never trusted.
 
     use super::*;
+    use std::os::unix::fs::DirBuilderExt;
 
     /// Controlled permission/renewal during the production frontend picker
     /// refuses before returning a route. Same-epoch changes invalidate the entire
@@ -3514,10 +3522,15 @@ mod tests {
         Registry::new(config, 0).unwrap()
     }
 
-    /// A fresh temporary directory for one test.
+    /// A private temporary directory for one test, including under inherited
+    /// default ACLs that would otherwise make a new store group-writable.
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("m2{tag}{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&dir)
+            .unwrap();
         dir.canonicalize().unwrap()
     }
 
@@ -3674,7 +3687,7 @@ mod tests {
         // no file; good and changed qualify so far.
         assert_eq!(registry.warm_digests(), (3, 1));
         assert_eq!(registry.unqualified_executables(), 2);
-        std::fs::write(&changed, vec![4u8; 4096]).unwrap();
+        update_in_place(&changed, vec![4u8; 4096]);
         assert_eq!(
             registry.unqualified_executables(),
             3,
@@ -3936,12 +3949,7 @@ mod tests {
             "an identity that changed during the read is not cached"
         );
         assert!(
-            registry
-                .lock()
-                .unwrap()
-                .digests
-                .keys()
-                .all(|key| key.inode != fifo_key.inode),
+            !registry.lock().unwrap().digests.contains_key(&fifo_key),
             "nothing was cached for the unstable identity"
         );
         std::fs::remove_dir_all(&dir).unwrap();
@@ -4186,7 +4194,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = scratch("obs");
         let store = dir.join("store");
-        std::fs::create_dir(&store).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&store)
+            .unwrap();
         let exe = dir.join("harness");
         let child = live_child(&exe, "CLAUDE_CONFIG_DIR", &store);
         let mut registry = claude_registry();
@@ -4299,7 +4310,10 @@ mod tests {
         let dir = scratch("rob");
         let store = dir.join("store");
         let elsewhere = dir.join("elsewhere");
-        std::fs::create_dir_all(&store).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&store)
+            .unwrap();
         let exe = dir.join("harness");
         let child = live_child(&exe, "CLAUDE_CONFIG_DIR", &store);
         let mut registry = claude_registry();

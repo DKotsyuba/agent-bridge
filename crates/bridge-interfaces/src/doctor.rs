@@ -170,7 +170,12 @@ fn interfaces(config: &InterfacesConfig, push: &mut dyn FnMut(&str, &'static str
     push("config.interfaces", "ok", json!("valid"));
     push(
         "core.reachable",
-        if std::os::unix::net::UnixStream::connect(&config.core_socket).is_ok() {
+        if bridge_adapters::os::connect_unix(
+            &config.core_socket,
+            std::time::Instant::now() + std::time::Duration::from_secs(3),
+        )
+        .is_ok()
+        {
             "ok"
         } else {
             "fail"
@@ -247,7 +252,12 @@ fn interfaces(config: &InterfacesConfig, push: &mut dyn FnMut(&str, &'static str
             );
             push(
                 "relay.reachable",
-                if std::os::unix::net::UnixStream::connect(&root.socket).is_ok() {
+                if bridge_adapters::os::connect_unix(
+                    &root.socket,
+                    std::time::Instant::now() + std::time::Duration::from_secs(3),
+                )
+                .is_ok()
+                {
                     "ok"
                 } else {
                     "fail"

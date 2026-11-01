@@ -482,6 +482,7 @@ mod tests {
 
     use super::*;
     use serde_json::json;
+    use std::os::unix::fs::DirBuilderExt;
 
     /// A Codex binding over a canonical scratch store with `transcript` retained.
     fn binding_for(store: &Path, thread: &str, transcript: &Path) -> Binding {
@@ -511,10 +512,15 @@ mod tests {
         }
     }
 
-    /// A fresh canonical store with a `sessions` directory.
+    /// A fresh canonical private store and `sessions` directory, independent of
+    /// inherited default ACLs on the prepared temporary root.
     fn store(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("m2{tag}{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(dir.join("sessions"))
+            .unwrap();
         dir.canonicalize().unwrap()
     }
 

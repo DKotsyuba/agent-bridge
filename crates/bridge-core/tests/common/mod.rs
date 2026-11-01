@@ -62,14 +62,16 @@ impl Drop for TempDir {
 /// static test label `tag`.
 /// The process counter prevents clock-resolution collisions between parallel
 /// calls. No path is created; the caller owns socket creation and cleanup.
-/// The short `bl-` prefix retains the same tag, PID, timestamp and counter.
+/// The short `bl-` prefix and a 24-hex digest of tag, PID, timestamp and counter
+/// keep the basename fixed-size, including long literal labels.
 /// Panics if the system clock precedes the Unix epoch.
 /// The caller must configure a root short enough for the generated basename and
 /// the macOS AF_UNIX ceiling of about 104 bytes; no nested test tree is added.
 #[allow(dead_code)]
 pub fn short_socket(tag: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "bl-{}-{}-{}-{}.sock",
+    use sha2::{Digest, Sha256};
+    let identity = format!(
+        "{}-{}-{}-{}",
         tag,
         std::process::id(),
         std::time::SystemTime::now()
@@ -77,7 +79,9 @@ pub fn short_socket(tag: &str) -> std::path::PathBuf {
             .unwrap()
             .as_nanos(),
         NEXT_PATH_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ))
+    );
+    let digest = format!("{:x}", Sha256::digest(identity.as_bytes()));
+    std::env::temp_dir().join(format!("bl-{}.sock", &digest[..24]))
 }
 
 /// Waits until a client can connect to the socket, bounded to `budget`.

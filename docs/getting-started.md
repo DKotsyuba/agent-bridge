@@ -1,7 +1,8 @@
 # Getting started
 
-This guide takes a clean macOS machine from source to a running Bridge with one
-native session able to send and receive. It builds and installs from your own
+This guide builds and installs Bridge on macOS Apple silicon or Linux x86_64/ARM64.
+Native send/receive availability depends on the platform and exact harness route
+in the [qualification matrix](qualification.md). It builds from your own
 checkout. The installer downloads nothing and extracts no archive; it trusts only
 the `SHA256SUMS` digest you pass it. A hash is not a signature: the digest of your
 own build is the strongest trust available. If the project's release page offers a
@@ -13,8 +14,9 @@ build.
 
 | Need | Why |
 |---|---|
-| macOS on Apple silicon | the only supported platform (`install.sh` refuses others) |
-| Xcode command line tools (`xcode-select --install`) | linker, `/usr/bin/curl`, `/usr/bin/shasum`, `/usr/bin/sandbox-exec` |
+| macOS on Apple silicon or Linux x86_64/ARM64 | accepted local-bundle installation targets; Linux native qualification remains pending |
+| Xcode command line tools on macOS; a C compiler/linker on Linux | native builds, including bundled SQLite |
+| Bash and `sha256sum` or `shasum` | installer and pre-execution SHA-256 verification |
 | [rustup](https://rustup.rs) with Rust 1.98.1 | pinned in `rust-toolchain.toml` |
 | A short directory you own for `TMPDIR` | Unix socket paths are limited to about 100 bytes |
 | An exact Codex, Claude Code or managed OpenCode build, run as the same user | the native session you want to reach; OpenCode 2.0.28 requires a supervisor/owner and lifecycle plugin; see the [qualification matrix](qualification.md) |
@@ -22,6 +24,10 @@ build.
 
 The daemon, hook and relay are ordinary user processes. Nothing needs `sudo`,
 and Bridge never edits your harness configuration for you.
+
+On Linux, use the [native-owner integration](linux-agent-ide.md) for automatic
+Codex/OpenCode delivery. The macOS `sandbox-exec` queue helper is unavailable;
+never substitute an unconfining executable. A missing native owner holds delivery.
 
 ## 2. Build and test
 

@@ -8,6 +8,7 @@
 
 mod common;
 
+use std::os::unix::fs::DirBuilderExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -456,7 +457,10 @@ fn non_harness_callers_and_relabeled_harnesses_refuse_while_unlisted_stores_regi
     // A harness in a store no configuration names registers from its own hook:
     // no store path or executable is predeclared.
     let foreign = lab.dir.0.join("foreign-store");
-    std::fs::create_dir_all(&foreign).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&foreign)
+        .unwrap();
     let mut stranger = Harnessed::start(Harness::CLAUDE_CODE, &foreign);
     let reply = stranger.hook(
         &lab.socket,
@@ -665,6 +669,117 @@ fn lifecycle_holds_unknown_input_waits_pause_and_ended_sessions() {
     assert!(matches!(report, DispatchReport::Held(_)), "{report:?}");
 }
 
+/// An executable changed after attestation holds before a write, while a changed
+/// executable's late receipt cannot accept or replay an already-written attempt.
+#[test]
+fn claude_changed_executable_holds_before_write_and_rejects_late_receipt() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    for before_write in [true, false] {
+        let lab = Lab::new(if before_write { "cxpre" } else { "cxlate" });
+        let address = lab.claude_address("sess-changed");
+        let executable = lab.dir.0.join("bridge-fixture-claude");
+        std::fs::copy(fixture_exe(), &executable).unwrap();
+        let metadata = std::fs::metadata(&executable).unwrap();
+        let changed = u64::try_from(metadata.mtime().max(metadata.ctime())).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        while now() / 1000 <= changed.saturating_add(1) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture clock did not advance"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let mut harness =
+            Harnessed::start_from(&executable, Harness::CLAUDE_CODE, &lab.claude_store);
+        harness.cmd(json!({"cmd": "inbox", "session_id": "sess-changed", "behavior": "none"}));
+        harness.hook(
+            &lab.socket,
+            Harness::CLAUDE_CODE,
+            hook("SessionStart", "sess-changed"),
+        );
+        harness.hook(
+            &lab.socket,
+            Harness::CLAUDE_CODE,
+            hook("Stop", "sess-changed"),
+        );
+        lab.registry
+            .lock()
+            .unwrap()
+            .attest_recipient(&address)
+            .expect("the unchanged executable must register before the negative control");
+        let custody = Arc::clone(&lab.storage) as Arc<dyn Custody>;
+        let timing = ClaudeTiming {
+            receipt_wait: Duration::from_millis(50),
+            ..ClaudeTiming::default()
+        };
+        let mut carrier =
+            ClaudeLaterCarrier::new(Arc::clone(&lab.registry), custody, timing).unwrap();
+        lab.publish("evt-changed", &address, Mode::Message, "retained payload");
+        if before_write {
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let report = dispatch_message(
+            &lab.storage,
+            &mut carrier,
+            &address,
+            &now,
+            &DispatchTiming::default(),
+        )
+        .unwrap();
+        if before_write {
+            assert!(matches!(report, DispatchReport::Held(_)), "{report:?}");
+            assert!(lab.attempt("evt-changed").is_none());
+            assert!(
+                harness.cmd(json!({"cmd": "frames"}))["frames"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        } else {
+            assert!(
+                matches!(
+                    report,
+                    DispatchReport::Sent {
+                        state: AttemptState::WrittenNoReceipt,
+                        ..
+                    }
+                ),
+                "{report:?}"
+            );
+            let attempt = lab.attempt("evt-changed").unwrap();
+            let frames = harness.cmd(json!({"cmd": "frames"}));
+            let msg_id = frames["frames"][0]["msg_id"].as_str().unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(
+                harness.cmd(json!({"cmd": "receipt", "msg_id": msg_id, "status": "delivered", "close": true}))["sent"],
+                true
+            );
+            std::thread::sleep(Duration::from_millis(200));
+            let retained = lab.attempt("evt-changed").unwrap();
+            assert_eq!(retained.fence, attempt.fence);
+            assert_eq!(retained.state, AttemptState::WrittenNoReceipt);
+            let _ = dispatch_message(
+                &lab.storage,
+                &mut carrier,
+                &address,
+                &now,
+                &DispatchTiming::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                harness.cmd(json!({"cmd": "frames"}))["frames"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1,
+                "post-write uncertainty must not replay"
+            );
+        }
+        harness.stop();
+    }
+}
+
 /// Claude later: held then released by the recipient, forged receipts ignored, silence closed only by the exact transcript marker.
 #[test]
 fn claude_later_held_release_receipts_and_transcript_closure() {
@@ -741,6 +856,16 @@ fn claude_later_held_release_receipts_and_transcript_closure() {
         writeln!(closed, "{line}").unwrap();
     }
     std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        lab.attempt("evt-held").unwrap().state,
+        AttemptState::NativeHeld
+    );
+    // The exact native sender cannot settle this callback with another attempt's
+    // identifier. This isolates correlation from the foreign-PID checks above.
+    assert_eq!(
+        harness.cmd(json!({"cmd": "receipt", "msg_id": msg_id, "orig_msg_id": "other-attempt", "status": "delivered"}))["sent"],
+        true
+    );
     assert_eq!(
         lab.attempt("evt-held").unwrap().state,
         AttemptState::NativeHeld
@@ -1819,6 +1944,7 @@ fn lost_callback_after_restart_stays_retained_without_replay() {
 }
 
 /// Writes the fake App Server behavior and probe port.
+#[cfg(target_os = "macos")]
 fn codex_setup(lab: &Lab, behavior: &str, port: u16) {
     std::fs::write(lab.codex_store.join("behavior"), behavior).unwrap();
     std::fs::write(lab.codex_store.join("probe_port"), port.to_string()).unwrap();
@@ -1827,6 +1953,7 @@ fn codex_setup(lab: &Lab, behavior: &str, port: u16) {
 
 /// The Codex helper runs confined (negative probe plus positive control) and classifies accept, refusal and silence.
 #[test]
+#[cfg(target_os = "macos")]
 fn codex_queue_helper_is_confined_and_classifies_outcomes() {
     let lab = Lab::new("cx");
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2242,6 +2369,7 @@ fn sealed_proof_relays_registry_facts_once_to_a_configured_relay() {
 /// extends it and a helper that stops reading cannot block the write past
 /// it; both possibly-written hand-offs end unknown, never accepted.
 #[test]
+#[cfg(target_os = "macos")]
 fn codex_helper_total_budget_survives_floods_and_stalled_writes() {
     let lab = Lab::new("cb");
     let address = lab.codex_address("thread-b");
@@ -2358,7 +2486,10 @@ fn native_daemon_restarts_after_a_crash_left_stale_sockets() {
 fn daemon_composition_hands_probe_context_to_the_root_hook() {
     let dir = TempDir::new("dc");
     let store = dir.0.join("s");
-    std::fs::create_dir(&store).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&store)
+        .unwrap();
     let channel_dir = dir.0.join("ch");
     bridge_adapters::server::private_directory(&channel_dir).unwrap();
     let channel = channel_dir.join("c.sock");
@@ -3776,7 +3907,21 @@ fn codex_live_store_alias_is_refused_and_the_canonical_store_keeps_capabilities(
         "/usr/bin/sandbox-exec".into(),
         Duration::from_secs(1),
     );
+    #[cfg(target_os = "macos")]
     let attestation = carrier.attest(&address).unwrap();
+    #[cfg(not(target_os = "macos"))]
+    let attestation = {
+        assert!(
+            carrier.attest(&address).is_err(),
+            "no macOS confinement helper on this platform"
+        );
+        lab.registry
+            .lock()
+            .unwrap()
+            .attest_recipient(&address)
+            .unwrap()
+            .0
+    };
     assert_eq!(attestation.lifecycle(), Lifecycle::Inactive);
     receiver.hook(
         &lab.socket,
@@ -3789,7 +3934,16 @@ fn codex_live_store_alias_is_refused_and_the_canonical_store_keeps_capabilities(
         Mode::Auto,
         "aliased inject capability",
     );
+    #[cfg(target_os = "macos")]
     let active = carrier.attest(&address).unwrap();
+    #[cfg(not(target_os = "macos"))]
+    let active = lab
+        .registry
+        .lock()
+        .unwrap()
+        .attest_recipient(&address)
+        .unwrap()
+        .0;
     assert_eq!(active.lifecycle(), Lifecycle::Active);
     let inject = lab
         .storage

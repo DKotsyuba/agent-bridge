@@ -1,10 +1,24 @@
-# Linux ARM64 Agent IDE integration candidate
+# Linux Agent Bridge and Agent IDE integration candidate
 
 This is a development handoff, not a native wake qualification. Linux process
 fixtures prove the protected MCP transport and owner boundary; a real Codex
 0.164.0 or OpenCode 2.2.5 session must still produce the receipts below. No
 provider credential, previous session store or model response belongs in this
 bundle. The [configuration reference](configuration.md) defines all TOML fields.
+
+Linux x86_64 and ARM64 are source candidates. The x86_64 candidate has separate
+Ubuntu 24.04 synthetic process/IPC checks and 30 isolated install, upgrade,
+rollback and service-lifecycle checks. These observations do not reuse the
+historical ARM64 executable or qualify real native model delivery. The
+`linux-arm64` host labels below are one internally consistent example, not OS
+authority; choose the actual deployment's labels consistently in every scope.
+
+The signed-parent frontend adopts its private FD3 socket on Linux through pinned
+`listenfd` 1.0.2 at single-threaded startup, before workers exist. The wrapper
+validates socket family/type and sets CLOEXEC; Bridge still verifies the actual
+kernel parent PID and UID. Descriptor selectors inherited from unrelated services
+are removed by the Node parent and rejected by the Rust child. This avoids Linux's
+unsupported `/dev/fd` socket reopening without adding an unauthenticated endpoint.
 
 ## Executables and private paths
 

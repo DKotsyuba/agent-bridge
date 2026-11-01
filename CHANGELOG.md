@@ -8,6 +8,17 @@ source, and the crates are not published to crates.io.
 
 ### Changed
 
+- Accept local Linux x86_64/ARM64 bundles with the existing pre-execution
+  attestation and native target checks; use `sha256sum` or `shasum` and include
+  Ubuntu in ordinary source CI without claiming native-host qualification.
+- Bound Unix-socket readiness connections by the existing startup deadline,
+  including a full Linux accept queue.
+- Adopt the inherited signed-parent Unix socket on Linux through pinned
+  `listenfd` at single-threaded startup, preserving kernel parent/UID proof.
+- Revalidate Claude process, executable and private-store identity before inbox
+  writes and late receipts; changed identity retains uncertainty without replay.
+- Preserve exact sealed-file modes under Linux default ACLs and restrictive umasks.
+
 - Inspect the genuine OpenCode 2.2.5 plugin lifecycle/executor contract alongside
   2.0.28; keep protected native MCP context and permission execution unchanged.
 - Linux ARM64 integration candidate: resolve configured shell aliases to actual

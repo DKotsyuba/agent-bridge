@@ -12,7 +12,8 @@ fail closed, never infer evidence, never repeat an uncertain delivery.
   pull request.
 - Report vulnerabilities privately, as described in [SECURITY.md](SECURITY.md),
   not in an issue or pull request.
-- The supported platform is macOS on Apple silicon. Portable code is welcome,
+- The supported release platform is macOS on Apple silicon; Linux x86_64/ARM64
+  source and local-install candidates run the same synthetic checks. Portable code is welcome,
   but a change must not claim support for another platform without a way to
   verify it.
 

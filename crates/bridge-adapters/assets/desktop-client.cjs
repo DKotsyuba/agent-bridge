@@ -95,6 +95,10 @@ function mcpFrontend() {
   const env={...process.env};
   delete env.CODEX_APP_TOOLS_PIPE_PATH;delete env.CODEX_MCP_NODE_PATH;
   env.BRIDGE_DESKTOP_PARENT_PID=String(process.pid);
+  if(process.platform==='linux') {
+    env.LISTEN_FDS='1';
+    delete env.LISTEN_PID;delete env.LISTEN_FDS_FIRST_FD;delete env.LISTEN_FDNAMES;
+  }
   /** Owned Rust MCP child and its private socket-backed descriptor 3. @type {import('node:child_process').ChildProcess} */
   const child=spawn(executable,args,{env,stdio:['inherit','inherit','inherit','pipe']});
   /** Bounded private frame bytes across partial reads. @type {Buffer} */

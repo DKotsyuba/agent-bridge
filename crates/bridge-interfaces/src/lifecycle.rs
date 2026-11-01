@@ -23,7 +23,6 @@
 
 use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -255,9 +254,10 @@ fn managed_exe(home: &Path, component: Component, exe: &Path) -> bool {
 
 /// Whether `socket` is served by process `pid` right now: a connection
 /// is accepted and the kernel names `pid` as the listening peer. A foreign
-/// endpoint at the same path never counts.
-fn served_by(socket: &Path, pid: u32) -> bool {
-    UnixStream::connect(socket)
+/// endpoint at the same path never counts. Connect is bounded by the caller's
+/// startup deadline, including a listener whose accept queue is full.
+fn served_by(socket: &Path, pid: u32, deadline: Instant) -> bool {
+    bridge_adapters::os::connect_unix(socket, deadline)
         .ok()
         .and_then(|stream| bridge_adapters::os::peer_identity(&stream).ok())
         .is_some_and(|peer| peer.pid == pid)
@@ -270,12 +270,12 @@ fn served_by(socket: &Path, pid: u32) -> bool {
 /// on a case-insensitive volume, a hard link, or any other alias) are answered
 /// by one listener and so never count as two ready endpoints. An unreadable
 /// identity is not ready.
-fn served_distinct(sockets: &[PathBuf], pid: u32) -> bool {
+fn served_distinct(sockets: &[PathBuf], pid: u32, deadline: Instant) -> bool {
     use std::os::unix::fs::MetadataExt;
     let mut seen = Vec::with_capacity(sockets.len());
     sockets.iter().all(|socket| {
         let identity = std::fs::metadata(socket).map(|meta| (meta.dev(), meta.ino()));
-        served_by(socket, pid)
+        served_by(socket, pid, deadline)
             && identity.is_ok_and(|identity| {
                 let fresh = !seen.contains(&identity);
                 seen.push(identity);
@@ -419,7 +419,7 @@ pub fn start(
                 component.name()
             ));
         }
-        if served_distinct(&ready, pid) {
+        if served_distinct(&ready, pid, deadline) {
             guard.release();
             return Ok(record);
         }
@@ -560,13 +560,40 @@ mod tests {
         let _channel = UnixListener::bind(&channel).unwrap();
         let alias = dir.path().join("K2.sock");
         std::fs::hard_link(&core, &alias).unwrap();
-        assert!(served_distinct(&[core.clone(), channel.clone()], me));
-        assert!(!served_distinct(&[core.clone(), alias.clone()], me));
-        assert!(!served_distinct(&[alias.clone(), core.clone()], me));
-        assert!(!served_distinct(&[core.clone(), channel.clone()], me + 1));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        assert!(served_distinct(
+            &[core.clone(), channel.clone()],
+            me,
+            deadline
+        ));
+        assert!(!served_distinct(
+            &[core.clone(), alias.clone()],
+            me,
+            deadline
+        ));
+        assert!(!served_distinct(
+            &[alias.clone(), core.clone()],
+            me,
+            deadline
+        ));
+        assert!(!served_distinct(
+            &[core.clone(), channel.clone()],
+            me + 1,
+            deadline
+        ));
         assert!(!served_distinct(
             &[core, dir.path().join("absent.sock")],
-            me
+            me,
+            deadline
         ));
+    }
+
+    /// Even a listening socket cannot report readiness after the startup budget.
+    #[test]
+    fn expired_startup_deadline_is_not_ready() {
+        let dir = TestDir::new("rdt");
+        let socket = dir.path().join("s.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        assert!(!served_by(&socket, std::process::id(), Instant::now()));
     }
 }

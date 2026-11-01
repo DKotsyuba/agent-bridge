@@ -34,19 +34,14 @@ pub const HOST: &str = "lab-host";
 pub struct TempDir(pub PathBuf);
 
 impl TempDir {
-    /// A fresh owned directory under `TMPDIR`, short enough for socket
-    /// paths.
-    pub fn new(tag: &str) -> TempDir {
-        let nonce = u32::from_ne_bytes(
-            bridge_adapters::os::random_bytes().unwrap()[..4]
-                .try_into()
-                .unwrap(),
-        );
-        let path = std::env::temp_dir().join(format!(
-            "m2{tag}{}{:08x}",
-            std::process::id() % 10_000,
-            nonce
-        ));
+    /// A fresh owned directory under `TMPDIR`. Its fixed 12-hex basename leaves
+    /// room for real native inbox and callback paths even with long test labels.
+    pub fn new(_tag: &str) -> TempDir {
+        let nonce: String = bridge_adapters::os::random_bytes().unwrap()[..6]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let path = std::env::temp_dir().join(nonce);
         std::fs::create_dir(&path).unwrap();
         TempDir(path.canonicalize().unwrap())
     }
@@ -145,7 +140,8 @@ impl Lab {
         Lab::build(tag, sha256)
     }
 
-    /// Builds the lab. The registry names no native owner path or digest: the
+    /// Builds private stores with explicit mode 0700 even under inherited default
+    /// ACLs. The registry names no native owner path or digest: the
     /// owner route needs none.
     fn build(tag: &str, sha256: Option<String>) -> Lab {
         let dir = TempDir::new(tag);
@@ -153,10 +149,13 @@ impl Lab {
         let codex_store = dir.0.join("xs");
         let opencode_store = dir.0.join("os");
         let generic_store = dir.0.join("zs");
-        std::fs::create_dir_all(&claude_store).unwrap();
-        std::fs::create_dir_all(&codex_store).unwrap();
-        std::fs::create_dir_all(&opencode_store).unwrap();
-        std::fs::create_dir_all(&generic_store).unwrap();
+        use std::os::unix::fs::DirBuilderExt;
+        for store in [&claude_store, &codex_store, &opencode_store, &generic_store] {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(store)
+                .unwrap();
+        }
         let channel_dir = dir.0.join("ch");
         let owner_uid = private_directory(&channel_dir).unwrap();
         let socket = channel_dir.join("c.sock");

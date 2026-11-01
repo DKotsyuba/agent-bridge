@@ -855,14 +855,18 @@ mod tests {
         std::fs::write(&target, EMPTY_LEDGER).unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::os::unix::fs::symlink(&target, &setup.notify.ledger).unwrap();
-        // Give the link itself private permission bits, so only the
-        // file-type rule can refuse it.
-        let chmod = std::process::Command::new("/bin/chmod")
-            .args(["-h", "600"])
-            .arg(&setup.notify.ledger)
-            .status()
-            .unwrap();
-        assert!(chmod.success());
+        // macOS permits private permission bits on the link itself, isolating
+        // the file-type rule. Linux symlink permissions are fixed; it must
+        // still reject the link and leave the private target untouched.
+        #[cfg(target_os = "macos")]
+        {
+            let chmod = std::process::Command::new("/bin/chmod")
+                .args(["-h", "600"])
+                .arg(&setup.notify.ledger)
+                .status()
+                .unwrap();
+            assert!(chmod.success());
+        }
         let transport = script(vec![]);
         let linked = run(
             &setup.notify,

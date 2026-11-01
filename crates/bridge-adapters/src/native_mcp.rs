@@ -309,8 +309,10 @@ fn endpoint(
         if prior != identity || !fs::symlink_metadata(&path)?.file_type().is_socket() {
             return Err(io::Error::other("unmanaged native context endpoint"));
         }
-        if UnixStream::connect(&path).is_ok() {
-            return Err(io::Error::other("native context endpoint active"));
+        match crate::os::connect_unix(&path, std::time::Instant::now() + Duration::from_secs(3)) {
+            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
+            Ok(_) => return Err(io::Error::other("native context endpoint active")),
+            Err(_) => return Err(io::Error::other("native context endpoint state unknown")),
         }
         fs::remove_file(&path)?;
     }
@@ -513,7 +515,7 @@ pub fn run_sidecar(arguments: &[String]) -> io::Result<()> {
         Ok(())
     })();
     stop.store(true, Ordering::Release);
-    let _ = UnixStream::connect(&socket_guard.path);
+    let _ = os::connect_unix(&socket_guard.path, std::time::Instant::now() + IO_TIME);
     drop(events);
     drop(backend);
     drop(client);

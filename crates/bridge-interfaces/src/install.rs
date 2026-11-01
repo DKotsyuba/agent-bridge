@@ -398,7 +398,9 @@ fn exact_entries(dir: &Path, names: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
-/// Writes a new file with `mode`, synced.
+/// Writes a new file with exact `mode`, synced. Set the opened file's final
+/// permissions explicitly so inherited default ACLs or umask cannot silently
+/// change the sealed release contract; existing paths are never opened.
 fn write_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -406,7 +408,8 @@ fn write_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
         .mode(mode)
         .open(path)
         .map_err(|error| format!("{}: {error}", path.display()))?;
-    file.write_all(bytes)
+    file.set_permissions(std::fs::Permissions::from_mode(mode))
+        .and_then(|()| file.write_all(bytes))
         .and_then(|()| file.sync_all())
         .map_err(|error| format!("{}: {error}", path.display()))
 }

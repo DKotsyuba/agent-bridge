@@ -5,7 +5,7 @@
 //! scratch directories under the configured temporary root; the only processes started or
 //! signalled are the relay copies these tests spawn.
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -74,13 +74,18 @@ struct Fixture {
     core_socket: PathBuf,
 }
 
-/// Builds a fixture.
+/// Builds a fixture whose home/release ancestry is private even under inherited
+/// default ACLs, then seals the finished release directories as installation does.
 fn fixture() -> Fixture {
     let scratch = Scratch::new();
     let root = scratch.0.clone();
     let home = root.join("home");
     let bin = home.join("releases").join("0.1.0+t").join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(&bin)
+        .unwrap();
     let exe = bin.join("bridge-root-relay");
     std::fs::copy(env!("CARGO_BIN_EXE_bridge-root-relay"), &exe).unwrap();
     std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();

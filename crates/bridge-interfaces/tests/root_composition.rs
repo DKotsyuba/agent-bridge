@@ -15,7 +15,7 @@
 //! temporary root.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -49,6 +49,9 @@ const NAMESPACE: &str = "claude-lab";
 
 /// Second Claude store namespace of the lab (same harness build).
 const NAMESPACE2: &str = "claude-lab2";
+
+/// Private test-binary copy prepared once per lab before its harnesses start.
+const HARNESS_EXECUTABLE: &str = "root_composition-harness";
 
 /// Role dispatcher: a no-op test normally; the harness or hook role when
 /// re-run by the composition test.
@@ -193,9 +196,11 @@ struct Harnessed {
 }
 
 impl Harnessed {
-    /// Starts the stand-in with `CLAUDE_CONFIG_DIR=store`.
+    /// Starts the lab's prepared private executable beside `store`, with
+    /// `CLAUDE_CONFIG_DIR=store`; several harnesses may share the unchanged copy.
     fn start(store: &Path) -> Harnessed {
-        let mut child = Command::new(std::env::current_exe().unwrap())
+        let executable = store.parent().unwrap().join(HARNESS_EXECUTABLE);
+        let mut child = Command::new(executable)
             .args([
                 "--exact",
                 "role_entry",
@@ -346,13 +351,34 @@ fn lab_with_addresses(tag: &str, any: bool) -> Lab {
     lab_with_delivery(tag, any, false)
 }
 
-/// Opts in to bounded delivery only for its dedicated synthetic composition check.
+/// Prepares private stores and an executable copy unchanged before process birth,
+/// independent of the built test binary's inherited ACL permissions. Opts in to
+/// bounded delivery only for its dedicated synthetic composition check.
 fn lab_with_delivery(tag: &str, any: bool, bounded: bool) -> Lab {
     let dir = scratch(tag);
     let store = dir.join("cs");
-    std::fs::create_dir_all(&store).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&store)
+        .unwrap();
     let store2 = dir.join("cs2");
-    std::fs::create_dir_all(&store2).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&store2)
+        .unwrap();
+    let executable = dir.join(HARNESS_EXECUTABLE);
+    std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let metadata = std::fs::metadata(&executable).unwrap();
+    let written = u64::try_from(metadata.mtime().max(metadata.ctime())).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    while bridge_core::service::current_unix_millis() / 1000 <= written.saturating_add(1) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fixture executable clock did not advance before process birth"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
     let core_socket = dir.join("core.sock");
     let grants = vec![
         GrantConfig {

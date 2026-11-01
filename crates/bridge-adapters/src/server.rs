@@ -313,7 +313,7 @@ fn claim_stale_socket(socket: &Path, owner_uid: u32) -> std::io::Result<()> {
             "channel path is not a socket of this user; left untouched",
         ));
     }
-    match UnixStream::connect(socket) {
+    match crate::os::connect_unix(socket, std::time::Instant::now() + Duration::from_secs(3)) {
         Ok(_) => Err(std::io::Error::new(
             std::io::ErrorKind::AddrInUse,
             "a live server already owns the channel socket",
