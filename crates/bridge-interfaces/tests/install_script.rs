@@ -144,3 +144,64 @@ fn a_linked_bin_directory_or_sums_file_is_refused_before_anything_runs() {
         );
     }
 }
+
+/// Plugin files join pre-execution attestation. Missing, linked, tampered or
+/// extra entries (including hidden files) refuse before the synthetic bridge runs.
+#[test]
+fn plugin_pre_execution_attestation_and_exact_entries() {
+    if !supported() {
+        return;
+    }
+    for kind in [
+        "valid",
+        "missing",
+        "link",
+        "directory",
+        "tamper",
+        "extra",
+        "hidden",
+        "root",
+    ] {
+        let root = scratch();
+        bundle(&root);
+        let dir = root.join("bundle");
+        std::fs::create_dir_all(dir.join("plugins/opencode")).unwrap();
+        let mut sums = std::fs::read_to_string(dir.join("SHA256SUMS")).unwrap();
+        for name in ["index.js", "package.json"] {
+            let path = dir.join("plugins/opencode").join(name);
+            std::fs::write(&path, "synthetic").unwrap();
+            sums.push_str(&format!(
+                "{}  plugins/opencode/{name}\n",
+                file_sha256(&path).unwrap()
+            ));
+        }
+        std::fs::write(dir.join("SHA256SUMS"), &sums).unwrap();
+        let digest = file_sha256(&dir.join("SHA256SUMS")).unwrap();
+        let entry = dir.join("plugins/opencode/index.js");
+        match kind {
+            "missing" => std::fs::remove_file(&entry).unwrap(),
+            "link" => {
+                std::fs::remove_file(&entry).unwrap();
+                std::os::unix::fs::symlink(dir.join("release-manifest.json"), &entry).unwrap();
+            }
+            "directory" => {
+                std::fs::rename(dir.join("plugins"), root.join("external")).unwrap();
+                std::os::unix::fs::symlink(root.join("external"), dir.join("plugins")).unwrap();
+            }
+            "tamper" => std::fs::write(&entry, "changed").unwrap(),
+            "extra" => std::fs::write(dir.join("plugins/opencode/extra.js"), "x").unwrap(),
+            "hidden" => std::fs::write(dir.join("plugins/opencode/.hidden"), "x").unwrap(),
+            "root" => std::fs::write(dir.join("extra"), "x").unwrap(),
+            "valid" => {}
+            _ => unreachable!(),
+        }
+        let output = install(&root, &digest);
+        assert_eq!(
+            output.status.success(),
+            kind == "valid",
+            "{kind}: {output:?}"
+        );
+        assert_eq!(root.join("ran").exists(), kind == "valid", "{kind}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

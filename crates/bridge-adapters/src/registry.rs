@@ -4,11 +4,15 @@
 //! The registry lives in the Bridge daemon and is fed only by connections
 //! on the adapter channel ([`crate::server`]) whose peer the kernel
 //! identifies. A peer counts as a *hook of a harness* only when its parent
-//! chain reaches a qualified harness executable through allowlisted
-//! intermediates (shells), as the same user, and that harness's own store
-//! is a configured profile. That harness process incarnation (PID plus
-//! start time) is the protected channel: every record below is scoped to
-//! it.
+//! chain reaches the harness process through allowlisted intermediates
+//! (shells), as the same user, for a harness kind enabled by the configured
+//! harness policy. That process must be a marked harness (its resolved
+//! executable path carries the product marker), run an executable that is
+//! unchanged since it started, and have its own store (derived from its
+//! environment) be a canonical directory owned by this user that no group or
+//! other user can write. No store path or harness executable is predeclared.
+//! That harness process incarnation (PID plus start time) is the protected
+//! channel: every record below is scoped to it.
 //!
 //! - **Bindings.** The first hook of an address from a harness incarnation,
 //!   the owner's own non-`compact` `SessionStart` (never a Claude child's,
@@ -24,6 +28,16 @@
 //!   leaves it only on such a positive owner event (a first `SubagentStop`,
 //!   a child's event or an unrelated notification never makes it idle).
 //!   Unknown is never inactive.
+//! - **Component evidence.** Bridge's own privileged components (relays, owner
+//!   relays, backend audiences) are qualified by the real SHA-256 of their exact
+//!   file identity, hashed outside this registry's lock (at startup and by a
+//!   background refresh after an update), never by reading a file while serving.
+//!   Native recipient binaries are not predeclared: capabilities come from the
+//!   harness-level policy.
+//! - **Idle gateway.** A Codex Desktop address whose harness incarnation ended
+//!   while positively idle can still receive one MESSAGE through a unique live
+//!   Desktop frontend, from a transcript-bound proof and with no caller or inject
+//!   authority (the `gateway` module).
 //! - **Call records.** Each `PreToolUse` records its per-call id
 //!   (`tool_use_id`, the same value the harness later presents as Claude
 //!   `claudecode/toolUseId` or Codex `callId`) with the actual actor. A
@@ -43,6 +57,8 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bridge_core::dispatch::{Attestation, Capabilities, Lifecycle};
 use bridge_core::{Harness, NativeAddress};
@@ -50,10 +66,19 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::os::{self, PeerIdentity, ProcessFacts};
+use crate::server::lock_registry;
 
 mod assertions;
 mod claims;
+mod executables;
+mod gateway;
+mod observations;
 pub(crate) use claims::EvidenceClaim;
+pub use executables::VendorSignature;
+#[cfg(test)]
+use executables::wait_refresh;
+pub(crate) use executables::{refresh_stale, stop_refresh};
+pub(crate) use gateway::WakeProof;
 
 /// Largest accepted native identifier (session, agent, call id), in bytes.
 pub const MAX_NATIVE_ID_BYTES: usize = 256;
@@ -68,36 +93,228 @@ pub const DEFAULT_MAX_BINDINGS: usize = 4_096;
 /// Default largest age of a call record a caller may join, in milliseconds.
 pub const DEFAULT_MAX_CALL_AGE_MS: u64 = 10 * 60_000;
 
-/// One executable build qualified for a profile, and what it supports.
+/// Legacy migration input: one executable build of a retired profile entry.
 ///
-/// Capabilities are qualified support of this exact loaded build (matched
-/// by resolved path *and* SHA-256 of the file the process was started
-/// from), not network liveness.
+/// It still parses so that a configuration written for the removed executable
+/// trust loads, and only its `inject` and `message` flags are read (to derive
+/// the harness-level policy when no `[[adapters.harnesses]]` entry exists). The
+/// path, digest and signature never authorize, qualify or restrict a harness.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QualifiedExecutable {
     /// Absolute resolved path of the harness executable.
     pub path: PathBuf,
-    /// Lowercase hex SHA-256 of the qualified file.
+    /// Lowercase hex SHA-256 recorded for the legacy file; never checked.
     pub sha256: String,
-    /// Human version label recorded in proof references.
+    /// Human version label recorded in legacy configuration.
     pub version: String,
-    /// Root hook context injection is qualified on this build.
+    /// Legacy: root hook context injection declared for this build; read only to
+    /// derive the harness policy when no `harnesses` entry exists.
     pub inject: bool,
-    /// The harness's message carrier is qualified on this build.
+    /// Legacy: the harness's message carrier declared for this build; read only
+    /// to derive the harness policy when no `harnesses` entry exists.
     pub message: bool,
+    /// Optional legacy vendor signing identity, ignored (see [`VendorSignature`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<VendorSignature>,
 }
 
-/// One native store (home/profile) of one harness under this OS user.
+/// Legacy migration input: one native store entry of the retired static trust.
+///
+/// A configuration written for it still loads. It authorizes nothing: no store
+/// is allowed or refused because of it. Its only effects are the harness policy
+/// derived from it when no `[[adapters.harnesses]]` entry exists, and the
+/// namespace label an address of exactly this store keeps, so addresses of
+/// existing journals and consumers stay stable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Profile {
     /// The `native_store_namespace` component of addresses in this store.
     pub namespace: String,
     /// Harness product of the store.
     pub harness: Harness,
-    /// Absolute store directory (`CODEX_HOME`, Claude config directory).
+    /// Absolute store directory (`CODEX_HOME`, Claude config directory); only a
+    /// namespace label, never an allowlist entry.
     pub store: PathBuf,
-    /// Qualified harness builds that may own sessions in this store.
+    /// Legacy executable entries; only their capability flags are read.
     pub executables: Vec<QualifiedExecutable>,
+}
+
+/// Harness-level policy (the harness *profile*): which native harness product
+/// this daemon serves, the default `native_store_namespace` of its addresses, the
+/// capabilities its bindings carry and, for a harness Bridge ships no code for,
+/// where its store lives and how its children are addressed. It names no store
+/// path and no executable: a fresh session of the harness in any canonical
+/// owner-only store registers from its genuine lifecycle hook. A profile only
+/// says where to look; every kernel check of the registry still applies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessPolicy {
+    /// The harness product: `Codex`, `ClaudeCode`, `OpenCode` (historical
+    /// spellings of the built-in harnesses) or any other canonical identifier.
+    pub harness: Harness,
+    /// Default `native_store_namespace` component of this harness's addresses.
+    pub namespace: String,
+    /// Root hook context injection is supported for this harness.
+    pub inject: bool,
+    /// The harness's message carrier is supported.
+    pub message: bool,
+    /// Case-insensitive substrings of the harness process's resolved executable
+    /// path that positively mark it as this product. Empty means the product name
+    /// (`codex`, `claude` or `opencode`) of a built-in harness, else the harness
+    /// identifier. An unrelated ancestor (a terminal, a build tool, a generic
+    /// wrapper) matches none and is never a harness. Best-effort identification,
+    /// not authentication.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub executable_markers: Vec<String>,
+    /// Environment variable of the harness process that names its store; read
+    /// from that process's own environment. Only for a harness that is not
+    /// built in (whose store rule is fixed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_env: Option<String>,
+    /// Store relative to the harness process's own `$HOME`, used when
+    /// `store_env` is unset or absent. Only for a harness that is not built in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_home: Option<PathBuf>,
+    /// How a child actor (an event with an `agent_id`) is addressed. Only for a
+    /// harness that is not built in; absent means [`ChildAddress::Shared`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_address: Option<ChildAddress>,
+    /// Accepted caller proofs ([`CallerProof`]); empty means the harness
+    /// default ([`HarnessPolicy::caller_proofs`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub caller_proof: Vec<CallerProof>,
+}
+
+/// How an MCP call that reached Bridge is joined to the protected `PreToolUse`
+/// record a hook of the same harness incarnation made for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CallerProof {
+    /// Claude Code `_meta["claudecode/toolUseId"]`.
+    ClaudeMeta,
+    /// Codex `_meta.threadId` + `_meta.callId` + `x-codex-turn-metadata`.
+    CodexMeta,
+    /// OpenCode plugin-stamped `_meta` session and call identifiers.
+    OpencodeMeta,
+    /// A single-use token the daemon issues at the `PreToolUse` hook of a Bridge
+    /// root tool call and the hook writes into the call's input
+    /// (`hookSpecificOutput.updatedInput`); independent of host `_meta`.
+    HookToken,
+}
+
+/// How the child actors of a harness are addressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildAddress {
+    /// A child acts inside its root session's address and never owns it: its
+    /// events never make the address idle (Claude Code subagents).
+    Shared,
+    /// A child has its own address and owns it (Codex child threads).
+    Own,
+}
+
+impl HarnessPolicy {
+    /// The marker used when `executable_markers` is empty: the product name of
+    /// a built-in harness, else the harness identifier.
+    fn default_marker(&self) -> &str {
+        match self.harness {
+            Harness::CODEX => "codex",
+            Harness::CLAUDE_CODE => "claude",
+            Harness::OPENCODE => "opencode",
+            _ => self.harness.as_str(),
+        }
+    }
+
+    /// Effective child addressing: fixed for the built-in harnesses (Claude
+    /// children share the root address; Codex threads and OpenCode sessions have
+    /// their own), configured or shared for any other harness.
+    pub fn child_address(&self) -> ChildAddress {
+        match self.harness {
+            Harness::CLAUDE_CODE => ChildAddress::Shared,
+            Harness::CODEX | Harness::OPENCODE => ChildAddress::Own,
+            _ => self.child_address.unwrap_or(ChildAddress::Shared),
+        }
+    }
+
+    /// Effective accepted caller proofs: the configured list, else the harness
+    /// default (the built-in `_meta` contract of a built-in harness, the hook
+    /// token for any other harness).
+    pub fn caller_proofs(&self) -> Vec<CallerProof> {
+        if !self.caller_proof.is_empty() {
+            return self.caller_proof.clone();
+        }
+        vec![self.native_meta_proof().unwrap_or(CallerProof::HookToken)]
+    }
+
+    /// The `_meta` contract a built-in harness's host presents, if any.
+    fn native_meta_proof(&self) -> Option<CallerProof> {
+        match self.harness {
+            Harness::CODEX => Some(CallerProof::CodexMeta),
+            Harness::CLAUDE_CODE => Some(CallerProof::ClaudeMeta),
+            Harness::OPENCODE => Some(CallerProof::OpencodeMeta),
+            _ => None,
+        }
+    }
+
+    /// Whether this profile accepts `proof`.
+    pub fn accepts(&self, proof: CallerProof) -> bool {
+        self.caller_proofs().contains(&proof)
+    }
+
+    /// Checks the profile fields that only a harness without built-in code may
+    /// carry: a built-in harness has a fixed store rule and child addressing; any
+    /// other harness needs a store rule (`store_env` and/or a relative,
+    /// `..`-free `store_home`).
+    ///
+    /// # Errors
+    ///
+    /// The violated rule, naming the harness.
+    fn validate_profile(&self) -> Result<(), String> {
+        let id = self.harness.as_str();
+        if let Some(foreign) = self.caller_proof.iter().find(|proof| {
+            **proof != CallerProof::HookToken && Some(**proof) != self.native_meta_proof()
+        }) {
+            return Err(format!(
+                "{id}: caller_proof {foreign:?} is another host's _meta contract"
+            ));
+        }
+        if self.harness.is_built_in() {
+            if self.store_env.is_some() || self.store_home.is_some() || self.child_address.is_some()
+            {
+                return Err(format!(
+                    "{id}: store_env, store_home and child_address are fixed for a built-in harness"
+                ));
+            }
+            return Ok(());
+        }
+        if let Some(variable) = &self.store_env {
+            let valid = !variable.is_empty()
+                && variable.len() <= 128
+                && variable
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+                && !variable.as_bytes()[0].is_ascii_digit();
+            if !valid {
+                return Err(format!(
+                    "{id}: store_env is not an environment variable name"
+                ));
+            }
+        }
+        if let Some(relative) = &self.store_home {
+            let valid = !relative.as_os_str().is_empty()
+                && relative
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)));
+            if !valid {
+                return Err(format!(
+                    "{id}: store_home must be a relative path without `.` or `..`"
+                ));
+            }
+        }
+        if self.store_env.is_none() && self.store_home.is_none() {
+            return Err(format!("{id}: a profile needs store_env or store_home"));
+        }
+        Ok(())
+    }
 }
 
 /// Registry configuration, normally the `[adapters]` table of the daemon
@@ -106,7 +323,12 @@ pub struct Profile {
 pub struct RegistryConfig {
     /// `host_id` component of every address this daemon attests.
     pub host_id: String,
-    /// Configured stores.
+    /// Harness-level policies; empty together with empty `profiles` serves no
+    /// native harness.
+    #[serde(default)]
+    pub harnesses: Vec<HarnessPolicy>,
+    /// Legacy migration input (see [`Profile`]); authorizes nothing.
+    #[serde(default)]
     pub profiles: Vec<Profile>,
     /// Executables allowed between a peer and its harness (shells that
     /// launch hook commands). The peer's own executable is not checked.
@@ -123,6 +345,50 @@ pub struct RegistryConfig {
     /// Optional generic backend audiences; absent preserves legacy deployments.
     #[serde(default)]
     pub audiences: Vec<BackendAudience>,
+    /// Parse-only legacy input: how many `[[adapters.owner_relays]]` entries a
+    /// configuration written for the removed owner path and SHA-256 allowlist
+    /// carries. The entries themselves are discarded unread: they authorize
+    /// nothing, join no digest cache and play no part in owner admission; the
+    /// count only lets [`Registry::migration_notes`] report them as
+    /// `legacy_owner_relays_ignored`. Never serialized and not a current setting.
+    #[doc(hidden)]
+    #[serde(
+        default,
+        rename = "owner_relays",
+        deserialize_with = "count_legacy_entries",
+        skip_serializing
+    )]
+    pub legacy_owner_relays: usize,
+}
+
+/// Prefix of the migration note that reports an ignored legacy `owner_relays`
+/// table: the daemon log event and the `bridge doctor` check
+/// `legacy_owner_relays_ignored` are derived from it. Profile notes carry no
+/// prefix and keep their established event and check names.
+pub const LEGACY_OWNER_RELAYS_PREFIX: &str = "legacy_owner_relays_ignored: ";
+
+/// Deserializes a legacy list setting into its entry count, discarding every
+/// entry unread (whatever its shape): the parse-only half of a retired setting.
+fn count_legacy_entries<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<usize, D::Error> {
+    Vec::<serde::de::IgnoredAny>::deserialize(deserializer).map(|entries| entries.len())
+}
+
+impl RegistryConfig {
+    /// The effective harness-level policies and the notes of what was migrated
+    /// or ignored from legacy `profiles` and `owner_relays`, exactly as
+    /// [`Registry::new`] derives them, without building a registry (no file is
+    /// read). Used by the operator checks.
+    ///
+    /// # Errors
+    ///
+    /// An invalid namespace, two policies for one harness, `harnesses` together
+    /// with legacy `profiles`, or legacy profiles of one harness naming more than
+    /// one distinct namespace.
+    pub fn harness_policies(&self) -> Result<(Vec<HarnessPolicy>, Vec<String>), String> {
+        Registry::derive_policies(self)
+    }
 }
 
 /// One relay build allowed to redeem sealed caller proofs.
@@ -218,7 +484,8 @@ pub enum CorrelationError {
     /// Records, binding or presented fields disagree.
     Conflicting(String),
     /// The presented material is not caller evidence (not a hook of a
-    /// qualified harness, wrong user, model arguments, foreign fields).
+    /// marked harness process of a served policy, wrong user, model arguments,
+    /// foreign fields).
     NotEvidence(String),
     /// The registry could not be reached or answered malformed data.
     Unavailable(String),
@@ -295,6 +562,12 @@ pub enum CallerChannel {
     /// Codex `_meta.threadId` + `_meta.callId` joined to one `PreToolUse`
     /// hook record of the same thread.
     CodexCall,
+    /// Trusted OpenCode Bridge plugin context joined to its exact native hook call.
+    #[serde(rename = "opencode_call")]
+    OpenCodeCall,
+    /// A single-use hook token ([`CallerProof::HookToken`]) joined to its exact
+    /// `PreToolUse` record.
+    HookToken,
 }
 
 /// Protected native MCP request metadata presented for caller attestation.
@@ -335,12 +608,70 @@ pub enum PresentedMeta {
         /// `_meta.callId`: the per-call identifier.
         call_id: String,
     },
+    /// Native context carried by the first-party OpenCode Bridge plugin only.
+    /// Ordinary OpenCode MCP session metadata alone is not a complete contract.
+    #[serde(rename = "opencode")]
+    OpenCode {
+        /// Native ToolContext.sessionID, independent of model arguments.
+        session_id: String,
+        /// Native ToolContext.id joined to the plugin's protected PreToolUse record.
+        call_id: String,
+    },
     /// A sealed proof issued by the registry for an already attested
     /// caller; redeemable once, only by a configured relay executable.
     Sealed {
         /// The opaque proof text.
         proof: SealedProof,
     },
+    /// A single-use hook token the frontend took out of the call's arguments
+    /// (see [`CallerProof::HookToken`]); it names one protected `PreToolUse`
+    /// record and still needs the presenting process's own kernel ancestry.
+    HookToken {
+        /// The opaque token text.
+        token: CallToken,
+    },
+}
+
+/// An opaque, unguessable, single-use hook token issued for one protected
+/// `PreToolUse` record. It carries no caller facts; `Debug` never prints it and
+/// the registry keeps only its SHA-256.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CallToken(String);
+
+impl CallToken {
+    /// Wraps token text received from a hook reply or an MCP argument; validity
+    /// is decided only by the registry join.
+    pub fn from_wire(text: impl Into<String>) -> Self {
+        CallToken(text.into())
+    }
+
+    /// The token text (treat as a secret; never log).
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for CallToken {
+    /// Prints a placeholder instead of the token.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CallToken(<redacted>)")
+    }
+}
+
+/// The MCP argument a hook token travels in: the `PreToolUse` reply adds it to
+/// the call's input and the restricted frontend removes it before anything else
+/// reads the arguments.
+pub const CALL_TOKEN_ARGUMENT: &str = "bridge_call_token";
+
+/// Whether `tool_name` is a Bridge root tool call in the native MCP grammar
+/// (`mcp__<server>__bridge_me|bridge_send|bridge_status`), the only calls a
+/// hook token is issued for, so no other MCP server ever receives one.
+fn is_bridge_root_tool(tool_name: &str) -> bool {
+    tool_name.starts_with("mcp__")
+        && ["__bridge_me", "__bridge_send", "__bridge_status"]
+            .iter()
+            .any(|suffix| tool_name.ends_with(suffix))
 }
 
 /// An opaque, unguessable, single-use caller proof issued by the registry.
@@ -387,6 +718,9 @@ impl PresentedMeta {
             .iter()
             .any(|field| meta.contains_key(*field));
         let claude = meta.contains_key("claudecode/toolUseId");
+        let opencode = ["ai.opencode/sessionID", "ai.agent_bridge/toolCallID"]
+            .iter()
+            .any(|key| meta.contains_key(*key));
         let field = |name: &str| -> Result<String, CorrelationError> {
             let value = meta
                 .get(name)
@@ -394,8 +728,8 @@ impl PresentedMeta {
                 .ok_or_else(|| CorrelationError::NotEvidence(format!("_meta {name} missing")))?;
             checked_id(value, name).map_err(CorrelationError::NotEvidence)
         };
-        match (codex, claude) {
-            (true, false) => {
+        match (codex, claude, opencode) {
+            (true, false, false) => {
                 let Some(turn) = meta
                     .get("x-codex-turn-metadata")
                     .and_then(serde_json::Value::as_object)
@@ -420,8 +754,12 @@ impl PresentedMeta {
                     call_id: field("callId")?,
                 })
             }
-            (false, true) => Ok(PresentedMeta::Claude {
+            (false, true, false) => Ok(PresentedMeta::Claude {
                 tool_use_id: field("claudecode/toolUseId")?,
+            }),
+            (false, false, true) => Ok(PresentedMeta::OpenCode {
+                session_id: field("ai.opencode/sessionID")?,
+                call_id: field("ai.agent_bridge/toolCallID")?,
             }),
             _ => Err(CorrelationError::NotEvidence(
                 "_meta does not carry exactly one supported host contract".into(),
@@ -434,13 +772,22 @@ impl PresentedMeta {
         PresentedMeta::Sealed { proof }
     }
 
-    /// The per-call identifier and harness of native metadata; `None` for
-    /// a sealed proof.
-    fn native(&self) -> Option<(&str, Harness)> {
+    /// The per-call identifier, harness and caller channel of native metadata;
+    /// `None` for a sealed proof.
+    fn native(&self) -> Option<(&str, Harness, CallerChannel)> {
         match self {
-            PresentedMeta::Claude { tool_use_id } => Some((tool_use_id, Harness::ClaudeCode)),
-            PresentedMeta::Codex { call_id, .. } => Some((call_id, Harness::Codex)),
-            PresentedMeta::Sealed { .. } => None,
+            PresentedMeta::Claude { tool_use_id } => Some((
+                tool_use_id,
+                Harness::CLAUDE_CODE,
+                CallerChannel::ClaudeToolUse,
+            )),
+            PresentedMeta::Codex { call_id, .. } => {
+                Some((call_id, Harness::CODEX, CallerChannel::CodexCall))
+            }
+            PresentedMeta::OpenCode { call_id, .. } => {
+                Some((call_id, Harness::OPENCODE, CallerChannel::OpenCodeCall))
+            }
+            PresentedMeta::Sealed { .. } | PresentedMeta::HookToken { .. } => None,
         }
     }
 }
@@ -597,6 +944,10 @@ impl CallerAttestor for Unattested {
 /// Native hook event names this registry understands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookKind {
+    /// OpenCode observed activity; never a context drain or caller record.
+    OpenCodeActivity,
+    /// OpenCode lost its lifecycle feed; readiness is explicitly unknown.
+    OpenCodeUnknown,
     /// Session started, resumed, cleared or compacted.
     SessionStart,
     /// A user prompt was submitted (natural context point).
@@ -623,6 +974,8 @@ impl HookKind {
     /// Parses the native `hook_event_name`.
     fn parse(name: &str) -> Option<Self> {
         Some(match name {
+            "OpenCodeActivity" => HookKind::OpenCodeActivity,
+            "OpenCodeUnknown" => HookKind::OpenCodeUnknown,
             "SessionStart" => HookKind::SessionStart,
             "UserPromptSubmit" => HookKind::UserPromptSubmit,
             "PreToolUse" => HookKind::PreToolUse,
@@ -640,6 +993,8 @@ impl HookKind {
     /// The native name, for hook output and proof references.
     pub fn as_str(self) -> &'static str {
         match self {
+            HookKind::OpenCodeActivity => "OpenCodeActivity",
+            HookKind::OpenCodeUnknown => "OpenCodeUnknown",
             HookKind::SessionStart => "SessionStart",
             HookKind::UserPromptSubmit => "UserPromptSubmit",
             HookKind::PreToolUse => "PreToolUse",
@@ -709,6 +1064,10 @@ pub struct HookAdmission {
     /// At a context point of the addressed root actor with qualified
     /// inject: the attestation under which the hook may drain.
     pub drain: Option<Attestation>,
+    /// At the `PreToolUse` of a Bridge root tool call of a harness whose profile
+    /// accepts [`CallerProof::HookToken`]: the token the hook writes into the
+    /// call's input.
+    pub token: Option<CallToken>,
 }
 
 /// One binding of an address to a harness incarnation. Only daemon-verified
@@ -726,22 +1085,25 @@ struct Binding {
     /// on positive runtime disablement, and restore it only up to
     /// `qualified`).
     capabilities: Capabilities,
-    /// The capabilities the loaded build is qualified for at renewal (the
-    /// profile's, minus host-level unsupported paths); never exceeded.
+    /// The capabilities the harness policy grants at renewal (minus host-level
+    /// unsupported paths); never exceeded.
     qualified: Capabilities,
-    /// Qualified build label for proof references.
+    /// Label of the policy the binding was made under, for proof references.
     version: String,
     /// Owner-session lifecycle from the latest hook; a new or renewed
     /// binding starts [`Lifecycle::Unknown`] and leaves it only on a
     /// positive owner-actor observation ([`next_lifecycle`]).
     lifecycle: Lifecycle,
-    /// Session transcript inside the profile store, when reported.
+    /// Session transcript inside the harness store, when reported.
     transcript: Option<PathBuf>,
-    /// Profile store of the binding.
+    /// Harness store of the binding (the harness process's own, a process fact).
     store: PathBuf,
-    /// Qualified harness executable of the binding.
+    /// Harness executable of the binding, as the verified process runs it (a
+    /// process fact, never an allowlist entry).
     executable: PathBuf,
-    /// Set by root `SessionEnd`; normal recipient and caller authority stays refused.
+    /// Set by the root's `SessionEnd`, and by an OpenCode child's own
+    /// `SessionEnd` (its own address ended); normal recipient and caller
+    /// authority stays refused until a renewal.
     retired: bool,
     /// Positive pre-end Desktop owner idleness, granting only native MESSAGE
     /// candidate eligibility. Missing legacy facts keep tombstones held. Old
@@ -754,6 +1116,30 @@ struct Binding {
     /// Missing values read as None and are omitted when writing old-shaped rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     desktop_idle_transcript: Option<(u64, u64)>,
+    /// Positive-idle proof of a live Codex Desktop owner, bound to its exact
+    /// stable transcript, enabling the MESSAGE-only gateway route after the
+    /// harness incarnation ends (see the `gateway` module). Stamped only by an
+    /// owner hook that leaves the lifecycle `Inactive` and cleared by every other
+    /// lifecycle, renewal, retirement and a spent hand-off; absent in journals of
+    /// older builds (such rows are never gateway-eligible) and omitted when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wake: Option<WakeProof>,
+    /// Journal compatibility only: a row written by the removed vendor-signature
+    /// verification of a route whose build was not yet proven. It is never
+    /// written (always false) and a row carrying `true` is dropped on restore,
+    /// because it was never proven; the harness's own next hook registers the
+    /// address afresh. Absent in journals of other builds; omitted when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pending: bool,
+    /// OpenCode only: the actor whose own hooks feed this address (`Root`, or
+    /// `Child` for a subagent session, which is never a MESSAGE recipient),
+    /// recorded at binding. `None` for every other harness (their rows keep
+    /// their shape) and in OpenCode rows written by earlier builds: such a row
+    /// is ambiguous, restored without MESSAGE until the address's own next hook
+    /// renews it with the actor recorded. An earlier build refuses a journal
+    /// carrying this field (rows deny unknown fields), like `wake`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    role: Option<ActorRole>,
 }
 
 /// Serde omission predicate for the private idle fact: false carries no new
@@ -787,6 +1173,8 @@ struct CallRecord {
     claimed: bool,
     /// Bounded protected native tool classification, never producer meaning.
     tool_name: Option<String>,
+    /// SHA-256 of the hook token issued for this record, if any.
+    token_digest: Option<String>,
 }
 
 /// The harness a peer belongs to.
@@ -794,10 +1182,14 @@ struct CallRecord {
 struct HarnessMatch {
     /// Harness incarnation.
     incarnation: (u32, u64),
-    /// Index of the matched profile.
-    profile: usize,
-    /// Index of the matched executable in the profile.
-    executable: usize,
+    /// The harness's own store, derived from its process environment and proven
+    /// canonical, owned by this user and not writable by group or other.
+    store: PathBuf,
+    /// The resolved executable of the harness process (a process fact recorded
+    /// for incarnation consistency, never an allowlist entry).
+    executable: PathBuf,
+    /// The harness-level policy of the matched harness kind.
+    policy: HarnessPolicy,
 }
 
 /// Identity of one exact executable file, the key of its hashed digest.
@@ -827,15 +1219,19 @@ struct FileKey {
 /// The identity of the file at `path` (following symlinks, as the kernel
 /// resolves a started executable), or `None` when it is unreadable.
 fn file_key(path: &Path) -> Option<FileKey> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = std::fs::metadata(path).ok()?;
-    Some(FileKey {
+    Some(key_of(path, &std::fs::metadata(path).ok()?))
+}
+
+/// The identity of `path` from already read `metadata`, which may come from an
+/// opened descriptor so the identity is that of the exact file being read.
+fn key_of(path: &Path, metadata: &std::fs::Metadata) -> FileKey {
+    FileKey {
         path: path.to_path_buf(),
         inode: (metadata.dev(), metadata.ino()),
         len: metadata.len(),
         mtime: (metadata.mtime(), metadata.mtime_nsec()),
         ctime: (metadata.ctime(), metadata.ctime_nsec()),
-    })
+    }
 }
 
 /// Recipient view for the message carriers.
@@ -845,34 +1241,39 @@ pub struct RecipientBinding {
     pub harness: (u32, u64),
     /// Endpoint epoch.
     pub epoch: u64,
-    /// Profile store directory.
+    /// Harness store directory, the harness process's own (a process fact).
     pub store: PathBuf,
-    /// Qualified harness executable (the loaded build).
+    /// Harness executable the verified process runs (a process fact).
     pub executable: PathBuf,
     /// Session transcript inside the store, when reported by hooks.
     pub transcript: Option<PathBuf>,
     /// This MESSAGE snapshot requires the native Desktop route even if its
     /// capability disappears after validation; never fall back to a CLI helper.
     pub(crate) desktop_message_only: bool,
+    /// This snapshot is the MESSAGE-only physical gateway of an idle address
+    /// whose harness incarnation ended; `harness` is then the gateway, and a
+    /// hand-off through it spends the one-shot wake proof.
+    pub(crate) gateway: bool,
 }
 
-/// Owned Codex MESSAGE validation snapshot; performs OS/file validation after
-/// releasing the registry lock. Ordinary bindings retain their capabilities;
-/// retired Desktop exceptions supply no inject, caller or call authority.
-pub(crate) struct CodexMessageCandidate {
+/// Owned MESSAGE validation snapshot of a Codex or Claude Code recipient;
+/// performs OS/file validation after releasing the registry lock. Ordinary
+/// bindings retain their capabilities; retired Codex Desktop exceptions supply no
+/// inject, caller or call authority. Both the carrier routes and the native owner
+/// route start from this snapshot and then separately prove their own route.
+pub(crate) struct MessageCandidate {
     /// Exact private binding, including its unchanged tombstone epoch.
     binding: Binding,
-    /// Current configured executable qualification, never journal authority.
-    qualified: QualifiedExecutable,
+    /// Current harness-level policy, never journal authority: it can only narrow
+    /// the binding's capabilities.
+    policy: HarnessPolicy,
     /// Owner required for both process and retained transcript.
     owner_uid: u32,
-    /// Startup-warmed identities of this qualified executable; no runtime hashing.
-    keys: Vec<FileKey>,
 }
 
-impl CodexMessageCandidate {
-    /// Revalidates exact PID/start, owner, executable, current profile/store and
-    /// startup-warmed loaded bytes. Retired candidates additionally require the
+impl MessageCandidate {
+    /// Revalidates exact PID/start, owner, recorded executable and the harness's
+    /// own canonical owner-only store. Retired candidates additionally require the
     /// app capability and the same owned regular transcript under sessions,
     /// with no symlink/path traversal. Returns Inactive only for that private
     /// positive fact; all missing or changed evidence refuses before sending.
@@ -881,23 +1282,18 @@ impl CodexMessageCandidate {
     /// retired transcript checks still require the literal configured sessions
     /// prefix and a canonical path without symlink components, plus exact inode.
     /// The caller must perform the final locked stamp check after frontend I/O.
+    ///
+    /// A live, non-retired Codex Desktop binding whose lifecycle is `Unknown` but
+    /// that carries an unspent idle proof is
+    /// attested `Inactive`, message-only and flagged as a proof route (its send
+    /// spends the proof) only while that exact transcript proof reads back
+    /// unchanged; otherwise it stays `Unknown`, which core holds.
     pub(crate) fn validate(&self) -> Result<(Attestation, RecipientBinding), String> {
         let binding = &self.binding;
-        let facts = os::process_facts(binding.harness.0).ok_or("harness is gone")?;
-        let key = file_key(&binding.executable).ok_or("executable unreadable")?;
-        if facts.uid != Some(self.owner_uid)
-            || facts.start_time != binding.harness.1
-            || facts.exe.as_ref() != Some(&binding.executable)
-            || !harness_store(&facts, Harness::Codex)
-                .is_some_and(|store| same_path(&store, &binding.store))
-            || !self.keys.contains(&key)
-            || i128::from(key.mtime.0.max(key.ctime.0)) >= i128::from(facts.start_time)
-        {
-            return Err("Codex message harness/store/loaded build changed".into());
-        }
+        let facts = self.live_check()?;
         let lifecycle = if binding.retired {
             if !binding.desktop_idle_message
-                || binding.address.harness != Harness::Codex
+                || binding.address.harness != Harness::CODEX
                 || os::process_env(facts.pid, "CODEX_APP_TOOLS_PIPE_PATH").is_none()
                 || retained_transcript(binding, self.owner_uid) != binding.desktop_idle_transcript
                 || binding.desktop_idle_transcript.is_none()
@@ -905,21 +1301,34 @@ impl CodexMessageCandidate {
                 return Err("retired Desktop message evidence unavailable".into());
             }
             Lifecycle::Inactive
+        } else if self.needs_idle_proof() && self.proves_idle().is_ok() {
+            Lifecycle::Inactive
         } else {
             binding.lifecycle
         };
+        let proven = !binding.retired && lifecycle != binding.lifecycle;
         let attestation = Attestation::verified(
             binding.address.clone(),
             binding.address.native_session_id.clone(),
             binding.epoch,
             lifecycle,
             Capabilities {
-                inject: !binding.retired && binding.capabilities.inject,
-                message: binding.capabilities.message && self.qualified.message,
+                inject: !binding.retired
+                    && !proven
+                    && binding.capabilities.inject
+                    && self.policy.inject,
+                message: binding.capabilities.message && self.policy.message,
             },
             proof(format!(
-                "codex-message:{}@{}:epoch{}",
-                binding.harness.0, binding.harness.1, binding.epoch
+                "{}-message:{}@{}:epoch{}",
+                match &binding.address.harness {
+                    &Harness::CODEX => "codex",
+                    &Harness::CLAUDE_CODE => "claude",
+                    other => other.as_str(),
+                },
+                binding.harness.0,
+                binding.harness.1,
+                binding.epoch
             )),
         )
         .map_err(|error| error.to_string())?;
@@ -932,9 +1341,45 @@ impl CodexMessageCandidate {
                 executable: binding.executable.clone(),
                 transcript: binding.transcript.clone(),
                 desktop_message_only: binding.retired,
+                gateway: proven,
             },
         ))
     }
+
+    /// Re-reads the live harness of the snapshot and proves it still is the
+    /// recorded incarnation (exact PID and start time), the same user, executable
+    /// and store, an executable that is still owner/root-owned, non-writable and
+    /// unchanged since process birth, and a store that is still a canonical
+    /// directory owned by this user and not writable by group or other. Returns
+    /// its facts.
+    ///
+    /// # Errors
+    ///
+    /// The harness is gone or anything above changed.
+    fn live_check(&self) -> Result<ProcessFacts, String> {
+        live_binding(&self.binding, &self.policy, self.owner_uid)
+    }
+}
+
+/// Revalidates one existing binding's exact live PID/start, UID, executable and
+/// process-selected canonical private store without modifying registry state.
+/// Returns current process facts; any absent or changed fact fails closed.
+fn live_binding(
+    binding: &Binding,
+    policy: &HarnessPolicy,
+    owner_uid: u32,
+) -> Result<ProcessFacts, String> {
+    let facts = os::process_facts(binding.harness.0).ok_or("harness is gone")?;
+    if facts.uid != Some(owner_uid)
+        || facts.start_time != binding.harness.1
+        || facts.exe.as_ref() != Some(&binding.executable)
+        || harness_store(&facts, policy).is_none_or(|store| store != binding.store)
+        || private_store(&binding.store, owner_uid).is_err()
+        || executable_current(&binding.executable, &facts, owner_uid).is_err()
+    {
+        return Err("message harness/store changed".into());
+    }
+    Ok(facts)
 }
 
 /// Returns device/inode only for the exact owned regular transcript inside the
@@ -968,8 +1413,9 @@ struct RouteSnapshot {
 const MAX_ROUTE_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Protected native registry. Verified recipient routes can be journaled in the
-/// private channel directory and recovered only for the same live, qualified
-/// harness/store. Call records, exclusive claims, sealed proofs and detached
+/// private channel directory and recovered only for the same live harness
+/// incarnation in its own store (or as a gateway candidate of a gone Codex
+/// incarnation). Call records, exclusive claims, sealed proofs and detached
 /// assertions remain strictly memory-only; route history is never fresh authority.
 #[derive(Debug)]
 pub struct Registry {
@@ -985,9 +1431,23 @@ pub struct Registry {
     calls: HashMap<String, Vec<CallRecord>>,
     /// Call ids in insertion order, for bounded eviction.
     call_order: VecDeque<String>,
-    /// Executable digests hashed by [`Registry::warm_digests`], keyed by the
-    /// exact file identity; never filled while serving.
+    /// Digests of the configured relay and audience executables
+    /// hashed by [`Registry::warm_digests`] or [`refresh_stale`], keyed by the
+    /// exact file identity; the newest identity per path only. Serving never
+    /// hashes: the cache is filled only outside the registry lock.
     digests: HashMap<FileKey, String>,
+    /// Single-flight flag of [`refresh_stale`]: set while a background pass runs.
+    refreshing: Arc<AtomicBool>,
+    /// Join handle of the running refresh pass, for [`stop_refresh`].
+    pass: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+    /// Set by [`stop_refresh`] when the daemon stops: no pass starts or commits.
+    stopping: Arc<AtomicBool>,
+    /// Effective harness-level policies, at most one per harness kind: the
+    /// configured `harnesses`, or the single policy migrated from legacy profiles.
+    policies: Vec<HarnessPolicy>,
+    /// Plain-text notes of what was migrated or ignored from the legacy
+    /// configuration, for the operator log; never silently dropped.
+    migration_notes: Vec<String>,
     /// Outstanding sealed proofs by SHA-256 of the proof text.
     sealed: HashMap<String, Sealed>,
     /// Ephemeral issuer identity for globally unique native source-use keys.
@@ -1000,8 +1460,8 @@ pub struct Registry {
     assertion_slots: std::collections::HashSet<(String, String)>,
     /// Bound of retained call records.
     max_calls: usize,
-    /// Harnesses whose message carrier is unavailable on this host (for
-    /// example no OS confinement launcher): never granted, so publication
+    /// Harnesses whose entire message carrier is explicitly unavailable on this host:
+    /// never granted, so publication
     /// refuses before acceptance.
     message_disabled: Vec<Harness>,
 }
@@ -1060,9 +1520,16 @@ impl Registry {
     /// Builds an empty registry for `owner_uid` (the daemon's own user).
     ///
     /// Refuses a configuration with relative paths, an empty namespace or
-    /// host id, or a malformed digest.
+    /// host id, a malformed digest, more than one policy for a harness, both
+    /// `harnesses` and legacy `profiles`, or legacy profiles of one harness that
+    /// name more than one distinct namespace.
     ///
-    /// Before returning, hashes every configured harness and relay
+    /// Native recipients are not predeclared by store or executable: the harness
+    /// policy (or the single policy migrated from legacy profiles, whose paths,
+    /// digests and signatures are dropped and reported by
+    /// [`Registry::migration_notes`]) is all a fresh session needs.
+    ///
+    /// Before returning, hashes every configured relay and audience
     /// executable once ([`Registry::warm_digests`]), so a registry that is
     /// shared and served afterwards never reads an executable while
     /// handling a request and no caller has to remember a separate warm-up
@@ -1071,23 +1538,105 @@ impl Registry {
     /// unoptimized); a missing or unreadable file does not fail the
     /// constructor, it just stays unqualified.
     pub fn new(config: RegistryConfig, owner_uid: u32) -> Result<Self, String> {
-        checked_id(&config.host_id, "host_id")?;
+        Self::build(config, owner_uid)
+    }
+
+    /// Derives the effective harness policies and the migration notes from
+    /// `config`: `harnesses` as written, or one policy per harness of the legacy
+    /// `profiles` (union of their capability flags, their single namespace).
+    ///
+    /// # Errors
+    ///
+    /// A namespace is invalid, a harness has two policies, `harnesses` and
+    /// `profiles` are both present, or legacy profiles of one harness name more
+    /// than one distinct namespace (ambiguous: the operator must choose).
+    pub(crate) fn derive_policies(
+        config: &RegistryConfig,
+    ) -> Result<(Vec<HarnessPolicy>, Vec<String>), String> {
+        for policy in &config.harnesses {
+            checked_id(&policy.namespace, "namespace")?;
+            policy.validate_profile()?;
+        }
+        if !config.harnesses.is_empty() && !config.profiles.is_empty() {
+            return Err(
+                "configure either [[adapters.harnesses]] or the legacy [[adapters.profiles]], not both"
+                    .into(),
+            );
+        }
+        let mut policies: Vec<HarnessPolicy> = Vec::new();
+        let mut notes = Vec::new();
+        if config.legacy_owner_relays > 0 {
+            notes.push(format!(
+                "{LEGACY_OWNER_RELAYS_PREFIX}{} [[adapters.owner_relays]] entr{} ignored; the native owner route no longer uses an owner path or digest and trusts only the same-user direct-parent owner running a trusted, unchanged executable, so nothing here authorizes or restricts anything",
+                config.legacy_owner_relays,
+                if config.legacy_owner_relays == 1 { "y" } else { "ies" }
+            ));
+        }
+        for policy in &config.harnesses {
+            if policies.iter().any(|known| known.harness == policy.harness) {
+                return Err("one harness cannot carry two policies".into());
+            }
+            policies.push(policy.clone());
+        }
         for profile in &config.profiles {
             checked_id(&profile.namespace, "namespace")?;
-            if !profile.store.is_absolute() {
-                return Err("profile store must be absolute".into());
+            let capability =
+                |select: fn(&QualifiedExecutable) -> bool| profile.executables.iter().any(select);
+            match policies
+                .iter_mut()
+                .find(|known| known.harness == profile.harness)
+            {
+                Some(known) if known.namespace != profile.namespace => {
+                    return Err(format!(
+                        "legacy profiles of one harness name more than one namespace ({} and {}); configure [[adapters.harnesses]] explicitly",
+                        known.namespace, profile.namespace
+                    ));
+                }
+                Some(known) => {
+                    known.inject |= capability(|e| e.inject);
+                    known.message |= capability(|e| e.message);
+                }
+                None => policies.push(HarnessPolicy {
+                    harness: profile.harness,
+                    namespace: profile.namespace.clone(),
+                    inject: capability(|e| e.inject),
+                    message: capability(|e| e.message),
+                    executable_markers: Vec::new(),
+                    store_env: None,
+                    store_home: None,
+                    child_address: None,
+                    caller_proof: Vec::new(),
+                }),
             }
-            for executable in &profile.executables {
-                if !executable.path.is_absolute() {
-                    return Err("qualified executable path must be absolute".into());
-                }
-                if executable.sha256.len() != 64
-                    || !executable.sha256.bytes().all(|b| b.is_ascii_hexdigit())
-                {
-                    return Err("qualified executable sha256 must be 64 hex digits".into());
-                }
+            notes.push(format!(
+                "legacy profile {} migrated to the {} harness policy: its store path, {} executable path(s), digests and vendor signatures no longer authorize anything",
+                profile.namespace,
+                profile.harness,
+                profile.executables.len()
+            ));
+        }
+        if policies
+            .iter()
+            .any(|policy| policy.harness == Harness::OPENCODE && policy.inject)
+        {
+            return Err("OpenCode hook context injection is not qualified".into());
+        }
+        Ok((policies, notes))
+    }
+
+    /// Resolves existing configured intermediate aliases to the kernel's executable paths,
+    /// validates policy and warms privileged-component digests once. Unresolvable paths retain
+    /// their configured spelling; no fallback executable or trust policy is introduced.
+    fn build(mut config: RegistryConfig, owner_uid: u32) -> Result<Self, String> {
+        // Kernel process facts report resolved executable paths. Preserve each operator-selected
+        // executable across aliases such as Debian's /bin/sh -> /usr/bin/dash.
+        for path in &mut config.intermediates {
+            if let Ok(canonical) = path.canonicalize() {
+                *path = canonical;
             }
         }
+        checked_id(&config.host_id, "host_id")?;
+        let (policies, migration_notes) = Self::derive_policies(&config)?;
         let mut audience_names = Vec::new();
         for audience in &config.audiences {
             checked_id(&audience.name, "audience")?;
@@ -1115,6 +1664,11 @@ impl Registry {
             calls: HashMap::new(),
             call_order: VecDeque::new(),
             digests: HashMap::new(),
+            refreshing: Arc::new(AtomicBool::new(false)),
+            pass: Arc::new(Mutex::new(None)),
+            stopping: Arc::new(AtomicBool::new(false)),
+            policies,
+            migration_notes,
             sealed: HashMap::new(),
             issuer_boot: crate::os::random_bytes()
                 .map_err(|error| error.to_string())?
@@ -1134,16 +1688,29 @@ impl Registry {
     /// Attaches the private route journal and revalidates every saved route before
     /// publishing a new endpoint epoch. `path` must lie in an existing owner-only
     /// channel directory. Missing snapshots are initial setup; malformed, symlinked,
-    /// foreign, shared, oversized or unsupported files refuse startup. Dead/reused
-    /// processes and changed stores/builds/profiles are omitted. Retired
-    /// tombstones retain their exact epoch and refusal fences; their optional
-    /// Desktop MESSAGE fact is revalidated on every carrier use, never promoted
-    /// into normal live authority by recovery. Missing new fields default false/
-    /// None and false/None values are omitted, preserving old row shape. Older
-    /// binaries reject eligible rows with new fields (`deny_unknown_fields`),
-    /// so rollback with those rows requires a compatible journal or fresh setup.
-    /// Current profile capabilities bound recovery; unknown/input-wait lifecycle
-    /// stays such. No hook is manufactured and no caller/proof record is restored.
+    /// foreign, shared, oversized or unsupported files refuse startup. A recorded
+    /// PID is the same incarnation only with its exact recorded start time (a reused
+    /// PID is gone), and a live row whose process store, executable or owner no
+    /// longer matches the recorded facts is omitted. A row carrying the removed
+    /// `pending` flag is dropped, never restored: it was never proven. A gone
+    /// Codex incarnation is retained, inert, only while it carries an *unspent*
+    /// idle proof and its address still has a harness policy and an owned private
+    /// store (its committed gateway is forgotten; a spent or absent proof drops the
+    /// row). Retired tombstones retain their exact epoch and refusal fences; their
+    /// optional Desktop MESSAGE fact is revalidated on every carrier use, never
+    /// promoted into normal live authority by recovery. Missing new fields default
+    /// false/None and false/None values are omitted, preserving old row shape.
+    /// Rollback boundary: `Binding.wake` (written on every Desktop idle owner hook)
+    /// and `Binding.pending` are journal fields and the row type denies unknown
+    /// fields, so a daemon of an earlier build refuses to start on a journal that
+    /// contains them; rolling back
+    /// needs a compatible (earlier) journal or a fresh one, and no migration rewrites
+    /// rows. A live OpenCode row keeps MESSAGE only when it records its actor as
+    /// the root (`Binding.role`): a recorded child, or an earlier build's row
+    /// with no actor fact, is restored with MESSAGE withheld, so core refuses a
+    /// message to it before acceptance until its own next hook renews it. Current harness policy capabilities bound recovery; unknown/input-wait
+    /// lifecycle stays such. No hook is manufactured and no caller/proof record is
+    /// restored.
     /// Returns fresh recipient attestations for core to fence before serving.
     pub fn attach_journal(&mut self, path: &Path, now_ms: u64) -> Result<Vec<Attestation>, String> {
         if self.journal.as_deref() == Some(path) {
@@ -1200,46 +1767,51 @@ impl Registry {
                         .or_insert(binding);
                     continue;
                 }
-                let Some(facts) = os::process_facts(binding.harness.0) else {
+                // A row of the removed vendor verification was never proven; it
+                // is inert history and is not restored.
+                if binding.pending {
+                    continue;
+                }
+                // The recorded incarnation is alive only if its PID is held by a
+                // process with exactly the recorded start time: a reused PID is a
+                // different process, gone for every purpose and never authority.
+                let live = os::process_facts(binding.harness.0)
+                    .filter(|facts| facts.start_time == binding.harness.1);
+                let Some(facts) = live else {
+                    // A gone incarnation survives only as an *unspent* gateway
+                    // candidate (the spend is journaled before any native write, so
+                    // a spent proof is already absent) of a still-configured exact
+                    // thread, store and executable: it keeps its epoch and proof, no
+                    // ordinary route attests it, and every gateway fact is proven
+                    // again at use against the live gateway.
+                    if self.policy(binding.address.harness).is_some()
+                        && binding.address.harness == Harness::CODEX
+                        && private_store(&binding.store, self.owner_uid).is_ok()
+                        && let Some(wake) = binding.wake.as_mut()
+                    {
+                        // A committed gateway was bound to a process of the
+                        // previous daemon life: it is forgotten and re-committed
+                        // with a fresh epoch at first use.
+                        wake.forget_gateway();
+                        self.bindings
+                            .entry(binding.address.to_canonical_string())
+                            .or_insert(binding);
+                    }
+                    continue;
+                };
+                let Some(policy) = self.policy(binding.address.harness).cloned() else {
                     continue;
                 };
                 if facts.uid != Some(self.owner_uid)
-                    || facts.start_time != binding.harness.1
                     || facts.exe.as_ref() != Some(&binding.executable)
-                    || harness_store(&facts, binding.address.harness).as_ref()
-                        != Some(&binding.store)
-                {
-                    continue;
-                }
-                let qualified = self
-                    .config
-                    .profiles
-                    .iter()
-                    .find(|p| {
-                        p.harness == binding.address.harness
-                            && p.namespace == binding.address.native_store_namespace
-                            && p.store == binding.store
-                    })
-                    .and_then(|p| p.executables.iter().find(|e| e.path == binding.executable))
-                    .cloned();
-                let Some(qualified) = qualified else {
-                    continue;
-                };
-                if self
-                    .verify_loaded(&qualified.path, facts.start_time, &qualified.sha256)
-                    .is_err()
+                    || harness_store(&facts, &policy).as_ref() != Some(&binding.store)
+                    || private_store(&binding.store, self.owner_uid).is_err()
+                    || executable_current(&binding.executable, &facts, self.owner_uid).is_err()
                 {
                     continue;
                 }
                 binding.epoch = now_ms.max(binding.epoch + 1);
-                binding.qualified = Capabilities {
-                    inject: qualified.inject,
-                    message: qualified.message
-                        && !self.message_disabled.contains(&binding.address.harness),
-                };
-                binding.capabilities.inject &= binding.qualified.inject;
-                binding.capabilities.message &= binding.qualified.message;
-                binding.version = qualified.version;
+                self.apply_policy(&mut binding, &policy);
                 if binding
                     .transcript
                     .as_ref()
@@ -1257,9 +1829,49 @@ impl Registry {
         Ok(self
             .bindings
             .values()
-            .filter(|b| !b.retired)
+            .filter(|b| !b.retired && !b.pending)
             .filter_map(|b| self.attest_recipient(&b.address).ok().map(|(a, _)| a))
             .collect())
+    }
+
+    /// The effective harness-level policy of `harness`, or `None` when this
+    /// daemon serves no such harness.
+    pub(crate) fn policy(&self, harness: Harness) -> Option<&HarnessPolicy> {
+        self.policies
+            .iter()
+            .find(|policy| policy.harness == harness)
+    }
+
+    /// What was migrated or ignored from the legacy configuration, for the
+    /// operator log and `bridge doctor`: one note per legacy profile, plus one
+    /// `legacy_owner_relays_ignored` note (prefixed
+    /// [`LEGACY_OWNER_RELAYS_PREFIX`]) when an `owner_relays` table was present;
+    /// empty when none was configured.
+    pub fn migration_notes(&self) -> &[String] {
+        &self.migration_notes
+    }
+
+    /// Sets a restored binding's capabilities from the current harness policy:
+    /// the saved capabilities are only ever narrowed, message is not granted on a
+    /// host that disabled it, and the policy label replaces the saved one.
+    /// An OpenCode row recorded as a child is never qualified for MESSAGE, and
+    /// one without a recorded actor (an earlier build's row) is restored with
+    /// MESSAGE withheld, so core refuses messages to it before acceptance until
+    /// its own next hook records the actor (see [`Registry::admit_hook`]).
+    fn apply_policy(&self, binding: &mut Binding, policy: &HarnessPolicy) {
+        let opencode = binding.address.harness == Harness::OPENCODE;
+        binding.qualified = Capabilities {
+            inject: policy.inject,
+            message: policy.message
+                && !self.message_disabled.contains(&binding.address.harness)
+                && !(opencode && binding.role == Some(ActorRole::Child)),
+        };
+        binding.capabilities.inject &= binding.qualified.inject;
+        binding.capabilities.message &= binding.qualified.message;
+        if opencode && binding.role.is_none() {
+            binding.capabilities.message = false;
+        }
+        binding.version = POLICY_LABEL.to_string();
     }
 
     /// Atomically fsyncs the bounded verified-route snapshot with mode 0600 and
@@ -1302,36 +1914,42 @@ impl Registry {
         Ok(())
     }
 
-    /// Bootstraps a missing interactive Claude recipient from fresh native session
-    /// metadata, including clients opened before route journals existed. Addresses
-    /// already known (including ended/held tombstones) are never overwritten. A
-    /// descriptor supplies only session/PID/status; current OS UID/start/executable,
-    /// process-owned store, descriptor age and qualified loaded bytes are rechecked.
-    /// Persistence precedes delivery and caller records remain absent. Returns
-    /// no-op on absent/unknown native evidence; normal attestation then holds it.
+    /// Re-observes the lifecycle of a known live interactive Claude route stuck at
+    /// `Unknown` from fresh native session metadata. No address is ever created
+    /// here (registration comes only from the harness's own hook), and every other
+    /// known address (ended or held tombstones, input-waiting or already-observed
+    /// routes) is left alone.
+    ///
+    /// Only a fresh owned descriptor in the route's own store that positively
+    /// reports `idle` or `busy` for exactly the recorded session, PID and start
+    /// time, executable and store, written at or after the process start, sets the
+    /// lifecycle (same epoch, no capability or caller change, journaled with
+    /// rollback on failure). The store must still be a canonical owner-only
+    /// directory, the process a marked harness running a trusted executable
+    /// unchanged since it started. An unreadable, unknown-status, stale,
+    /// foreign-store or reused-PID descriptor changes nothing; nothing is inferred
+    /// from the earlier saved state.
     pub(crate) fn discover_claude_recipient(
         &mut self,
         address: &NativeAddress,
-        now_ms: u64,
     ) -> Result<(), String> {
         let key = address.to_canonical_string();
-        if self.bindings.contains_key(&key)
+        let Some(known) = self.bindings.get(&key).cloned() else {
+            return Ok(());
+        };
+        if known.retired
+            || known.pending
+            || known.lifecycle != Lifecycle::Unknown
             || address.host_id != self.config.host_id
-            || address.harness != Harness::ClaudeCode
+            || address.harness != Harness::CLAUDE_CODE
         {
             return Ok(());
         }
-        let Some(profile) = self
-            .config
-            .profiles
-            .iter()
-            .find(|p| p.harness == address.harness && p.namespace == address.native_store_namespace)
-            .cloned()
-        else {
+        let Some(policy) = self.policy(Harness::CLAUDE_CODE).cloned() else {
             return Ok(());
         };
         let Some(hint) =
-            crate::claude::session_hint(&profile.store, &address.native_session_id, self.owner_uid)
+            crate::claude::session_hint(&known.store, &address.native_session_id, self.owner_uid)
         else {
             return Ok(());
         };
@@ -1339,53 +1957,21 @@ impl Registry {
             return Ok(());
         };
         if facts.uid != Some(self.owner_uid)
+            || (facts.pid, facts.start_time) != known.harness
             || i128::from(hint.written_at) < i128::from(facts.start_time)
-            || harness_store(&facts, Harness::ClaudeCode).as_ref() != Some(&profile.store)
+            || facts.exe.as_ref() != Some(&known.executable)
+            || harness_store(&facts, &policy).as_ref() != Some(&known.store)
+            || private_store(&known.store, self.owner_uid).is_err()
+            || !product_marked(&facts, &policy)
+            || executable_current(&known.executable, &facts, self.owner_uid).is_err()
         {
             return Ok(());
         }
-        let Some(exe) = profile
-            .executables
-            .iter()
-            .find(|e| facts.exe.as_ref() == Some(&e.path))
-            .cloned()
-        else {
-            return Ok(());
-        };
-        if self
-            .verify_loaded(&exe.path, facts.start_time, &exe.sha256)
-            .is_err()
-        {
-            return Ok(());
-        }
-        self.evict_bindings();
-        if self.bindings.len() >= DEFAULT_MAX_BINDINGS {
-            return Err("verified route capacity exhausted".into());
-        }
-        let qualified = Capabilities {
-            inject: exe.inject,
-            message: exe.message && !self.message_disabled.contains(&Harness::ClaudeCode),
-        };
-        self.bindings.insert(
-            key.clone(),
-            Binding {
-                address: address.clone(),
-                harness: (facts.pid, facts.start_time),
-                epoch: now_ms.max(1),
-                capabilities: qualified,
-                qualified,
-                version: exe.version,
-                lifecycle: hint.lifecycle,
-                transcript: None,
-                store: profile.store,
-                executable: exe.path,
-                retired: false,
-                desktop_idle_message: false,
-                desktop_idle_transcript: None,
-            },
-        );
+        let mut observed = known.clone();
+        observed.lifecycle = hint.lifecycle;
+        self.bindings.insert(key.clone(), observed);
         if let Err(error) = self.persist_routes() {
-            self.bindings.remove(&key);
+            self.bindings.insert(key, known);
             return Err(error);
         }
         Ok(())
@@ -1400,22 +1986,9 @@ impl Registry {
         }
     }
 
-    /// Whether the file at `exe` is still a qualified build of some
-    /// profile (same path and digest) — checked before a carrier launches
-    /// it, so a replaced file is never started as the qualified build.
-    /// Reads no file: a file replaced since the startup hash is refused.
-    pub fn executable_qualified(&mut self, exe: &Path) -> bool {
-        let qualified: Vec<String> = self
-            .config
-            .profiles
-            .iter()
-            .flat_map(|profile| profile.executables.iter())
-            .filter(|candidate| candidate.path == exe)
-            .map(|candidate| candidate.sha256.clone())
-            .collect();
-        qualified
-            .iter()
-            .any(|digest| self.verify_loaded(exe, u64::MAX, digest).is_ok())
+    /// The only user id this registry accepts (the daemon's own user).
+    pub(crate) fn owner_uid(&self) -> u32 {
+        self.owner_uid
     }
 
     /// The configured host id.
@@ -1423,16 +1996,28 @@ impl Registry {
         &self.config.host_id
     }
 
-    /// Resolves the qualified harness a channel peer belongs to.
+    /// Resolves the harness a channel peer belongs to.
     ///
-    /// The peer must run as the owner; its nearest ancestor that is not an
-    /// allowlisted intermediate must be a configured executable of
-    /// `harness`, unmodified since that process started, with the
-    /// qualified digest, and its own store must be a configured profile.
+    /// The peer must run as the owner, and `harness` must be enabled by the
+    /// harness policy. Its nearest ancestor that is not an allowlisted
+    /// intermediate is the harness process: it must run as the owner, carry the
+    /// positive product marker ([`product_marked`]: the product name or a
+    /// configured marker in its resolved executable path; an inherited
+    /// environment variable never counts), have an executable that is a regular file owned by the owner or
+    /// root, not writable by group or other and unchanged since that process
+    /// started ([`executable_current`]), and a store, derived from its own
+    /// environment, that is a canonical directory owned by the owner and not
+    /// writable by group or other ([`private_store`]). No store path and no
+    /// executable is predeclared.
+    ///
+    /// `frontend` is true only for a Codex MCP caller attestation: then the
+    /// peer's direct parent alone may be the signed Node frontend hop (see
+    /// [`signed_node_hop`]) and is skipped before the walk; hooks never get it.
     fn harness_of(
         &mut self,
         peer: PeerIdentity,
         harness: Harness,
+        frontend: bool,
     ) -> Result<HarnessMatch, CorrelationError> {
         if peer.uid != self.owner_uid {
             return Err(CorrelationError::NotEvidence(
@@ -1443,7 +2028,12 @@ impl Registry {
         let Some((_, ancestors)) = chain.split_first() else {
             return Err(CorrelationError::NotEvidence("peer process is gone".into()));
         };
-        let candidate = ancestors.iter().find(|facts| {
+        let hop = frontend
+            && harness == Harness::CODEX
+            && ancestors
+                .first()
+                .is_some_and(|parent| signed_node_hop(peer.pid, parent, self.owner_uid));
+        let candidate = ancestors[usize::from(hop)..].iter().find(|facts| {
             !facts
                 .exe
                 .as_ref()
@@ -1457,107 +2047,75 @@ impl Registry {
                 "harness runs as another user".into(),
             ));
         }
+        let policy = self.policy(harness).cloned().ok_or_else(|| {
+            CorrelationError::NotEvidence(format!(
+                "{harness}: this harness is not enabled by any harness profile"
+            ))
+        })?;
+        if !product_marked(facts, &policy) {
+            return Err(CorrelationError::NotEvidence(format!(
+                "{harness}: the ancestor is not a marked harness process (executable_markers)"
+            )));
+        }
         let exe = facts
             .exe
             .clone()
             .ok_or_else(|| CorrelationError::NotEvidence("harness executable unreadable".into()))?;
-        let store = harness_store(facts, harness)
-            .ok_or_else(|| CorrelationError::NotEvidence("harness store unresolvable".into()))?;
-        let mut found = None;
-        for (index, profile) in self.config.profiles.iter().enumerate() {
-            if profile.harness != harness || !same_path(&profile.store, &store) {
-                continue;
-            }
-            if let Some(position) = profile.executables.iter().position(|e| e.path == exe) {
-                found = Some((index, position));
-                break;
-            }
-        }
-        let (profile, executable) = found.ok_or_else(|| {
-            CorrelationError::NotEvidence(
-                "harness build or store is not a qualified profile".into(),
-            )
+        executable_current(&exe, facts, self.owner_uid).map_err(CorrelationError::NotEvidence)?;
+        let store = harness_store(facts, &policy).ok_or_else(|| {
+            CorrelationError::NotEvidence(format!(
+                "{harness}: harness store unresolvable (store_env / store_home)"
+            ))
         })?;
-        let qualified = self.config.profiles[profile].executables[executable]
-            .sha256
-            .clone();
-        self.verify_loaded(&exe, facts.start_time, &qualified)?;
+        private_store(&store, self.owner_uid).map_err(CorrelationError::NotEvidence)?;
         Ok(HarnessMatch {
             incarnation: (facts.pid, facts.start_time),
-            profile,
-            executable,
+            store,
+            executable: exe,
+            policy,
         })
     }
 
-    /// Hashes every configured harness, relay and backend executable into the digest
-    /// cache. This is the only place an executable is ever hashed: serving
-    /// never reads one, so no hook or relay request can stall the registry
-    /// lock on a whole (possibly hundreds of MB) file.
+    /// Hashes every configured relay and backend executable into the digest
+    /// cache, blocking the caller for the whole read. It is the startup warm-up
+    /// ([`Registry::new`] already runs it, so consumers need not): never call it on
+    /// a registry that is shared and serving, since that would hash under the
+    /// lock. A serving daemon refreshes the cache with `refresh_stale` instead,
+    /// which hashes outside the lock. Calling it again is idempotent: a file whose
+    /// identity is already cached is not read again (it only reports the counts,
+    /// as the daemon does for its log), and only a file that changed since is
+    /// re-hashed, replacing the superseded identities of that path. The work is
+    /// one streamed read per distinct configured path, bounded by the file sizes
+    /// (about 1.6 s for 246 MB in an optimized build, tens of seconds
+    /// unoptimized). Each file is hashed for real, never trusted from its
+    /// configured digest, and cached only when its file identity (path, device
+    /// and inode, length, nanosecond mtime and ctime) is the same before and
+    /// after the read.
     ///
-    /// [`Registry::new`] already runs this, so consumers need not. Calling
-    /// it again is idempotent: a file whose identity is already cached is
-    /// not read again (it only reports the counts, as the daemon does for
-    /// its log), and only a file that changed since is re-hashed. Never call
-    /// it on a registry that is shared and serving, since that would hash
-    /// under the lock. The work is one streamed read per distinct
-    /// configured path, bounded by
-    /// the file sizes (about 1.6 s for 246 MB in an optimized build, tens
-    /// of seconds unoptimized). Each file is hashed for real, never trusted
-    /// from its configured digest, and cached only when its file identity
-    /// (path, device and inode, length, nanosecond mtime) is the same
-    /// before and after the read.
-    ///
-    /// Qualified afterwards: exactly those files, unchanged since. Not
-    /// qualified, with a `NotEvidence` refusal from every route that needs
-    /// the file: a configured file that was missing, unreadable or changing
-    /// at this call, and any file installed, replaced or modified later
-    /// (even by a same-size rewrite within the same second); other cached
-    /// executables keep attesting. The operator's next action is to restart
-    /// the daemon, which re-hashes the then-current files. Returns
-    /// `(cached, skipped)` path counts.
+    /// Qualified afterwards: exactly the files whose cached digest equals the
+    /// configured one, unchanged since. Not qualified, with a `NotEvidence`
+    /// refusal from every route that needs the file: a configured file that was
+    /// missing, unreadable or changing at this call, one whose real digest is not
+    /// the configured one (a new build is never accepted by hashing it), and any
+    /// file installed, replaced or modified later until `refresh_stale` has
+    /// hashed its new identity (even a same-size rewrite within the same second);
+    /// other cached executables keep attesting. Returns `(cached, skipped)` path
+    /// counts.
     pub fn warm_digests(&mut self) -> (usize, usize) {
-        let mut paths: Vec<&Path> = self
-            .config
-            .profiles
+        self.refresh_blocking();
+        let paths = self.configured_paths();
+        let cached = paths
             .iter()
-            .flat_map(|profile| profile.executables.iter().map(|e| e.path.as_path()))
-            .chain(self.config.relays.iter().map(|relay| relay.path.as_path()))
-            .chain(
-                self.config
-                    .audiences
-                    .iter()
-                    .map(|audience| audience.executable.path.as_path()),
-            )
-            .collect();
-        paths.sort();
-        paths.dedup();
-        let paths: Vec<PathBuf> = paths.into_iter().map(Path::to_path_buf).collect();
-        let (mut cached, mut skipped) = (0, 0);
-        for path in paths {
-            let Some(key) = file_key(&path) else {
-                skipped += 1;
-                continue;
-            };
-            if self.digests.contains_key(&key) {
-                cached += 1;
-                continue;
-            }
-            match file_sha256(&path) {
-                Ok(digest) if file_key(&path).as_ref() == Some(&key) => {
-                    self.digests.insert(key, digest);
-                    cached += 1;
-                }
-                _ => skipped += 1,
-            }
-        }
-        (cached, skipped)
+            .filter(|path| file_key(path).is_some_and(|key| self.digests.contains_key(&key)))
+            .count();
+        (cached, paths.len() - cached)
     }
 
-    /// How many configured harness and relay executable entries cannot
-    /// attest right now: the file is missing, unreadable, changed since it
+    /// How many configured relay and audience executable entries
+    /// cannot attest right now: the file is missing, unreadable, changed since it
     /// was hashed or not hashed, or its real hashed digest differs from the
-    /// configured one. One entry counts once, so the number is bounded by
-    /// the configuration.
+    /// configured one. One entry counts once, so the number is bounded by the
+    /// configuration.
     ///
     /// It only stats files and compares the cached real digests with the
     /// configured ones (never trusting the configured value, never reading
@@ -1565,85 +2123,91 @@ impl Registry {
     /// [`Registry::new`], to tell the operator that a route is
     /// unqualified. It does not look at process start times.
     pub fn unqualified_executables(&self) -> usize {
-        let profiles = self
-            .config
-            .profiles
-            .iter()
-            .flat_map(|profile| profile.executables.iter().map(|e| (&e.path, &e.sha256)));
-        let relays = self
-            .config
+        self.config
             .relays
             .iter()
-            .map(|relay| (&relay.path, &relay.sha256));
-        profiles
-            .chain(relays)
-            .filter(|(path, configured)| {
-                !file_key(path)
+            .filter(|relay| {
+                !file_key(&relay.path)
                     .and_then(|key| self.digests.get(&key))
-                    .is_some_and(|actual| actual.eq_ignore_ascii_case(configured))
+                    .is_some_and(|actual| actual.eq_ignore_ascii_case(&relay.sha256))
             })
             .count()
     }
 
-    /// Proves the loaded build: both the modification second and the
+    /// Proves the loaded build of a configured relay, audience or other Bridge
+    /// executable (never a native recipient's binary): both the modification second and the
     /// status-change (ctime) second of the file are strictly before the
     /// process start (`started` is the process start in Unix seconds, or
     /// `u64::MAX` when no process is involved) and its digest, hashed by
-    /// [`Registry::warm_digests`] for this exact file identity (which
-    /// includes the nanosecond ctime), equals `qualified`.
+    /// [`Registry::warm_digests`] or [`refresh_stale`] for this exact file
+    /// identity (which includes the nanosecond ctime), equals `qualified`.
     ///
     /// What this proves: since before the process was born, the file at the
     /// path has not been written, replaced, renamed into place or chmod-ed,
-    /// so the bytes on disk, hashed at startup, are the bytes the process
-    /// started from. mtime alone is not enough: an installer that restores
-    /// timestamps (`cp -p`, `install -p`, `touch`) keeps an old mtime, but
-    /// the kernel sets ctime on every such change and a program cannot set
-    /// it back, and the OS keeps reporting the same executable path for the
-    /// live process after a replacement (probed on macOS), so the path
-    /// alone shows nothing. Times are whole seconds, so a change in the very
-    /// second the process was born is ambiguous and refused; restarting the
-    /// harness a second or more after the last change to the file resolves
-    /// the birth-second ambiguity. A benign chmod or link change also moves
-    /// the nanosecond ctime, which is part of the daemon-start digest cache
-    /// identity too, so any change after the daemon warmed needs BOTH a
-    /// daemon restart (to hash the current file again, never under this
-    /// lock) and a harness restart (a new birth second). A run that wants
-    /// to show the stock binary was not touched should record its
-    /// inode, mtime and ctime before and after; nothing here claims the
-    /// operating system can never write it. It does not defend against code
-    /// that already runs as the user with the ability to move the system
-    /// clock backwards.
+    /// so the bytes on disk, hashed at any later time under the same identity,
+    /// are the bytes the process started from. mtime alone is not enough: an
+    /// installer that restores timestamps (`cp -p`, `install -p`, `touch`)
+    /// keeps an old mtime, but the kernel sets ctime on every such change and
+    /// a program cannot set it back, and the OS keeps reporting the same
+    /// executable path for the live process after a replacement (probed on
+    /// macOS), so the path alone shows nothing. Times are whole seconds, so a
+    /// change in the very second the process was born is ambiguous and
+    /// refused; restarting the harness a second or more after the last change
+    /// to the file resolves the birth-second ambiguity. A benign chmod or link
+    /// change moves the nanosecond ctime and so needs a new digest identity
+    /// ([`refresh_stale`], automatic and outside this lock) and a harness
+    /// started after it. A process that started before the change is never
+    /// proven loaded, whatever the digest. A run that wants to show the stock
+    /// binary was not touched should record its inode, mtime and ctime before
+    /// and after; nothing here claims the operating system can never write it.
+    /// It does not defend against code that already runs as the user with the
+    /// ability to move the system clock backwards.
     ///
-    /// Never reads the file: a file without a warmed digest (installed,
-    /// replaced or changed since startup, or missing at startup) is refused
-    /// as unqualified until the daemon restarts, so this is safe under the
-    /// registry lock.
+    /// Never reads the file: a file without a cached digest for its current
+    /// identity (missing, or installed, replaced or changed since the last
+    /// refresh) is refused as unqualified until [`refresh_stale`] has hashed
+    /// it, so this is safe under the registry lock. A different real digest is
+    /// refused as "not the configured build" however it got there.
     fn verify_loaded(
-        &mut self,
+        &self,
         exe: &Path,
         started: u64,
         qualified: &str,
     ) -> Result<(), CorrelationError> {
-        let key = file_key(exe)
-            .ok_or_else(|| CorrelationError::NotEvidence("harness executable unreadable".into()))?;
-        if i128::from(key.mtime.0.max(key.ctime.0)) >= i128::from(started) {
-            return Err(CorrelationError::NotEvidence(
-                "harness executable written or changed on disk at or after the process start second; loaded build unproven"
-                    .into(),
-            ));
-        }
+        let key = self.stable_identity(exe, started)?;
         let Some(digest) = self.digests.get(&key) else {
             return Err(CorrelationError::NotEvidence(
-                "harness executable was not hashed unchanged at daemon startup (new, replaced or modified since); unqualified until the daemon restarts"
+                "configured executable has no hashed digest for its current file identity (new, replaced or modified since the last hash); unqualified until it is hashed again"
                     .into(),
             ));
         };
         if !digest.eq_ignore_ascii_case(qualified) {
             return Err(CorrelationError::NotEvidence(
-                "harness build digest is not the qualified build".into(),
+                "executable digest is not the configured build".into(),
             ));
         }
         Ok(())
+    }
+
+    /// The current identity of `exe` when it was neither written nor changed
+    /// (mtime and ctime) at or after the process start second `started`, the
+    /// file-time gate of [`Registry::verify_loaded`].
+    ///
+    /// # Errors
+    ///
+    /// The file is unreadable, or its mtime or ctime second is not strictly
+    /// before `started` (the loaded build is then unproven).
+    fn stable_identity(&self, exe: &Path, started: u64) -> Result<FileKey, CorrelationError> {
+        let key = file_key(exe).ok_or_else(|| {
+            CorrelationError::NotEvidence("configured executable unreadable".into())
+        })?;
+        if i128::from(key.mtime.0.max(key.ctime.0)) >= i128::from(started) {
+            return Err(CorrelationError::NotEvidence(
+                "configured executable written or changed on disk at or after the process start second; loaded build unproven"
+                    .into(),
+            ));
+        }
+        Ok(key)
     }
 
     /// Admits one hook event from a channel peer.
@@ -1659,6 +2223,35 @@ impl Registry {
     /// Root Desktop SessionEnd can retain only prior positive owner Inactive
     /// message eligibility and the exact owned regular sessions transcript inode;
     /// retirement and Unknown lifecycle remain, and renewal clears both facts.
+    /// OpenCode bindings record their actor (`Binding.role`, from the hook:
+    /// root without `agent_id`, child with it). A child (its own address, never
+    /// positively idle) is bound without the MESSAGE capability, so core refuses
+    /// a message to it before acceptance; its `Stop` never makes it idle; its
+    /// own `SessionEnd` retires its binding with Unknown lifecycle. An OpenCode
+    /// binding whose recorded actor differs from, or lacks, this hook's actor
+    /// (an earlier build's row, restored with MESSAGE withheld) is renewed with
+    /// a new epoch, so a root regains MESSAGE and a child keeps it withdrawn.
+    /// Caller attestation is unchanged.
+    ///
+    /// The binding's namespace and capabilities come from the harness-level policy
+    /// of the matched harness, its store from the harness process's own
+    /// environment (proven canonical and owner-only), and it records the
+    /// executable the verified process actually runs. A fresh session in any such
+    /// store registers from its genuine hook with no pre-enrollment. After the
+    /// lifecycle transition a
+    /// Codex Desktop owner's **positive** idle event (the owner's own session
+    /// start, `Stop` or idle-prompt notification, never an event that merely
+    /// leaves an earlier `Inactive` in place) re-stamps the idle proof: the
+    /// retained transcript must be the owned regular file inside the store's
+    /// sessions directory whose first line (up to 1 MiB) is the `session_meta`
+    /// record of exactly this thread, read with its length, nanosecond times and
+    /// last 64 KiB from one stable descriptor; any other lifecycle, a retirement
+    /// or an unreadable transcript leaves no proof, and a `SessionEnd` keeps only
+    /// the proof stamped before it under the narrow retired-Desktop idle
+    /// exception. Every refusal above (another live incarnation, route-journal
+    /// failure with rollback, a peer that is not a marked harness) keeps the private endpoint
+    /// epoch, lifecycle and permission fences: labels, PIDs and model text never
+    /// become evidence.
     pub fn admit_hook(
         &mut self,
         peer: PeerIdentity,
@@ -1668,6 +2261,13 @@ impl Registry {
     ) -> Result<HookAdmission, CorrelationError> {
         let kind = HookKind::parse(&payload.hook_event_name)
             .ok_or_else(|| CorrelationError::NotEvidence("unsupported hook event".into()))?;
+        if harness != Harness::OPENCODE
+            && matches!(kind, HookKind::OpenCodeActivity | HookKind::OpenCodeUnknown)
+        {
+            return Err(CorrelationError::NotEvidence(
+                "hook event belongs to another harness".into(),
+            ));
+        }
         let session =
             checked_id(&payload.session_id, "session_id").map_err(CorrelationError::NotEvidence)?;
         let agent = payload
@@ -1679,35 +2279,41 @@ impl Registry {
         if kind == HookKind::PreToolUse && payload.tool_use_id.is_some() {
             self.ensure_call_capacity()?;
         }
-        let matched = self.harness_of(peer, harness)?;
-        let profile = self.config.profiles[matched.profile].clone();
-        let qualified = profile.executables[matched.executable].clone();
+        let matched = self.harness_of(peer, harness, false)?;
         // Claude children share the root session's address; Codex children
-        // are their own threads with their own addresses.
-        let (role, native_id, address_session) = match (&agent, harness) {
+        // are their own threads with their own addresses; any other harness
+        // follows its profile.
+        let (role, native_id, address_session) = match (&agent, matched.policy.child_address()) {
             (None, _) => (ActorRole::Root, session.clone(), session.clone()),
-            (Some(agent), Harness::ClaudeCode) => {
+            (Some(agent), ChildAddress::Shared) => {
                 (ActorRole::Child, agent.clone(), session.clone())
             }
-            (Some(agent), Harness::Codex) => (ActorRole::Child, agent.clone(), agent.clone()),
+            (Some(agent), ChildAddress::Own) => (ActorRole::Child, agent.clone(), agent.clone()),
         };
         let address = NativeAddress::new(
             self.config.host_id.clone(),
             harness,
-            profile.namespace.clone(),
+            matched.policy.namespace.clone(),
             address_session,
         )
         .map_err(|error| CorrelationError::NotEvidence(error.to_string()))?;
         let key = address.to_canonical_string();
+        // An OpenCode child never becomes positively idle (it does not own a
+        // wakeable session), so no MESSAGE to it could ever be delivered: its
+        // binding never advertises the capability and core refuses such a
+        // publication before acceptance instead of holding it forever.
+        let opencode_child = harness == Harness::OPENCODE && role == ActorRole::Child;
         let capabilities = Capabilities {
-            inject: qualified.inject,
-            message: qualified.message && !self.message_disabled.contains(&harness),
+            inject: matched.policy.inject,
+            message: matched.policy.message
+                && !self.message_disabled.contains(&harness)
+                && !opencode_child,
         };
         let transcript = payload
             .transcript_path
             .as_deref()
             .map(PathBuf::from)
-            .filter(|path| path.is_absolute() && path.starts_with(&profile.store));
+            .filter(|path| path.is_absolute() && path.starts_with(&matched.store));
 
         let previous_binding = self.bindings.get(&key).cloned();
         let (renewed, previous_epoch) = match self.bindings.get(&key) {
@@ -1719,8 +2325,14 @@ impl Registry {
                 }
                 (true, Some(binding.epoch))
             }
+            // An OpenCode binding without this actor recorded (an earlier
+            // build's row, restored with MESSAGE withheld) is renewed from the
+            // address's own hook, so core records the actor's true capability.
             Some(binding) => (
-                starts_own_session(kind, role, harness, payload) || binding.retired,
+                starts_own_session(kind, role, &matched.policy, payload)
+                    || binding.retired
+                    || binding.pending
+                    || (harness == Harness::OPENCODE && binding.role != Some(role)),
                 Some(binding.epoch),
             ),
             None => (true, None),
@@ -1742,18 +2354,23 @@ impl Registry {
                     epoch,
                     capabilities,
                     qualified: capabilities,
-                    version: qualified.version.clone(),
+                    version: POLICY_LABEL.to_string(),
                     lifecycle: Lifecycle::Unknown,
                     transcript: None,
-                    store: profile.store.clone(),
-                    executable: qualified.path.clone(),
+                    store: matched.store.clone(),
+                    executable: matched.executable.clone(),
                     retired: false,
                     desktop_idle_message: false,
                     desktop_idle_transcript: None,
+                    wake: None,
+                    pending: false,
+                    role: (harness == Harness::OPENCODE).then_some(role),
                 },
             );
         }
+        let owner_uid = self.owner_uid;
         let binding = self.bindings.get_mut(&key).expect("binding inserted above");
+        let prior_wake = binding.wake.take();
         let retained_path = transcript
             .as_ref()
             .is_none_or(|path| binding.transcript.as_ref() == Some(path));
@@ -1761,7 +2378,7 @@ impl Registry {
             binding.transcript = transcript;
         }
         if kind == HookKind::SessionEnd && role == ActorRole::Root {
-            binding.desktop_idle_transcript = if harness == Harness::Codex
+            binding.desktop_idle_transcript = if harness == Harness::CODEX
                 && binding.lifecycle == Lifecycle::Inactive
                 && retained_path
                 && os::process_env(binding.harness.0, "CODEX_APP_TOOLS_PIPE_PATH").is_some()
@@ -1772,8 +2389,33 @@ impl Registry {
             };
             binding.desktop_idle_message = binding.desktop_idle_transcript.is_some();
             binding.retired = true;
+        } else if kind == HookKind::SessionEnd && opencode_child {
+            // The child's own address ended (its native session was deleted):
+            // retire it truthfully; there is no idle exception for a child.
+            binding.retired = true;
         }
-        binding.lifecycle = next_lifecycle(binding.lifecycle, kind, role, harness, payload);
+        binding.lifecycle = next_lifecycle(binding.lifecycle, kind, role, &matched.policy, payload);
+        // ponytail: one bounded transcript read per idle hook under the lock (head line up to 1 MiB, last 64 KiB); stamp from a worker if hook rates ever matter.
+        // The proof is re-stamped only by a positive owner idle event, never by an
+        // event that merely leaves an earlier `Inactive` in place (a subagent stop,
+        // a Claude child's stop, an unrelated notification): those keep the proof
+        // stamped at the real idle, and any non-idle lifecycle clears it.
+        binding.wake = if harness != Harness::CODEX
+            || binding.retired
+            || binding.lifecycle != Lifecycle::Inactive
+        {
+            None
+        } else if is_positive_idle_event(kind, role, &matched.policy, payload) {
+            os::process_env(binding.harness.0, "CODEX_APP_TOOLS_PIPE_PATH")
+                .and_then(|_| gateway::read_stamp(binding, owner_uid))
+        } else {
+            prior_wake.clone()
+        };
+        if kind == HookKind::SessionEnd && role == ActorRole::Root && binding.desktop_idle_message {
+            // The narrow retired-Desktop idle exception keeps the proof stamped at
+            // the positive idle before the end; every other end clears it.
+            binding.wake = prior_wake;
+        }
         let binding = binding.clone();
         if let Err(error) = self.persist_routes() {
             match previous_binding {
@@ -1787,10 +2429,23 @@ impl Registry {
             return Err(CorrelationError::Unavailable(error));
         }
 
+        let mut token = None;
         if kind == HookKind::PreToolUse
             && let Some(call) = payload.tool_use_id.as_deref()
         {
             let call = checked_id(call, "tool_use_id").map_err(CorrelationError::NotEvidence)?;
+            let tool_name = payload
+                .tool_name
+                .as_deref()
+                .and_then(|name| checked_id(name, "tool_name").ok());
+            // A token is issued only for a Bridge root tool call of a profile that
+            // accepts it; an unavailable random source issues none (the call then
+            // simply cannot be attested by token).
+            token = (matched.policy.accepts(CallerProof::HookToken)
+                && tool_name.as_deref().is_some_and(is_bridge_root_tool))
+            .then(os::random_bytes)
+            .and_then(Result::ok)
+            .map(|random| CallToken(random.iter().map(|byte| format!("{byte:02x}")).collect()));
             self.record_call(
                 call,
                 CallRecord {
@@ -1802,10 +2457,10 @@ impl Registry {
                     observed_ms: now_ms,
                     consumed: false,
                     claimed: false,
-                    tool_name: payload
-                        .tool_name
-                        .as_deref()
-                        .and_then(|name| checked_id(name, "tool_name").ok()),
+                    tool_name,
+                    token_digest: token
+                        .as_ref()
+                        .map(|token| crate::server::sha256_hex(token.as_str().as_bytes())),
                 },
             );
         }
@@ -1832,7 +2487,7 @@ impl Registry {
             None
         };
         // Only the addressed actor itself, at a natural context point, with
-        // qualified inject, may drain; a Claude child sharing the root
+        // the inject capability of its binding, may drain; a Claude child sharing the root
         // address never may.
         let drain = if kind.is_context_point()
             && native_id == address.native_session_id
@@ -1860,6 +2515,7 @@ impl Registry {
             native_id,
             renewed,
             drain,
+            token,
         })
     }
 
@@ -1918,8 +2574,8 @@ impl Registry {
     /// Attests the actual caller of one MCP request.
     ///
     /// `peer` is the kernel identity of the process presenting the request
-    /// (the harness-launched MCP server). It must belong to a qualified
-    /// harness of the metadata's host; the per-call id must join exactly
+    /// (the harness-launched MCP server). It must belong to a marked harness
+    /// that the harness policy enables, on the metadata's host; the per-call id must join exactly
     /// one unconsumed record from that same harness incarnation, of the
     /// binding's current epoch, younger than the configured age; Codex's
     /// thread id must be the record's actor. A successful join consumes the
@@ -1943,6 +2599,39 @@ impl Registry {
         Ok(caller)
     }
 
+    /// Resolves a hook token to the native call it was issued for, the harness
+    /// of that call's binding and the hook-token channel. Only the token's
+    /// SHA-256 is compared; the refusal never repeats the token.
+    ///
+    /// # Errors
+    ///
+    /// No retained record carries this token (never issued, evicted, or the
+    /// `PreToolUse` hook that would issue it did not run), or its binding is gone.
+    fn token_call(
+        &self,
+        token: &CallToken,
+    ) -> Result<(String, Harness, CallerChannel), CorrelationError> {
+        let digest = crate::server::sha256_hex(token.as_str().as_bytes());
+        // ponytail: bounded linear scan (at most max_calls records); index if measured hot.
+        let found = self.calls.iter().find_map(|(call, records)| {
+            records
+                .iter()
+                .find(|record| record.token_digest.as_deref() == Some(digest.as_str()))
+                .map(|record| (call.clone(), record.address.clone()))
+        });
+        let Some((call, address)) = found else {
+            return Err(CorrelationError::Missing(
+                "no protected PreToolUse record carries this hook token (is bridge-hook installed for PreToolUse of this harness?)".into(),
+            ));
+        };
+        let harness = self
+            .bindings
+            .get(&address)
+            .map(|binding| binding.address.harness)
+            .ok_or_else(|| CorrelationError::Missing("the hook token's binding is gone".into()))?;
+        Ok((call, harness, CallerChannel::HookToken))
+    }
+
     /// Validates a native source without spending it. `allow_spent` is only
     /// historical replay origin inspection; it never returns fresh permission.
     /// Result fixes caller, actual incarnation, native call and host tool name.
@@ -1953,17 +2642,31 @@ impl Registry {
         now_ms: u64,
         allow_spent: bool,
     ) -> Result<NativeInspection, CorrelationError> {
-        let (call, harness) = match meta {
+        let (call, harness, channel) = match meta {
             PresentedMeta::Sealed { .. } => {
                 return Err(CorrelationError::NotEvidence(
                     "native metadata required".into(),
                 ));
             }
-            native => native.native().expect("native metadata"),
+            PresentedMeta::HookToken { token } => self.token_call(token)?,
+            native => {
+                let (call, harness, channel) = native.native().expect("native metadata");
+                (call.to_string(), harness, channel)
+            }
         };
-        let call = call.to_string();
         checked_id(&call, "call id").map_err(CorrelationError::NotEvidence)?;
-        let matched = self.harness_of(peer, harness)?;
+        let matched = self.harness_of(peer, harness, true)?;
+        let proof = match channel {
+            CallerChannel::ClaudeToolUse => CallerProof::ClaudeMeta,
+            CallerChannel::CodexCall => CallerProof::CodexMeta,
+            CallerChannel::OpenCodeCall => CallerProof::OpencodeMeta,
+            CallerChannel::HookToken => CallerProof::HookToken,
+        };
+        if !matched.policy.accepts(proof) {
+            return Err(CorrelationError::NotEvidence(format!(
+                "{harness}: the profile does not accept {proof:?} caller proof"
+            )));
+        }
         let max_age = self.config.max_call_age_ms;
         let records = self
             .calls
@@ -2013,6 +2716,11 @@ impl Registry {
         {
             return Err(CorrelationError::Conflicting(call));
         }
+        if let PresentedMeta::OpenCode { session_id, .. } = meta
+            && *session_id != record.native_id
+        {
+            return Err(CorrelationError::Conflicting(call));
+        }
         Ok((
             VerifiedCaller::new(
                 binding.address.clone(),
@@ -2020,10 +2728,7 @@ impl Registry {
                 record.native_id.clone(),
                 binding.epoch,
                 record.observed_ms,
-                match harness {
-                    Harness::ClaudeCode => CallerChannel::ClaudeToolUse,
-                    Harness::Codex => CallerChannel::CodexCall,
-                },
+                channel,
             ),
             matched.incarnation,
             call,
@@ -2145,12 +2850,12 @@ impl Registry {
     /// registry never grants message while core still refuses it, and a
     /// failed core write leaves the binding unchanged for the next check.
     /// A withdrawal lasts until the binding is renewed (a new
-    /// `SessionStart` or incarnation takes capabilities from the profile
-    /// again) or the same incarnation later advertises its inbox.
+    /// `SessionStart` or incarnation takes capabilities from the harness
+    /// policy again) or the same incarnation later advertises its inbox.
     ///
     /// Returns `Ok(None)` when nothing would change: the capability already
-    /// has that value, or `message` is `true` but the loaded build is not
-    /// qualified for it (a late inbox never promotes beyond `qualified`).
+    /// has that value, or `message` is `true` but the harness policy does not
+    /// grant it to this binding (a late inbox never promotes beyond `qualified`).
     /// The endpoint epoch, lifecycle and actor are the binding's own.
     ///
     /// # Errors
@@ -2224,13 +2929,13 @@ impl Registry {
     }
 
     /// Addresses of live `harness` bindings whose message capability was
-    /// withdrawn at runtime although the loaded build is qualified for it.
+    /// withdrawn at runtime although the harness policy grants it to them.
     ///
     /// A carrier re-checks these periodically, independent of pending
     /// work, so a late inbox restores message even when no event waits
     /// (publications are refused while it is withdrawn, so no work would
-    /// otherwise trigger the check). Retired bindings and builds not
-    /// qualified for message are never listed. The list is bounded by the
+    /// otherwise trigger the check). Retired bindings and bindings whose
+    /// policy does not grant message are never listed. The list is bounded by the
     /// registry's own binding bound.
     pub fn message_withdrawn(&self, harness: Harness) -> Vec<NativeAddress> {
         self.bindings
@@ -2245,49 +2950,33 @@ impl Registry {
             .collect()
     }
 
-    /// Copies current Codex MESSAGE qualification and private binding under the
-    /// lock, without OS/file/native I/O. The owned candidate MUST be validated
-    /// outside the lock on every attest/send, and app frontends separately checked.
-    /// Missing profiles, disabled message capability and legacy tombstones refuse.
-    pub(crate) fn codex_message_candidate(
+    /// Copies current MESSAGE qualification and private binding of a Codex or
+    /// Claude recipient under the lock, without OS/file/native I/O. The owned
+    /// candidate MUST be validated outside the lock on every attest/send, and
+    /// app frontends or owner routes separately checked. A harness without a
+    /// policy, disabled message capability and legacy tombstones refuse.
+    pub(crate) fn message_candidate(
         &self,
         address: &NativeAddress,
-    ) -> Result<CodexMessageCandidate, String> {
+    ) -> Result<MessageCandidate, String> {
         let binding = self
             .bindings
             .get(&address.to_canonical_string())
-            .ok_or("no Codex message binding")?;
-        if address.harness != Harness::Codex
-            || self.message_disabled.contains(&Harness::Codex)
+            .ok_or("no message binding")?;
+        if self.message_disabled.contains(&address.harness)
+            || binding.pending
             || (binding.retired && !binding.desktop_idle_message)
         {
-            return Err("Codex message binding unavailable".into());
+            return Err("message binding unavailable".into());
         }
-        let qualified = self
-            .config
-            .profiles
-            .iter()
-            .find(|p| {
-                p.harness == Harness::Codex
-                    && p.namespace == address.native_store_namespace
-                    && p.store == binding.store
-            })
-            .and_then(|p| p.executables.iter().find(|e| e.path == binding.executable))
-            .ok_or("Codex message profile changed")?
+        let policy = self
+            .policy(address.harness)
+            .ok_or("message policy changed")?
             .clone();
-        let keys = self
-            .digests
-            .iter()
-            .filter(|(key, digest)| {
-                key.path == qualified.path && digest.eq_ignore_ascii_case(&qualified.sha256)
-            })
-            .map(|(key, _)| key.clone())
-            .collect();
-        Ok(CodexMessageCandidate {
+        Ok(MessageCandidate {
             binding: binding.clone(),
-            qualified,
+            policy,
             owner_uid: self.owner_uid,
-            keys,
         })
     }
 
@@ -2296,17 +2985,16 @@ impl Registry {
     /// retirement and private transcript evidence, and current host disablement.
     /// Pure in-memory check; callers run it under the registry lock last, on both
     /// attest and send. It grants no caller or ordinary recipient authority.
-    pub(crate) fn codex_message_current(
-        &self,
-        candidate: &CodexMessageCandidate,
-    ) -> Result<(), String> {
-        if self.message_disabled.contains(&Harness::Codex)
+    pub(crate) fn message_current(&self, candidate: &MessageCandidate) -> Result<(), String> {
+        if self
+            .message_disabled
+            .contains(&candidate.binding.address.harness)
             || self
                 .bindings
                 .get(&candidate.binding.address.to_canonical_string())
                 != Some(&candidate.binding)
         {
-            return Err("Codex message binding changed during validation".into());
+            return Err("message binding changed during validation".into());
         }
         Ok(())
     }
@@ -2356,16 +3044,22 @@ impl Registry {
                 executable: binding.executable.clone(),
                 transcript: binding.transcript.clone(),
                 desktop_message_only: false,
+                gateway: false,
             },
         ))
     }
 }
 
 /// Whether the actor is the owner of the address its event belongs to: the
-/// root, or a Codex child thread (which has its own address). A Claude
-/// child shares the root's address and is not its owner.
-fn owns_address(role: ActorRole, harness: Harness) -> bool {
-    role == ActorRole::Root || (harness == Harness::Codex && role == ActorRole::Child)
+/// root, or a child with its own address ([`ChildAddress::Own`], such as a Codex
+/// child thread). A Claude child shares the root's address and is not its
+/// owner; an OpenCode child session never becomes positively idle, so it is
+/// never treated as one either.
+fn owns_address(role: ActorRole, policy: &HarnessPolicy) -> bool {
+    role == ActorRole::Root
+        || (role == ActorRole::Child
+            && policy.child_address() == ChildAddress::Own
+            && policy.harness != Harness::OPENCODE)
 }
 
 /// Whether one hook event is the address owner's own real session start
@@ -2376,12 +3070,35 @@ fn owns_address(role: ActorRole, harness: Harness) -> bool {
 fn starts_own_session(
     kind: HookKind,
     role: ActorRole,
-    harness: Harness,
+    policy: &HarnessPolicy,
     payload: &HookPayload,
 ) -> bool {
     kind == HookKind::SessionStart
-        && owns_address(role, harness)
+        && owns_address(role, policy)
         && payload.source.as_deref() != Some("compact")
+}
+
+/// Whether one hook event is a *positive* owner idle observation: exactly the
+/// events [`next_lifecycle`] turns into `Inactive` by themselves (the owner's own
+/// session start, the owner's `Stop` and its idle-prompt notification). An event
+/// that merely leaves an earlier `Inactive` in place is not one.
+fn is_positive_idle_event(
+    kind: HookKind,
+    role: ActorRole,
+    policy: &HarnessPolicy,
+    payload: &HookPayload,
+) -> bool {
+    match kind {
+        HookKind::SessionStart => {
+            policy.harness != Harness::OPENCODE && starts_own_session(kind, role, policy, payload)
+        }
+        HookKind::Stop => owns_address(role, policy),
+        HookKind::Notification => {
+            owns_address(role, policy)
+                && payload.notification_type.as_deref() == Some("idle_prompt")
+        }
+        _ => false,
+    }
 }
 
 /// The next owner-session lifecycle after one hook event.
@@ -2390,7 +3107,7 @@ fn starts_own_session(
 /// awaits its subagent); `AskUserQuestion`, permission requests and
 /// permission notifications await input; the owner's own `Stop`, idle-prompt
 /// notification and non-`compact` `SessionStart` are idle; the owner's
-/// `SessionEnd` is unknown. Every other event (`SubagentStop`, a Claude
+/// `SessionEnd`, and an OpenCode child's own `SessionEnd`, is unknown. Every other event (`SubagentStop`, a Claude
 /// child's `Stop`, `SessionStart`, `SessionEnd` or idle notification, other
 /// notification types, a `compact` restart) keeps `current`, which for a new or renewed
 /// binding is unknown: only the owner's own events may establish idle.
@@ -2398,12 +3115,16 @@ fn next_lifecycle(
     current: Lifecycle,
     kind: HookKind,
     role: ActorRole,
-    harness: Harness,
+    policy: &HarnessPolicy,
     payload: &HookPayload,
 ) -> Lifecycle {
-    let owner = owns_address(role, harness);
+    let harness = policy.harness;
+    let owner = owns_address(role, policy);
     match kind {
-        HookKind::SessionStart if starts_own_session(kind, role, harness, payload) => {
+        HookKind::OpenCodeActivity => Lifecycle::Active,
+        HookKind::OpenCodeUnknown => Lifecycle::Unknown,
+        HookKind::SessionStart if harness == Harness::OPENCODE => Lifecycle::Unknown,
+        HookKind::SessionStart if starts_own_session(kind, role, policy, payload) => {
             Lifecycle::Inactive
         }
         HookKind::SessionStart => current,
@@ -2425,18 +3146,49 @@ fn next_lifecycle(
         },
         HookKind::Stop if owner => Lifecycle::Inactive,
         HookKind::Stop | HookKind::SubagentStop => current,
-        HookKind::SessionEnd if owner => Lifecycle::Unknown,
+        // An OpenCode child's end is its own address ending (it is retired).
+        HookKind::SessionEnd if owner || harness == Harness::OPENCODE => Lifecycle::Unknown,
         HookKind::SessionEnd => current,
     }
 }
 
-/// Resolves a harness process's own store directory from its own
-/// environment: `CODEX_HOME` or `CLAUDE_CONFIG_DIR`, else `$HOME/.codex`
-/// or `$HOME/.claude`.
-fn harness_store(facts: &ProcessFacts, harness: Harness) -> Option<PathBuf> {
+/// Resolves the harness's store from its OS environment, never hook arguments:
+/// the fixed rule of a built-in harness ([`built_in_store`]), else the profile's
+/// `store_env` variable of the harness process, then its `$HOME` joined with
+/// `store_home`, both also found when a process-title rewrite shifted them
+/// ([`os::process_env_shifted`]).
+fn harness_store(facts: &ProcessFacts, policy: &HarnessPolicy) -> Option<PathBuf> {
+    if policy.harness.is_built_in() {
+        return built_in_store(facts, policy.harness);
+    }
+    if let Some(value) = policy
+        .store_env
+        .as_deref()
+        .and_then(|variable| os::process_env_shifted(facts.pid, variable))
+    {
+        return Some(PathBuf::from(value));
+    }
+    let relative = policy.store_home.as_ref()?;
+    os::process_env_shifted(facts.pid, "HOME").map(|home| PathBuf::from(home).join(relative))
+}
+
+/// The fixed store rule of a built-in harness; `None` for any other harness.
+/// Codex/Claude retain their existing home defaults. Supported owned OpenCode
+/// launches explicitly name OPENCODE_DB; its absolute parent is the store, with
+/// no guessed fallback for arbitrary unowned installations.
+fn built_in_store(facts: &ProcessFacts, harness: Harness) -> Option<PathBuf> {
     let (variable, default) = match harness {
-        Harness::Codex => ("CODEX_HOME", ".codex"),
-        Harness::ClaudeCode => ("CLAUDE_CONFIG_DIR", ".claude"),
+        Harness::CODEX => ("CODEX_HOME", ".codex"),
+        Harness::CLAUDE_CODE => ("CLAUDE_CONFIG_DIR", ".claude"),
+        Harness::OPENCODE => {
+            let database = PathBuf::from(os::process_env(facts.pid, "OPENCODE_DB")?);
+            return if database.is_absolute() {
+                database.parent().map(Path::to_path_buf)
+            } else {
+                None
+            };
+        }
+        _ => return None,
     };
     if let Some(value) = os::process_env(facts.pid, variable) {
         return Some(PathBuf::from(value));
@@ -2444,23 +3196,152 @@ fn harness_store(facts: &ProcessFacts, harness: Harness) -> Option<PathBuf> {
     os::process_env(facts.pid, "HOME").map(|home| PathBuf::from(home).join(default))
 }
 
-/// Whether two paths name the same directory (canonicalized when both
-/// exist, otherwise compared literally).
-fn same_path(left: &Path, right: &Path) -> bool {
-    match (left.canonicalize(), right.canonicalize()) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => left == right,
+/// Whether the native owner process `owner` runs from a trusted executable:
+/// the resolved path exists and [`executable_current`] holds for it (a regular
+/// file owned by `owner_uid` or root, not writable by group or other, unchanged
+/// since the owner process started). No path or digest is predeclared and
+/// nothing else is granted; used only by the native owner route.
+///
+/// # Errors
+///
+/// The reason the owner executable is refused (a static text, never the path).
+pub(crate) fn owner_executable_current(owner: &ProcessFacts, owner_uid: u32) -> Result<(), String> {
+    let exe = owner
+        .exe
+        .as_ref()
+        .ok_or("native owner executable is unreadable")?;
+    executable_current(exe, owner, owner_uid)
+}
+
+/// Version label recorded on every binding made under the harness-level policy.
+const POLICY_LABEL: &str = "harness-policy";
+
+/// Whether `facts` is positively a process of the product `policy` serves: its
+/// resolved executable path contains, case-insensitively, one of the policy's
+/// `executable_markers`, or [`HarnessPolicy::default_marker`] when none is
+/// configured. An environment variable never counts: every descendant of a
+/// harness inherits the harness's store variables. An unrelated ancestor such as
+/// a terminal, a build tool or a generic wrapper that is not an allowlisted
+/// intermediate matches none and is never a harness. This is a best-effort
+/// marker, not authentication: same-user code can fake it (the documented
+/// excluded hostile same-user case).
+fn product_marked(facts: &ProcessFacts, policy: &HarnessPolicy) -> bool {
+    let default = policy.default_marker();
+    let Some(exe) = facts.exe.as_ref() else {
+        return false;
+    };
+    let path = exe.to_string_lossy().to_lowercase();
+    if policy.executable_markers.is_empty() {
+        path.contains(default)
+    } else {
+        policy
+            .executable_markers
+            .iter()
+            .any(|marker| !marker.is_empty() && path.contains(&marker.to_lowercase()))
     }
+}
+
+/// Proves `store` is a runtime store Bridge may bind: an absolute path that is
+/// already canonical (no symlink component, no `.`/`..`), a directory (read with
+/// `lstat`, never through a final link) owned by `owner_uid` that no group or
+/// other user can write. Re-read on every use, never cached.
+///
+/// # Errors
+///
+/// The reason the store is refused (a static text, never the path).
+fn private_store(store: &Path, owner_uid: u32) -> Result<(), String> {
+    if !store.is_absolute() || store.canonicalize().ok().as_deref() != Some(store) {
+        return Err("harness store is not an absolute canonical path".into());
+    }
+    let meta = std::fs::symlink_metadata(store).map_err(|_| "harness store is unreadable")?;
+    if !meta.is_dir() || meta.uid() != owner_uid || meta.mode() & 0o022 != 0 {
+        return Err(
+            "harness store is not an owner-owned directory closed to group and other writers"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Proves the executable `exe` of the process `facts` may be run by Bridge: a
+/// regular file owned by `owner_uid` or root that no group or other user can
+/// write, whose modification and status-change seconds are strictly before the
+/// process start second (so it is unchanged since the process began). No digest
+/// or path is allowlisted.
+///
+/// # Errors
+///
+/// The reason the executable is refused (a static text, never the path).
+fn executable_current(exe: &Path, facts: &ProcessFacts, owner_uid: u32) -> Result<(), String> {
+    let meta = std::fs::metadata(exe).map_err(|_| "executable is unreadable")?;
+    if !meta.is_file() || !(meta.uid() == owner_uid || meta.uid() == 0) || meta.mode() & 0o022 != 0
+    {
+        return Err("executable is not a regular, trusted-owner, non-writable file".into());
+    }
+    if i128::from(meta.mtime().max(meta.ctime())) >= i128::from(facts.start_time) {
+        return Err("executable was written or changed at or after the process start".into());
+    }
+    Ok(())
+}
+
+/// Whether `parent`, the kernel parent of the MCP peer `peer_pid`, is the
+/// signed Node frontend hop of a Codex application MCP server: the launched
+/// Bridge MCP process replaced itself (same PID, `exec`) with the
+/// host-supplied Node runtime, which runs the Rust MCP child (the peer).
+///
+/// All of these must hold, so neither an environment value nor a PID alone
+/// is authority: the hop runs as `owner_uid`; its kernel-resolved executable
+/// is current ([`executable_current`]) and is exactly the runtime that the
+/// host named in the hop's own preserved exec-time environment
+/// (`CODEX_MCP_NODE_PATH`, both paths canonical); that environment also holds
+/// the application pipe capability (`CODEX_APP_TOOLS_PIPE_PATH`); and the
+/// peer's environment carries `BRIDGE_DESKTOP_PARENT_PID` naming the hop's
+/// kernel PID (the frontend stamps it when it spawns its child, after removing
+/// both capability variables from the child). Unreadable facts refuse. The
+/// harness above the hop is still proven by every ordinary check.
+fn signed_node_hop(peer_pid: u32, parent: &ProcessFacts, owner_uid: u32) -> bool {
+    let Some(exe) = parent.exe.as_deref() else {
+        return false;
+    };
+    let declared = os::process_env(parent.pid, "CODEX_MCP_NODE_PATH")
+        .and_then(|path| Path::new(&path).canonicalize().ok());
+    parent.uid == Some(owner_uid)
+        && executable_current(exe, parent, owner_uid).is_ok()
+        && declared.is_some()
+        && declared == exe.canonicalize().ok()
+        && os::process_env(parent.pid, "CODEX_APP_TOOLS_PIPE_PATH").is_some()
+        && os::process_env(peer_pid, "BRIDGE_DESKTOP_PARENT_PID")
+            .is_some_and(|pid| pid.to_str() == Some(parent.pid.to_string().as_str()))
+}
+
+/// Starts a background evidence refresh of a serving registry when a configured
+/// executable has a new file identity; never blocks and never hashes on the
+/// caller's thread (see `refresh_stale`). The daemon calls it periodically
+/// from its main loop, so an application update is covered within about a
+/// second plus one hash pass, with no request and no restart involved.
+pub fn refresh_executables(registry: &Arc<Mutex<Registry>>) {
+    refresh_stale(registry);
+}
+
+/// Ends the background evidence refresh at daemon shutdown: no later call starts a
+/// pass, a running pass abandons its hash and commits nothing more, and this
+/// returns only after the pass thread has been joined.
+/// Call it after the service has stopped and before the process exits.
+pub fn stop_executable_refresh(registry: &Arc<Mutex<Registry>>) {
+    stop_refresh(registry);
 }
 
 /// Lowercase hex SHA-256 of a file's bytes, streamed.
 pub fn file_sha256(path: &Path) -> std::io::Result<String> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path)?;
+    sha256_reader(&mut std::fs::File::open(path)?)
+}
+
+/// Lowercase hex SHA-256 of everything `reader` yields, streamed in 64 KiB chunks.
+fn sha256_reader(reader: &mut impl Read) -> std::io::Result<String> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1 << 16];
     loop {
-        let read = file.read(&mut buffer)?;
+        let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
         }
@@ -2486,7 +3367,7 @@ mod tests {
     #[test]
     fn codex_message_stamp_rejects_same_epoch_changes_and_legacy_facts() {
         let mut registry = registry_with(&[]);
-        let address = NativeAddress::new("h", Harness::Codex, "ns", "idle").unwrap();
+        let address = NativeAddress::new("h", Harness::CODEX, "ns", "idle").unwrap();
         let binding = Binding {
             address: address.clone(),
             harness: (1, 2),
@@ -2507,29 +3388,35 @@ mod tests {
             retired: true,
             desktop_idle_message: true,
             desktop_idle_transcript: Some((4, 5)),
+            wake: None,
+            pending: false,
+            role: None,
         };
-        let candidate = CodexMessageCandidate {
+        let candidate = MessageCandidate {
             binding: binding.clone(),
             owner_uid: 0,
-            keys: Vec::new(),
-            qualified: QualifiedExecutable {
-                path: binding.executable.clone(),
-                sha256: "0".repeat(64),
-                version: "qualified".into(),
+            policy: HarnessPolicy {
+                harness: Harness::CODEX,
+                namespace: "ns".into(),
                 inject: true,
                 message: true,
+                executable_markers: Vec::new(),
+                store_env: None,
+                store_home: None,
+                child_address: None,
+                caller_proof: Vec::new(),
             },
         };
         let key = address.to_canonical_string();
         registry.bindings.insert(key.clone(), binding.clone());
-        assert!(registry.codex_message_current(&candidate).is_ok());
+        assert!(registry.message_current(&candidate).is_ok());
         {
             let shared = std::cell::RefCell::new(&mut registry);
             let selected = PathBuf::from("/owned/frontend.sock");
             assert_eq!(
                 crate::codex::checked_frontend(
                     || Ok(Some(selected.clone())),
-                    || shared.borrow().codex_message_current(&candidate),
+                    || shared.borrow().message_current(&candidate),
                 )
                 .unwrap(),
                 Some(selected.clone())
@@ -2550,7 +3437,7 @@ mod tests {
                         }
                         Ok(Some(selected.clone()))
                     },
-                    || shared.borrow().codex_message_current(&candidate),
+                    || shared.borrow().message_current(&candidate),
                 );
                 assert!(
                     result.is_err(),
@@ -2571,11 +3458,11 @@ mod tests {
                 _ => changed.capabilities.inject = false,
             }
             registry.bindings.insert(key.clone(), changed);
-            assert!(registry.codex_message_current(&candidate).is_err());
+            assert!(registry.message_current(&candidate).is_err());
         }
         registry.bindings.insert(key, binding.clone());
-        registry.message_disabled.push(Harness::Codex);
-        assert!(registry.codex_message_current(&candidate).is_err());
+        registry.message_disabled.push(Harness::CODEX);
+        assert!(registry.message_current(&candidate).is_err());
         let mut legacy = serde_json::to_value(binding).unwrap();
         legacy
             .as_object_mut()
@@ -2594,30 +3481,35 @@ mod tests {
         assert!(old_shape.get("desktop_idle_transcript").is_none());
     }
 
-    /// A registry whose one Claude profile qualifies `executables` (path,
-    /// configured digest) and whose relays are empty.
+    /// A registry whose Claude harness policy serves any store and whose relay
+    /// entries are `executables` (path, configured digest): the only executables
+    /// whose digests the cache covers.
     fn registry_with(executables: &[(&Path, &str)]) -> Registry {
         let config = RegistryConfig {
             host_id: "h".into(),
-            profiles: vec![Profile {
+            harnesses: vec![HarnessPolicy {
+                harness: Harness::CLAUDE_CODE,
                 namespace: "ns".into(),
-                harness: Harness::ClaudeCode,
-                store: PathBuf::from("/tmp/store"),
-                executables: executables
-                    .iter()
-                    .map(|(path, sha256)| QualifiedExecutable {
-                        path: path.to_path_buf(),
-                        sha256: (*sha256).into(),
-                        version: "t".into(),
-                        inject: true,
-                        message: true,
-                    })
-                    .collect(),
+                inject: true,
+                message: true,
+                executable_markers: Vec::new(),
+                store_env: None,
+                store_home: None,
+                child_address: None,
+                caller_proof: Vec::new(),
             }],
+            profiles: Vec::new(),
             intermediates: Vec::new(),
             max_call_age_ms: 600_000,
-            relays: Vec::new(),
+            relays: executables
+                .iter()
+                .map(|(path, sha256)| RelayExecutable {
+                    path: path.to_path_buf(),
+                    sha256: (*sha256).into(),
+                })
+                .collect(),
             audiences: Vec::new(),
+            legacy_owner_relays: 0,
         };
         Registry::new(config, 0).unwrap()
     }
@@ -2626,7 +3518,7 @@ mod tests {
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("m2{tag}{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        dir.canonicalize().unwrap()
     }
 
     /// Construction alone (no manual warm) caches the real digest of every
@@ -2740,7 +3632,7 @@ mod tests {
         let exe = dir.join("exe");
         std::fs::write(&exe, vec![5u8; 4096]).unwrap();
         let digest = file_sha256(&exe).unwrap();
-        let mut registry = registry_with(&[(&exe, &digest)]);
+        let registry = registry_with(&[(&exe, &digest)]);
         let second = u64::try_from(file_key(&exe).unwrap().mtime.0).unwrap();
         assert!(
             registry.verify_loaded(&exe, second, &digest).is_err(),
@@ -2841,7 +3733,7 @@ mod tests {
         let installed = u64::try_from(status_change_second(&exe)).unwrap();
         let born = installed + 1;
         let digest_old = file_sha256(&exe).unwrap();
-        let mut before = registry_with(&[(&exe, &digest_old)]);
+        let before = registry_with(&[(&exe, &digest_old)]);
         before
             .verify_loaded(&exe, born, &digest_old)
             .expect("installed before the process was born");
@@ -2856,7 +3748,7 @@ mod tests {
         assert_ne!(digest_old, digest_new);
         // A daemon constructed after the update warms and is configured
         // with the new digest.
-        let mut after = registry_with(&[(&exe, &digest_new)]);
+        let after = registry_with(&[(&exe, &digest_new)]);
         assert!(
             after.verify_loaded(&exe, born, &digest_new).is_err(),
             "the old process cannot have loaded the new bytes"
@@ -2874,7 +3766,7 @@ mod tests {
         std::fs::write(&exe, vec![1u8; 4096]).unwrap();
         backdate(&exe);
         let digest = file_sha256(&exe).unwrap();
-        let mut registry = registry_with(&[(&exe, &digest)]);
+        let registry = registry_with(&[(&exe, &digest)]);
         registry
             .verify_loaded(&exe, u64::MAX, &digest)
             .expect("warmed and unchanged");
@@ -2887,5 +3779,1193 @@ mod tests {
             "the stale digest must not vouch for the rewritten file"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+    /// Runs one background refresh pass to completion (the production call only
+    /// starts it and returns).
+    fn refresh(registry: &Arc<Mutex<Registry>>) {
+        if refresh_stale(registry) {
+            wait_refresh(registry);
+        }
+    }
+
+    /// Replaces `exe` by a renamed file holding `bytes` with the original mtime
+    /// restored (an installer-style update), after the status-change second moved on.
+    fn update_in_place(exe: &Path, bytes: Vec<u8>) {
+        wait_until_second(u64::try_from(status_change_second(exe)).unwrap() + 1);
+        let staged = exe.with_extension("staged");
+        std::fs::write(&staged, bytes).unwrap();
+        backdate(&staged);
+        std::fs::rename(&staged, exe).unwrap();
+    }
+
+    /// An application update that leaves the approved bytes identical (a new
+    /// inode and ctime) is refused until the cache is refreshed and then attests
+    /// again without a daemon restart; the daemon-held registry is only locked
+    /// to stage and commit. The process-birth gate still refuses a process that
+    /// started before the update, whatever the digest, and repeated updates keep
+    /// exactly one cached identity per path.
+    #[test]
+    fn refresh_requalifies_identical_bytes_but_never_an_old_process() {
+        let dir = scratch("rfs");
+        let exe = dir.join("exe");
+        std::fs::write(&exe, vec![3u8; 4096]).unwrap();
+        backdate(&exe);
+        let digest = file_sha256(&exe).unwrap();
+        let registry = Arc::new(Mutex::new(registry_with(&[(&exe, &digest)])));
+        let first = u64::try_from(status_change_second(&exe)).unwrap();
+        for round in 0..3 {
+            update_in_place(&exe, vec![3u8; 4096]);
+            let updated = u64::try_from(status_change_second(&exe)).unwrap();
+            assert!(first <= updated);
+            assert!(
+                registry
+                    .lock()
+                    .unwrap()
+                    .verify_loaded(&exe, u64::MAX, &digest)
+                    .is_err(),
+                "round {round}: a new identity has no digest until refreshed"
+            );
+            refresh(&registry);
+            let registry = registry.lock().unwrap();
+            registry
+                .verify_loaded(&exe, updated + 1, &digest)
+                .expect("identical approved bytes qualify a process born after the update");
+            assert!(
+                registry.verify_loaded(&exe, updated, &digest).is_err(),
+                "a process born in the update second is unproven"
+            );
+            assert!(
+                registry.verify_loaded(&exe, first, &digest).is_err(),
+                "a process that predates the update is never proven loaded"
+            );
+            assert_eq!(
+                registry.digests.len(),
+                1,
+                "superseded identities are pruned"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A refresh never accepts a new build: other bytes at the approved path are
+    /// hashed for real and refused as "not the configured build", while an
+    /// unrelated approved path keeps attesting.
+    #[test]
+    fn refresh_never_accepts_a_changed_digest() {
+        let dir = scratch("rfc");
+        let exe = dir.join("exe");
+        let other = dir.join("other");
+        std::fs::write(&exe, vec![3u8; 4096]).unwrap();
+        std::fs::write(&other, vec![4u8; 4096]).unwrap();
+        backdate(&exe);
+        let digest = file_sha256(&exe).unwrap();
+        let other_digest = file_sha256(&other).unwrap();
+        let registry = Arc::new(Mutex::new(registry_with(&[
+            (&exe, &digest),
+            (&other, &other_digest),
+        ])));
+        update_in_place(&exe, vec![5u8; 4096]);
+        refresh(&registry);
+        let registry = registry.lock().unwrap();
+        let refused = registry.verify_loaded(&exe, u64::MAX, &digest).unwrap_err();
+        assert!(
+            refused.detail().contains("not the configured build"),
+            "{}",
+            refused.detail()
+        );
+        registry
+            .verify_loaded(&other, u64::MAX, &other_digest)
+            .expect("an unaffected approved path keeps attesting");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The whole-file read happens with the registry lock released, and a file
+    /// whose metadata changes during the read is not cached. A FIFO at the
+    /// configured path blocks the hash until a writer connects, which holds the
+    /// refresh mid-read deterministically: the registry must stay lockable, and
+    /// a `chmod` (ctime) during the read makes the digest unstable, so nothing
+    /// is committed and the path stays unqualified.
+    #[test]
+    fn refresh_hashes_outside_the_registry_lock_and_drops_an_unstable_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("rfl");
+        let exe = dir.join("exe");
+        std::fs::write(&exe, vec![3u8; 4096]).unwrap();
+        let digest = file_sha256(&exe).unwrap();
+        let registry = Arc::new(Mutex::new(registry_with(&[(&exe, &digest)])));
+        std::fs::remove_file(&exe).unwrap();
+        assert!(
+            std::process::Command::new("/usr/bin/mkfifo")
+                .arg(&exe)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(refresh_stale(&registry), "a stale identity starts a pass");
+        assert!(
+            !refresh_stale(&registry),
+            "a pass already in flight is shared, not duplicated"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(
+            registry.lock().unwrap().refreshing.load(Ordering::SeqCst),
+            "the hash is blocked on the FIFO"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let fifo_key = file_key(&exe).unwrap();
+        let lockable = loop {
+            if let Ok(guard) = registry.try_lock() {
+                break guard.digests.contains_key(&fifo_key);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "refresh holds the registry lock while hashing"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert!(!lockable, "the FIFO identity has no digest yet");
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o600)).unwrap();
+        drop(std::fs::OpenOptions::new().write(true).open(&exe).unwrap());
+        wait_refresh(&registry);
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .verify_loaded(&exe, u64::MAX, &digest)
+                .is_err(),
+            "an identity that changed during the read is not cached"
+        );
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .digests
+                .keys()
+                .all(|key| key.inode != fifo_key.inode),
+            "nothing was cached for the unstable identity"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    /// A result computed for a file identity that changed before the commit is
+    /// dropped under the final lock: nothing is pruned or cached for it, the new
+    /// identity stays unqualified and is staged again.
+    #[test]
+    fn commit_skips_a_result_for_a_file_changed_after_the_check() {
+        let dir = scratch("cmt");
+        let exe = dir.join("exe");
+        std::fs::write(&exe, vec![1u8; 4096]).unwrap();
+        backdate(&exe);
+        let digest = file_sha256(&exe).unwrap();
+        let mut registry = registry_with(&[(&exe, &digest)]);
+        update_in_place(&exe, vec![1u8; 4096]);
+        let checked: Vec<_> = registry
+            .stale_files()
+            .into_iter()
+            .filter_map(executables::check_file)
+            .collect();
+        assert_eq!(checked.len(), 1);
+        update_in_place(&exe, vec![1u8; 4096]);
+        let before = registry.digests.clone();
+        for item in checked {
+            registry.commit_checked(item);
+        }
+        assert_eq!(registry.digests, before, "nothing pruned or inserted");
+        assert!(registry.verify_loaded(&exe, u64::MAX, &digest).is_err());
+        assert_eq!(
+            registry.stale_files().len(),
+            1,
+            "staged again for its new identity"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Stopping the refresh ends it for good: no pass starts, and a running pass
+    /// is abandoned and joined (a blocked hash is interrupted only by its reader
+    /// closing here, so this checks the flag path with an idle registry).
+    #[test]
+    fn stopped_refresh_starts_nothing_and_commits_nothing() {
+        let dir = scratch("stp");
+        let exe = dir.join("exe");
+        std::fs::write(&exe, vec![1u8; 4096]).unwrap();
+        backdate(&exe);
+        let digest = file_sha256(&exe).unwrap();
+        let registry = Arc::new(Mutex::new(registry_with(&[(&exe, &digest)])));
+        update_in_place(&exe, vec![1u8; 4096]);
+        stop_refresh(&registry);
+        assert!(!refresh_stale(&registry));
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .verify_loaded(&exe, u64::MAX, &digest)
+                .is_err()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The child side of [`live_child`]: parks for a minute only when the process
+    /// was started by it (the marker variable is set), and returns at once in every
+    /// ordinary test run.
+    #[test]
+    fn park_for_live_child() {
+        if std::env::var_os("BRIDGE_TEST_PARK").is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    }
+
+    /// An owned fixture child: killed and reaped when dropped, so an assertion
+    /// panic cannot leak a parked process.
+    pub(super) struct LiveChild(std::process::Child);
+
+    impl LiveChild {
+        /// Takes ownership of an already started child.
+        pub(super) fn own(child: std::process::Child) -> Self {
+            LiveChild(child)
+        }
+    }
+
+    impl std::ops::Deref for LiveChild {
+        type Target = std::process::Child;
+
+        /// The owned child, for its PID and status.
+        fn deref(&self) -> &std::process::Child {
+            &self.0
+        }
+    }
+
+    impl std::ops::DerefMut for LiveChild {
+        /// The owned child, mutably (status polling).
+        fn deref_mut(&mut self) -> &mut std::process::Child {
+            &mut self.0
+        }
+    }
+
+    impl Drop for LiveChild {
+        /// Kills and reaps the child, whatever the test's outcome.
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A copy of this test binary at `path` (the "harness" executable) and a live
+    /// child started from it that parks, born in a later second than the copy so
+    /// the loaded-build file-time gate can prove it. Only the child gets the
+    /// marker variable `BRIDGE_TEST_PARK` and `store` as its store through the
+    /// environment variable `variable`; it runs exactly the parking test. The
+    /// fixture asserts the child is still alive after startup and that the OS
+    /// reports exactly this executable path and store for it. (A copy of
+    /// `/bin/sleep` did not stay alive in a manual probe, so it cannot serve.)
+    pub(super) fn live_child(path: &Path, variable: &str, store: &Path) -> LiveChild {
+        std::fs::copy(std::env::current_exe().unwrap(), path).unwrap();
+        let metadata = std::fs::metadata(path).unwrap();
+        let written = u64::try_from(metadata.mtime().max(metadata.ctime())).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        // Kernel birth seconds and filesystem timestamps have independent quantization. Wait
+        // against observed metadata with one second of margin, then prove the actual child below.
+        while std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            <= written.saturating_add(1)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture executable clock did not become older than process birth"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let mut child = LiveChild(
+            std::process::Command::new(path)
+                .args([
+                    "--exact",
+                    "registry::tests::park_for_live_child",
+                    "--nocapture",
+                ])
+                .env(variable, store)
+                .env("BRIDGE_TEST_PARK", "1")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the fixture harness must stay alive"
+        );
+        let facts = os::process_facts(child.id()).expect("fixture process facts");
+        assert_eq!(facts.exe.as_deref(), Some(path), "fixture executable");
+        assert_eq!(
+            os::process_env(child.id(), variable).as_deref(),
+            Some(store.as_os_str()),
+            "fixture store"
+        );
+        let metadata = std::fs::metadata(path).unwrap();
+        let executable_proof = executable_current(path, &facts, facts.uid.unwrap());
+        assert!(
+            executable_proof.is_ok(),
+            "fixture executable proof: {executable_proof:?}; mtime {},ctime {},birth {}",
+            metadata.mtime(),
+            metadata.ctime(),
+            facts.start_time
+        );
+        let store_proof = private_store(store, facts.uid.unwrap());
+        assert!(store_proof.is_ok(), "fixture store proof: {store_proof:?}");
+        child
+    }
+    /// A Claude registry whose harness policy serves any store (inject and
+    /// message supported) and whose configuration names no store or executable.
+    fn claude_registry() -> Registry {
+        Registry::new(
+            RegistryConfig {
+                host_id: "h".into(),
+                harnesses: vec![HarnessPolicy {
+                    harness: Harness::CLAUDE_CODE,
+                    namespace: "ns".into(),
+                    inject: true,
+                    message: true,
+                    executable_markers: vec!["harness".into()],
+                    store_env: None,
+                    store_home: None,
+                    child_address: None,
+                    caller_proof: Vec::new(),
+                }],
+                profiles: Vec::new(),
+                intermediates: Vec::new(),
+                max_call_age_ms: 600_000,
+                relays: Vec::new(),
+                audiences: Vec::new(),
+                legacy_owner_relays: 0,
+            },
+            os::process_facts(std::process::id()).unwrap().uid.unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// A live Claude binding of `child` under `store`/`exe`, lifecycle `Unknown`.
+    fn unknown_binding(
+        address: &NativeAddress,
+        child: &std::process::Child,
+        store: &Path,
+        exe: &Path,
+    ) -> Binding {
+        let facts = os::process_facts(child.id()).unwrap();
+        Binding {
+            address: address.clone(),
+            harness: (facts.pid, facts.start_time),
+            epoch: 5,
+            capabilities: Capabilities {
+                inject: true,
+                message: true,
+            },
+            qualified: Capabilities {
+                inject: true,
+                message: true,
+            },
+            version: "vendor".into(),
+            lifecycle: Lifecycle::Unknown,
+            transcript: None,
+            store: store.to_path_buf(),
+            executable: exe.to_path_buf(),
+            retired: false,
+            desktop_idle_message: false,
+            desktop_idle_transcript: None,
+            wake: None,
+            pending: false,
+            role: None,
+        }
+    }
+
+    /// Observation reads preserve the whole registry and journal, and a final
+    /// snapshot fence rejects epoch, lifecycle, retirement, store or policy races.
+    /// Live process checks reject a mismatching expected tuple and a dead process.
+    #[test]
+    fn observation_snapshot_is_read_only_and_fenced() {
+        use bridge_protocol::{Host, ResolveRecipientParams};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("obs");
+        let store = dir.join("store");
+        std::fs::create_dir(&store).unwrap();
+        let exe = dir.join("harness");
+        let child = live_child(&exe, "CLAUDE_CONFIG_DIR", &store);
+        let mut registry = claude_registry();
+        let address = registry
+            .observation_address(Host::ClaudeCode, "session")
+            .unwrap();
+        assert_eq!(address.to_canonical_string(), "h/claude-code/ns/session");
+        assert!(
+            registry
+                .observation_address(Host::Codex, "session")
+                .is_none()
+        );
+        let key = address.to_canonical_string();
+        let binding = unknown_binding(&address, &child, &store, &exe);
+        registry.bindings.insert(key.clone(), binding.clone());
+        let journal = dir.join("untouched.json");
+        registry.journal = Some(journal.clone());
+        let expected = ResolveRecipientParams {
+            host: Host::ClaudeCode,
+            native_session_id: "session".into(),
+            expected_store: store.to_str().unwrap().into(),
+            expected_harness_pid: binding.harness.0,
+            expected_harness_start_time_secs: binding.harness.1,
+        };
+        let candidate = registry.observation_candidate(&address).unwrap();
+        assert!(candidate.live(Some(&expected)));
+        assert!(registry.observation_current(&candidate));
+        assert!(candidate.live(None));
+        assert_eq!(registry.bindings[&key], binding);
+        assert!(
+            registry.calls.is_empty()
+                && registry.sealed.is_empty()
+                && registry.claims.is_empty()
+                && registry.assertions.is_empty()
+        );
+        assert!(!journal.exists(), "read must not persist a journal");
+        for case in 0..6 {
+            let changed = registry.bindings.get_mut(&key).unwrap();
+            match case {
+                0 => changed.epoch += 1,
+                1 => changed.lifecycle = Lifecycle::AwaitingInput,
+                2 => changed.retired = true,
+                3 => changed.store = dir.clone(),
+                4 => changed.capabilities.message = false,
+                _ => changed.pending = true,
+            }
+            assert!(
+                !registry.observation_current(&candidate),
+                "changed snapshot {case}"
+            );
+            if case == 2 || case == 5 {
+                assert!(registry.observation_candidate(&address).is_none());
+            }
+            registry.bindings.insert(key.clone(), binding.clone());
+        }
+        registry.policies[0].message = false;
+        assert!(!registry.observation_current(&candidate));
+        registry.policies[0].message = true;
+        registry.message_disabled.push(Harness::CLAUDE_CODE);
+        assert!(!registry.observation_current(&candidate));
+        registry.message_disabled.clear();
+        let mut wrong = expected.clone();
+        wrong.expected_harness_start_time_secs += 1;
+        assert!(!candidate.live(Some(&wrong)));
+        wrong = expected.clone();
+        wrong.expected_store.push_str("-other");
+        assert!(!candidate.live(Some(&wrong)));
+        // A private store changing permissions is not a valid current binding.
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(!candidate.live(Some(&expected)));
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(candidate.live(Some(&expected)));
+        drop(child);
+        assert!(!candidate.live(Some(&expected)));
+        assert!(!journal.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Writes a Claude session descriptor `<store>/sessions/<pid>.json` for
+    /// `session` claiming `pid` with `status`, modified `age_secs` before now.
+    fn descriptor(store: &Path, session: &str, pid: u32, status: &str, age_secs: u64) {
+        std::fs::create_dir_all(store.join("sessions")).unwrap();
+        let path = store.join("sessions").join(format!("{pid}.json"));
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"sessionId\":\"{session}\",\"kind\":\"interactive\",\"pid\":{pid},\"status\":\"{status}\"}}"
+            ),
+        )
+        .unwrap();
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    /// A known live Claude route stuck at `Unknown` (a promoted pending route) is
+    /// re-observed from a fresh owned native descriptor, and only from one: idle
+    /// and busy statuses set the lifecycle for exactly the recorded session, PID
+    /// and start, executable and store with no capability change; an unknown
+    /// status, a descriptor claiming another PID, one older than the process, one
+    /// in another store, a reused PID, a retired tombstone, a pending route and an
+    /// already observed lifecycle all change nothing. The address and its history
+    /// survive throughout.
+    #[test]
+    fn unknown_claude_route_is_reobserved_only_from_an_exact_fresh_descriptor() {
+        let dir = scratch("rob");
+        let store = dir.join("store");
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir_all(&store).unwrap();
+        let exe = dir.join("harness");
+        let child = live_child(&exe, "CLAUDE_CONFIG_DIR", &store);
+        let mut registry = claude_registry();
+        let address = NativeAddress::new("h", Harness::CLAUDE_CODE, "ns", "sess").unwrap();
+        let key = address.to_canonical_string();
+        let pid = child.id();
+        let lifecycle = |registry: &Registry| registry.bindings[&key].lifecycle;
+        let reset = |registry: &mut Registry, edit: &dyn Fn(&mut Binding)| {
+            let mut binding = unknown_binding(&address, &child, &store, &exe);
+            edit(&mut binding);
+            registry.bindings.insert(key.clone(), binding);
+        };
+        let observe = |registry: &mut Registry| {
+            registry.discover_claude_recipient(&address).unwrap();
+        };
+
+        descriptor(&store, "sess", pid, "idle", 0);
+        reset(&mut registry, &|_| {});
+        observe(&mut registry);
+        assert_eq!(lifecycle(&registry), Lifecycle::Inactive, "fresh idle");
+        assert_eq!(registry.bindings[&key].epoch, 5, "same epoch");
+        let (attestation, _) = registry.attest_recipient(&address).unwrap();
+        assert_eq!(attestation.lifecycle(), Lifecycle::Inactive);
+        descriptor(&store, "sess", pid, "busy", 0);
+        reset(&mut registry, &|_| {});
+        observe(&mut registry);
+        assert_eq!(lifecycle(&registry), Lifecycle::Active, "fresh busy");
+
+        for (status, claimed, age, why) in [
+            ("starting", pid, 0, "unknown status"),
+            (
+                "idle",
+                std::process::id(),
+                0,
+                "descriptor claims another PID",
+            ),
+            ("idle", pid, 3_600, "descriptor older than the process"),
+        ] {
+            let _ = std::fs::remove_file(store.join("sessions").join(format!("{pid}.json")));
+            descriptor(&store, "sess", claimed, status, age);
+            reset(&mut registry, &|_| {});
+            observe(&mut registry);
+            assert_eq!(lifecycle(&registry), Lifecycle::Unknown, "{why}");
+            let _ = std::fs::remove_file(store.join("sessions").join(format!("{claimed}.json")));
+        }
+        descriptor(&store, "other-session", pid, "idle", 0);
+        reset(&mut registry, &|_| {});
+        observe(&mut registry);
+        assert_eq!(lifecycle(&registry), Lifecycle::Unknown, "another session");
+        let _ = std::fs::remove_file(store.join("sessions").join(format!("{pid}.json")));
+
+        descriptor(&store, "sess", pid, "idle", 0);
+        reset(&mut registry, &|b| b.retired = true);
+        observe(&mut registry);
+        assert_eq!(lifecycle(&registry), Lifecycle::Unknown, "tombstone");
+        reset(&mut registry, &|b| b.pending = true);
+        observe(&mut registry);
+        assert_eq!(lifecycle(&registry), Lifecycle::Unknown, "pending");
+        reset(&mut registry, &|b| b.harness.1 += 7);
+        observe(&mut registry);
+        assert_eq!(lifecycle(&registry), Lifecycle::Unknown, "reused PID");
+        reset(&mut registry, &|b| b.lifecycle = Lifecycle::AwaitingInput);
+        observe(&mut registry);
+        assert_eq!(
+            lifecycle(&registry),
+            Lifecycle::AwaitingInput,
+            "input wait is never overwritten"
+        );
+        std::fs::remove_file(store.join("sessions").join(format!("{pid}.json"))).unwrap();
+        descriptor(&elsewhere, "sess", pid, "idle", 0);
+        reset(&mut registry, &|_| {});
+        observe(&mut registry);
+        assert_eq!(lifecycle(&registry), Lifecycle::Unknown, "other store");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Facts of this very test process for the marker and executable checks.
+    fn own_facts() -> ProcessFacts {
+        os::process_facts(std::process::id()).unwrap()
+    }
+
+    /// A store is bindable only when it is an absolute, already canonical
+    /// directory owned by this user that no group or other user can write: a
+    /// private store (mode 0700) and an ordinary 0755 home store pass, while a
+    /// group-writable or world-writable one, a symlink to a good store, a
+    /// non-canonical spelling, a relative path, a file and a missing path are
+    /// each refused with a static reason that names no path.
+    #[test]
+    fn a_store_must_be_canonical_owner_owned_and_closed_to_writers() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("pst");
+        let uid = own_facts().uid.unwrap();
+        let mode = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let store = dir.join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        for good in [0o700, 0o755, 0o750] {
+            mode(&store, good);
+            assert!(private_store(&store, uid).is_ok(), "{good:o}");
+        }
+        for bad in [0o775, 0o777, 0o757, 0o770 | 0o020] {
+            mode(&store, bad);
+            let reason = private_store(&store, uid).unwrap_err();
+            assert!(!reason.contains(store.to_str().unwrap()), "{reason}");
+        }
+        mode(&store, 0o700);
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&store, &link).unwrap();
+        assert!(private_store(&link, uid).is_err(), "symlink");
+        assert!(
+            private_store(&dir.join("store").join("..").join("store"), uid).is_err(),
+            "non-canonical"
+        );
+        assert!(private_store(Path::new("relative/store"), uid).is_err());
+        assert!(private_store(&dir.join("missing"), uid).is_err());
+        let file = dir.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(private_store(&file, uid).is_err(), "not a directory");
+        assert!(
+            private_store(&store, uid.wrapping_add(1)).is_err(),
+            "foreign owner"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A process executable must be a regular file of this user or root that
+    /// no group or other user can write and that is unchanged since the process
+    /// started: a freshly written file, a group-writable one and a directory are
+    /// refused, a backdated private file passes. No digest is involved.
+    #[test]
+    fn a_process_executable_must_be_trusted_and_unchanged_since_start() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("exc");
+        let facts = own_facts();
+        let uid = facts.uid.unwrap();
+        let exe = dir.join("exe");
+        std::fs::write(&exe, b"x").unwrap();
+        assert!(
+            executable_current(&exe, &facts, uid).is_err(),
+            "written after the process started"
+        );
+        backdate(&exe);
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // chmod moves the status-change time: the file counts as changed again.
+        let mut older = facts.clone();
+        older.start_time = u64::MAX / 2;
+        assert!(executable_current(&exe, &older, uid).is_ok());
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(
+            executable_current(&exe, &older, uid).is_err(),
+            "group writable"
+        );
+        assert!(executable_current(&dir, &older, uid).is_err(), "directory");
+        assert!(executable_current(&exe, &older, uid.wrapping_add(1)).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Message delivery rechecks the executable after admission: changing the
+    /// running harness file's permissions after the snapshot was created makes
+    /// the candidate unusable before any native send.
+    #[test]
+    fn message_candidate_refuses_an_executable_changed_after_admission() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("mex");
+        let store = dir.join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = dir.join("claude-harness");
+        let mut child = live_child(&executable, "CLAUDE_CONFIG_DIR", &store);
+        let facts = os::process_facts(child.id()).unwrap();
+        let address = NativeAddress::new("h", Harness::CLAUDE_CODE, "ns", "session").unwrap();
+        let candidate = MessageCandidate {
+            binding: Binding {
+                address,
+                harness: (facts.pid, facts.start_time),
+                epoch: 1,
+                capabilities: Capabilities {
+                    inject: true,
+                    message: true,
+                },
+                qualified: Capabilities {
+                    inject: true,
+                    message: true,
+                },
+                version: POLICY_LABEL.into(),
+                lifecycle: Lifecycle::Inactive,
+                transcript: None,
+                store: store.clone(),
+                executable: executable.clone(),
+                retired: false,
+                desktop_idle_message: false,
+                desktop_idle_transcript: None,
+                wake: None,
+                pending: false,
+                role: None,
+            },
+            policy: HarnessPolicy {
+                harness: Harness::CLAUDE_CODE,
+                namespace: "ns".into(),
+                inject: true,
+                message: true,
+                executable_markers: Vec::new(),
+                store_env: None,
+                store_home: None,
+                child_address: None,
+                caller_proof: Vec::new(),
+            },
+            owner_uid: facts.uid.unwrap(),
+        };
+        candidate.live_check().expect("unchanged executable");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(
+            candidate.live_check().is_err(),
+            "changed executable must refuse"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A process is positively a harness only by its resolved executable path:
+    /// the product name by default or a configured marker. An inherited store
+    /// variable never marks it (every descendant of a harness carries it), so an
+    /// unrelated process, even one whose environment names the product store, is
+    /// never a Codex or Claude harness.
+    #[test]
+    fn an_unmarked_ancestor_is_never_a_harness() {
+        let policy = |harness, markers: &[&str]| HarnessPolicy {
+            harness,
+            namespace: "ns".into(),
+            inject: true,
+            message: true,
+            executable_markers: markers.iter().map(|m| (*m).to_string()).collect(),
+            store_env: None,
+            store_home: None,
+            child_address: None,
+            caller_proof: Vec::new(),
+        };
+        let codex = policy(Harness::CODEX, &[]);
+        let claude = policy(Harness::CLAUDE_CODE, &[]);
+        // An unrelated executable that inherited the product store variable.
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .env("CLAUDE_CONFIG_DIR", "/tmp/anything")
+            .env("CODEX_HOME", "/tmp/anything")
+            .spawn()
+            .unwrap();
+        let facts = os::process_facts(child.id()).unwrap();
+        assert!(!product_marked(&facts, &codex));
+        assert!(!product_marked(&facts, &claude));
+        let _ = child.kill();
+        let _ = child.wait();
+        let mut named = facts.clone();
+        named.exe = Some(PathBuf::from("/opt/Claude/bin/Claude Code"));
+        assert!(product_marked(&named, &claude));
+        assert!(!product_marked(&named, &codex));
+        named.exe = Some(PathBuf::from("/Applications/ChatGPT.app/codex-cli/codex"));
+        assert!(product_marked(&named, &codex));
+        // A configured marker replaces the product name; an empty marker matches nothing.
+        let custom = policy(Harness::CODEX, &["wrapper-x", ""]);
+        named.exe = Some(PathBuf::from("/opt/Wrapper-X/run"));
+        assert!(product_marked(&named, &custom));
+        named.exe = Some(PathBuf::from("/opt/codex/run"));
+        assert!(!product_marked(&named, &custom));
+        named.exe = None;
+        assert!(!product_marked(&named, &codex));
+    }
+
+    /// A channel peer of another user, a harness the policy does not serve, and a
+    /// hook of an unmarked ancestor are all refused as not evidence before any
+    /// state changes; no store path or executable is consulted.
+    #[test]
+    fn foreign_user_unserved_harness_and_unmarked_ancestor_are_refused() {
+        let mut registry = registry_with(&[]);
+        let uid = own_facts().uid.unwrap();
+        registry.owner_uid = uid;
+        let payload = HookPayload {
+            hook_event_name: "SessionStart".into(),
+            session_id: "s".into(),
+            agent_id: None,
+            tool_use_id: None,
+            tool_name: None,
+            notification_type: None,
+            transcript_path: None,
+            source: None,
+        };
+        let me = |uid| PeerIdentity {
+            pid: std::process::id(),
+            uid,
+        };
+        for (peer, harness, why, reason) in [
+            (
+                me(uid.wrapping_add(1)),
+                Harness::CLAUDE_CODE,
+                "foreign user",
+                "another user",
+            ),
+            (
+                me(uid),
+                Harness::CODEX,
+                "harness not served by the policy",
+                "not enabled",
+            ),
+            (
+                me(uid),
+                Harness::CLAUDE_CODE,
+                "no marked harness ancestor",
+                "no harness ancestor",
+            ),
+        ] {
+            let error = registry
+                .admit_hook(peer, harness, &payload, 1_000)
+                .unwrap_err();
+            assert_eq!(error.class(), "not_evidence", "{why}: {error}");
+            // The exact refusal, so a skipped earlier fence cannot hide behind a later one.
+            assert!(
+                error.detail().contains(reason)
+                    || (reason == "no harness ancestor" && error.detail().contains("marked")),
+                "{why}: {error}"
+            );
+        }
+        assert!(registry.bindings.is_empty(), "nothing was bound");
+    }
+
+    /// Legacy `profiles` are migration input only: one policy per harness (their
+    /// single namespace, union of the capability flags) with an explicit note per
+    /// profile and no path, digest or signature authorizing anything; both
+    /// `harnesses` and `profiles`, two namespaces for one harness, two policies
+    /// for one harness and a bad namespace fail loudly, and a configuration with
+    /// neither serves no harness.
+    #[test]
+    fn legacy_profiles_migrate_explicitly_and_ambiguity_fails_loudly() {
+        let entry = |inject, message| QualifiedExecutable {
+            path: "/nowhere/harness".into(),
+            sha256: "0".repeat(64),
+            version: "legacy".into(),
+            inject,
+            message,
+            signature: Some(VendorSignature {
+                identifier: "vendor-tool".into(),
+                team_id: "ABCDE12345".into(),
+            }),
+        };
+        let profile = |namespace: &str, harness, store: &str, inject, message| Profile {
+            namespace: namespace.into(),
+            harness,
+            store: store.into(),
+            executables: vec![entry(inject, message)],
+        };
+        let base = || RegistryConfig {
+            host_id: "h".into(),
+            harnesses: Vec::new(),
+            profiles: Vec::new(),
+            intermediates: Vec::new(),
+            max_call_age_ms: 1,
+            relays: Vec::new(),
+            audiences: Vec::new(),
+            legacy_owner_relays: 0,
+        };
+        let none = base().harness_policies().unwrap();
+        assert!(none.0.is_empty() && none.1.is_empty());
+
+        let mut legacy = base();
+        legacy.profiles = vec![
+            profile("claude-main", Harness::CLAUDE_CODE, "/s/one", true, false),
+            profile("claude-main", Harness::CLAUDE_CODE, "/s/two", false, true),
+            profile("codex-main", Harness::CODEX, "/s/x", false, true),
+        ];
+        let (policies, notes) = legacy.harness_policies().unwrap();
+        assert_eq!(policies.len(), 2);
+        assert_eq!(
+            policies[0],
+            HarnessPolicy {
+                harness: Harness::CLAUDE_CODE,
+                namespace: "claude-main".into(),
+                inject: true,
+                message: true,
+                executable_markers: Vec::new(),
+                store_env: None,
+                store_home: None,
+                child_address: None,
+                caller_proof: Vec::new(),
+            }
+        );
+        assert!(!policies[1].inject && policies[1].message);
+        assert_eq!(notes.len(), 3, "one explicit note per legacy profile");
+        assert!(notes.iter().all(|n| n.contains("no longer authorize")));
+        let registry = Registry::new(legacy.clone(), 0).unwrap();
+        assert_eq!(registry.migration_notes().len(), 3);
+        assert!(registry.policy(Harness::CODEX).is_some());
+
+        let mut ambiguous = legacy.clone();
+        ambiguous.profiles.push(profile(
+            "claude-other",
+            Harness::CLAUDE_CODE,
+            "/s/three",
+            true,
+            true,
+        ));
+        assert!(
+            ambiguous
+                .harness_policies()
+                .unwrap_err()
+                .contains("more than one namespace")
+        );
+        assert!(Registry::new(ambiguous, 0).is_err());
+
+        let policy = HarnessPolicy {
+            harness: Harness::CODEX,
+            namespace: "codex-main".into(),
+            inject: false,
+            message: true,
+            executable_markers: Vec::new(),
+            store_env: None,
+            store_home: None,
+            child_address: None,
+            caller_proof: Vec::new(),
+        };
+        let mut both = legacy.clone();
+        both.harnesses = vec![policy.clone()];
+        assert!(both.harness_policies().unwrap_err().contains("not both"));
+        let mut twice = base();
+        twice.harnesses = vec![policy.clone(), policy.clone()];
+        assert!(
+            twice
+                .harness_policies()
+                .unwrap_err()
+                .contains("two policies")
+        );
+        let mut bad = base();
+        bad.harnesses = vec![HarnessPolicy {
+            namespace: String::new(),
+            ..policy.clone()
+        }];
+        assert!(bad.harness_policies().is_err());
+
+        // Profile fields: a built-in harness has a fixed store rule and child
+        // addressing; a profile-only harness needs a safe store rule.
+        let zcode = HarnessPolicy {
+            harness: Harness::from_static("zcode"),
+            namespace: "zcode-main".into(),
+            store_home: Some(".zcode".into()),
+            ..policy.clone()
+        };
+        let accepted = |policy: HarnessPolicy| {
+            let mut config = base();
+            config.harnesses = vec![policy];
+            config.harness_policies().map(|_| ())
+        };
+        assert!(accepted(zcode.clone()).is_ok());
+        assert!(
+            accepted(HarnessPolicy {
+                store_env: Some("ZCODE_HOME".into()),
+                store_home: None,
+                child_address: Some(ChildAddress::Own),
+                caller_proof: Vec::new(),
+                ..zcode.clone()
+            })
+            .is_ok()
+        );
+        for (refused, why) in [
+            (
+                HarnessPolicy {
+                    store_home: Some(".claude".into()),
+                    ..policy.clone()
+                },
+                "fixed for a built-in",
+            ),
+            (
+                HarnessPolicy {
+                    child_address: Some(ChildAddress::Shared),
+                    caller_proof: Vec::new(),
+                    ..policy.clone()
+                },
+                "fixed for a built-in",
+            ),
+            (
+                HarnessPolicy {
+                    store_home: None,
+                    ..zcode.clone()
+                },
+                "needs store_env or store_home",
+            ),
+            (
+                HarnessPolicy {
+                    store_home: Some("../elsewhere".into()),
+                    ..zcode.clone()
+                },
+                "relative path",
+            ),
+            (
+                HarnessPolicy {
+                    store_home: Some("/abs/store".into()),
+                    ..zcode.clone()
+                },
+                "relative path",
+            ),
+            (
+                HarnessPolicy {
+                    store_env: Some("zcode-home".into()),
+                    ..zcode.clone()
+                },
+                "environment variable name",
+            ),
+        ] {
+            let error = accepted(refused).unwrap_err();
+            assert!(error.contains(why), "{error}");
+        }
+    }
+
+    /// Child addressing and address ownership follow the profile: fixed for the
+    /// built-in harnesses, configured (default shared) for any other.
+    #[test]
+    fn child_addressing_follows_the_profile() {
+        let policy = |harness: Harness, child_address| HarnessPolicy {
+            harness,
+            namespace: "ns".into(),
+            inject: true,
+            message: true,
+            executable_markers: Vec::new(),
+            store_env: None,
+            store_home: (!harness.is_built_in()).then(|| ".store".into()),
+            child_address,
+            caller_proof: Vec::new(),
+        };
+        let zcode = Harness::from_static("zcode");
+        for (policy, child, owns) in [
+            (
+                policy(Harness::CLAUDE_CODE, None),
+                ChildAddress::Shared,
+                false,
+            ),
+            (policy(Harness::CODEX, None), ChildAddress::Own, true),
+            (policy(Harness::OPENCODE, None), ChildAddress::Own, false),
+            (policy(zcode, None), ChildAddress::Shared, false),
+            (
+                policy(zcode, Some(ChildAddress::Own)),
+                ChildAddress::Own,
+                true,
+            ),
+        ] {
+            assert_eq!(policy.child_address(), child, "{:?}", policy.harness);
+            assert_eq!(
+                owns_address(ActorRole::Child, &policy),
+                owns,
+                "{:?}",
+                policy.harness
+            );
+            assert!(owns_address(ActorRole::Root, &policy));
+        }
+        assert_eq!(policy(zcode, None).default_marker(), "zcode");
+        assert_eq!(
+            policy(Harness::CLAUDE_CODE, None).default_marker(),
+            "claude"
+        );
+    }
+
+    /// A configuration written for the removed store and build trust still parses
+    /// from TOML, vendor signature included, and only migrates: the policy keeps
+    /// its namespace and capability flags and nothing else survives.
+    #[test]
+    fn a_legacy_toml_profile_with_signature_parses_and_migrates() {
+        let legacy = r#"
+host_id = "h"
+[[profiles]]
+namespace = "codex-main"
+harness = "Codex"
+store = "/ABS/home/.codex"
+[[profiles.executables]]
+path = "/Applications/Codex.app/codex"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+version = "1"
+inject = false
+message = true
+signature = { identifier = "codex", team_id = "ABCDE12345" }
+"#;
+        let config: RegistryConfig = toml::from_str(legacy).unwrap();
+        assert!(config.harnesses.is_empty());
+        let (policies, notes) = config.harness_policies().unwrap();
+        assert_eq!(
+            policies,
+            vec![HarnessPolicy {
+                harness: Harness::CODEX,
+                namespace: "codex-main".into(),
+                inject: false,
+                message: true,
+                executable_markers: Vec::new(),
+                store_env: None,
+                store_home: None,
+                child_address: None,
+                caller_proof: Vec::new(),
+            }]
+        );
+        assert!(notes[0].contains("vendor signatures no longer authorize"));
+        let current: RegistryConfig = toml::from_str(
+            "host_id = \"h\"\n[[harnesses]]\nharness = \"Codex\"\nnamespace = \"codex-main\"\ninject = false\nmessage = true\nexecutable_markers = [\"codex\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            current.harness_policies().unwrap().0[0].executable_markers,
+            ["codex"]
+        );
+        assert!(
+            toml::from_str::<RegistryConfig>(
+                "host_id = \"h\"\n[[harnesses]]\nharness = \"Codex\"\nnamespace = \"c\"\ninject = false\nmessage = true\nstore = \"/x\"\n"
+            )
+            .is_err(),
+            "a harness policy accepts no store or executable path"
+        );
+    }
+
+    /// A configuration written for the removed owner-build allowlist still
+    /// parses: its `owner_relays` input is an ignored unknown key that
+    /// authorizes nothing and changes no policy, and an invalid entry in it is
+    /// not even validated.
+    #[test]
+    fn legacy_owner_relays_input_is_ignored() {
+        let with_legacy: RegistryConfig = toml::from_str(
+            "host_id = \"h\"\n[[harnesses]]\nharness = \"Codex\"\nnamespace = \"codex-main\"\ninject = false\nmessage = true\n[[owner_relays]]\npath = \"relative/not-even-absolute\"\nsha256 = \"nothex\"\n",
+        )
+        .unwrap();
+        let without: RegistryConfig = toml::from_str(
+            "host_id = \"h\"\n[[harnesses]]\nharness = \"Codex\"\nnamespace = \"codex-main\"\ninject = false\nmessage = true\n",
+        )
+        .unwrap();
+        assert_eq!(with_legacy.legacy_owner_relays, 1);
+        assert_eq!(without.legacy_owner_relays, 0);
+        assert_eq!(
+            with_legacy.harness_policies().unwrap().0,
+            without.harness_policies().unwrap().0,
+            "the legacy input changes no policy"
+        );
+        assert!(
+            without.harness_policies().unwrap().1.is_empty(),
+            "a current configuration reports nothing"
+        );
+        let registry = Registry::new(with_legacy.clone(), 0).unwrap();
+        assert_eq!(registry.unqualified_executables(), 0);
+        assert!(
+            registry.configured_paths().is_empty(),
+            "no owner path joins the digest cache"
+        );
+        assert!(registry.policy(Harness::CODEX).is_some());
+        // The one explicit migration note, with its log/check code.
+        assert_eq!(registry.migration_notes().len(), 1);
+        assert!(
+            registry.migration_notes()[0].starts_with(
+                "legacy_owner_relays_ignored: 1 [[adapters.owner_relays]] entry ignored"
+            ),
+            "{:?}",
+            registry.migration_notes()
+        );
+        // Never serialized back: the retired key does not reappear.
+        assert!(
+            !serde_json::to_string(&with_legacy)
+                .unwrap()
+                .contains("owner_relays")
+        );
+    }
+
+    /// The registry advertises no native host/build fact: there is no configured
+    /// build to disclose, and nothing fake is listed.
+    #[test]
+    fn no_native_build_contract_is_advertised() {
+        let mut registry = registry_with(&[]);
+        assert!(registry.native_contracts().is_empty());
     }
 }

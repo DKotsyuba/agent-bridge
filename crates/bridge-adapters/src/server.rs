@@ -2,13 +2,13 @@
 //! hook commands and root MCP servers connect to.
 //!
 //! Every connection's peer is identified by the kernel (PID, UID) before a
-//! byte is read, and the registry resolves it to a qualified harness
-//! incarnation (see [`crate::registry`]). One JSON request line per
-//! connection:
+//! byte is read, and the registry resolves it to a marked harness incarnation
+//! that the harness policy enables (see [`crate::registry`]). One JSON request
+//! line per connection:
 //!
 //! - `{"op":"hook","harness":..,"payload":{native hook JSON}}` admits one
 //!   hook event. At a natural context point of the addressed actor with
-//!   qualified inject, the server drains through core
+//!   inject granted by the harness policy, the server drains through core
 //!   [`Storage::drain_inject`] — which commits the reserved, `invoking`,
 //!   frozen manifest *before* any byte is returned — and replies with the
 //!   exact stdout line the hook must print. The hook prints, flushes and
@@ -186,6 +186,13 @@ pub(crate) enum ChannelResponse {
         #[serde(default)]
         proof: Option<crate::registry::SealedProof>,
     },
+    /// Admitted `PreToolUse` of a Bridge root tool call: write `token` into the
+    /// call's input (`hookSpecificOutput.updatedInput`). Unlike inject there is
+    /// no flush confirmation: a token that never reaches the call joins nothing.
+    CallToken {
+        /// The single-use hook token.
+        token: crate::registry::CallToken,
+    },
     /// Refused; nothing was admitted or disclosed.
     Refused {
         /// Correlation error class.
@@ -237,6 +244,94 @@ pub struct ChannelServer {
     state: Arc<ChannelState>,
     /// Accept loop.
     accept: Option<JoinHandle<()>>,
+    /// Exclusive endpoint lock (`<socket>.lock`), held for the server's whole
+    /// life and released after the socket is removed on stop.
+    _lock: std::fs::File,
+}
+
+/// Takes the exclusive advisory lock that serializes every channel server
+/// contending for `socket`: `<socket>.lock`, created `0600` if absent and left
+/// in place afterwards (removing it would reopen the race it closes). A
+/// non-regular file (including a symlink) at that path is refused untouched.
+///
+/// # Errors
+///
+/// The lock path is not a regular file or cannot be opened, or another live
+/// server holds the lock (`WouldBlock`).
+fn lock_endpoint(socket: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut name = socket.as_os_str().to_owned();
+    name.push(".lock");
+    let path = PathBuf::from(name);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(std::io::Error::other(
+                "channel endpoint lock path is not a regular file",
+            ));
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(&path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "another channel server owns this endpoint",
+        )),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
+    }
+}
+
+/// Clears `socket` for binding only when it is positively stale; called with
+/// the endpoint lock held, so no other channel server can bind in between.
+///
+/// Absent: nothing to do. A socket file owned by `owner_uid` that refuses a
+/// connection (nothing listens: a crashed earlier server) is removed, and only
+/// while it is still the inode that was inspected. Everything else is refused
+/// and left untouched: a live listener (`AddrInUse`), a symlink, a regular
+/// file or directory, a socket of another user, a replaced inode, and any
+/// connect error that is not a refusal (no positive staleness proof).
+///
+/// # Errors
+///
+/// Any refusal above or an inspection/removal failure.
+fn claim_stale_socket(socket: &Path, owner_uid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    let metadata = match std::fs::symlink_metadata(socket) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        other => other?,
+    };
+    if !metadata.file_type().is_socket() || metadata.uid() != owner_uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "channel path is not a socket of this user; left untouched",
+        ));
+    }
+    match UnixStream::connect(socket) {
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "a live server already owns the channel socket",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+            let again = std::fs::symlink_metadata(socket)?;
+            if (again.dev(), again.ino()) != (metadata.dev(), metadata.ino()) {
+                return Err(std::io::Error::other(
+                    "channel socket was replaced while it was inspected",
+                ));
+            }
+            std::fs::remove_file(socket)
+        }
+        Err(error) => Err(std::io::Error::new(
+            error.kind(),
+            "cannot prove the channel socket is stale; left untouched",
+        )),
+    }
 }
 
 /// Locks the registry, tolerating poison (each admission is a whole
@@ -282,8 +377,13 @@ impl ChannelServer {
     ///
     /// Revalidates the private sibling route journal and records renewed core
     /// fences before accepting hooks. Call records are never recovered.
-    /// An existing path at `socket` is refused, never removed: a stale
-    /// endpoint must be cleared by its owner.
+    ///
+    /// Endpoint ownership: the exclusive `<socket>.lock` is taken first (a
+    /// second live server refuses before inspecting anything) and held for
+    /// the server's life. A stale socket left by a crashed server (this
+    /// user's socket, connection refused, same inode) is removed so a restart
+    /// binds again; a live listener, a symlink, a non-socket path or another
+    /// user's socket is refused and never removed.
     pub fn start(
         socket: &Path,
         registry: Arc<Mutex<Registry>>,
@@ -293,7 +393,9 @@ impl ChannelServer {
         let directory = socket
             .parent()
             .ok_or_else(|| std::io::Error::other("channel socket has no directory"))?;
-        private_directory(directory)?;
+        let owner = private_directory(directory)?;
+        let lock = lock_endpoint(socket)?;
+        claim_stale_socket(socket, owner)?;
         let restored = lock_registry(&registry)
             .attach_journal(
                 &socket.with_extension("bindings.json"),
@@ -333,6 +435,7 @@ impl ChannelServer {
             identity: (metadata.dev(), metadata.ino()),
             state,
             accept: Some(accept),
+            _lock: lock,
         })
     }
 
@@ -436,7 +539,8 @@ fn write_response(stream: &mut UnixStream, response: &ChannelResponse) -> std::i
     stream.flush()
 }
 
-/// Serves one connection.
+/// Serves one protected connection. Native observation reads bypass executable
+/// digest refresh so authorization precedes registry access and reads stay pure.
 fn serve(stream: UnixStream, state: &ChannelState) {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
@@ -457,6 +561,9 @@ fn serve(stream: UnixStream, state: &ChannelState) {
         producer::serve_v1(&line, peer, state, &mut writer);
         return;
     }
+    // Refresh configured relay/audience builds before legacy attestation; v1
+    // registration/assertion paths refresh after decoding their operation.
+    crate::registry::refresh_stale(&state.registry);
     let request: ChannelRequest = match serde_json::from_str(&line) {
         Ok(request) => request,
         Err(_) => {
@@ -509,7 +616,7 @@ fn serve(stream: UnixStream, state: &ChannelState) {
     }
 }
 
-/// Admits one hook event and, at a qualified context point, drains.
+/// Admits one hook event and, at a context point with inject granted, drains.
 fn serve_hook(
     peer: os::PeerIdentity,
     harness: Harness,
@@ -549,6 +656,10 @@ fn serve_hook(
                 &[("error", &error.to_string())],
             );
         }
+    }
+    if let Some(token) = admission.token {
+        let _ = write_response(writer, &ChannelResponse::CallToken { token });
+        return;
     }
     let Some(attestation) = admission.drain else {
         let _ = write_response(writer, &ChannelResponse::Ok);
@@ -628,5 +739,93 @@ fn serve_hook(
             "hook_outcome_unrecorded",
             &[("error", &error.to_string())],
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Channel endpoint ownership: only a positively stale socket of this user
+    //! is reclaimed, under an exclusive lock; nothing else is ever removed.
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A fresh private scratch directory (mode 0700) under `TMPDIR`.
+    fn scratch(tag: &str) -> PathBuf {
+        let entropy = os::random_bytes().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "{tag}{:x}",
+            u64::from_le_bytes(entropy[..8].try_into().unwrap())
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    /// A crashed server's socket (bound, listener gone) is removed; a live
+    /// listener, a symlink to a stale socket, a regular file and a directory
+    /// are refused and left exactly in place; an absent path is fine.
+    #[test]
+    fn only_a_positively_stale_own_socket_is_claimed() {
+        let dir = scratch("cs");
+        let uid = os::process_facts(std::process::id()).unwrap().uid.unwrap();
+        let path = dir.join("c.sock");
+        claim_stale_socket(&path, uid).unwrap();
+        drop(UnixListener::bind(&path).unwrap());
+        assert!(path.exists(), "a dropped listener leaves its socket file");
+        claim_stale_socket(&path, uid).unwrap();
+        assert!(!path.exists(), "the stale socket is reclaimed");
+        let live = UnixListener::bind(&path).unwrap();
+        let error = claim_stale_socket(&path, uid).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(
+            UnixStream::connect(&path).is_ok(),
+            "the live endpoint survives"
+        );
+        drop(live);
+        let error = claim_stale_socket(&path, uid + 1).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(path.exists(), "another user's socket is never removed");
+        let link = dir.join("l.sock");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        claim_stale_socket(&link, uid).unwrap_err();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(path.exists(), "a symlink target is never touched");
+        let file = dir.join("f.sock");
+        std::fs::write(&file, b"foreign").unwrap();
+        claim_stale_socket(&file, uid).unwrap_err();
+        assert_eq!(std::fs::read(&file).unwrap(), b"foreign");
+        let directory = dir.join("d.sock");
+        std::fs::create_dir(&directory).unwrap();
+        claim_stale_socket(&directory, uid).unwrap_err();
+        assert!(directory.is_dir());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The endpoint lock admits one holder at a time and is released on drop;
+    /// a symlink at the lock path is refused untouched.
+    #[test]
+    fn the_endpoint_lock_is_exclusive() {
+        let dir = scratch("cl");
+        let path = dir.join("c.sock");
+        let held = lock_endpoint(&path).unwrap();
+        let error = lock_endpoint(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        drop(held);
+        drop(lock_endpoint(&path).unwrap());
+        let other = dir.join("o.sock");
+        std::os::unix::fs::symlink(dir.join("c.sock.lock"), dir.join("o.sock.lock")).unwrap();
+        lock_endpoint(&other).unwrap_err();
+        assert!(
+            std::fs::symlink_metadata(dir.join("o.sock.lock"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

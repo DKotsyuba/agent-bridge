@@ -10,6 +10,29 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// A trusted plugin's exact per-call context is supported; vendor session-only,
+/// model-argument, malformed and mixed-host candidates never become evidence.
+#[test]
+fn opencode_plugin_metadata_requires_a_complete_separate_contract() {
+    let native = serde_json::json!({"ai.opencode/sessionID":"ses_native","ai.agent_bridge/toolCallID":"call_native"});
+    assert!(extract_native_evidence(Host::OpenCode, &native).is_ok());
+    assert_eq!(
+        serde_json::to_value(Host::OpenCode).unwrap(),
+        serde_json::json!("opencode")
+    );
+    for invalid in [
+        serde_json::json!({"ai.opencode/sessionID":"ses_native"}),
+        serde_json::json!({"arguments":native}),
+        serde_json::json!({"ai.opencode/sessionID":"ses_native","ai.agent_bridge/toolCallID":""}),
+        serde_json::json!({"ai.opencode/sessionID":"ses_native","ai.agent_bridge/toolCallID":"call_native","claudecode/toolUseId":"other"}),
+        serde_json::json!({"ai.opencode/sessionID":"ses_native","ai.agent_bridge/toolCallID":"call_native","callId":"other"}),
+    ] {
+        assert!(extract_native_evidence(Host::OpenCode, &invalid).is_err());
+    }
+    assert!(extract_native_evidence(Host::Codex, &native).is_err());
+    assert!(extract_native_evidence(Host::ClaudeCode, &native).is_err());
+}
+
 /// Synthetic publication fixture, deliberately unrelated to any consumer product.
 fn publication() -> PublishParams {
     PublishParams {
@@ -57,11 +80,110 @@ fn acknowledge(request: &Request) -> Vec<u8> {
     bytes.push(b'\n');
     bytes
 }
-/// Opens only a task-private socket beneath the explicitly configured TMPDIR.
+/// Names a test-private socket beneath the explicitly configured, absolute
+/// `TMPDIR` (no system fallback); it must be short enough for a Unix socket.
 fn path(name: &str) -> PathBuf {
     let base = PathBuf::from(std::env::var_os("TMPDIR").expect("explicit task TMPDIR required"));
-    assert!(base.starts_with("/Users/pluto/projects/tmp/agent-bridge"));
+    assert!(base.is_absolute(), "TMPDIR must be an absolute directory");
     base.join(format!("sdk-{}-{name}.sock", std::process::id()))
+}
+
+/// Both read methods use only the adapter socket; lost ACK retries preserve the
+/// exact request and mismatched replies remain read failures without reconciliation.
+/// Calling this synchronous client inside a Tokio task must not nest block_on or
+/// panic while creating/releasing the private peer-credential driver.
+#[test]
+fn native_observation_sdk_boundary() {
+    let socket = path("observations");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let worker = thread::spawn(move || {
+        let mut original = String::new();
+        let (stream, _) = listener.accept().unwrap();
+        BufReader::new(stream).read_line(&mut original).unwrap();
+        for step in 0..4 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let request = decode_request(line.trim_end().as_bytes()).unwrap();
+            let result = if step == 0 {
+                assert_eq!(line, original, "lost read ACK must not change identity");
+                assert!(matches!(request.operation, Operation::ObserveRecipient(_)));
+                OperationResult::ObserveRecipient(RecipientObservation {
+                    address: "host/codex/store/session".into(),
+                    sampled_at_ms: 1,
+                    observation: RecipientObservationState::Unavailable,
+                })
+            } else {
+                assert!(matches!(request.operation, Operation::ResolveRecipient(_)));
+                OperationResult::ResolveRecipient(ResolveRecipientResult {
+                    sampled_at_ms: 1,
+                    resolution: RecipientResolution::Resolved {
+                        address: format!(
+                            "host/codex/store/{}",
+                            if step == 1 { "session" } else { "foreign" }
+                        ),
+                    },
+                })
+            };
+            let mut bytes = encode_response(&Response::ok(&request.request_id, result)).unwrap();
+            bytes.push(b'\n');
+            stream.write_all(&bytes).unwrap();
+        }
+    });
+    let client = Client::new(
+        Config::new(
+            &socket,
+            path("unused-core"),
+            Secret::new("fixture-secret"),
+            Duration::from_secs(2),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .unwrap();
+    assert_eq!(
+        runtime
+            .block_on(async {
+                client.observe_recipient(
+                    "observe",
+                    ObserveRecipientParams {
+                        address: "host/codex/store/session".into(),
+                    },
+                )
+            })
+            .unwrap()
+            .observation,
+        RecipientObservationState::Unavailable
+    );
+    let params = ResolveRecipientParams {
+        host: Host::Codex,
+        native_session_id: "session".into(),
+        expected_store: "/private/synthetic".into(),
+        expected_harness_pid: 23,
+        expected_harness_start_time_secs: 42,
+    };
+    assert!(matches!(
+        client
+            .resolve_recipient("resolve", params.clone())
+            .unwrap()
+            .resolution,
+        RecipientResolution::Resolved { .. }
+    ));
+    assert!(matches!(
+        client.resolve_recipient("foreign", params),
+        Err(ClientError::Transport {
+            outcome: TransportOutcome::ReadFailed,
+            reconciliation: None,
+            ..
+        })
+    ));
+    worker.join().unwrap();
+    fs::remove_file(socket).unwrap();
 }
 /// One reusable public control exercises real streams, not an artificial transport trait.
 #[test]
@@ -258,4 +380,41 @@ fn public_sdk_boundary() {
         )
         .is_err()
     );
+}
+
+/// A service that answers and closes at once is read on the first connection: the answer is
+/// returned and no second connection (a replayed request) is ever made.
+#[test]
+fn immediate_close_after_answer_is_not_retried() {
+    let socket = path("fast-close");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let worker = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let request = decode_request(line.trim_end().as_bytes()).unwrap();
+        let mut stream = stream;
+        stream.write_all(&acknowledge(&request)).unwrap();
+        drop(stream);
+        listener.set_nonblocking(true).unwrap();
+        // Give a retry every chance to arrive before checking that none did.
+        thread::sleep(Duration::from_millis(200));
+        assert!(listener.accept().is_err(), "the request was replayed");
+    });
+    let client = Client::new(
+        Config::new(
+            &socket,
+            &socket,
+            Secret::new("never-log-this-credential"),
+            Duration::from_secs(1),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let received = client.publish("fast-close", publication()).unwrap();
+    assert!(received.replayed);
+    worker.join().unwrap();
+    fs::remove_file(&socket).unwrap();
 }

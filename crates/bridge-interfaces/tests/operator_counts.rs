@@ -32,7 +32,7 @@ const OPERATOR: &str = "operator-token-for-counts-01";
 
 /// The one synthetic recipient.
 fn recipient() -> NativeAddress {
-    NativeAddress::new("lab", Harness::ClaudeCode, "store", "session").unwrap()
+    NativeAddress::new("lab", Harness::CLAUDE_CODE, "store", "session").unwrap()
 }
 
 /// An exclusively created scratch tree removed (only it) on drop.
@@ -126,6 +126,8 @@ fn lab() -> Lab {
         modes: vec!["inject".into(), "message".into()],
         policies: vec!["latest".into(), "keep_all".into()],
         admin: false,
+        managed_feedback: false,
+        diagnostics: false,
         producer_v1: None,
     };
     let core = start_with_carriers(
@@ -145,6 +147,8 @@ fn lab() -> Lab {
                     modes: vec![],
                     policies: vec![],
                     admin: true,
+                    managed_feedback: false,
+                    diagnostics: false,
                     producer_v1: None,
                 },
             ],

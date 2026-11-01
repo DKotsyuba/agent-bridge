@@ -1,13 +1,14 @@
 # Native producer ingress v1
 
-Contract ID: `bridge-producer-native-v1`, revision 3. Provider: M-009.
-Consumers: M-007 and M-008. Status: implemented source candidate with owned
-process/SQLite boundary controls. Stock native v1 qualification belongs to root
-assembly and is not claimed here. Consumer projects and the installed service
-remain unchanged.
-Canonical related boundaries are `bridge-producer-wire-v1` (M-007) and
-`bridge-producer-core-v1` (M-008). This artifact refines DOC-015 sections 4/8
-and DOC-017's detached invocation transfer for the initial implementation.
+Contract ID: `bridge-producer-native-v1`, revision 3. Provider: the native
+adapters. Consumers: the protocol/SDK and the core. Status: implemented, with
+owned process and SQLite boundary controls. Native host qualification is recorded
+separately in the [qualification matrix](../../../docs/qualification.md) and is not
+claimed here. Related boundaries are the [wire contract](../../bridge-protocol/docs/wire-v1.md)
+(`bridge-producer-wire-v1`) and the [core contract](../../bridge-core/docs/producer-core-v1.md)
+(`bridge-producer-core-v1`). This document refines the producer onboarding sequence
+in [Producer integration](../../../docs/producer-integration.md) and its detached
+invocation transfer.
 
 ## Ownership and ingress
 
@@ -26,14 +27,16 @@ is supported native host MCP-call grammar. Payload meaning and local admission,
 sandbox/access/source/generation checks remain with the producer.
 
 The registry and custody locks never overlap; neither spans socket I/O. Serving
-reuses warmed executable identity/digest checks and current kernel process facts;
-it never hashes executable bytes under an admission lock.
+reuses warmed digest checks of the configured relay and audience
+executables and current kernel process facts (harness executables get no digest
+check: they are checked for owner, mode and unchanged-since-start process facts); it never hashes executable bytes under an
+admission lock.
 
 ## Verified origin and claim
 
 New registration requires one exact native MCP invocation or a registry-issued
 sealed transfer of it. Direct metadata joins one protected fresh PreToolUse
-record belonging to the same qualified harness incarnation and binding epoch.
+record belonging to the same verified harness incarnation and binding epoch.
 Mixed, ambiguous, foreign, stale, malformed and previously consumed evidence
 refuse. Root and child remain distinct even when they share a session address.
 An address, operation key, PID, cwd, environment, display name or model-authored
@@ -76,6 +79,63 @@ not contain PID, endpoint epoch, native call ID or daemon boot. Destination scop
 may be equal for different callers without collapsing their authority.
 
 ## Registration coordinator
+
+### OpenCode managed lifecycle
+
+The first-party [lifecycle plugin](../plugins/opencode/index.js) targets OpenCode
+2.0.28. Its native prompt and tool hooks observe actual session/call IDs; its
+execution event subscription reports activity, terminal execution and deletion.
+Session discovery starts `Unknown`; only a genuine terminal execution becomes
+`Inactive`. Lost subscriptions and disposal invalidate readiness. Parent facts
+come from `session.get`, never display labels or model arguments. The actual
+process's absolute `OPENCODE_DB` parent identifies its private store.
+
+OpenCode policies support `message` only; `inject=true` is rejected. A child
+session never has the `message` capability, including a binding renewed from an
+older one that had it (the capability is withdrawn at renewal). A child's own
+`SessionEnd` retires its binding to `Unknown`, and a child `Stop` never makes it
+`Inactive`; child wake stays unqualified. Root attestation is unchanged. The route journal records whether an OpenCode address
+is a root or a child: a recorded root keeps `message` across a restart with no new
+hook, while a recorded child, or a row written by an earlier build without that fact, is
+restored with `message` withheld until the address's own next hook (a root then regains
+it; a child does not). An earlier build refuses a journal that holds the new field. Under
+sustained native-feed overload the plugin drops observations, queues one
+invalidation that makes every retained session `Unknown`, and accepts nothing
+until it has run, so a later `Stop` cannot restore readiness it invalidated.
+A message
+uses the existing live launcher's exact direct-parent owner route with protocol
+`opencode_input`. Bridge neither guesses an HTTP endpoint nor starts a second
+scheduler. Correlated owner admission is native acceptance, not processing;
+uncertain outcomes retain their original identity without resend or fallback.
+
+The optional SDK metadata candidate requires both `ai.opencode/sessionID` and
+`ai.agent_bridge/toolCallID`. The second field belongs to the trusted first-party
+plugin contract: stock OpenCode MCP metadata supplies only the session ID and
+is insufficient. Managed component ABI 2 (`native-context`) wraps the original
+permission-checked MCP executor and keeps its backend persistent. A private stdio
+transport worker accepts actual ToolContext from only the frontend's kernel-verified
+direct native parent PID, user and process incarnation. The bootstrap waits for a
+private socket-pair readiness handshake and execs the original backend in place,
+so the frontend remains the native harness's direct child. The worker validates
+its private transport peer against that frontend parent; it neither adds an
+ancestor nor needs a new registry intermediate allowlist. Per-server admission is bounded and
+serialized; exactly matching session, method and arguments receive the call ID
+once, before a possible backend write. Discovery and original results pass through.
+Missing or mismatched context is not forwarded; an already forwarded invocation
+remains uncertain and must never be replayed. Failed cleanup blocks further calls.
+Neither model arguments nor sibling processes can supply this context. The SDK
+parser, protected hook join and actor/audience checks are unchanged; no new caller
+authority is minted. A launcher must seal the matching component and proxy binary.
+OpenCode exposes MCP tool IDs as `<namespace>_<name>`. The component maps only
+actual configured native MCP definitions to Bridge's normalized `mcp__server__tool`
+hook classification; it never guesses MCP origin from an arbitrary name prefix.
+Actual native session and call IDs stay unchanged.
+Parsing these fields grants no authority. Standalone OpenCode
+root MCP registration, child message wake and context injection are unqualified.
+
+Synthetic plugin checks run with `node --expose-gc --test
+crates/bridge-adapters/plugins/opencode/index.test.js`; they use no native host.
+Native wake qualification remains a separate manual check.
 
 1. Decode/validate v1 and authenticate via core's shared ProducerAuthorizer.
    Core/adapters use one immutable per-boot policy; no second credential or grant
@@ -146,9 +206,23 @@ No credentials, raw proof strings or assertion keys enter ordinary Debug/log out
 ## Capabilities and acceptance controls
 
 Authenticated capabilities disclose only the producer's permitted boundary.
-Native host/build/digest and direct/nested path support are explicit. Declarative
-profile support is distinct from recorded native qualification. Initial
-host_observations is unsupported; existing lifecycle hooks/carriers remain intact.
+Native host/build/digest facts are not advertised (the list is empty: no harness
+build is predeclared), so a consumer never reads a fake build. Harness-policy
+support is distinct from recorded native qualification. `host_observations` is
+advertised only for an explicitly enabled producer grant on this adapter endpoint.
+
+`observe_recipient` and `resolve_recipient` implement the
+[exact native reads](../../bridge-protocol/docs/wire-v1.md#exact-native-reads).
+Both require recipient and native namespace permission before binding or process
+lookup. The latter derives the one address from configured host id, harness policy
+namespace and requested native session, then compares expected store/PID/start
+seconds with the existing protected nonretired binding. Both check current UID,
+executable, private canonical store and actual process environment outside the
+registry lock, then compare the entire binding and policy under the lock last.
+No lookup starts executable digest refresh, spends a proof, writes a journal or
+custody, creates a binding or invokes a carrier. Missing or changed facts return
+unavailable without private expected facts in errors or results. This seconds-based
+process check is not caller authentication or a stronger birth/ownership proof.
 
 Decisive owned-process controls: direct/sealed reservation exclusivity versus
 legacy consumers; exact registration replay before evidence; same operation/new
@@ -158,7 +232,7 @@ backend audience/invocation; consumption expiry/retry/issuer boot/endpoint renew
 outer-wrapper/missing native MCP classification refusal; frame limits/redaction;
 and unchanged existing native message/inject behavior. Controls include a meaningful
 ownership/fence mutation that fails, restoration and successful control rerun.
-Actual native host qualification is separately owned root evidence, not inferred
+Actual native host qualification is separate, observed evidence (see the qualification matrix), not inferred
 from a fixture, cache or queue acceptance.
 
 ## Consumer integration and owned probe
@@ -174,15 +248,15 @@ Optional TOML `adapters.audiences` entries have opaque `name`, authenticated
 The corresponding core producer policy explicitly grants the audience name.
 Do not share a backend credential or executable qualification with an untrusted
 frontend; this deployment trust declaration is not product permission. Missing
-configuration, wrong peer/build/producer/invocation or expired/revoked assertion
+configuration, wrong peer/executable/producer/invocation or expired/revoked assertion
 refuses before a new consume effect. Consumed receipts remain bounded per boot;
 exhaustion refuses new assertion capacity rather than dropping their identities.
 
 The Bridge-owned qualification binary supports:
 `bridge-fixture universal-mcp <adapter> <core> <token-file> <evidence-file> <config-file>`.
 Runtime configuration contains only `tool_name`, `request_id`, `operation_key`,
-`event_id`, `kind`, `payload_file`, and `mode`. Select opaque names after freezing
-common binaries. The probe preserves actual framework `_meta`, registers using
+`event_id`, `kind`, `payload_file`, and `mode`. Choose opaque names independently of
+the build under test. The probe preserves actual framework `_meta`, registers using
 the public wire, publishes the hidden payload through its route and returns
 receipt facts only. It reuses the existing MCP loop, bounded sender and private
 credential reader; there is no producer-specific transport or framework.
@@ -194,4 +268,29 @@ nonconsuming foreign-origin refusal, wrapper/missing/mixed host evidence,
 unsupported operation/version refusal, original assertion expiry, audience/RPC
 linkage, endpoint renewal and issuer boot loss. Existing native message/inject
 regression remains covered. Controlled implementation mutations must fail these
-public checks and restoration must pass before a candidate is submitted.
+public checks and restoration must pass again.
+
+## Native-owner busy delivery fences
+
+The owner-routed Codex, Claude Code and OpenCode message carriers hold a
+positively non-idle recipient before reserving work. An owner endpoint or idle
+state change proven before native input is a deferred known-unsent outcome.
+After writing the owner request, only a correlated strictly closed receipt with
+state `known_unsent`, null protocol/native-id and reason `not_idle`,
+`awaiting_input` or `capacity` permits this zero-effect deferral. Other valid
+known-unsent reasons keep ordinary bounded retries. Missing, malformed,
+uncorrelated and unknown receipts remain outcome-unknown, with no resend and no
+alternate route. These delivery outcomes grant no producer caller authority and
+never answer native permission or input requests.
+
+## Linux candidate route availability
+
+The Linux ARM64 candidate resolves existing configured intermediate executable
+aliases before comparing them with kernel process paths (for example Debian's
+`/bin/sh` resolves to `/usr/bin/dash`). This preserves the operator's selected
+executable; it adds no inferred ancestor, UID, store or harness permission.
+A missing Codex confinement launcher disables only the legacy helper selection.
+Native owners still require exact direct-parent kernel identity, trusted unchanged
+executable, canonical private socket and positively idle recipient. An absent or
+unprovable owner cannot activate that path or fall back through an unavailable
+helper. Source/process fixtures and real native-model qualification remain distinct.

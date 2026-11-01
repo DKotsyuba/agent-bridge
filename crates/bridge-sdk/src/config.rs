@@ -4,11 +4,12 @@ use bridge_protocol::{Secret, validate_id};
 use std::{path::PathBuf, time::Duration};
 
 /// Immutable shareable endpoint/credential/deadline configuration.
-/// Endpoints must reside in service-owned protected directories; this SDK does
-/// not recreate native process attestation. One client may serve many threads.
+/// Endpoints must reside in service-owned protected directories. The SDK verifies
+/// the connected peer has the caller's effective UID before writing credentials;
+/// this is not native process attestation. One client may serve many threads.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Explicit native registration/assertion Unix endpoint.
+    /// Explicit native registration/assertion/observation Unix endpoint.
     pub registration_socket: PathBuf,
     /// Explicit durable publication/status/lifecycle Unix endpoint.
     pub core_socket: PathBuf,

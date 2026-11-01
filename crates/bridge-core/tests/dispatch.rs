@@ -28,6 +28,148 @@ fn timing() -> DispatchTiming {
     DispatchTiming::default()
 }
 
+/// Late batch evidence settles only members still owned by the old attempt.
+/// Disposed members and newer invoking, accepted or unknown attempts retain
+/// their states and incidents; every original member still receives evidence.
+#[test]
+fn late_batch_outcomes_fence_each_member_independently() {
+    for sibling in ["disposed", "invoking", "accepted", "unknown"] {
+        for refusal in [false, true] {
+            let mut storage = store();
+            let recipient = codex("batch-owner");
+            let attestation = attest(&recipient, Lifecycle::Inactive, 1);
+            for id in ["a", "b"] {
+                storage
+                    .publish(&batched("agent-run", id, &recipient, "pair"), 1000)
+                    .unwrap();
+            }
+            let first = attempt(
+                storage
+                    .reserve_next(&attestation, EffectiveMode::Message, 2000, &timing())
+                    .unwrap(),
+            );
+            assert_eq!(first.members.len(), 2);
+            storage
+                .mark_invoking(&first.fence, &attestation, 2001)
+                .unwrap();
+            storage
+                .record_outcome(
+                    &first.fence,
+                    Outcome::OutcomeUnknown {
+                        reason: "fixture lost receipt".into(),
+                    },
+                    2002,
+                )
+                .unwrap();
+            if sibling == "disposed" {
+                storage
+                    .dispose_event("agent-run", "a", "operator", "fixture decision", 3000)
+                    .unwrap();
+            } else {
+                storage
+                    .authorize_manual_retry("agent-run", "a", "operator", "fixture retry", 3000)
+                    .unwrap();
+                let second = attempt(
+                    storage
+                        .reserve_next(&attestation, EffectiveMode::Message, 3001, &timing())
+                        .unwrap(),
+                );
+                assert_eq!(second.members.len(), 1);
+                storage
+                    .mark_invoking(&second.fence, &attestation, 3002)
+                    .unwrap();
+                let outcome = match sibling {
+                    "accepted" => Some(Outcome::NativeAccepted {
+                        evidence: "fixture queue accepted".into(),
+                    }),
+                    "unknown" => Some(Outcome::OutcomeUnknown {
+                        reason: "fixture newer lost receipt".into(),
+                    }),
+                    _ => None,
+                };
+                if let Some(outcome) = outcome {
+                    storage
+                        .record_outcome(&second.fence, outcome, 3003)
+                        .unwrap();
+                }
+            }
+            let before = storage
+                .delivery_evidence("agent-run", "a")
+                .unwrap()
+                .unwrap();
+            let incidents = storage
+                .incidents(true, 4000, 100)
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.event_id == "a")
+                .collect::<Vec<_>>();
+            if refusal {
+                storage
+                    .record_outcome(
+                        &first.fence,
+                        Outcome::PermanentRefusal {
+                            reason: "fixture old refusal".into(),
+                        },
+                        4000,
+                    )
+                    .unwrap();
+            } else {
+                storage
+                    .record_evidence(
+                        "agent-run",
+                        "b",
+                        first.fence.attempt_seq,
+                        EvidenceTier::KnownUnsent,
+                        "fixture old helper never wrote",
+                        4000,
+                    )
+                    .unwrap();
+            }
+            let after = storage
+                .delivery_evidence("agent-run", "a")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                after.delivery, before.delivery,
+                "sibling {sibling}, refusal {refusal}"
+            );
+            assert_eq!(after.attempts_made, before.attempts_made);
+            if sibling != "disposed" {
+                assert_eq!(
+                    after.attempt, before.attempt,
+                    "the newer attempt is untouched"
+                );
+            }
+            assert_eq!(
+                storage
+                    .incidents(true, 4000, 100)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|row| row.event_id == "a")
+                    .collect::<Vec<_>>(),
+                incidents
+            );
+            for id in ["a", "b"] {
+                assert!(
+                    storage
+                        .delivery_evidence("agent-run", id)
+                        .unwrap()
+                        .unwrap()
+                        .tiers
+                        .iter()
+                        .any(|entry| entry.attempt_seq == first.fence.attempt_seq
+                            && entry.tier
+                                == if refusal {
+                                    EvidenceTier::Refused
+                                } else {
+                                    EvidenceTier::KnownUnsent
+                                })
+                );
+            }
+        }
+    }
+}
+
 /// Unwraps a reserved or invoking attempt from a selection.
 fn attempt(selection: Selection) -> bridge_core::dispatch::AttemptRecord {
     match selection {
@@ -2070,9 +2212,28 @@ fn long_holds_escalate_to_an_incident_that_clears_with_the_hold() {
     assert!(storage.open_incidents(700_001, 10).unwrap().is_empty());
 }
 
+/// An attestation of `recipient` with exactly the given loaded paths.
+fn attest_with(
+    recipient: &NativeAddress,
+    lifecycle: Lifecycle,
+    inject: bool,
+    message: bool,
+) -> Attestation {
+    Attestation::verified(
+        recipient.clone(),
+        recipient.native_session_id.clone(),
+        1,
+        lifecycle,
+        Capabilities { inject, message },
+        "fixture-proof",
+    )
+    .unwrap()
+}
+
 /// Modes the recipient is known not to support are refused before
 /// acceptance, while an unknown recipient is accepted pending
-/// attestation.
+/// attestation. `auto` needs only that at least one path is loaded: it
+/// resolves per dispatch and its effective path is gated there.
 #[test]
 fn unsupported_modes_are_refused_before_acceptance_but_unknown_recipients_are_accepted() {
     let mut storage = store();
@@ -2084,38 +2245,59 @@ fn unsupported_modes_are_refused_before_acceptance_but_unknown_recipients_are_ac
             1_000,
         )
         .unwrap();
-    // The adapter attests that only message is loaded.
-    let message_only = Attestation::verified(
-        recipient.clone(),
-        "thread-caps",
-        1,
-        Lifecycle::Inactive,
-        Capabilities {
-            inject: false,
-            message: true,
-        },
-        "fixture-proof",
-    )
-    .unwrap();
-    storage.observe_binding(&message_only, 2_000).unwrap();
-    for mode in [Mode::Inject, Mode::Auto] {
-        assert!(
-            matches!(
-                storage.publish(
-                    &keep_all("agent-run", &format!("caps-{mode:?}"), &recipient, mode),
-                    3_000
-                ),
-                Err(CoreError::Unsupported(_))
-            ),
-            "{mode:?} needs the inject path"
-        );
-    }
+    // The adapter attests that only message is loaded: inject is refused,
+    // auto resolves to message and is admitted, message is admitted.
     storage
-        .publish(
-            &keep_all("agent-run", "caps-msg", &recipient, Mode::Message),
-            3_000,
+        .observe_binding(
+            &attest_with(&recipient, Lifecycle::Inactive, false, true),
+            2_000,
         )
         .unwrap();
+    assert!(
+        matches!(
+            storage.publish(
+                &keep_all("agent-run", "caps-inject", &recipient, Mode::Inject),
+                3_000
+            ),
+            Err(CoreError::Unsupported(_))
+        ),
+        "inject needs the inject path"
+    );
+    for mode in [Mode::Auto, Mode::Message] {
+        storage
+            .publish(
+                &keep_all("agent-run", &format!("caps-{mode:?}"), &recipient, mode),
+                3_000,
+            )
+            .unwrap();
+    }
+    // With neither path loaded every mode is refused before custody.
+    storage
+        .observe_binding(
+            &attest_with(&recipient, Lifecycle::Inactive, false, false),
+            3_500,
+        )
+        .unwrap();
+    for mode in [Mode::Inject, Mode::Message, Mode::Auto] {
+        let id = format!("caps-none-{mode:?}");
+        assert!(
+            matches!(
+                storage.publish(&keep_all("agent-run", &id, &recipient, mode), 3_600),
+                Err(CoreError::Unsupported(_))
+            ),
+            "{mode:?} has no loaded path"
+        );
+        assert!(
+            storage
+                .lookup(
+                    &bridge_core::PublisherId::new("agent-run").unwrap(),
+                    &bridge_core::EventId::new(&id).unwrap()
+                )
+                .unwrap()
+                .is_none(),
+            "{mode:?} was never accepted"
+        );
+    }
     // Unsupported is permanent and distinct from a transient hold: the
     // adapter re-attesting with the inject path loaded lifts the refusal.
     storage
@@ -2128,6 +2310,67 @@ fn unsupported_modes_are_refused_before_acceptance_but_unknown_recipients_are_ac
                 5_000
             )
             .is_ok()
+    );
+}
+
+/// An admitted `auto` event of a message-only recipient follows the
+/// lifecycle: positively inactive resolves to the message path and reserves
+/// one attempt; active resolves to inject, which is not loaded, so nothing is
+/// reserved or sent and the message path never takes it.
+#[test]
+fn auto_for_a_message_only_recipient_follows_the_lifecycle_without_effect() {
+    let mut storage = store();
+    let inactive = codex("thread-auto-idle");
+    let active = codex("thread-auto-busy");
+    for (recipient, lifecycle, event) in [
+        (&inactive, Lifecycle::Inactive, "auto-idle"),
+        (&active, Lifecycle::Active, "auto-busy"),
+    ] {
+        let attestation = attest_with(recipient, lifecycle, false, true);
+        storage.observe_binding(&attestation, 1_000).unwrap();
+        storage
+            .publish(&keep_all("agent-run", event, recipient, Mode::Auto), 2_000)
+            .unwrap();
+    }
+    let reserved = attempt(
+        storage
+            .reserve_next(
+                &attest_with(&inactive, Lifecycle::Inactive, false, true),
+                EffectiveMode::Message,
+                3_000,
+                &timing(),
+            )
+            .unwrap(),
+    );
+    assert_eq!(reserved.requested_mode, Mode::Auto);
+    assert_eq!(reserved.effective_mode, EffectiveMode::Message);
+
+    let busy = attest_with(&active, Lifecycle::Active, false, true);
+    assert!(matches!(
+        storage
+            .reserve_next(&busy, EffectiveMode::Message, 3_000, &timing())
+            .unwrap(),
+        Selection::Idle
+    ));
+    assert!(matches!(
+        storage
+            .reserve_next(&busy, EffectiveMode::Inject, 3_000, &timing())
+            .unwrap(),
+        Selection::Held(reason) if reason.contains("not loaded")
+    ));
+    assert!(
+        storage
+            .latest_attempt("agent-run", "auto-idle")
+            .unwrap()
+            .is_some(),
+        "the inactive recipient's event has its attempt"
+    );
+    assert!(
+        storage
+            .latest_attempt("agent-run", "auto-busy")
+            .unwrap()
+            .is_none(),
+        "the active recipient's event has no attempt and no native effect"
     );
 }
 
@@ -2913,4 +3156,153 @@ fn disposing_the_expired_predecessor_closes_the_dependent_incident_without_reope
             .unwrap(),
     );
     assert_eq!(released.members[0].event_id, "dep-d");
+}
+
+/// More than five proven busy deferrals retain the original event until a
+/// fresh idle endpoint accepts it once; no replacement event or refusal is made.
+#[test]
+fn deferred_known_unsent_waits_past_retry_budget_then_delivers() {
+    let shared = Mutex::new(store());
+    let recipient = codex("deferred-owner");
+    shared
+        .lock()
+        .unwrap()
+        .publish(
+            &keep_all("agent-run", "deferred-event", &recipient, Mode::Message),
+            1_000,
+        )
+        .unwrap();
+    let mut carrier = ScriptedCarrier::new(
+        Lifecycle::Inactive,
+        Outcome::DeferredKnownUnsent {
+            evidence: "fixture owner proved not_idle before native input".into(),
+        },
+    );
+    let mut now = 2_000;
+    for _ in 0..8 {
+        assert!(matches!(
+            drive(&shared, &mut carrier, &recipient, now),
+            DispatchReport::Sent {
+                state: AttemptState::KnownUnsent,
+                ..
+            }
+        ));
+        let storage = shared.lock().unwrap();
+        let evidence = storage
+            .delivery_evidence("agent-run", "deferred-event")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            evidence.delivery,
+            DeliveryState::Unhanded,
+            "temporary recipient state must not permanently refuse queued work"
+        );
+        assert!(storage.open_incidents(now, 10).unwrap().is_empty());
+        drop(storage);
+        now += 30_000;
+    }
+    carrier.outcome = ScriptedCarrier::accepted();
+    assert!(matches!(
+        drive(&shared, &mut carrier, &recipient, now),
+        DispatchReport::Sent {
+            state: AttemptState::NativeAccepted,
+            events: 1
+        }
+    ));
+    assert_eq!(carrier.sends.len(), 9);
+    assert!(
+        carrier
+            .sends
+            .iter()
+            .all(|attempt| attempt.manifest == carrier.sends[0].manifest)
+    );
+    let storage = shared.lock().unwrap();
+    let evidence = storage
+        .delivery_evidence("agent-run", "deferred-event")
+        .unwrap()
+        .unwrap();
+    assert_eq!(evidence.delivery, DeliveryState::Accepted);
+    assert_eq!(
+        evidence.attempts_made, 1,
+        "only the eligible handoff consumes the budget"
+    );
+}
+
+/// Busy deferrals preserve an earlier real failure charge, while subsequent
+/// ordinary failures still exhaust at five and uncertain sends never retry.
+#[test]
+fn deferred_known_unsent_preserves_failure_and_unknown_boundaries() {
+    for uncertain in [false, true] {
+        let shared = Mutex::new(store());
+        let recipient = codex("deferred-budget");
+        shared
+            .lock()
+            .unwrap()
+            .publish(
+                &keep_all(
+                    "agent-run",
+                    "deferred-budget-event",
+                    &recipient,
+                    Mode::Message,
+                ),
+                1_000,
+            )
+            .unwrap();
+        let mut carrier = ScriptedCarrier::new(
+            Lifecycle::Inactive,
+            Outcome::KnownUnsent {
+                evidence: "fixture transport failed before write".into(),
+            },
+        );
+        let mut now = 2_000;
+        drive(&shared, &mut carrier, &recipient, now);
+        carrier.outcome = Outcome::DeferredKnownUnsent {
+            evidence: "fixture correlated busy refusal before native effect".into(),
+        };
+        for _ in 0..8 {
+            now += 30_000;
+            drive(&shared, &mut carrier, &recipient, now);
+            let storage = shared.lock().unwrap();
+            let evidence = storage
+                .delivery_evidence("agent-run", "deferred-budget-event")
+                .unwrap()
+                .unwrap();
+            assert_eq!(evidence.attempts_made, 1);
+            assert_eq!(evidence.delivery, DeliveryState::Unhanded);
+        }
+        carrier.outcome = if uncertain {
+            Outcome::OutcomeUnknown {
+                reason: "fixture receipt lost after write".into(),
+            }
+        } else {
+            Outcome::KnownUnsent {
+                evidence: "fixture ordinary transport failure".into(),
+            }
+        };
+        for _ in 0..4 {
+            now += 30_000;
+            drive(&shared, &mut carrier, &recipient, now);
+        }
+        let sends = carrier.sends.len();
+        now += 300_000;
+        assert!(!matches!(
+            drive(&shared, &mut carrier, &recipient, now),
+            DispatchReport::Sent { .. }
+        ));
+        assert_eq!(carrier.sends.len(), sends);
+        let storage = shared.lock().unwrap();
+        let evidence = storage
+            .delivery_evidence("agent-run", "deferred-budget-event")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            evidence.delivery,
+            if uncertain {
+                DeliveryState::Review
+            } else {
+                DeliveryState::Refused
+            }
+        );
+        assert_eq!(evidence.attempts_made, if uncertain { 2 } else { 5 });
+    }
 }

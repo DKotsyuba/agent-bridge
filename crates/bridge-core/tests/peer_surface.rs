@@ -1,6 +1,6 @@
-//! Peer-consumption surface checks requested by the interfaces Module
-//! (M-006): the conditional receipt-token tier's actual scope, operator
-//! counts, stable incident pages, exact retention facts, and trusted issuer
+//! Peer-consumption surface checks: the conditional receipt-token tier's actual
+//! scope, operator counts, stable incident pages, exact retention facts, and
+//! trusted issuer
 //! provenance. Revision-2 reads are exercised through the public typed client.
 //!
 //! All state is isolated synthetic fixtures; no real session, adapter or
@@ -29,7 +29,7 @@ const ROOT_TOKEN: &str = "peer-root-backend-token-0004";
 
 /// The recipient every grant may use.
 fn recipient() -> NativeAddress {
-    NativeAddress::new("host-1", Harness::Codex, "default", "thread-7").unwrap()
+    NativeAddress::new("host-1", Harness::CODEX, "default", "thread-7").unwrap()
 }
 
 /// An isolated file store/socket with publisher, root-backend and operator grants.
@@ -44,6 +44,7 @@ fn config(dir: &TempDir) -> Config {
         limits: Limits::new(1_000),
         grants: vec![
             GrantConfig {
+                managed_feedback: false,
                 producer_v1: None,
                 token: RUN_TOKEN.to_string(),
                 publisher: "agent-run".to_string(),
@@ -52,8 +53,10 @@ fn config(dir: &TempDir) -> Config {
                 modes: vec!["message".into(), "auto".into()],
                 policies: vec!["keep_all".into(), "latest".into()],
                 admin: false,
+                diagnostics: false,
             },
             GrantConfig {
+                managed_feedback: false,
                 producer_v1: None,
                 token: ROOT_TOKEN.to_string(),
                 publisher: "bridge-root".into(),
@@ -62,8 +65,10 @@ fn config(dir: &TempDir) -> Config {
                 modes: vec!["message".into()],
                 policies: vec!["keep_all".into()],
                 admin: false,
+                diagnostics: false,
             },
             GrantConfig {
+                managed_feedback: false,
                 producer_v1: None,
                 token: OPS_TOKEN.to_string(),
                 publisher: "bridge-ops".to_string(),
@@ -72,6 +77,7 @@ fn config(dir: &TempDir) -> Config {
                 modes: vec![],
                 policies: vec![],
                 admin: true,
+                diagnostics: false,
             },
         ],
     }

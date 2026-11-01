@@ -185,7 +185,7 @@ mod tests {
         Envelope::new(
             PublisherId::new("agent-run").unwrap(),
             EventId::new(id).unwrap(),
-            NativeAddress::new("host", Harness::Codex, "default", "thread-1").unwrap(),
+            NativeAddress::new("host", Harness::CODEX, "default", "thread-1").unwrap(),
             Kind::new("worker.completed").unwrap(),
             Mode::Auto,
             Policy::KeepAll,

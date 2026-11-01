@@ -3,9 +3,9 @@
 //! Integration tests start it to play the parts that must be real
 //! processes with real kernel identities:
 //!
-//! - `bridge-fixture harness`: a stand-in harness process. Tests qualify
-//!   this executable in a test profile and start it with the profile's
-//!   store in `CLAUDE_CONFIG_DIR`/`CODEX_HOME`. It reads JSON commands on
+//! - `bridge-fixture harness`: a stand-in harness process. Tests name its
+//!   path in a harness policy marker (`executable_markers`) and start it with
+//!   the store in `CLAUDE_CONFIG_DIR`/`CODEX_HOME`. It reads JSON commands on
 //!   stdin, one per line, and answers one JSON line each:
 //!   - `{"cmd":"hook","bin":..,"socket":..,"harness":..,"payload":{..},
 //!     "close_stdout":bool}` runs the real `bridge-hook` as its child
@@ -14,7 +14,11 @@
 //!     print (a lost reply).
 //!   - `{"cmd":"mcp","socket":..,"meta":{..}}` runs `bridge-fixture mcp`
 //!     as its child (a harness-launched MCP server) and answers its
-//!     attestation result.
+//!     attestation result. With `"node":<path>` the child is instead the
+//!     production signed frontend: that Node runs the embedded desktop client,
+//!     which spawns `bridge-fixture mcp` as its Rust child; the Node process gets
+//!     `CODEX_MCP_NODE_PATH` = `"node_path"` (default `"node"`) and, unless
+//!     `"pipe"` is null, `CODEX_APP_TOOLS_PIPE_PATH` = `"pipe"`.
 //!   - `{"cmd":"desktop_frontend","node":..,"channel":..}` starts one
 //!     test-provisioned Node primary and its Rust typed relay under this exact
 //!     harness. Both inputs are UTF-8 paths; the native mock pipe is inherited
@@ -35,6 +39,15 @@
 //!     runs `bridge-fixture mcp-server` as its child, sends the JSON-RPC
 //!     requests and answers the responses of those with an id.
 //!   - `{"cmd":"exit"}` closes/reaps an owned Desktop child, then exits.
+//! - `bridge-fixture owner <directory>`: a scripted stand-in native owner. It
+//!   binds `<directory>/o.sock` (private directory, mode 0600), starts
+//!   `bridge-fixture harness` (or the executable named by
+//!   `BRIDGE_FIXTURE_HARNESS_EXE`) as its direct child with `BRIDGE_NATIVE_OWNER_SOCKET`
+//!   set, forwards every other stdin command to that child and answers its reply,
+//!   and answers the owner commands `owner_script` (`mode`: the receipt the next
+//!   requests get), `owner_log` (probe connections, the strict request
+//!   frames received and the harness child's pid), `owner_stop_harness` (ends only the harness child) and
+//!   `owner_die` (the owner exits at once, leaving the harness orphaned).
 //! - `bridge-fixture mcp <socket>` (or `mcp-seal`) with `_meta` JSON on
 //!   stdin: attests through `RegistryAttestor` (sealing a proof) and prints
 //!   the result. The harness `mcp` command takes `"seal": true`.
@@ -265,6 +278,166 @@ fn harness() {
     }
 }
 
+/// State of the scripted owner shared with its listener thread.
+#[derive(Default)]
+struct OwnerState {
+    /// Receipt behavior for the next requests (see `owner_receipt`).
+    mode: String,
+    /// Connections that closed without sending a request (liveness probes).
+    probes: u64,
+    /// Strict request frames received, in order.
+    frames: Vec<Value>,
+}
+
+/// Renders the scripted receipt bytes for `mode` answering `request`, or
+/// `None` when the owner must stay silent. Modes: `codex_accept`,
+/// `claude_accept`, `opencode_accept`, `zlab_accept` (a profile-only harness),
+/// `known_unsent:<reason>`, `unknown:<reason>`, `wrong_call`,
+/// `extra_key`, `dup_key`, `garbage`, `silent` and `stall`.
+fn owner_receipt(mode: &str, request: &Value) -> Option<Vec<u8>> {
+    let call = request["call_id"].as_str().unwrap_or_default();
+    let accept = |protocol: &str| json!({"call_id":call,"state":"accepted","protocol":protocol,"native_id":"fresh-native-id","reason":null});
+    let refuse = |state: &str, reason: &str| json!({"call_id":call,"state":state,"protocol":null,"native_id":null,"reason":reason});
+    let value = match mode.split_once(':').unwrap_or((mode, "")) {
+        ("codex_accept", _) => accept("codex_turn"),
+        ("claude_accept", _) => accept("claude_input"),
+        ("opencode_accept", _) => accept("opencode_input"),
+        ("zlab_accept", _) => accept("zlab_input"),
+        ("known_unsent", reason) => refuse("known_unsent", reason),
+        ("unknown", reason) => refuse("unknown", reason),
+        ("wrong_call", _) => {
+            let mut value = accept("codex_turn");
+            value["call_id"] = json!("another-call");
+            value
+        }
+        ("extra_key", _) => {
+            let mut value = accept("codex_turn");
+            value["version"] = json!(1);
+            value
+        }
+        ("dup_key", _) => {
+            return Some(
+                format!(
+                    r#"{{"call_id":"{call}","state":"accepted","state":"accepted","protocol":"codex_turn","native_id":"x","reason":null}}"#
+                )
+                .into_bytes(),
+            );
+        }
+        ("garbage", _) => return Some(b"not json".to_vec()),
+        _ => return None,
+    };
+    Some(value.to_string().into_bytes())
+}
+
+/// Serves the scripted owner socket: one request per connection, recorded
+/// strictly (the six agreed keys only) and answered per the current mode.
+/// A connection that closes before any byte is a liveness probe.
+fn owner_serve(listener: UnixListener, state: Arc<Mutex<OwnerState>>) {
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else { break };
+        let state = Arc::clone(&state);
+        std::thread::spawn(move || {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut head = [0; 4];
+            if stream.read_exact(&mut head).is_err() {
+                state.lock().unwrap().probes += 1;
+                return;
+            }
+            let mut body = vec![0; u32::from_le_bytes(head) as usize];
+            if stream.read_exact(&mut body).is_err() {
+                return;
+            }
+            let Ok(request) = serde_json::from_slice::<Value>(&body) else {
+                return;
+            };
+            let mode = {
+                let mut state = state.lock().unwrap();
+                state.frames.push(request.clone());
+                state.mode.clone()
+            };
+            if mode == "stall" {
+                std::thread::sleep(Duration::from_secs(40));
+                return;
+            }
+            if let Some(bytes) = owner_receipt(&mode, &request) {
+                let _ = stream.write_all(&(bytes.len() as u32).to_le_bytes());
+                let _ = stream.write_all(&bytes);
+            }
+        });
+    }
+}
+
+/// The scripted stand-in owner process: binds its socket, starts the harness as
+/// its direct child and multiplexes owner commands with harness forwarding.
+fn owner(directory: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let socket = Path::new(directory).join("o.sock");
+    let listener = UnixListener::bind(&socket).expect("owner socket");
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).expect("mode");
+    let state = Arc::new(Mutex::new(OwnerState::default()));
+    let served = Arc::clone(&state);
+    std::thread::spawn(move || owner_serve(listener, served));
+    let harness_exe = std::env::var_os("BRIDGE_FIXTURE_HARNESS_EXE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_exe().expect("self"));
+    let mut child = Command::new(harness_exe)
+        .arg("harness")
+        .env("BRIDGE_NATIVE_OWNER_SOCKET", &socket)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("harness child");
+    let mut to_child = child.stdin.take();
+    let mut from_child = BufReader::new(child.stdout.take().expect("child stdout"));
+    let mut stdout = std::io::stdout();
+    for line in std::io::stdin().lock().lines() {
+        let Ok(line) = line else { break };
+        let command: Value = serde_json::from_str(&line).unwrap_or_default();
+        let reply = match command["cmd"].as_str().unwrap_or_default() {
+            "owner_script" => {
+                state.lock().unwrap().mode = command["mode"].as_str().unwrap_or_default().into();
+                json!({"ok": true})
+            }
+            "owner_log" => {
+                let state = state.lock().unwrap();
+                json!({"probes": state.probes, "frames": state.frames, "harness_pid": child.id()})
+            }
+            "owner_stop_harness" => {
+                drop(to_child.take());
+                let _ = child.wait();
+                json!({"ok": true})
+            }
+            "owner_die" => {
+                // Acknowledge first so the driving test reads a reply, then
+                // vanish without reaping the harness child.
+                let _ = writeln!(stdout, "{}", json!({"ok": true}));
+                let _ = stdout.flush();
+                std::process::exit(0);
+            }
+            _ => {
+                let mut answer = String::new();
+                let forwarded = to_child.as_mut().is_some_and(|input| {
+                    writeln!(input, "{line}")
+                        .and_then(|()| input.flush())
+                        .is_ok()
+                });
+                if forwarded && from_child.read_line(&mut answer).unwrap_or(0) > 0 {
+                    serde_json::from_str(&answer).unwrap_or_default()
+                } else {
+                    json!({"error": "harness gone"})
+                }
+            }
+        };
+        let _ = writeln!(stdout, "{reply}");
+        let _ = stdout.flush();
+        if command["cmd"] == "exit" {
+            break;
+        }
+    }
+    drop(to_child);
+    let _ = child.wait();
+}
+
 /// Starts an owned Node primary and Rust typed relay under this fixture harness,
 /// inheriting only the fixture's native mock pipe. `node` and `channel` name
 /// test-provisioned resources; readiness is required before returning the child.
@@ -442,10 +615,33 @@ fn run_mcp_server(command: &Value) -> Value {
     json!({"responses": responses})
 }
 
-/// Runs `bridge-fixture mcp` as a child (the harness's MCP server).
+/// Runs `bridge-fixture mcp` as a child (the harness's MCP server), directly
+/// or, when `command["node"]` names a Node runtime, as the Rust child of the
+/// embedded signed desktop client run by that Node (see the module inventory
+/// for `node_path` and `pipe`). Answers the attestation JSON, or an error object.
 fn run_mcp(command: &Value) -> Value {
     let exe = std::env::current_exe().expect("own exe");
-    let mut child = Command::new(exe)
+    let mut child = match command["node"].as_str() {
+        Some(node) => {
+            let mut frontend = Command::new(node);
+            frontend
+                .arg("-e")
+                .arg(include_str!("../../assets/desktop-client.cjs"))
+                .arg("--")
+                .arg(exe)
+                .env(
+                    "CODEX_MCP_NODE_PATH",
+                    command["node_path"].as_str().unwrap_or(node),
+                );
+            match command["pipe"].as_str() {
+                Some(pipe) => frontend.env("CODEX_APP_TOOLS_PIPE_PATH", pipe),
+                None => frontend.env_remove("CODEX_APP_TOOLS_PIPE_PATH"),
+            };
+            frontend
+        }
+        None => Command::new(exe),
+    };
+    let mut child = child
         .arg(if command["seal"].as_bool() == Some(true) {
             "mcp-seal"
         } else {
@@ -565,14 +761,26 @@ fn render(result: Result<(VerifiedCaller, Option<String>), CorrelationError>) ->
 }
 
 /// The MCP-server stand-in (a harness-launched frontend): attest native
-/// `_meta` from stdin through the registry, optionally sealing, and print.
+/// `_meta` (or a `bridge_call_token` hook token) from stdin through the
+/// registry, optionally sealing, and print.
 fn mcp(socket: &str, seal: bool) {
     let mut text = String::new();
     let _ = std::io::stdin().read_to_string(&mut text);
     let meta: serde_json::Map<String, Value> = serde_json::from_str(&text).unwrap_or_default();
     let now = bridge_core::service::current_unix_millis();
     let attestor = RegistryAttestor::new(Path::new(socket), Duration::from_secs(5), 600_000);
-    let result = PresentedMeta::from_mcp_meta(&meta).and_then(|meta| {
+    // Like the restricted frontend, a hook token in the presented object is
+    // preferred over `_meta`.
+    let presented = match meta
+        .get(bridge_adapters::registry::CALL_TOKEN_ARGUMENT)
+        .and_then(Value::as_str)
+    {
+        Some(token) => Ok(PresentedMeta::HookToken {
+            token: bridge_adapters::registry::CallToken::from_wire(token),
+        }),
+        None => PresentedMeta::from_mcp_meta(&meta),
+    };
+    let result = presented.and_then(|meta| {
         if seal {
             attestor
                 .attest_sealed(&meta, now)
@@ -1036,6 +1244,7 @@ fn universal_probe(
     let host = match PresentedMeta::from_mcp_meta(&metadata) {
         Ok(PresentedMeta::Codex { .. }) => Host::Codex,
         Ok(PresentedMeta::Claude { .. }) => Host::ClaudeCode,
+        Ok(PresentedMeta::OpenCode { .. }) => Host::OpenCode,
         _ => return json!({"error": "native evidence candidate refused"}),
     };
     let request = Request::new(
@@ -1182,6 +1391,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("harness") => harness(),
+        Some("owner") => owner(args.get(2).map(String::as_str).unwrap_or_default()),
         Some("delayed-hook") => delayed_hook(args.get(2).map(String::as_str).unwrap_or_default()),
         Some("desktop-child") => desktop_child(args.get(2).unwrap()),
         Some("mcp") => mcp(args.get(2).map(String::as_str).unwrap_or_default(), false),
@@ -1194,6 +1404,28 @@ fn main() {
             v1_frontend(args.get(2).map(String::as_str).unwrap_or_default(), true)
         }
         Some("app-server") => app_server(),
+        Some("mcp-meta-echo") => {
+            for line in std::io::stdin().lock().lines() {
+                let value: Value =
+                    serde_json::from_str(&line.expect("fixture frame")).expect("fixture JSON");
+                println!(
+                    "{}",
+                    json!({"jsonrpc":"2.0","id":value["id"],"result":value})
+                );
+            }
+        }
+        Some("mcp-context") => {
+            let mut stream =
+                std::os::unix::net::UnixStream::connect(&args[2]).expect("fixture context socket");
+            let mut input = String::new();
+            std::io::stdin()
+                .read_line(&mut input)
+                .expect("fixture context input");
+            let _ = stream.write_all(format!("{input}\n").as_bytes());
+            let mut line = String::new();
+            let _ = std::io::BufReader::new(stream).read_line(&mut line);
+            print!("{line}");
+        }
         Some("publish") if args.len() == 8 => {
             println!(
                 "{}",

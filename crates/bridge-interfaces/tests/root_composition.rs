@@ -4,8 +4,8 @@
 //!
 //! Evidence level: contract wiring over real kernel identities, NOT native
 //! host qualification. The harness is a labeled stand-in: this very test
-//! executable re-run with `BRIDGE_IF_ROLE=harness`, qualified in an owned
-//! test profile by its own path and SHA-256. Its hooks are this executable
+//! executable re-run with `BRIDGE_IF_ROLE=harness`, marked as a harness by an
+//! `executable_markers` entry of the lab's harness policy. Its hooks are this executable
 //! re-run with `BRIDGE_IF_ROLE=hook` calling the product hook client
 //! (`ChannelClient::run_hook`) with Claude-shaped hook JSON. The frontend is
 //! started by the stand-in harness through `/bin/sh`, so the registry
@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use bridge_adapters::ChannelClient;
 use bridge_adapters::registry::{
-    CallerAttestor, Profile, QualifiedExecutable, Registry, RegistryConfig, RelayExecutable,
-    SealedProof, Unattested, file_sha256,
+    CallerAttestor, HarnessPolicy, Registry, RegistryConfig, RelayExecutable, SealedProof,
+    Unattested, file_sha256,
 };
 use bridge_adapters::server::{ChannelServer, Custody, private_directory};
 use bridge_client::BridgeClient;
@@ -175,9 +175,9 @@ fn hook_role() {
     );
     let mut out = Vec::new();
     let run = if std::env::var_os("HOOK_LOST").is_some() {
-        client.run_hook(Harness::ClaudeCode, &input, &mut LostStdout)
+        client.run_hook(Harness::CLAUDE_CODE, &input, &mut LostStdout)
     } else {
-        client.run_hook(Harness::ClaudeCode, &input, &mut out)
+        client.run_hook(Harness::CLAUDE_CODE, &input, &mut out)
     };
     print!("@@HOOK{}@@{:?}", String::from_utf8_lossy(&out), run);
 }
@@ -292,7 +292,7 @@ impl Drop for Lab {
 
 /// Canonical address of a lab Claude session.
 fn claude(session: &str) -> NativeAddress {
-    NativeAddress::new(HOST, Harness::ClaudeCode, NAMESPACE, session).unwrap()
+    NativeAddress::new(HOST, Harness::CLAUDE_CODE, NAMESPACE, session).unwrap()
 }
 
 /// Structured recipient argument for a session.
@@ -339,10 +339,15 @@ fn lab(tag: &str) -> Lab {
 /// concise message defaults solely in the new policy test. Legacy labs retain
 /// their original exact grants and forbidden kind/mode cases. When the inherited
 /// Desktop capabilities select the signed Node frontend, only its exact canonical
-/// executable is admitted as an intermediate; the stand-in harness still must
-/// match its qualified executable digest and owned store. A different selected
+/// executable is admitted as an intermediate; the stand-in harness still must be
+/// a marked harness process with an owned canonical store. A different selected
 /// frontend or unavailable executable panics before starting the registry.
 fn lab_with_addresses(tag: &str, any: bool) -> Lab {
+    lab_with_delivery(tag, any, false)
+}
+
+/// Opts in to bounded delivery only for its dedicated synthetic composition check.
+fn lab_with_delivery(tag: &str, any: bool, bounded: bool) -> Lab {
     let dir = scratch(tag);
     let store = dir.join("cs");
     std::fs::create_dir_all(&store).unwrap();
@@ -373,6 +378,8 @@ fn lab_with_addresses(tag: &str, any: bool) -> Lab {
             },
             policies: vec!["keep_all".into()],
             admin: false,
+            managed_feedback: bounded,
+            diagnostics: false,
             producer_v1: None,
         },
         GrantConfig {
@@ -383,6 +390,8 @@ fn lab_with_addresses(tag: &str, any: bool) -> Lab {
             modes: vec![],
             policies: vec![],
             admin: true,
+            managed_feedback: false,
+            diagnostics: false,
             producer_v1: None,
         },
     ];
@@ -402,7 +411,6 @@ fn lab_with_addresses(tag: &str, any: bool) -> Lab {
     let channel_dir = dir.join("ch");
     let owner = private_directory(&channel_dir).unwrap();
     let channel_socket = channel_dir.join("c.sock");
-    let harness_exe = std::env::current_exe().unwrap().canonicalize().unwrap();
     let relay_exe = PathBuf::from(env!("CARGO_BIN_EXE_bridge-root-relay"))
         .canonicalize()
         .unwrap();
@@ -424,21 +432,18 @@ fn lab_with_addresses(tag: &str, any: bool) -> Lab {
     let registry = Registry::new(
         RegistryConfig {
             host_id: HOST.into(),
-            profiles: [(NAMESPACE, &store), (NAMESPACE2, &store2)]
-                .into_iter()
-                .map(|(namespace, store)| Profile {
-                    namespace: namespace.into(),
-                    harness: Harness::ClaudeCode,
-                    store: store.clone(),
-                    executables: vec![QualifiedExecutable {
-                        sha256: file_sha256(&harness_exe).unwrap(),
-                        path: harness_exe.clone(),
-                        version: "stand-in".into(),
-                        inject: true,
-                        message: false,
-                    }],
-                })
-                .collect(),
+            harnesses: vec![HarnessPolicy {
+                harness: Harness::CLAUDE_CODE,
+                namespace: NAMESPACE.into(),
+                inject: true,
+                message: bounded,
+                executable_markers: vec!["root_composition".into()],
+                store_env: None,
+                store_home: None,
+                child_address: None,
+                caller_proof: Vec::new(),
+            }],
+            profiles: Vec::new(),
             intermediates,
             max_call_age_ms: 600_000,
             relays: vec![RelayExecutable {
@@ -446,6 +451,7 @@ fn lab_with_addresses(tag: &str, any: bool) -> Lab {
                 path: relay_exe.clone(),
             }],
             audiences: Vec::new(),
+            legacy_owner_relays: 0,
         },
         owner,
     )
@@ -478,6 +484,7 @@ socket = "{relay}"
 token_file = "{token}"
 channel = "{channel}"
 max_body_bytes = 64
+bounded_delivery = {bounded}
 [[root.callers]]
 host_id = "{HOST}"
 harness = "claude-code"
@@ -1021,81 +1028,38 @@ fn lost_hook_reply_stays_a_manual_incident_without_resend() {
     drop(harness);
 }
 
-/// Equal session ids in different native stores are distinct callers: neither
-/// replays nor sees the other's events.
+/// Equal session ids in two native stores of one harness are one address, and
+/// a live incarnation holds it: the second store's hook is refused as
+/// conflicting, its calls never attest, and the first caller's custody and
+/// events are untouched. (Store paths are no longer namespaces; the single
+/// harness namespace makes this the collision rule.)
 #[test]
-fn equal_session_ids_in_two_stores_never_share_events() {
+fn equal_session_ids_in_two_stores_are_a_refused_collision() {
     let lab = lab("n");
-    // Two stand-in harnesses, one per store, each with a root session
-    // whose native id is the same `s1`.
     let mut first = Harnessed::start(&lab.store);
     let mut second = Harnessed::start(&lab.store2);
     let start = |session: &str| json!({"hook_event_name": "SessionStart", "session_id": session, "cwd": "/ignored"});
     lab.hook(&mut first, start("s1"));
     lab.hook(&mut first, start("s2"));
-    lab.hook(&mut second, start("s1"));
+    let refused = lab.hook(&mut second, start("s1"));
+    assert!(
+        refused.to_lowercase().contains("conflicting"),
+        "the second store's equal session id is a conflict: {refused}"
+    );
     let send = json!({"request_id": "same", "recipient": recipient("s2"), "kind": "root.note",
                       "mode": "inject", "body": "same body"});
     let from_first = lab.call(&mut first, "s1", "n-1", None, "bridge_send", send.clone());
-    let from_second = lab.call(&mut second, "s1", "n-2", None, "bridge_send", send.clone());
     assert_eq!(class(&from_first), "ok", "{from_first}");
-    assert_eq!(class(&from_second), "ok", "{from_second}");
-    let (one, two) = (
-        &from_first["structuredContent"]["custody"],
-        &from_second["structuredContent"]["custody"],
+    let from_second = lab.call(&mut second, "s1", "n-2", None, "bridge_send", send);
+    assert_ne!(
+        class(&from_second),
+        "ok",
+        "the refused store never attests: {from_second}"
     );
-    assert_eq!(one["replayed"], false);
+    let me_first = lab.call(&mut first, "s1", "n-3", None, "bridge_me", json!({}));
     assert_eq!(
-        two["replayed"], false,
-        "a foreign store's caller is not a replay"
-    );
-    assert_ne!(one["envelope_hash"], two["envelope_hash"]);
-    // Each caller sees exactly its own event.
-    let me_second = lab.call(&mut second, "s1", "n-3", None, "bridge_me", json!({}));
-    assert_eq!(
-        me_second["structuredContent"]["caller"]["address"]["native_store_namespace"],
-        NAMESPACE2
-    );
-    let status_second = lab.call(
-        &mut second,
-        "s1",
-        "n-4",
-        None,
-        "bridge_status",
-        json!({"request_id": "same"}),
-    );
-    assert_eq!(
-        status_second["structuredContent"]["custody"]["envelope_hash"],
-        two["envelope_hash"]
-    );
-    let status_first = lab.call(
-        &mut first,
-        "s1",
-        "n-5",
-        None,
-        "bridge_status",
-        json!({"request_id": "same"}),
-    );
-    assert_eq!(
-        status_first["structuredContent"]["custody"]["envelope_hash"],
-        one["envelope_hash"]
-    );
-    // Both events reach the recipient, one per natural hook, as two
-    // distinct framed events.
-    let prompt = json!({"hook_event_name": "UserPromptSubmit", "session_id": "s2", "prompt": "hi"});
-    let drained = [
-        lab.hook(&mut first, prompt.clone()),
-        lab.hook(&mut first, prompt),
-    ];
-    let ids: std::collections::BTreeSet<&str> = drained
-        .iter()
-        .filter_map(|out| out.split("event=\\\"").nth(1))
-        .filter_map(|rest| rest.split('\\').next())
-        .collect();
-    assert_eq!(ids.len(), 2, "{drained:?}");
-    assert!(
-        drained.iter().all(|out| out.contains("same body")),
-        "{drained:?}"
+        me_first["structuredContent"]["caller"]["address"]["native_store_namespace"],
+        NAMESPACE
     );
     drop((first, second));
 }
@@ -1288,4 +1252,168 @@ fn address_message_send_needs_no_per_session_configuration() {
         json!({"address":"broken","message":"hi"}),
     );
     assert_eq!(class(&bad), "invalid");
+}
+
+/// Root sender routing is stamped from verified caller identity, not send arguments.
+/// Real daemon maintenance archives an expired target and queues one MESSAGE to the attested sender.
+#[test]
+fn bounded_root_delivery_uses_attested_sender_and_retains_status_report() {
+    let lab = lab_with_delivery("bounded", true, true);
+    let mut harness = Harnessed::start(&lab.store);
+    lab.hook(
+        &mut harness,
+        json!({"hook_event_name":"SessionStart","session_id":"s1","cwd":"/ignored"}),
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let sent = lab.call(
+        &mut harness,
+        "s1",
+        "bounded-send",
+        None,
+        "bridge_send",
+        json!({
+        "request_id":"bounded-request","address":claude("offline").to_canonical_string(),
+        "message":"synthetic original payload","expires_at_ms":now+1000}),
+    );
+    assert_eq!(class(&sent), "ok", "{sent}");
+    let spoof = lab.call(
+        &mut harness,
+        "s1",
+        "bounded-spoof",
+        None,
+        "bridge_send",
+        json!({
+        "request_id":"spoof","address":claude("offline").to_canonical_string(),"message":"x",
+        "sender":claude("other").to_canonical_string()}),
+    );
+    assert_eq!(class(&spoof), "invalid");
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    let mut call = 0;
+    let report = loop {
+        call += 1;
+        let status = lab.call(
+            &mut harness,
+            "s1",
+            &format!("bounded-status-{call}"),
+            None,
+            "bridge_status",
+            json!({"request_id":"bounded-request"}),
+        );
+        let view = &status["structuredContent"];
+        if view["report"].is_object() {
+            break view.clone();
+        }
+        assert!(std::time::Instant::now() < deadline, "{status}");
+        std::thread::sleep(Duration::from_millis(30));
+    };
+    assert_eq!(report["report"]["outcome"], "failed");
+    assert_eq!(report["native"], "not_handed");
+    assert_eq!(report["delivery"]["state"], "disposed");
+    assert_eq!(report["report"]["feedback_state"], "queued");
+    let own = lab.call(
+        &mut harness,
+        "s1",
+        "bounded-me",
+        None,
+        "bridge_me",
+        json!({}),
+    );
+    assert_eq!(class(&own), "ok");
+    assert_eq!(
+        own["structuredContent"]["delivery_reports"]["state"],
+        "available"
+    );
+    assert_eq!(
+        own["structuredContent"]["delivery_reports"]["reports"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        own["structuredContent"]["delivery_reports"]["reports"][0]["request_id"],
+        "bounded-request"
+    );
+    let after = own["structuredContent"]["delivery_reports"]["reports"][0]["completion_seq"]
+        .as_u64()
+        .unwrap();
+    let finished = lab.call(
+        &mut harness,
+        "s1",
+        "bounded-me-after",
+        None,
+        "bridge_me",
+        json!({"reports_after":after}),
+    );
+    assert!(
+        finished["structuredContent"]["delivery_reports"]["reports"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let spoofed = lab.call(
+        &mut harness,
+        "s1",
+        "bounded-me-spoof",
+        None,
+        "bridge_me",
+        json!({"sender":claude("other").to_canonical_string()}),
+    );
+    assert_eq!(class(&spoofed), "invalid");
+    let mut other = Harnessed::start(&lab.store);
+    lab.hook(
+        &mut other,
+        json!({"hook_event_name":"SessionStart","session_id":"s2","cwd":"/ignored"}),
+    );
+    let foreign_me = lab.call(
+        &mut other,
+        "s2",
+        "bounded-other-me",
+        None,
+        "bridge_me",
+        json!({}),
+    );
+    assert_eq!(class(&foreign_me), "ok", "{foreign_me}");
+    assert_eq!(
+        foreign_me["structuredContent"]["delivery_reports"]["state"],
+        "available"
+    );
+    assert!(
+        foreign_me["structuredContent"]["delivery_reports"]["reports"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let storage =
+        bridge_core::Storage::open(lab.dir.join("bridge.db"), bridge_core::Limits::new(1000))
+            .unwrap();
+    let waiting = storage
+        .next_pending(&claude("s1").to_canonical_string(), 10)
+        .unwrap();
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(
+        waiting[0].event_id,
+        report["report"]["feedback_event_id"].as_str().unwrap()
+    );
+    assert!(
+        storage
+            .next_pending(&claude("offline").to_canonical_string(), 10)
+            .unwrap()
+            .is_empty()
+    );
+    let foreign = lab.call(
+        &mut harness,
+        "s1",
+        "bounded-foreign",
+        None,
+        "bridge_status",
+        json!({"request_id":"spoof"}),
+    );
+    assert_eq!(
+        foreign["structuredContent"]["custody"]["state"],
+        "not_found"
+    );
 }

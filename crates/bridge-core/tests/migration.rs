@@ -162,7 +162,7 @@ fn version_two_databases_migrate_without_touching_accepted_bytes_or_identity() {
         .collect();
 
     let mut storage = Storage::open(&path, Limits::new(100)).unwrap();
-    assert_eq!(version(&path), "6");
+    assert_eq!(version(&path), "7");
     let after: Vec<(String, Vec<u8>, String)> = Connection::open(&path)
         .unwrap()
         .prepare("SELECT event_id, envelope_json, envelope_hash FROM events ORDER BY event_id")
@@ -318,7 +318,8 @@ fn version_three_attempts_that_may_have_reached_a_carrier_are_never_redispatched
 #[test]
 fn unknown_versions_and_foreign_files_are_refused_untouched() {
     let dir = TempDir::new("migrate-refuse");
-    for stored in ["1", "7", "garbage"] {
+    let future = (bridge_core::schema::SCHEMA_VERSION + 1).to_string();
+    for stored in ["1", future.as_str(), "garbage"] {
         let path = dir.path(&format!("v{stored}.db"));
         {
             let connection = Connection::open(&path).unwrap();
@@ -330,10 +331,15 @@ fn unknown_versions_and_foreign_files_are_refused_untouched() {
                 )
                 .unwrap();
         }
+        let before = database_files(&path);
         assert!(matches!(
             Storage::open(&path, Limits::new(10)),
             Err(CoreError::Integrity(_))
         ));
+        assert!(
+            database_files(&path) == before,
+            "refusal preserves every database byte and sidecar"
+        );
         assert_eq!(
             version(&path),
             stored,
@@ -346,15 +352,92 @@ fn unknown_versions_and_foreign_files_are_refused_untouched() {
         .unwrap()
         .execute_batch("CREATE TABLE notes (body TEXT); INSERT INTO notes VALUES ('keep me');")
         .unwrap();
+    let before = database_files(&foreign);
     assert!(matches!(
         Storage::open(&foreign, Limits::new(10)),
         Err(CoreError::Integrity(_))
     ));
+    assert!(
+        database_files(&foreign) == before,
+        "foreign database bytes and sidecars stay untouched"
+    );
     let notes: String = Connection::open(&foreign)
         .unwrap()
         .query_row("SELECT body FROM notes", [], |row| row.get(0))
         .unwrap();
     assert_eq!(notes, "keep me");
+}
+
+/// Captures the database and SQLite sidecars without opening SQLite itself;
+/// missing sidecars remain distinct from empty ones and read failures panic.
+fn database_files(path: &std::path::Path) -> Vec<Option<Vec<u8>>> {
+    ["", "-wal", "-shm", "-journal"]
+        .into_iter()
+        .map(
+            |suffix| match std::fs::read(format!("{}{suffix}", path.display())) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("fixture snapshot failed: {error}"),
+            },
+        )
+        .collect()
+}
+
+/// Refusal preserves durable bytes, journal mode and sidecar presence in each
+/// journal mode, including a newer schema committed only in a live WAL. SQLite
+/// may update advisory wal-index read marks (bytes 100..120), never DB/WAL data.
+#[test]
+fn unsupported_journal_modes_and_live_sidecars_are_preserved() {
+    let dir = TempDir::new("journal-refusal");
+    for mode in ["DELETE", "TRUNCATE", "PERSIST", "WAL"] {
+        for foreign in [false, true] {
+            let path = dir.path(&format!("{mode}-{foreign}.db"));
+            let keeper = Connection::open(&path).unwrap();
+            keeper.pragma_update(None, "journal_mode", mode).unwrap();
+            keeper.execute_batch(if foreign {
+                "CREATE TABLE notes(body TEXT); INSERT INTO notes VALUES('synthetic retained bytes');"
+            } else {
+                "CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO schema_meta VALUES('schema_version', '999');"
+            }).unwrap();
+            let before = database_files(&path);
+            assert!(matches!(
+                Storage::open(&path, Limits::new(10)),
+                Err(CoreError::Integrity(_))
+            ));
+            let after = database_files(&path);
+            assert!(
+                [0, 1, 3]
+                    .into_iter()
+                    .all(|index| after[index] == before[index]),
+                "refusal changed {mode} foreign={foreign} durable database, WAL or journal bytes"
+            );
+            assert_eq!(
+                after[2].is_some(),
+                before[2].is_some(),
+                "SHM presence changed"
+            );
+            if let (Some(before), Some(after)) = (&before[2], &after[2]) {
+                assert_eq!(before.len(), after.len());
+                let differences: Vec<_> = before
+                    .iter()
+                    .zip(after)
+                    .enumerate()
+                    .filter(|(_, (left, right))| left != right)
+                    .map(|(offset, (left, right))| (offset, *left, *right))
+                    .collect();
+                eprintln!("{mode} foreign={foreign} SHM read-mark differences: {differences:?}");
+                assert!(
+                    differences
+                        .iter()
+                        .all(|(offset, _, _)| (100..120).contains(offset))
+                );
+            }
+            let after: String = keeper
+                .pragma_query_value(None, "journal_mode", |row| row.get(0))
+                .unwrap();
+            assert_eq!(after, mode.to_ascii_lowercase());
+        }
+    }
 }
 
 /// A migration that fails partway leaves no partial schema: the whole
@@ -489,12 +572,12 @@ fn version_four_databases_gain_lineages_additively() {
             .unwrap();
     }
     let mut storage = Storage::open(&path, Limits::new(10)).unwrap();
-    assert_eq!(version(&path), "6");
+    assert_eq!(version(&path), "7");
     // Lineage fencing is live on the migrated database.
     let event = Envelope::new(
         PublisherId::new("agent-run").unwrap(),
         EventId::new("lin-1").unwrap(),
-        NativeAddress::new("host-1", Harness::Codex, "default", "thread-1").unwrap(),
+        NativeAddress::new("host-1", Harness::CODEX, "default", "thread-1").unwrap(),
         Kind::new("diagnostics.view").unwrap(),
         Mode::Message,
         Policy::Latest {
@@ -671,7 +754,7 @@ fn version_two_databases_backfill_lineage_authority() {
 
 /// The lineage fixtures of this file: one recipient, one stream.
 fn lineage_recipient() -> String {
-    NativeAddress::new("host-1", Harness::Codex, "default", "thread-7")
+    NativeAddress::new("host-1", Harness::CODEX, "default", "thread-7")
         .unwrap()
         .to_canonical_string()
 }
@@ -681,7 +764,7 @@ fn lineage_event(publisher: &str, event: &str, revision: u64) -> Envelope {
     Envelope::new(
         PublisherId::new(publisher).unwrap(),
         EventId::new(event).unwrap(),
-        NativeAddress::new("host-1", Harness::Codex, "default", "thread-7").unwrap(),
+        NativeAddress::new("host-1", Harness::CODEX, "default", "thread-7").unwrap(),
         Kind::new("diagnostics.view").unwrap(),
         Mode::Auto,
         Policy::Latest {
@@ -726,7 +809,7 @@ fn ambiguous_migrated_pending_work_is_held_not_dispatched() {
 
     let mut storage = Storage::open(&path, Limits::new(100)).unwrap();
     storage.register_source_tag("source-a", "source-a").unwrap();
-    let address = NativeAddress::new("host-1", Harness::Codex, "default", "thread-7").unwrap();
+    let address = NativeAddress::new("host-1", Harness::CODEX, "default", "thread-7").unwrap();
     let attestation = attest(&address, Lifecycle::Inactive, 1);
     let selection = storage
         .reserve_next(
@@ -1062,4 +1145,45 @@ fn every_open_version_three_incident_stays_visible_and_uncertain_events_stay_und
             ["evt-hist", "evt-lifecycle", "evt-note", "evt-plain"]
         );
     }
+}
+
+/// Schema six upgrades add only an empty managed-policy table; custody stays legacy.
+#[test]
+fn version_six_adds_bounded_policy_without_enrolling_existing_messages() {
+    let dir = TempDir::new("v6-managed");
+    let path = dir.path("bridge.db");
+    let recipient = codex("legacy-root");
+    let original = keep_all("agent-run", "legacy-v6", &recipient, Mode::Message);
+    {
+        let mut storage = Storage::open(&path, Limits::new(100)).unwrap();
+        storage
+            .register_source_tag("agent-run", "agent-run")
+            .unwrap();
+        storage.publish(&original, 1000).unwrap();
+    }
+    {
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("DROP TABLE managed_deliveries; UPDATE schema_meta SET value='6' WHERE key='schema_version';").unwrap();
+    }
+    let mut storage = Storage::open(&path, Limits::new(100)).unwrap();
+    assert_eq!(version(&path), "7");
+    storage.run_maintenance(900_000).unwrap();
+    assert!(
+        storage
+            .delivery_evidence("agent-run", "legacy-v6")
+            .unwrap()
+            .and_then(|d| d.report)
+            .is_none()
+    );
+    let replay = storage.publish(&original, 900_001).unwrap();
+    assert!(replay.receipt.replayed);
+    assert_eq!(replay.receipt.envelope_hash, original.envelope_hash());
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM managed_deliveries", [], |r| r
+                .get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
 }

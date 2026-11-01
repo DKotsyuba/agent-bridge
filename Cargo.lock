@@ -19,8 +19,9 @@ dependencies = [
 
 [[package]]
 name = "bridge-adapters"
-version = "0.2.0"
+version = "0.5.0"
 dependencies = [
+ "bridge-adapters",
  "bridge-core",
  "bridge-protocol",
  "serde",
@@ -34,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-client"
-version = "0.2.0"
+version = "0.5.0"
 dependencies = [
  "bridge-core",
  "serde_json",
@@ -42,7 +43,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-core"
-version = "0.2.0"
+version = "0.5.0"
 dependencies = [
  "bridge-client",
  "bridge-protocol",
@@ -56,7 +57,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-interfaces"
-version = "0.2.0"
+version = "0.5.0"
 dependencies = [
  "bridge-adapters",
  "bridge-client",
@@ -70,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-protocol"
-version = "0.2.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -79,12 +80,13 @@ dependencies = [
 
 [[package]]
 name = "bridge-sdk"
-version = "0.2.0"
+version = "0.5.0"
 dependencies = [
  "bridge-protocol",
  "serde",
  "serde_json",
  "socket2",
+ "tokio",
 ]
 
 [[package]]
@@ -704,7 +706,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.2.0"
+version = "0.5.0"
 dependencies = [
  "serde_json",
 ]

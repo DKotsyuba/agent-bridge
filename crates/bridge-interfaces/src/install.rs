@@ -1,10 +1,14 @@
 //! Release bundles, verified installation, activation and rollback.
 //!
 //! A bundle is a directory with exactly `release-manifest.json`,
-//! `SHA256SUMS` and `bin/` holding exactly [`BINARIES`] as regular files.
-//! The manifest binds product, version, build label, target, the core
-//! storage schema and each binary's size and SHA-256; `SHA256SUMS` must be
-//! exactly the rendering of those digests plus the manifest's own. The
+//! `SHA256SUMS` and `bin/` holding exactly [`BINARIES`] as regular files, plus
+//! (from 0.3.0) `plugins/opencode/` holding exactly [`PLUGIN_FILES`], the
+//! first-party OpenCode lifecycle plugin. The manifest binds product, version,
+//! build label, target, the core storage schema and each file's size and
+//! SHA-256; `SHA256SUMS` must be exactly the rendering of those digests plus
+//! the manifest's own. A bundle without a `plugins` directory and without
+//! `plugin_files` in its manifest is a legacy (0.2) bundle: it still verifies,
+//! installs, rolls back and reports no plugin binding. The
 //! digest of `SHA256SUMS`, printed by [`package`], is the out-of-band
 //! attestation value: `install.sh` and [`self_install`] refuse a bundle
 //! whose `SHA256SUMS` differs from it *before* any bundle executable runs
@@ -16,8 +20,13 @@
 //! Layout under the installation home (nothing outside it and the launcher
 //! directory is written):
 //!
-//! - `releases/<version>+<label>/` — immutable sealed copies (files `0555`,
-//!   manifest `0444`, directory `0555`); staged, verified, then renamed;
+//! - `releases/<version>+<label>/` — immutable sealed copies (executables `0555`,
+//!   manifest and plugin files `0444`, directories `0555`); staged
+//!   owner-writable, verified, renamed, and only then sealed `0555` before
+//!   activation. The installed plugin entrypoint is
+//!   `<home>/current/plugins/opencode/index.js` with `package.json` beside it;
+//!   a supervisor must be given the resolved release path and SHA-256 of
+//!   [`Activation::plugin_binding`], never a source-tree or `current` path;
 //! - `current` — symlink to the active release, replaced atomically;
 //! - `install-state.json` — active and previous release and the highest
 //!   core storage schema ever activated;
@@ -58,6 +67,13 @@ pub const BINARIES: [&str; 6] = [
     "bridge-daemon",
 ];
 
+/// Files of the first-party OpenCode plugin, in manifest order; the first is
+/// its entrypoint. Packaged under [`PLUGIN_DIR`] and never anything else.
+pub const PLUGIN_FILES: [&str; 2] = ["index.js", "package.json"];
+
+/// Release-relative directory of the OpenCode plugin.
+pub const PLUGIN_DIR: &str = "plugins/opencode";
+
 /// Manifest schema version.
 pub const MANIFEST_SCHEMA: u32 = 1;
 
@@ -71,11 +87,12 @@ pub const BUILD_LABEL: &str = match option_env!("BRIDGE_BUILD_LABEL") {
     None => "dev",
 };
 
-/// One packaged binary.
+/// One packaged file: a binary under `bin/` or a plugin file under
+/// [`PLUGIN_DIR`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseFile {
-    /// File name under `bin/`.
+    /// File name under `bin/` (or [`PLUGIN_DIR`] for a plugin file).
     pub name: String,
     /// Lowercase hex SHA-256.
     pub sha256: String,
@@ -101,6 +118,10 @@ pub struct ReleaseManifest {
     pub core_schema: u32,
     /// Exactly [`BINARIES`], in order.
     pub files: Vec<ReleaseFile>,
+    /// Empty for a legacy release (absent in its manifest); otherwise exactly
+    /// [`PLUGIN_FILES`], in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugin_files: Vec<ReleaseFile>,
 }
 
 impl ReleaseManifest {
@@ -116,11 +137,15 @@ impl ReleaseManifest {
         for file in &self.files {
             text.push_str(&format!("{}  bin/{}\n", file.sha256, file.name));
         }
+        for file in &self.plugin_files {
+            text.push_str(&format!("{}  {PLUGIN_DIR}/{}\n", file.sha256, file.name));
+        }
         text
     }
 
     /// Structural rules: schema, product, label/version charset, target of
-    /// this build, and exactly the expected binary list.
+    /// this build, exactly the expected binary list and either no plugin files
+    /// (legacy) or exactly [`PLUGIN_FILES`].
     fn check(&self) -> Result<(), String> {
         if self.schema != MANIFEST_SCHEMA || self.product != PRODUCT {
             return Err("manifest schema or product mismatch".into());
@@ -144,6 +169,14 @@ impl ReleaseManifest {
         let names: Vec<&str> = self.files.iter().map(|file| file.name.as_str()).collect();
         if names != BINARIES {
             return Err("manifest does not list exactly the product binaries".into());
+        }
+        let plugins: Vec<&str> = self
+            .plugin_files
+            .iter()
+            .map(|file| file.name.as_str())
+            .collect();
+        if !plugins.is_empty() && plugins != PLUGIN_FILES {
+            return Err("manifest does not list exactly the plugin files".into());
         }
         Ok(())
     }
@@ -185,8 +218,17 @@ fn hex(bytes: &[u8]) -> String {
 ///
 /// `from/bridge` must be this very executable (so the manifest's version
 /// and label are the packaged `bridge`'s own). `out` must not exist.
+/// With `plugin`, the explicit source directory of the OpenCode plugin, exactly
+/// [`PLUGIN_FILES`] are copied from it as regular files (a missing file or a
+/// link refuses; other entries of that directory, such as its test, are not
+/// packaged); the path is never inferred from the working directory or
+/// recorded. Without it the bundle is a legacy one.
 /// Returns the manifest and the `SHA256SUMS` digest to hand to installers.
-pub fn package(from: &Path, out: &Path) -> Result<(ReleaseManifest, String), String> {
+pub fn package(
+    from: &Path,
+    out: &Path,
+    plugin: Option<&Path>,
+) -> Result<(ReleaseManifest, String), String> {
     let own = std::env::current_exe()
         .and_then(|exe| exe.canonicalize())
         .map_err(|error| format!("own executable unreadable: {error}"))?;
@@ -199,6 +241,26 @@ pub fn package(from: &Path, out: &Path) -> Result<(ReleaseManifest, String), Str
     std::fs::create_dir(out).map_err(|error| format!("{}: {error}", out.display()))?;
     std::fs::create_dir(out.join("bin")).map_err(|error| error.to_string())?;
     let mut files = Vec::new();
+    let mut plugin_files = Vec::new();
+    if let Some(plugin) = plugin {
+        if !std::fs::symlink_metadata(plugin).is_ok_and(|metadata| metadata.is_dir()) {
+            return Err(format!("{} is not a plugin directory", plugin.display()));
+        }
+        std::fs::create_dir_all(out.join(PLUGIN_DIR)).map_err(|error| error.to_string())?;
+        for name in PLUGIN_FILES {
+            let source = plugin.join(name);
+            let bytes = regular(&source)?;
+            let destination = out.join(PLUGIN_DIR).join(name);
+            std::fs::copy(&source, &destination).map_err(|error| error.to_string())?;
+            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o644))
+                .map_err(|error| error.to_string())?;
+            plugin_files.push(ReleaseFile {
+                name: name.into(),
+                sha256: file_sha256(&destination)?,
+                bytes,
+            });
+        }
+    }
     for name in BINARIES {
         let source = from.join(name);
         let metadata = std::fs::symlink_metadata(&source)
@@ -224,6 +286,7 @@ pub fn package(from: &Path, out: &Path) -> Result<(ReleaseManifest, String), Str
         target: target(),
         core_schema: bridge_core::schema::SCHEMA_VERSION,
         files,
+        plugin_files,
     };
     manifest.check()?;
     let manifest_path = out.join(MANIFEST);
@@ -246,14 +309,13 @@ pub fn verify_bundle(
     bundle: &Path,
     expected_sums: Option<&str>,
 ) -> Result<ReleaseManifest, String> {
-    exact_entries(bundle, &[MANIFEST, SUMS, "bin"])?;
     let sums = std::fs::read(bundle.join(SUMS)).map_err(|error| error.to_string())?;
     if let Some(expected) = expected_sums
         && hex(&Sha256::digest(&sums)) != expected
     {
         return Err("SHA256SUMS does not match the attested digest".into());
     }
-    let manifest = verify_tree(bundle)?;
+    let manifest = verify_layout(bundle, &[SUMS])?;
     let expected = manifest.sums(&file_sha256(&bundle.join(MANIFEST))?);
     if sums != expected.as_bytes() {
         return Err("SHA256SUMS is not exactly the manifest's digests".into());
@@ -261,21 +323,42 @@ pub fn verify_bundle(
     Ok(manifest)
 }
 
-/// Verifies `dir/release-manifest.json` and `dir/bin/*` (exact set,
+/// Verifies a release directory: `release-manifest.json`, `bin/*` and, when
+/// the manifest lists plugin files, `plugins/opencode/*` (exact entry sets,
 /// regular files, sizes and digests).
 pub fn verify_tree(dir: &Path) -> Result<ReleaseManifest, String> {
+    verify_layout(dir, &[])
+}
+
+/// [`verify_tree`] where `dir` may also hold the `extra` top-level entries
+/// (`SHA256SUMS` in a bundle) and nothing else.
+fn verify_layout(dir: &Path, extra: &[&str]) -> Result<ReleaseManifest, String> {
     let manifest_path = dir.join(MANIFEST);
     regular(&manifest_path)?;
     let manifest: ReleaseManifest =
         serde_json::from_slice(&std::fs::read(&manifest_path).map_err(|error| error.to_string())?)
             .map_err(|error| format!("manifest unreadable: {error}"))?;
     manifest.check()?;
+    let mut top = vec![MANIFEST, "bin"];
+    top.extend(extra);
+    let plugins = !manifest.plugin_files.is_empty();
+    if plugins {
+        top.push("plugins");
+        exact_entries(&dir.join("plugins"), &["opencode"])?;
+        exact_entries(&dir.join(PLUGIN_DIR), &PLUGIN_FILES)?;
+    }
+    exact_entries(dir, &top)?;
     exact_entries(&dir.join("bin"), &BINARIES)?;
-    for file in &manifest.files {
-        let path = dir.join("bin").join(&file.name);
-        let size = regular(&path)?;
-        if size != file.bytes || file_sha256(&path)? != file.sha256 {
-            return Err(format!("{} does not match the manifest", file.name));
+    for (files, parent) in [
+        (&manifest.files, dir.join("bin")),
+        (&manifest.plugin_files, dir.join(PLUGIN_DIR)),
+    ] {
+        for file in files {
+            let path = parent.join(&file.name);
+            let size = regular(&path)?;
+            if size != file.bytes || file_sha256(&path)? != file.sha256 {
+                return Err(format!("{} does not match the manifest", file.name));
+            }
         }
     }
     Ok(manifest)
@@ -340,12 +423,18 @@ pub struct Activation {
     /// Path and digest to configure as the adapters' trusted root relay
     /// (`[[adapters.relays]]`): the real release path, not the launcher.
     pub relay_binding: RelayBinding,
+    /// Real release path and SHA-256 of the OpenCode plugin entrypoint to hand
+    /// to its supervisor; `null` when the active release is a legacy one
+    /// without the plugin (so a rollback to it reports none).
+    pub plugin_binding: Option<RelayBinding>,
 }
 
-/// A relay executable identity for the adapter registry.
+/// The identity of an executable or file by real release path and digest: the
+/// root relay for the adapter registry, or the OpenCode plugin entrypoint.
 #[derive(Debug, Clone, Serialize)]
 pub struct RelayBinding {
-    /// Absolute release path of `bridge-root-relay`.
+    /// Absolute canonical release path (`bridge-root-relay`, or the plugin's
+    /// `index.js`).
     pub path: PathBuf,
     /// Its SHA-256.
     pub sha256: String,
@@ -399,8 +488,10 @@ fn valid_release_id(id: &str) -> bool {
 }
 
 /// Verifies the sealed release `id` of `home`: a valid id naming a real
-/// directory (not a link) whose verified manifest has exactly that id. The
-/// home, its `releases` directory and the release directory must be owned by
+/// directory (not a link), sealed read-only (no write bit, owner can read and
+/// enter it; the installer sets `0555`, so a release that was
+/// renamed into place but never sealed fails closed), whose verified manifest
+/// has exactly that id. The home, its `releases` directory and the release directory must be owned by
 /// this user with no group/other write ([`crate::lifecycle::private_dir`]),
 /// so nobody else could have swapped what is about to be executed.
 pub(crate) fn verify_release(home: &Path, id: &str) -> Result<ReleaseManifest, String> {
@@ -415,6 +506,13 @@ pub(crate) fn verify_release(home: &Path, id: &str) -> Result<ReleaseManifest, S
         std::fs::symlink_metadata(&dir).map_err(|error| format!("release {id}: {error}"))?;
     if !metadata.is_dir() {
         return Err(format!("release {id} is not a directory"));
+    }
+    let mode = metadata.permissions().mode();
+    if mode & 0o222 != 0 || mode & 0o500 != 0o500 {
+        return Err(format!(
+            "release {id} is not sealed read-only (an interrupted install?); \
+             remove that release directory and install again"
+        ));
     }
     let manifest = verify_tree(&dir)?;
     if manifest.release_id() != id {
@@ -463,6 +561,15 @@ fn save_state(home: &Path, state: &InstallState) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+/// Test-only callback run once with the staging directory just before [`seal`]
+/// renames it.
+#[cfg(test)]
+type StagingHook = Box<dyn FnOnce(&Path)>;
+
+/// Test-only callback run once right after the bundle was verified.
+#[cfg(test)]
+type RaceHook = Box<dyn FnOnce()>;
+
 #[cfg(test)]
 thread_local! {
     /// Test-only fault point: the next `current` switch fails before it
@@ -472,10 +579,25 @@ thread_local! {
 
 #[cfg(test)]
 thread_local! {
+    /// Test-only fault point: the next [`seal`] fails right after the release
+    /// directory was renamed into place, before it is sealed `0555`.
+    static FAIL_AFTER_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only inspection point: runs once with the staging directory just
+    /// before [`seal`] renames it, to observe its permissions at that moment.
+    static BEFORE_RENAME: std::cell::RefCell<Option<StagingHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
     /// Test-only race point: runs once right after the bundle was verified,
     /// standing in for a writer that changes a writable bundle before it is
     /// copied.
-    static AFTER_BUNDLE_VERIFIED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+    static AFTER_BUNDLE_VERIFIED: std::cell::RefCell<Option<RaceHook>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -620,7 +742,7 @@ pub fn self_install(
         std::os::unix::fs::symlink(&target, &link)
             .map_err(|error| format!("{}: {error}", link.display()))?;
     }
-    activation(home, &state, reused)
+    activation(home, &state, &manifest, reused)
 }
 
 /// Launchers still to create; refuses a foreign file at any launcher path.
@@ -651,23 +773,53 @@ fn launcher_plan(home: &Path, bin_dir: &Path) -> Result<Vec<(PathBuf, PathBuf)>,
 /// files must hash — manifest and every binary — to the original attested
 /// `expected_sums` digest (the digest of the `SHA256SUMS` those hashes imply);
 /// a bundle changed after [`verify_bundle`], even consistently, is refused.
-/// On failure only that staging directory is removed; leftovers of other runs
-/// are never touched.
+///
+/// Sequencing: the staging directory is owner-private (`0700`) and writable
+/// until it has been renamed, because some platforms refuse to rename a
+/// directory the owner cannot write (macOS 15 answers `EACCES` for a `0555`
+/// source). The files are created read-only and `bin/` is sealed `0555`
+/// before the rename; only after the rename is the final release directory
+/// itself sealed `0555`, and the function returns only then. Nothing can
+/// activate the release earlier, because activation follows this call, and
+/// [`verify_release`] refuses a release directory that is still writable.
+///
+/// On failure only what this call created is removed: the staging directory,
+/// or, once renamed, the final release directory it just made (the caller
+/// has checked under the home lock that `releases/<id>` did not exist).
+/// Leftovers of other runs and foreign releases are never touched.
 fn seal(bundle: &Path, releases: &Path, id: &str, expected_sums: &str) -> Result<(), String> {
     let staging = releases.join(format!(".staging-{id}-{}", crate::config::random_hex(12)?));
+    let target = releases.join(id);
     std::fs::create_dir(&staging).map_err(|error| format!("cannot create staging: {error}"))?;
+    let mut renamed = false;
     let result = (|| {
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| error.to_string())?;
         std::fs::create_dir(staging.join("bin")).map_err(|error| error.to_string())?;
-        for (from, to, mode) in
-            std::iter::once((bundle.join(MANIFEST), staging.join(MANIFEST), 0o444)).chain(
-                BINARIES.iter().map(|name| {
-                    (
-                        bundle.join("bin").join(name),
-                        staging.join("bin").join(name),
-                        0o555,
-                    )
-                }),
+        if bundle.join("plugins").exists() {
+            std::fs::create_dir_all(staging.join(PLUGIN_DIR)).map_err(|error| error.to_string())?;
+        }
+        let executables = BINARIES.iter().map(|name| {
+            (
+                bundle.join("bin").join(name),
+                staging.join("bin").join(name),
+                0o555,
             )
+        });
+        let plugin_files = PLUGIN_FILES
+            .iter()
+            .filter(|_| bundle.join("plugins").exists())
+            .map(|name| {
+                (
+                    bundle.join(PLUGIN_DIR).join(name),
+                    staging.join(PLUGIN_DIR).join(name),
+                    0o444,
+                )
+            });
+        for (from, to, mode) in
+            std::iter::once((bundle.join(MANIFEST), staging.join(MANIFEST), 0o444))
+                .chain(executables)
+                .chain(plugin_files)
         {
             let bytes = std::fs::read(&from).map_err(|error| error.to_string())?;
             write_file(&to, &bytes, mode)?;
@@ -677,20 +829,40 @@ fn seal(bundle: &Path, releases: &Path, id: &str, expected_sums: &str) -> Result
         if hex(&Sha256::digest(implied.as_bytes())) != expected_sums {
             return Err("the sealed bytes do not match the attested digest".into());
         }
-        for dir in [staging.join("bin"), staging.clone()] {
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))
-                .map_err(|error| error.to_string())?;
+        for sealed in [
+            staging.join("bin"),
+            staging.join(PLUGIN_DIR),
+            staging.join("plugins"),
+        ] {
+            if sealed.exists() {
+                std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o555))
+                    .map_err(|error| error.to_string())?;
+            }
         }
-        std::fs::rename(&staging, releases.join(id)).map_err(|error| error.to_string())?;
+        #[cfg(test)]
+        if let Some(inspect) = BEFORE_RENAME.with(|slot| slot.borrow_mut().take()) {
+            inspect(&staging);
+        }
+        std::fs::rename(&staging, &target).map_err(|error| error.to_string())?;
+        renamed = true;
+        #[cfg(test)]
+        if FAIL_AFTER_RENAME.with(|fail| fail.replace(false)) {
+            return Err("injected failure after the release rename".into());
+        }
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o555))
+            .map_err(|error| error.to_string())?;
         File::open(releases)
             .and_then(|dir| dir.sync_all())
             .map_err(|error| error.to_string())
     })();
     if result.is_err() {
-        let _ = std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755));
-        let _ =
-            std::fs::set_permissions(staging.join("bin"), std::fs::Permissions::from_mode(0o755));
-        let _ = std::fs::remove_dir_all(&staging);
+        let ours = if renamed { &target } else { &staging };
+        let _ = std::fs::set_permissions(ours, std::fs::Permissions::from_mode(0o755));
+        for sealed in ["bin", "plugins", PLUGIN_DIR] {
+            let _ =
+                std::fs::set_permissions(ours.join(sealed), std::fs::Permissions::from_mode(0o755));
+        }
+        let _ = std::fs::remove_dir_all(ours);
     }
     result
 }
@@ -718,11 +890,18 @@ pub fn rollback(home: &Path) -> Result<Activation, String> {
     }
     state.previous = state.current.replace(previous);
     activate(home, &state)?;
-    activation(home, &state, true)
+    activation(home, &state, &manifest, true)
 }
 
-/// Builds the activation report for the current state.
-fn activation(home: &Path, state: &InstallState, reused: bool) -> Result<Activation, String> {
+/// Builds the activation report for the current state; `manifest` is the
+/// verified manifest of the active release and decides whether a plugin
+/// binding exists.
+fn activation(
+    home: &Path,
+    state: &InstallState,
+    manifest: &ReleaseManifest,
+    reused: bool,
+) -> Result<Activation, String> {
     let current = state
         .current
         .clone()
@@ -734,11 +913,27 @@ fn activation(home: &Path, state: &InstallState, reused: bool) -> Result<Activat
         .join("bridge-root-relay")
         .canonicalize()
         .map_err(|error| error.to_string())?;
+    let plugin_binding = if manifest.plugin_files.is_empty() {
+        None
+    } else {
+        let entry = home
+            .join("releases")
+            .join(&current)
+            .join(PLUGIN_DIR)
+            .join(PLUGIN_FILES[0])
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        Some(RelayBinding {
+            sha256: file_sha256(&entry)?,
+            path: entry,
+        })
+    };
     Ok(Activation {
         relay_binding: RelayBinding {
             sha256: file_sha256(&path)?,
             path,
         },
+        plugin_binding,
         current,
         previous: state.previous.clone(),
         reused,
@@ -756,19 +951,41 @@ mod tests {
 
     use crate::testdir::TestDir;
 
-    /// Writes a synthetic bundle whose binaries hold `content`.
+    /// Writes a synthetic legacy (no plugin) bundle whose binaries hold `content`.
     fn bundle(dir: &Path, label: &str, content: &str, core_schema: u32) -> (PathBuf, String) {
+        assemble(dir, label, content, core_schema, false)
+    }
+
+    /// Writes a synthetic bundle; with `plugin` it also carries the two
+    /// plugin files, whose text holds `content`.
+    fn assemble(
+        dir: &Path,
+        label: &str,
+        content: &str,
+        core_schema: u32,
+        plugin: bool,
+    ) -> (PathBuf, String) {
         let out = dir.join(format!("bundle-{label}"));
         std::fs::create_dir_all(out.join("bin")).unwrap();
+        let describe = |path: &Path, name: &str| ReleaseFile {
+            name: name.into(),
+            sha256: file_sha256(path).unwrap(),
+            bytes: std::fs::metadata(path).unwrap().len(),
+        };
         let mut files = Vec::new();
         for name in BINARIES {
             let path = out.join("bin").join(name);
             std::fs::write(&path, format!("#!/bin/sh\necho {name} {content}\n")).unwrap();
-            files.push(ReleaseFile {
-                name: name.into(),
-                sha256: file_sha256(&path).unwrap(),
-                bytes: std::fs::metadata(&path).unwrap().len(),
-            });
+            files.push(describe(&path, name));
+        }
+        let mut plugin_files = Vec::new();
+        if plugin {
+            std::fs::create_dir_all(out.join(PLUGIN_DIR)).unwrap();
+            for name in PLUGIN_FILES {
+                let path = out.join(PLUGIN_DIR).join(name);
+                std::fs::write(&path, format!("// {name} {content}\n")).unwrap();
+                plugin_files.push(describe(&path, name));
+            }
         }
         let manifest = ReleaseManifest {
             schema: MANIFEST_SCHEMA,
@@ -778,6 +995,7 @@ mod tests {
             target: target(),
             core_schema,
             files,
+            plugin_files,
         };
         std::fs::write(
             out.join(MANIFEST),
@@ -803,6 +1021,129 @@ mod tests {
         let (extra, _) = bundle(dir, "b", "two", 4);
         std::fs::write(extra.join("bin").join("payload"), "x").unwrap();
         assert!(verify_bundle(&extra, None).is_err(), "extra file refused");
+    }
+
+    /// Plugin bytes are attested, sealed and reused; legacy rollback reports no
+    /// binding, and rolling forward again restores the exact canonical binding.
+    #[test]
+    fn plugin_install_reuse_and_legacy_rollback() {
+        let scratch = TestDir::new("iplugin");
+        let dir = scratch.path();
+        let (home, bin) = (dir.join("home"), dir.join("bin"));
+        let (legacy, _) = bundle(dir, "legacy", "old", 4);
+        let mut legacy_manifest = verify_bundle(&legacy, None).unwrap();
+        legacy_manifest.version = "0.2.0".into();
+        std::fs::write(
+            legacy.join(MANIFEST),
+            serde_json::to_vec_pretty(&legacy_manifest).unwrap(),
+        )
+        .unwrap();
+        let legacy_text = legacy_manifest.sums(&file_sha256(&legacy.join(MANIFEST)).unwrap());
+        std::fs::write(legacy.join(SUMS), &legacy_text).unwrap();
+        let legacy_sums = hex(&Sha256::digest(legacy_text.as_bytes()));
+        let legacy_manifest = std::fs::read_to_string(legacy.join(MANIFEST)).unwrap();
+        assert!(!legacy_manifest.contains("plugin_files"));
+        assert!(
+            self_install(&legacy, &home, &bin, &legacy_sums)
+                .unwrap()
+                .plugin_binding
+                .is_none()
+        );
+        let (plugin, sums) = assemble(dir, "plugin", "new", 4, true);
+        let manifest = verify_bundle(&plugin, Some(&sums)).unwrap();
+        let installed = self_install(&plugin, &home, &bin, &sums).unwrap();
+        let binding = installed.plugin_binding.unwrap();
+        assert_eq!(
+            binding.path,
+            home.join("releases/0.1.0+plugin/plugins/opencode/index.js")
+                .canonicalize()
+                .unwrap()
+        );
+        assert_eq!(binding.sha256, manifest.plugin_files[0].sha256);
+        assert_eq!(
+            std::fs::read(&binding.path).unwrap(),
+            std::fs::read(plugin.join(PLUGIN_DIR).join("index.js")).unwrap()
+        );
+        for name in PLUGIN_FILES {
+            assert_eq!(
+                std::fs::metadata(binding.path.parent().unwrap().join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o444
+            );
+        }
+        for path in [
+            binding.path.parent().unwrap().to_path_buf(),
+            home.join("releases/0.1.0+plugin/plugins"),
+        ] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o555
+            );
+        }
+        assert_eq!(std::fs::read_dir(&bin).unwrap().count(), BINARIES.len());
+        assert!(self_install(&plugin, &home, &bin, &sums).unwrap().reused);
+        assert!(rollback(&home).unwrap().plugin_binding.is_none());
+        let restored = rollback(&home).unwrap().plugin_binding.unwrap();
+        assert_eq!(restored.path, binding.path);
+        assert_eq!(restored.sha256, binding.sha256);
+        std::fs::set_permissions(&binding.path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&binding.path, "tampered").unwrap();
+        assert!(
+            self_install(&plugin, &home, &bin, &sums).is_err(),
+            "tampered reuse refused"
+        );
+    }
+
+    /// Missing, additional, linked and changed plugin entries never verify or
+    /// activate. Nested directory links cannot escape exact-tree verification.
+    #[test]
+    fn plugin_layout_and_attestation_refusals() {
+        let scratch = TestDir::new("iplugbad");
+        let dir = scratch.path();
+        for kind in ["missing", "extra", "link", "tamper", "directory", "top"] {
+            let (out, sums) = assemble(dir, kind, "synthetic", 4, true);
+            let entry = out.join(PLUGIN_DIR).join("index.js");
+            match kind {
+                "missing" => std::fs::remove_file(&entry).unwrap(),
+                "extra" => std::fs::write(out.join(PLUGIN_DIR).join("extra.js"), "x").unwrap(),
+                "link" => {
+                    std::fs::remove_file(&entry).unwrap();
+                    std::os::unix::fs::symlink(out.join(MANIFEST), &entry).unwrap();
+                }
+                "tamper" => std::fs::write(&entry, "changed").unwrap(),
+                "directory" => {
+                    std::fs::rename(out.join(PLUGIN_DIR), out.join("external")).unwrap();
+                    std::os::unix::fs::symlink(out.join("external"), out.join(PLUGIN_DIR)).unwrap();
+                }
+                "top" => std::fs::write(out.join("plugins/extra"), "x").unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(verify_bundle(&out, Some(&sums)).is_err(), "{kind}");
+            let home = dir.join(format!("home-{kind}"));
+            assert!(
+                self_install(&out, &home, &dir.join("bin"), &sums).is_err(),
+                "{kind}"
+            );
+            assert!(!home.exists());
+        }
+    }
+
+    /// A plugin changed after bundle verification cannot pass the sealed-byte
+    /// attestation fence or leave an activated release behind.
+    #[test]
+    fn plugin_tamper_during_seal_is_refused() {
+        let scratch = TestDir::new("iplugrace");
+        let dir = scratch.path();
+        let (out, sums) = assemble(dir, "a", "good", 4, true);
+        let entry = out.join(PLUGIN_DIR).join("index.js");
+        AFTER_BUNDLE_VERIFIED.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || std::fs::write(entry, "changed").unwrap()));
+        });
+        assert!(self_install(&out, &dir.join("home"), &dir.join("bin"), &sums).is_err());
+        assert!(std::fs::symlink_metadata(dir.join("home/current")).is_err());
     }
 
     /// Install, no-op reinstall, upgrade and rollback work; an unattested digest,
@@ -1056,5 +1397,73 @@ mod tests {
         assert_eq!(linked(&home).as_deref(), Some("0.1.0+a"));
         std::fs::write(&state_file, original).unwrap();
         check_current(&home).unwrap();
+    }
+
+    /// The staging directory is still owner-writable (`0700`) when it is
+    /// renamed, because macOS 15 refuses to rename a directory its owner cannot
+    /// write; afterwards the release, its `bin/` and its files are sealed
+    /// read-only, and a release directory that is not `0555` fails closed.
+    #[test]
+    fn staging_is_writable_at_rename_and_the_release_is_sealed_afterwards() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let scratch = TestDir::new("iseal");
+        let dir = scratch.path();
+        let (home, bin) = (dir.join("home"), dir.join("bin"));
+        let (a, sums) = bundle(dir, "a", "one", 4);
+        let seen = Rc::new(Cell::new((0, 0)));
+        let slot = Rc::clone(&seen);
+        BEFORE_RENAME.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |staging| {
+                slot.set((mode(staging), mode(&staging.join("bin"))));
+            }));
+        });
+        self_install(&a, &home, &bin, &sums).unwrap();
+        assert_eq!(seen.get(), (0o700, 0o555), "owner-writable top, sealed bin");
+        let release = home.join("releases/0.1.0+a");
+        assert_eq!(mode(&release), 0o555);
+        assert_eq!(mode(&release.join("bin")), 0o555);
+        // Files keep the creation mask (a 077 umask yields 0400/0500), so the
+        // invariant is read-only for the owner: no write bit, owner can read.
+        for file in [
+            release.join(MANIFEST),
+            release.join("bin").join(BINARIES[0]),
+        ] {
+            assert_eq!(mode(&file) & 0o222, 0, "{}", file.display());
+            assert_eq!(mode(&file) & 0o400, 0o400, "{}", file.display());
+        }
+        std::fs::set_permissions(&release, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = verify_release(&home, "0.1.0+a").unwrap_err();
+        assert!(error.contains("not sealed"), "{error}");
+        std::fs::set_permissions(&release, std::fs::Permissions::from_mode(0o555)).unwrap();
+        verify_release(&home, "0.1.0+a").unwrap();
+    }
+
+    /// A failure right after the rename removes only the release this call
+    /// created and activates nothing; a sibling release stays intact and a
+    /// retry completes.
+    #[test]
+    fn a_failure_after_the_rename_removes_only_the_new_release() {
+        let scratch = TestDir::new("ifault");
+        let dir = scratch.path();
+        let (home, bin) = (dir.join("home"), dir.join("bin"));
+        let (a, sums_a) = bundle(dir, "a", "one", 4);
+        let (b, sums_b) = bundle(dir, "b", "two", 4);
+        self_install(&a, &home, &bin, &sums_a).unwrap();
+        FAIL_AFTER_RENAME.with(|fail| fail.set(true));
+        let error = self_install(&b, &home, &bin, &sums_b).unwrap_err();
+        assert!(error.contains("injected"), "{error}");
+        let names: Vec<_> = std::fs::read_dir(home.join("releases"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("0.1.0+a")]);
+        assert_eq!(check_current(&home).unwrap(), "0.1.0+a");
+        verify_release(&home, "0.1.0+a").unwrap();
+        assert_eq!(
+            self_install(&b, &home, &bin, &sums_b).unwrap().current,
+            "0.1.0+b"
+        );
     }
 }

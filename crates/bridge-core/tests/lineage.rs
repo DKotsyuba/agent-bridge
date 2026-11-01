@@ -29,7 +29,7 @@ const OPS_TOKEN: &str = "lin-operator-token-0000003";
 
 /// The shared recipient of the lineage.
 fn recipient() -> NativeAddress {
-    NativeAddress::new("host-1", Harness::Codex, "default", "thread-7").unwrap()
+    NativeAddress::new("host-1", Harness::CODEX, "default", "thread-7").unwrap()
 }
 
 /// A config with two producer grants (different publishers) and one
@@ -43,6 +43,7 @@ fn config(dir: &TempDir) -> Config {
         limits: Limits::new(1_000),
         grants: vec![
             GrantConfig {
+                managed_feedback: false,
                 producer_v1: None,
                 token: RUN_TOKEN.to_string(),
                 publisher: "agent-run".to_string(),
@@ -51,8 +52,10 @@ fn config(dir: &TempDir) -> Config {
                 modes: vec!["auto".into()],
                 policies: vec!["keep_all".into(), "latest".into(), "batch".into()],
                 admin: false,
+                diagnostics: false,
             },
             GrantConfig {
+                managed_feedback: false,
                 producer_v1: None,
                 token: IDE_TOKEN.to_string(),
                 publisher: "agent-ide".to_string(),
@@ -61,8 +64,10 @@ fn config(dir: &TempDir) -> Config {
                 modes: vec!["auto".into()],
                 policies: vec!["keep_all".into(), "latest".into(), "batch".into()],
                 admin: false,
+                diagnostics: false,
             },
             GrantConfig {
+                managed_feedback: false,
                 producer_v1: None,
                 token: OPS_TOKEN.to_string(),
                 publisher: "bridge-ops".to_string(),
@@ -71,6 +76,7 @@ fn config(dir: &TempDir) -> Config {
                 modes: vec![],
                 policies: vec![],
                 admin: true,
+                diagnostics: false,
             },
         ],
     }
@@ -977,7 +983,7 @@ fn transfer_lineage_validates_scope_fields() {
 #[test]
 fn transfer_lineage_uses_the_canonical_recipient() {
     let mut storage = common::store();
-    let slashed = NativeAddress::new("host-1", Harness::Codex, "default", "thread/7").unwrap();
+    let slashed = NativeAddress::new("host-1", Harness::CODEX, "default", "thread/7").unwrap();
     let mut event = latest_envelope("agent-run", "run-slash", 3);
     event.recipient = slashed.clone();
     storage.publish(&event, 1_000).unwrap();

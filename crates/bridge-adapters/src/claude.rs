@@ -2,6 +2,11 @@
 //! `priority = "later"`, a callback socket unique to each attempt, and
 //! positive closure of written-without-receipt hand-offs.
 //!
+//! A recipient whose own environment names a native owner socket is not sent
+//! an inbox frame at all: it is woken, only while positively idle and with no
+//! inbox descriptor needed, through that owner ([`crate::owner`]), selected
+//! before this carrier's inbox route and without fallback to it.
+//!
 //! The recipient is the exact harness process incarnation of the binding:
 //! its session descriptor (`<store>/sessions/*.json`) must name the
 //! attested session *and* that PID, and the inbox socket's kernel peer must
@@ -16,11 +21,11 @@
 //! `--messaging-socket-path`), so the message capability is withdrawn and
 //! recorded in core before any further acceptance; a descriptor not yet
 //! written is only a transient hold. An inbox that appears later in the
-//! same incarnation restores the message capability only when the loaded
-//! profile qualified it (never a promotion). Every such change is recorded
+//! same incarnation restores the message capability only when the harness
+//! policy grants it (never a promotion). Every such change is recorded
 //! in core first and applied to the registry only after that succeeded,
 //! and only to the exact binding (epoch and incarnation) it was observed
-//! under; withdrawn but qualified bindings are re-checked every 2 s even
+//! under; withdrawn bindings the policy grants message to are re-checked every 2 s even
 //! with no work pending, since publications refuse meanwhile.
 //!
 //! Receipts: the user frame names a callback socket this daemon binds in
@@ -37,10 +42,9 @@
 //! authenticated inbox and to this daemon) *and* only from the sender's
 //! kernel identity, read first thing
 //! after accept: it must be this user and the attested recipient PID. A
-//! sender whose identity can no longer be read (it closed before the
-//! daemon asked; the kernel stops reporting a closed peer's PID) is
-//! ignored, fail closed — the attempt then stays held or unreceipted and
-//! core raises the overdue incident. Within the short receipt window:
+//! sender whose identity can no longer be read is ignored, fail closed; that attempt
+//! stays held or unreceipted and core raises the overdue incident. Linux SO_PEERCRED
+//! may retain positive peer identity after EOF; the exact sender/callback checks apply. Within the short receipt window:
 //! `held` is a
 //! non-terminal hold with a recheck deadline, `delivered` is native
 //! acceptance, any native negative status (a refusal included) is an unknown
@@ -79,6 +83,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bridge_core::dispatch::{AttemptFence, AttemptRecord, Attestation, DispatchCarrier, Outcome};
+use bridge_core::framing::MAX_FRAMED_BYTES;
 use bridge_core::recovery::EvidenceTier;
 use bridge_core::service::{current_unix_millis, log_event};
 use bridge_core::{Harness, NativeAddress};
@@ -88,8 +93,17 @@ use crate::os;
 use crate::registry::{RecipientBinding, Registry};
 use crate::server::{Custody, lock_registry, with_custody};
 
-/// Largest manifest the native inbox accepts in one message, in bytes.
-pub const MAX_MESSAGE_BYTES: usize = 4096;
+/// Largest manifest this carrier writes in one inbox message, in bytes.
+///
+/// This is Bridge's own bound, the core framing bound ([`MAX_FRAMED_BYTES`]),
+/// not a measured native inbox limit: core never renders a larger manifest, so
+/// every manifest core admits and frames (including an advertised 16 KiB body,
+/// escaped and wrapped) is eligible for one bounded inbox hand-off; the same
+/// bound already guards the owner and desktop routes. Whether a native receiver
+/// accepts a message that large is a separate live qualification, not implied
+/// here. An over-bound manifest is a permanent refusal before any byte is
+/// written, never truncated.
+pub const MAX_MESSAGE_BYTES: usize = MAX_FRAMED_BYTES;
 
 /// Largest descriptor or key file read, in bytes.
 const MAX_DESCRIPTOR_BYTES: u64 = 16 * 1024;
@@ -300,7 +314,7 @@ pub(crate) struct SessionHint {
 /// Finds an owner-owned bounded native descriptor naming exactly `session` in
 /// `store`. Only current interactive Claude sessions can bootstrap a recipient.
 /// Returns no caller identity or credentials; registry must check UID, process
-/// incarnation, executable qualification and native store before trusting it.
+/// incarnation, marked-harness executable and native store before trusting it.
 /// Unknown/approval statuses remain held, and files cannot make a PID live.
 pub(crate) fn session_hint(store: &Path, session: &str, uid: u32) -> Option<SessionHint> {
     registry_entries(store, |p| p.extension().is_some_and(|x| x == "json"))
@@ -614,7 +628,7 @@ impl Hub {
     ///
     /// A positively disabled inbox withdraws message; an inbox advertised
     /// later by the same session and incarnation (native late binding)
-    /// restores it, never beyond the loaded build's qualification. A change
+    /// restores it, never beyond the harness policy's grant. A change
     /// is recorded in core first and applied to the registry only after
     /// that succeeded, so registry and core never disagree in the granting
     /// direction and a failed core write is simply retried by the next
@@ -678,14 +692,14 @@ impl Hub {
     }
 
     /// Re-checks every live Claude binding whose message capability was
-    /// withdrawn although its build is qualified, independent of pending
+    /// withdrawn although the harness policy grants it, independent of pending
     /// work: while message is withdrawn, publications refuse before
     /// acceptance, so no dispatch would ever re-attest the recipient. A late
     /// inbox restores message here (recorded in core first); a still
     /// disabled or absent inbox, a gone process or a failed core write
     /// leaves the binding for the next pass.
     fn refresh_withdrawn(&self, registry: &Mutex<Registry>) {
-        let withdrawn = lock_registry(registry).message_withdrawn(Harness::ClaudeCode);
+        let withdrawn = lock_registry(registry).message_withdrawn(Harness::CLAUDE_CODE);
         for address in withdrawn {
             let attested = lock_registry(registry).attest_recipient(&address);
             if let Ok((_, snapshot)) = attested {
@@ -1082,6 +1096,65 @@ impl ClaudeLaterCarrier {
         })
     }
 
+    /// Validates the native owner route of a recipient whose own environment
+    /// names an owner socket: the shared message candidate is revalidated
+    /// outside the registry lock (exact PID/start, UID, executable and home), the
+    /// owner is proven the exact owner-relay direct parent, and
+    /// a final locked equality check closes the selection. It needs no inbox
+    /// descriptor. Every failure is a hold; there is no fallback to the inbox.
+    fn owner_route(
+        &self,
+        recipient: &NativeAddress,
+    ) -> Result<(Attestation, RecipientBinding, PathBuf), String> {
+        crate::registry::refresh_stale(&self.registry);
+        let candidate = { lock_registry(&self.registry).message_candidate(recipient)? };
+        let (attestation, binding) = candidate.validate()?;
+        let socket = crate::owner::locate(&self.registry, binding.harness)?
+            .ok_or("native owner locator is no longer present")?;
+        lock_registry(&self.registry).message_current(&candidate)?;
+        Ok((attestation, binding, socket))
+    }
+
+    /// One native owner hand-off of the frozen manifest for an owner-routed
+    /// recipient. The unchanged epoch and a positive idle lifecycle are
+    /// required, whatever the requested mode. A proven epoch/idle change is
+    /// deferred without consuming transport retries; other pre-write failures
+    /// are ordinary known-unsent. No inbox frame, callback
+    /// socket or second route is ever used after this route is selected.
+    fn send_owner(&self, attempt: &AttemptRecord, address: &NativeAddress) -> Outcome {
+        let (attestation, binding, socket) = match self.owner_route(address) {
+            Ok(found) => found,
+            Err(reason) => {
+                return Outcome::KnownUnsent {
+                    evidence: format!("native owner route not proven: {reason}"),
+                };
+            }
+        };
+        if binding.epoch != attempt.fence.endpoint_epoch
+            || attestation.lifecycle() != bridge_core::dispatch::Lifecycle::Inactive
+        {
+            return Outcome::DeferredKnownUnsent {
+                evidence: "recipient epoch or idle lifecycle changed before owner hand-off".into(),
+            };
+        }
+        crate::owner::deliver(
+            &self.registry,
+            &socket,
+            binding.harness,
+            Harness::CLAUDE_CODE,
+            &crate::owner::Handoff {
+                thread_id: &address.native_session_id,
+                call_id: &format!(
+                    "agent-bridge-{}-{}",
+                    attempt.fence.attempt_seq,
+                    crate::registry::prefix_within(&attempt.fence.manifest_hash, 16)
+                ),
+                text: &attempt.manifest,
+                deadline_ms: attempt.deadline_ms,
+            },
+        )
+    }
+
     /// Writes the authenticated `later` frame of `frame`. On failure
     /// returns the outcome: known-unsent while no byte can have left,
     /// unknown once the write started.
@@ -1148,21 +1221,36 @@ impl DispatchCarrier for ClaudeLaterCarrier {
     /// publications refuse before acceptance) and is returned as such, so
     /// core holds visibly instead of treating the path as supported; an
     /// inbox advertised later by the same session and incarnation (native
-    /// late binding) restores message, only if the loaded build is
-    /// qualified for it; a descriptor not yet written, or a malformed one,
+    /// late binding) restores message, only if the harness policy grants it; a
+    /// descriptor not yet written, or a malformed one,
     /// is a transient condition reported as an attestation error (a hold),
     /// never as disabled, enabled or inactive. While every callback slot is
     /// held by an unsettled hand-off the recipient is held too
     /// (`Hub::callback_capacity`), before core reserves an attempt.
+    ///
+    /// A recipient whose own environment names a native owner socket is attested
+    /// through that owner route instead ([`crate::owner`]): it needs no session
+    /// descriptor or inbox, requires the exact direct-parent owner running a
+    /// trusted executable, and
+    /// any unprovable, unreadable or malformed locator is an attestation error
+    /// (a hold) with no fallback to the inbox route. Only a positively idle
+    /// lifecycle may then be woken; an absent locator keeps the behavior above.
     fn attest(&mut self, recipient: &NativeAddress) -> Result<Attestation, String> {
-        if recipient.harness != Harness::ClaudeCode {
+        if recipient.harness != Harness::CLAUDE_CODE {
             return Err("not a Claude recipient".into());
         }
         let (attestation, binding) = {
             let mut registry = lock_registry(&self.registry);
-            registry.discover_claude_recipient(recipient, current_unix_millis())?;
+            registry.discover_claude_recipient(recipient)?;
             registry.attest_recipient(recipient)?
         };
+        if crate::owner::locator(binding.harness.0)?.is_some() {
+            let attestation = self.owner_route(recipient)?.0;
+            if attestation.lifecycle() != bridge_core::dispatch::Lifecycle::Inactive {
+                return Err("native owner recipient is not positively idle".into());
+            }
+            return Ok(attestation);
+        }
         let changed = self.hub.sync_message(&self.registry, recipient, &binding)?;
         self.hub.callback_capacity()?;
         Ok(changed.unwrap_or(attestation))
@@ -1178,7 +1266,19 @@ impl DispatchCarrier for ClaudeLaterCarrier {
     /// receipt of the window contradicts it (another status, or a `held`
     /// after it), which is unknown; `held` alone
     /// holds until [`ClaudeTiming::held_recheck_ms`]; silence is written
-    /// without receipt. A hand-off is never repeated here.
+    /// without receipt. A hand-off is never repeated here. A manifest over
+    /// [`MAX_MESSAGE_BYTES`] is a permanent refusal before the inbox is
+    /// touched (core never frames one that large).
+    ///
+    /// For an owner-routed recipient (its environment names a native owner
+    /// socket) the frozen manifest instead goes through the native owner
+    /// ([`crate::owner`]) and none of the above applies: the unchanged epoch and
+    /// a positive idle lifecycle are required, whatever the requested mode, and
+    /// every failure before the request is written (including an unreadable
+    /// environment or a bad locator) is known-unsent. After the write only a
+    /// correlated, exactly shaped receipt is anything but an unknown outcome,
+    /// which is retained and never resent; no inbox frame, callback socket or
+    /// second route is used after selection.
     fn send(&mut self, attempt: &AttemptRecord) -> Outcome {
         let unsent = |evidence: String| Outcome::KnownUnsent { evidence };
         let Ok(address) = NativeAddress::parse(&attempt.fence.recipient) else {
@@ -1188,13 +1288,18 @@ impl DispatchCarrier for ClaudeLaterCarrier {
             Ok((_, binding)) => binding,
             Err(reason) => return unsent(format!("recipient not attested: {reason}")),
         };
+        match crate::owner::locator(binding.harness.0) {
+            Ok(None) => {}
+            Ok(Some(_)) => return self.send_owner(attempt, &address),
+            Err(reason) => return unsent(reason),
+        }
         if binding.epoch != attempt.fence.endpoint_epoch {
             return unsent("the endpoint epoch changed since the reservation".into());
         }
         if attempt.manifest.len() > MAX_MESSAGE_BYTES {
             return Outcome::PermanentRefusal {
                 reason: format!(
-                    "manifest exceeds the native inbox bound of {MAX_MESSAGE_BYTES} bytes"
+                    "manifest exceeds the inbox carrier bound of {MAX_MESSAGE_BYTES} bytes"
                 ),
             };
         }
@@ -1433,16 +1538,25 @@ mod tests {
         );
     }
 
-    /// A sender that closed before its identity was read is ignored even
-    /// with the known message id and the right uid.
+    /// EOF cannot replace kernel proof: macOS may lose the peer PID after close,
+    /// while Linux SO_PEERCRED retains it. Route only a still-proven exact sender.
     #[test]
-    fn disconnected_sender_with_known_id_is_ignored() {
+    fn closed_sender_requires_positive_kernel_identity() {
         let (hub, receiver) = hub_waiting(std::process::id());
         let (server, _) = receipt_stream(true);
+        let proven = os::peer_identity(&server).is_ok_and(|peer| peer.pid == std::process::id());
         hub.accept_receipt(server, "msg-known");
+        let routed = receiver.try_recv().is_ok();
         assert!(
-            receiver.try_recv().is_err(),
-            "an unverifiable receipt was routed"
+            !routed || proven,
+            "closed receipts require actual kernel identity"
+        );
+        // Linux retains SO_PEERCRED after EOF. Other kernels may revoke the earlier
+        // observation before the hub independently rechecks it, which must fail closed.
+        #[cfg(target_os = "linux")]
+        assert!(
+            proven && routed,
+            "Linux closed-peer credentials remain positive"
         );
     }
 
@@ -1602,5 +1716,82 @@ mod transcript_tests {
             "uds:/cb"
         ));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A manifest as large as core ever frames, full of multibyte text, is
+    /// still found byte-exact in a peer entry (JSON-escaped in the line).
+    #[test]
+    fn largest_framed_manifest_closes_from_the_transcript() {
+        let dir = std::env::temp_dir().join(format!("m2big{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+        let manifest = format!(
+            "\"\\\n{}",
+            "\u{e9}\u{1F600}".repeat((MAX_MESSAGE_BYTES - 16) / 6)
+        );
+        assert!(manifest.len() <= MAX_MESSAGE_BYTES && manifest.len() > 16 * 1024);
+        std::fs::write(
+            &path,
+            format!("{}\n", entry_line("sess", "uds:/cb", &manifest)),
+        )
+        .unwrap();
+        assert!(transcript_has_handoff(
+            &path,
+            &manifest,
+            own_uid(),
+            "sess",
+            "uds:/cb"
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod bound_tests {
+    //! The inbox size bound covers the advertised 16 KiB body.
+
+    use super::*;
+    use bridge_core::{
+        Envelope, EventId, Kind, Metadata, Mode, Payload, Policy, PublisherId,
+        framing::{MAX_TAG_BYTES, frame},
+    };
+
+    /// A 16 KiB UTF-8 payload rendered under the widest tag (ASCII `&` that
+    /// escapes to a 5-byte entity, or multibyte text), plus envelope and
+    /// provenance, fits the carrier bound. The bound is exactly core's framing
+    /// bound, so core refuses anything larger before it can reach this
+    /// carrier; a body of 16 KiB of `"` (a 6-byte entity each) already exceeds
+    /// that bound at core admission and is not a carrier case.
+    #[test]
+    fn a_full_16_kib_body_fits_the_carrier_bound() {
+        let address = NativeAddress::new("host", Harness::CLAUDE_CODE, "default", "s").unwrap();
+        let envelope = |payload: String| {
+            Envelope::new(
+                PublisherId::new("p").unwrap(),
+                EventId::new("e").unwrap(),
+                address.clone(),
+                Kind::new("k").unwrap(),
+                Mode::Message,
+                Policy::KeepAll,
+                Payload::new(payload).unwrap(),
+                Metadata::new(),
+                None,
+            )
+            .unwrap()
+        };
+        let tag = "a".repeat(MAX_TAG_BYTES);
+        for payload in [
+            "&".repeat(16 * 1024),
+            "\u{1F600}".repeat(4 * 1024),
+            "\u{e9}".repeat(8 * 1024),
+        ] {
+            assert_eq!(payload.len(), 16 * 1024);
+            let framed = frame(&tag, &envelope(payload)).unwrap();
+            assert!(framed.len() > 4096 && framed.len() <= MAX_MESSAGE_BYTES);
+        }
+        assert_eq!(MAX_MESSAGE_BYTES, MAX_FRAMED_BYTES);
+        let over = "&".repeat(MAX_FRAMED_BYTES / 5 + 1);
+        assert!(frame(&tag, &envelope(over)).is_err());
+        assert!(frame(&tag, &envelope("\"".repeat(16 * 1024))).is_err());
     }
 }

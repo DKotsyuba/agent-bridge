@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// Opt-in generic v1 permissions; no operation, job or product semantics.
-/// Missing policy disables v1 mutations; native scopes must be explicitly
+/// Missing policy disables v1 mutations and host observations; native scopes must be explicitly
 /// declared and shared-session return requires an explicit reply permission.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -23,11 +23,14 @@ pub struct ProducerPolicy {
     pub direct_address: bool,
     /// Whether producer lifetime creation/retirement is admitted.
     pub delivery_scopes: bool,
+    /// Enables exact recipient observation/resolution on the adapter endpoint;
+    /// recipient and native scope allowlists still apply before any lookup.
+    pub host_observations: bool,
     /// Literal configured backend audience names allowed for assertion issue.
     pub assertion_audiences: Vec<String>,
 }
 impl Default for ProducerPolicy {
-    /// Denies mutation features unless the deployment explicitly enables them.
+    /// Denies mutation and host-observation features unless explicitly enabled.
     fn default() -> Self {
         Self {
             registration: false,
@@ -35,6 +38,7 @@ impl Default for ProducerPolicy {
             native_scopes: Vec::new(),
             direct_address: false,
             delivery_scopes: false,
+            host_observations: false,
             assertion_audiences: Vec::new(),
         }
     }
@@ -220,7 +224,8 @@ impl ProducerAuthorizer {
         Ok(Self { grants: result })
     }
     /// Authenticates a nonoperator producer using constant-time comparison;
-    /// revoked/unknown/operator credentials never disclose producer records.
+    /// revoked/unknown/operator/diagnostics credentials never disclose producer
+    /// records or enter native attestation/registration/assertion paths.
     pub fn authenticate(&self, credential: &str) -> Result<&ProducerPolicyGrant, ApiError> {
         let mut matched = None;
         for grant in &self.grants {
@@ -230,7 +235,7 @@ impl ProducerAuthorizer {
             }
         }
         matched
-            .filter(|g| !g.grant.admin)
+            .filter(|g| !g.grant.admin && !g.grant.diagnostics)
             .ok_or_else(|| failure(ErrorClass::Auth, "invalid_producer_credential"))
     }
     /// Reuses the same boot authority for unchanged legacy operator/publisher

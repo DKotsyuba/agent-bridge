@@ -1,5 +1,5 @@
-//! Integration checks for the authenticated publisher service (T-004) and
-//! the daemon binary scaffold (T-001/F10).
+//! Integration checks for the authenticated publisher service and the daemon
+//! binary.
 //!
 //! All state is isolated: fresh temporary directories for the database and
 //! socket; the binary test spawns its own daemon on a private socket.
@@ -26,7 +26,7 @@ const SECOND_TOKEN: &str = "6f6f-second-publisher-token-0003";
 
 /// The canonical recipient the grant allows.
 fn recipient_text() -> String {
-    NativeAddress::new("host-1", Harness::Codex, "default", "thread-7")
+    NativeAddress::new("host-1", Harness::CODEX, "default", "thread-7")
         .unwrap()
         .to_canonical_string()
 }
@@ -40,6 +40,7 @@ fn test_config(dir: &TempDir) -> Config {
         limits: Limits::new(100),
         grants: vec![
             GrantConfig {
+                managed_feedback: false,
                 producer_v1: None,
                 token: GRANT_TOKEN.to_string(),
                 publisher: "agent-run".to_string(),
@@ -48,8 +49,10 @@ fn test_config(dir: &TempDir) -> Config {
                 modes: vec!["message".to_string(), "auto".to_string()],
                 policies: vec!["keep_all".to_string(), "latest".to_string()],
                 admin: false,
+                diagnostics: false,
             },
             GrantConfig {
+                managed_feedback: false,
                 producer_v1: None,
                 token: ADMIN_TOKEN.to_string(),
                 publisher: "bridge-ops".to_string(),
@@ -58,8 +61,10 @@ fn test_config(dir: &TempDir) -> Config {
                 modes: vec![],
                 policies: vec![],
                 admin: true,
+                diagnostics: false,
             },
             GrantConfig {
+                managed_feedback: false,
                 producer_v1: None,
                 token: SECOND_TOKEN.to_string(),
                 publisher: "agent-ide".to_string(),
@@ -68,6 +73,7 @@ fn test_config(dir: &TempDir) -> Config {
                 modes: vec!["message".to_string()],
                 policies: vec!["keep_all".to_string()],
                 admin: false,
+                diagnostics: false,
             },
         ],
     }
@@ -77,7 +83,7 @@ fn test_config(dir: &TempDir) -> Config {
 fn body(event: &str) -> PublishBody {
     PublishBody {
         event_id: event.to_string(),
-        recipient: NativeAddress::new("host-1", Harness::Codex, "default", "thread-7").unwrap(),
+        recipient: NativeAddress::new("host-1", Harness::CODEX, "default", "thread-7").unwrap(),
         kind: "worker.completed".to_string(),
         mode: Mode::Message,
         policy: Policy::KeepAll,
@@ -197,7 +203,7 @@ fn grant_allowlists_are_enforced_before_acceptance() {
 
     let mut wrong_recipient = body("evt-r");
     wrong_recipient.recipient =
-        NativeAddress::new("host-1", Harness::Codex, "default", "thread-999").unwrap();
+        NativeAddress::new("host-1", Harness::CODEX, "default", "thread-999").unwrap();
     assert_eq!(
         client
             .publish(GRANT_TOKEN, &wrong_recipient)
@@ -698,7 +704,7 @@ fn wildcard_recipient_grants_admit_new_addresses_without_widening_other_rights()
     let mut client = bridge_client::BridgeClient::connect(running.socket_path()).unwrap();
     let mut new = body("new-address");
     new.recipient =
-        NativeAddress::new("host-1", Harness::ClaudeCode, "new-store", "new-session").unwrap();
+        NativeAddress::new("host-1", Harness::CLAUDE_CODE, "new-store", "new-session").unwrap();
     assert!(!client.publish(GRANT_TOKEN, &new).unwrap().replayed);
     new.event_id = "wrong-kind".into();
     new.kind = "unlisted.kind".into();
@@ -706,6 +712,302 @@ fn wildcard_recipient_grants_admit_new_addresses_without_widening_other_rights()
         client.publish(GRANT_TOKEN, &new).unwrap_err().class,
         "forbidden"
     );
+    running.shutdown();
+    running.join();
+}
+
+/// Grant-authorized managed ingress is enforced before custody and real maintenance
+/// creates the retained report/notice without a caller polling a recovery operation.
+#[test]
+fn managed_ingress_requires_capability_and_callback_scope_and_runs_in_service() {
+    for enabled in [false, true] {
+        let dir = TempDir::new("svc-managed");
+        let mut config = test_config(&dir);
+        config.grants[0].managed_feedback = enabled;
+        let running = service::start(config).unwrap();
+        let mut client = bridge_client::BridgeClient::connect(running.socket_path()).unwrap();
+        let sender = bridge_core::managed::ManagedSender {
+            address: body("x").recipient,
+            request_id: "managed-1".into(),
+        };
+        let mut request = body("managed-1");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        request.expires_at = Some(ExpiresAt::from_unix_millis(now + 100).unwrap());
+        let mut foreign = sender.clone();
+        foreign.address = common::codex("foreign-sender");
+        assert_eq!(
+            client
+                .publish_managed(GRANT_TOKEN, &request, &foreign)
+                .unwrap_err()
+                .class,
+            "forbidden"
+        );
+        assert!(client.status(GRANT_TOKEN, "managed-1").unwrap().0.is_none());
+        assert_eq!(
+            client
+                .sender_reports(GRANT_TOKEN, &foreign.address, 0)
+                .unwrap_err()
+                .class,
+            "forbidden"
+        );
+        if enabled {
+            client
+                .publish_managed(GRANT_TOKEN, &request, &sender)
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let report = loop {
+                let (_, delivery) = client.status(GRANT_TOKEN, "managed-1").unwrap();
+                if let Some(report) = delivery.and_then(|d| d.report) {
+                    break report;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "real maintenance did not complete the bounded event"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert_eq!(report.outcome, "failed");
+            assert!(matches!(
+                report.feedback_state.as_str(),
+                "pending" | "queued"
+            ));
+            let page = client
+                .sender_reports(GRANT_TOKEN, &sender.address, 0)
+                .unwrap();
+            assert_eq!(page.reports.len(), 1);
+            assert_eq!(page.reports[0].request_id, "managed-1");
+            assert_eq!(
+                client
+                    .sender_reports(SECOND_TOKEN, &sender.address, 0)
+                    .unwrap_err()
+                    .class,
+                "forbidden"
+            );
+            let foreign_status = client.status(SECOND_TOKEN, "managed-1").unwrap();
+            assert!(foreign_status.0.is_none());
+        } else {
+            assert_eq!(
+                client
+                    .sender_reports(GRANT_TOKEN, &sender.address, 0)
+                    .unwrap_err()
+                    .class,
+                "forbidden"
+            );
+            assert_eq!(
+                client
+                    .publish_managed(GRANT_TOKEN, &request, &sender)
+                    .unwrap_err()
+                    .class,
+                "forbidden"
+            );
+            assert!(client.status(GRANT_TOKEN, "managed-1").unwrap().0.is_none());
+        }
+        running.shutdown();
+        running.join();
+    }
+}
+
+/// Diagnostics grants authorize only the four closed observations. Every old
+/// request variant, including harmless-looking listings and publisher status,
+/// is denied before its mutation/disclosure path; admin/publisher rights remain.
+#[test]
+fn diagnostics_realm_denies_every_legacy_request_and_producer_authority() {
+    use bridge_core::observation::{EmptyParams, IncidentParams, ObservationQuery, PageParams};
+    use bridge_core::service::{Request, Token};
+    use serde_json::json;
+    let dir = TempDir::new("observe");
+    let mut config = test_config(&dir);
+    let mut diagnostic = config.grants[1].clone();
+    diagnostic.token = "synthetic-diagnostics-token".into();
+    diagnostic.publisher = "diagnostics".into();
+    diagnostic.admin = false;
+    diagnostic.diagnostics = true;
+    let token = diagnostic.token.clone();
+    config.grants.push(diagnostic.clone());
+    let authority = bridge_core::ProducerAuthorizer::new(&config.grants).unwrap();
+    assert!(
+        authority.authenticate(&token).is_err(),
+        "native and v1 producer gate"
+    );
+    assert!(authority.authenticate(GRANT_TOKEN).is_ok());
+    let mut mixed = diagnostic.clone();
+    mixed.admin = true;
+    assert!(mixed.validate().is_err());
+    mixed = diagnostic.clone();
+    mixed.recipients.push("*".into());
+    assert!(mixed.validate().is_err());
+    mixed = diagnostic.clone();
+    mixed.managed_feedback = true;
+    assert!(mixed.validate().is_err());
+    mixed = diagnostic;
+    mixed.producer_v1 = Some(Default::default());
+    assert!(mixed.validate().is_err());
+    let running = service::start(config).unwrap();
+    let socket = running.socket_path();
+    let mut client = bridge_client::BridgeClient::connect(socket).unwrap();
+    let receipt = client.publish(GRANT_TOKEN, &body("observer-safe")).unwrap();
+    for query in [
+        ObservationQuery::Identity(EmptyParams {}),
+        ObservationQuery::Overview(EmptyParams {}),
+        ObservationQuery::Deliveries(PageParams::default()),
+        ObservationQuery::Incidents(IncidentParams::default()),
+    ] {
+        let view = client.observe(&token, &query).unwrap();
+        let text = serde_json::to_string(&view).unwrap();
+        assert!(!text.contains("synthetic worker result"));
+        assert!(!text.contains("thread-7"));
+        assert_eq!(
+            client.observe(ADMIN_TOKEN, &query).unwrap_err().class,
+            "forbidden"
+        );
+        assert_eq!(
+            client.observe(GRANT_TOKEN, &query).unwrap_err().class,
+            "forbidden"
+        );
+        assert_eq!(
+            client.observe(OTHER_TOKEN, &query).unwrap_err().class,
+            "auth"
+        );
+    }
+    let t = || Token::new(&token);
+    let requests = vec![
+        Request::Publish {
+            token: t(),
+            event: Box::new(body("must-not-exist")),
+        },
+        Request::PublishManaged {
+            token: t(),
+            event: Box::new(body("must-not-exist")),
+            sender: bridge_core::managed::ManagedSender {
+                address: body("x").recipient,
+                request_id: "diagnostic-no-authority".into(),
+            },
+        },
+        Request::SenderReports {
+            token: t(),
+            sender: body("x").recipient,
+            after_seq: 0,
+        },
+        Request::Status {
+            token: t(),
+            event_id: "observer-safe".into(),
+        },
+        Request::Shutdown { token: t() },
+        Request::Incidents {
+            token: t(),
+            include_closed: true,
+            limit: Some(1),
+        },
+        Request::IncidentsPage {
+            token: t(),
+            include_closed: true,
+            limit: Some(1),
+            after_seq: 0,
+            through_seq: None,
+        },
+        Request::Retention {
+            token: t(),
+            publisher: "agent-run".into(),
+            event_id: "observer-safe".into(),
+        },
+        Request::Holds {
+            token: t(),
+            limit: Some(1),
+        },
+        Request::Counts { token: t() },
+        Request::AuthorizeRetry {
+            token: t(),
+            publisher: "agent-run".into(),
+            event_id: "observer-safe".into(),
+            note: "PRIVATE_NOTE".into(),
+        },
+        Request::Dispose {
+            token: t(),
+            publisher: "agent-run".into(),
+            event_id: "observer-safe".into(),
+            note: "PRIVATE_NOTE".into(),
+        },
+        Request::WaivePredecessor {
+            token: t(),
+            publisher: "agent-run".into(),
+            event_id: "observer-safe".into(),
+            note: "PRIVATE_NOTE".into(),
+        },
+        Request::Evidence {
+            token: t(),
+            publisher: "agent-run".into(),
+            event_id: "observer-safe".into(),
+            attempt_seq: 1,
+            tier: bridge_core::recovery::EvidenceTier::ApplicationProcessed,
+            detail: "PRIVATE_NOTE".into(),
+        },
+        Request::TransferLineage {
+            token: t(),
+            recipient: body("x").recipient,
+            kind: "worker.completed".into(),
+            mode: "message".into(),
+            project: String::new(),
+            task: String::new(),
+            stream: "s".into(),
+            new_publisher: "agent-ide".into(),
+            note: "PRIVATE_NOTE".into(),
+        },
+        Request::Pause {
+            token: t(),
+            recipient: body("x").recipient,
+            reason: "PRIVATE_NOTE".into(),
+        },
+        Request::Resume {
+            token: t(),
+            recipient: body("x").recipient,
+        },
+    ];
+    for request in requests {
+        let response = raw_round_trip(socket, &serde_json::to_string(&request).unwrap());
+        assert!(
+            matches!(response,Response::Error { ref class,.. } if class=="forbidden"),
+            "{request:?}: {response:?}"
+        );
+    }
+    // Real public v1 ingress must also refuse, before replay, lifecycle writes
+    // or the unsupported-native-operation branch can disclose anything.
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../bridge-protocol/tests/wire-v1.json")).unwrap();
+    for mut request in fixture["requests"].as_array().unwrap().clone() {
+        use std::io::{BufRead, BufReader, Write};
+        request["credential"] = json!(token);
+        let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        writeln!(stream, "{request}").unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["success"], false);
+        assert_eq!(response["error"]["class"], "auth");
+    }
+    let malformed = raw_round_trip(socket,&json!({"op":"observe","token":token,"query":{"operation":"identity","params":{"arbitrary":"PRIVATE_NOTE"}}}).to_string());
+    assert!(matches!(malformed, Response::Error { .. }));
+    assert!(running.is_running());
+    let (after, _) = client.status(GRANT_TOKEN, "observer-safe").unwrap();
+    assert_eq!(after.unwrap().acceptance_seq, receipt.acceptance_seq);
+    assert!(
+        client
+            .status(GRANT_TOKEN, "must-not-exist")
+            .unwrap()
+            .0
+            .is_none()
+    );
+    assert!(
+        running
+            .with_storage(|s| s.audit_entries(100).unwrap())
+            .is_empty()
+    );
+    assert!(client.counts(ADMIN_TOKEN).is_ok());
     running.shutdown();
     running.join();
 }

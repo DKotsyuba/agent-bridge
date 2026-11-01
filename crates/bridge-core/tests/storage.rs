@@ -52,7 +52,7 @@ fn keep_all(event: &str, payload: &str, expires_at: Option<ExpiresAt>) -> Envelo
     Envelope::new(
         PublisherId::new("agent-run").unwrap(),
         EventId::new(event).unwrap(),
-        NativeAddress::new("host-1", Harness::Codex, "default", "thread-7").unwrap(),
+        NativeAddress::new("host-1", Harness::CODEX, "default", "thread-7").unwrap(),
         Kind::new("worker.completed").unwrap(),
         Mode::Message,
         Policy::KeepAll,
@@ -68,7 +68,7 @@ fn latest(event: &str, stream: &str, revision: u64) -> Envelope {
     Envelope::new(
         PublisherId::new("agent-ide").unwrap(),
         EventId::new(event).unwrap(),
-        NativeAddress::new("host-1", Harness::ClaudeCode, "default", "session-7").unwrap(),
+        NativeAddress::new("host-1", Harness::CLAUDE_CODE, "default", "session-7").unwrap(),
         Kind::new("diagnostics.view").unwrap(),
         Mode::Auto,
         Policy::Latest {

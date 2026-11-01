@@ -25,7 +25,8 @@ use crate::types::{CoreError, Envelope};
 /// lineage). Version 6 adds durable producer routes/request receipts, global
 /// evidence-use claims, lifetime fences and scoped snapshot watermarks;
 /// accepted legacy envelope bytes/hashes and possible effects stay unchanged.
-pub const SCHEMA_VERSION: u32 = 6;
+/// Version 7 adds opt-in bounded delivery/report associations without enrolling old events.
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Backfills each migrated `latest` event's lineage key.
 ///
@@ -122,7 +123,7 @@ CREATE TABLE IF NOT EXISTS counters (
 );
 INSERT OR IGNORE INTO counters (name, value) VALUES
     ('acceptance_seq', 0), ('attempt_seq', 0), ('incident_seq', 0),
-    ('evidence_seq', 0), ('audit_seq', 0), ('retained_events', 0);
+    ('evidence_seq', 0), ('audit_seq', 0), ('retained_events', 0), ('managed_completion_seq', 0);
 CREATE TABLE IF NOT EXISTS events (
     publisher_id TEXT NOT NULL,
     event_id TEXT NOT NULL,
@@ -148,6 +149,17 @@ CREATE TABLE IF NOT EXISTS events (
     delivery_scope_key TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (publisher_id, event_id)
 );
+CREATE TABLE IF NOT EXISTS managed_deliveries (
+    publisher_id TEXT NOT NULL, event_id TEXT NOT NULL,
+    feedback_sender TEXT, request_id TEXT NOT NULL DEFAULT '',
+    deadline_ms INTEGER NOT NULL, sends_made INTEGER NOT NULL DEFAULT 0,
+    outcome TEXT NOT NULL DEFAULT 'active', reason TEXT NOT NULL DEFAULT '',
+    completed_ms INTEGER, completion_seq INTEGER, notice_state TEXT NOT NULL DEFAULT 'none', notice_event_id TEXT,
+    PRIMARY KEY(publisher_id,event_id)
+);
+CREATE INDEX IF NOT EXISTS managed_by_deadline ON managed_deliveries(outcome,deadline_ms);
+CREATE INDEX IF NOT EXISTS managed_sender_reports ON managed_deliveries(publisher_id,feedback_sender,completion_seq);
+CREATE INDEX IF NOT EXISTS managed_pending_notices ON managed_deliveries(notice_state,completed_ms);
 CREATE TABLE IF NOT EXISTS watermarks (
     publisher_id TEXT NOT NULL,
     recipient TEXT NOT NULL,
@@ -362,6 +374,14 @@ pub fn ensure(tx: &Transaction<'_>) -> Result<(), CoreError> {
     match stored.as_deref().map(str::parse::<u32>) {
         Some(Ok(SCHEMA_VERSION)) => {
             tx.execute_batch(CURRENT_DDL)?;
+            Ok(())
+        }
+        Some(Ok(6)) => {
+            tx.execute_batch(CURRENT_DDL)?;
+            tx.execute(
+                "UPDATE schema_meta SET value=?1 WHERE key='schema_version'",
+                params![SCHEMA_VERSION.to_string()],
+            )?;
             Ok(())
         }
         Some(Ok(5)) => {

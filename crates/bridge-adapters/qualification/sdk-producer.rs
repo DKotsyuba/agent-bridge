@@ -203,7 +203,7 @@ fn run() -> Result<(), &'static str> {
         let Some(id) = rpc.get("id") else { continue; };
         let result = match rpc.get("method").and_then(Value::as_str) {
             Some("initialize") => json!({"protocolVersion":"2025-03-26", "capabilities":{"tools":{}},
-                "serverInfo":{"name":"independent-sdk-producer","version":"0.2.0"}}),
+                "serverInfo":{"name":"independent-sdk-producer","version":"0.3.0"}}),
             Some("ping") => json!({}),
             Some("tools/list") => json!({"tools":[{"name":setting(&config,"tool_name")?,
                 "description":"Register this native call and publish private fixture data; return receipts only",

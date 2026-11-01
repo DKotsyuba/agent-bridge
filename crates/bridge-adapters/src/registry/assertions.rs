@@ -248,7 +248,7 @@ impl Registry {
     }
 
     /// Current endpoint incarnation check; stable scope equality is irrelevant.
-    fn caller_current(&mut self, caller: &VerifiedCaller, harness: (u32, u64)) -> bool {
+    pub(super) fn caller_current(&mut self, caller: &VerifiedCaller, harness: (u32, u64)) -> bool {
         let Some(binding) = self
             .bindings
             .get(&caller.address().to_canonical_string())
@@ -259,49 +259,23 @@ impl Registry {
         !binding.retired
             && binding.harness == harness
             && binding.epoch == caller.epoch()
-            && os::incarnation_alive(harness.0, harness.1)
-            && self.executable_qualified(&binding.executable)
+            && os::process_facts(harness.0).is_some_and(|facts| {
+                facts.start_time == harness.1
+                    && facts.exe.as_ref() == Some(&binding.executable)
+                    && executable_current(&binding.executable, &facts, self.owner_uid).is_ok()
+            })
     }
 }
 
 impl Registry {
-    /// Adds configured native host/build support to authenticated capabilities.
-    /// Warmed pins support direct matching calls; nested paths are unqualified.
-    /// No session/address/foreign producer or executable path is disclosed.
+    /// Native host/build facts advertised to authenticated producers: none. Native
+    /// recipients are not predeclared by build, so there is no configured
+    /// host/build/path fact to disclose and nothing fake is advertised; the
+    /// harness-level policy is operator configuration, not a capability to
+    /// advertise. No session, address, foreign producer or executable path is
+    /// disclosed.
     pub(crate) fn native_contracts(&mut self) -> Vec<bridge_protocol::NativeContract> {
-        let profiles = self.config.profiles.clone();
-        let mut contracts = Vec::new();
-        for profile in profiles {
-            for executable in profile.executables {
-                let supported = self
-                    .verify_loaded(&executable.path, u64::MAX, &executable.sha256)
-                    .is_ok();
-                let contract = bridge_protocol::NativeContract {
-                    host: match profile.harness {
-                        Harness::Codex => bridge_protocol::Host::Codex,
-                        Harness::ClaudeCode => bridge_protocol::Host::ClaudeCode,
-                    },
-                    build_label: executable.version,
-                    build_digest: executable.sha256.to_ascii_lowercase(),
-                    paths: vec![
-                        bridge_protocol::HostPathCapability {
-                            path: bridge_protocol::HostPath::DirectMcp,
-                            supported,
-                            reason: (!supported).then(|| "unqualified_build".into()),
-                        },
-                        bridge_protocol::HostPathCapability {
-                            path: bridge_protocol::HostPath::NestedInnerMcp,
-                            supported: false,
-                            reason: Some("unsupported_host_path".into()),
-                        },
-                    ],
-                };
-                if !contracts.contains(&contract) {
-                    contracts.push(contract);
-                }
-            }
-        }
-        contracts
+        Vec::new()
     }
 
     /// Whether this producer's current allowed audience list intersects explicit

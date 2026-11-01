@@ -44,6 +44,12 @@ bundle="$work/bundle"
 actual=$(shasum -a 256 "$bundle/SHA256SUMS" | awk '{print $1}')
 [[ "$actual" == "$sums" ]] || { echo 'SHA256SUMS does not match the attested digest; nothing was executed' >&2; exit 1; }
 expected=(release-manifest.json bin/bridge bin/bridge-root-mcp bin/bridge-root-relay bin/bridge-native-daemon bin/bridge-hook bin/bridge-daemon)
+# A 0.3 bundle also carries the OpenCode plugin; a legacy bundle has no `plugins`.
+if [[ -e "$bundle/plugins" || -L "$bundle/plugins" ]]; then
+  [[ -d "$bundle/plugins" && ! -L "$bundle/plugins" && -d "$bundle/plugins/opencode" && ! -L "$bundle/plugins/opencode" ]] \
+    || { echo 'Bundle plugins directory is a link or malformed; nothing was executed' >&2; exit 1; }
+  expected+=(plugins/opencode/index.js plugins/opencode/package.json)
+fi
 (($(wc -l < "$bundle/SHA256SUMS") == ${#expected[@]})) || { echo 'SHA256SUMS lists unexpected entries; nothing was executed' >&2; exit 1; }
 for name in "${expected[@]}"; do
   [[ -f "$bundle/$name" && ! -L "$bundle/$name" ]] || { echo "Missing $name; nothing was executed" >&2; exit 1; }
@@ -52,4 +58,20 @@ for name in "${expected[@]}"; do
   [[ "$(shasum -a 256 "$bundle/$name" | awk '{print $1}')" == "$hash" ]] \
     || { echo "Checksum mismatch for $name; nothing was executed" >&2; exit 1; }
 done
+# Refuse every unlisted entry, including hidden files and links, before any
+# bundle code runs. Directory names are closed as well as file names.
+find "$bundle" -mindepth 1 -print0 > "$work/entries" \
+  || { echo 'Cannot enumerate bundle; nothing was executed' >&2; exit 1; }
+while IFS= read -r -d '' entry; do
+  name=${entry#"$bundle/"}
+  case "$name" in
+    bin|plugins|plugins/opencode)
+      [[ -d "$entry" && ! -L "$entry" ]] || { echo 'Unexpected bundle entry; nothing was executed' >&2; exit 1; };;
+    SHA256SUMS) ;;
+    *)
+      listed=false
+      for allowed in "${expected[@]}"; do [[ "$name" != "$allowed" ]] || listed=true; done
+      [[ "$listed" == true ]] || { echo 'Unexpected bundle entry; nothing was executed' >&2; exit 1; };;
+  esac
+done < "$work/entries"
 "$bundle/bin/bridge" self-install --bundle "$bundle" --home "$home" --bin-dir "$bin_dir" --sums-sha256 "$sums"

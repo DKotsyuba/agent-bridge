@@ -13,7 +13,7 @@
 //! tokio's stable `peer_cred` (LOCAL_PEEREPID + getpeereid on macOS,
 //! SO_PEERCRED on Linux) and process facts from `sysinfo`.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
@@ -106,7 +106,8 @@ pub fn process_facts(pid: u32) -> Option<ProcessFacts> {
 
 /// Reads the parent chain of `pid`, starting with `pid` itself, at most
 /// [`MAX_ANCESTRY`] + 1 entries; stops at the first process that cannot be
-/// read. Empty when `pid` itself is gone.
+/// read. PID 1 remains a real namespace parent, never implicit harness authority.
+/// Empty when `pid` itself is gone.
 pub fn ancestry(pid: u32) -> Vec<ProcessFacts> {
     let mut chain = Vec::new();
     let mut next = Some(pid);
@@ -119,10 +120,21 @@ pub fn ancestry(pid: u32) -> Vec<ProcessFacts> {
         };
         next = facts
             .parent
-            .filter(|parent| *parent != current && *parent > 1);
+            .filter(|parent| *parent != current && *parent > 0);
         chain.push(facts);
     }
     chain
+}
+
+/// Every process id the OS currently lists, from one process-table snapshot.
+///
+/// A cheap liveness prefilter for scans over many candidate PIDs (stale socket
+/// names): it proves nothing about identity, so a listed PID must still pass
+/// [`process_facts`]/[`ancestry`] and the incarnation checks before it counts.
+pub fn live_pids() -> std::collections::HashSet<u32> {
+    let mut system = System::new();
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    system.processes().keys().map(|pid| pid.as_u32()).collect()
 }
 
 /// Whether the exact process incarnation (`pid` started at `start_time`)
@@ -144,9 +156,26 @@ pub fn random_bytes() -> std::io::Result<[u8; 32]> {
 /// it (never from a peer's message).
 ///
 /// Returns `None` when the variable is absent or the environment is not
-/// readable. Used only for a harness process's own store selection
+/// readable; a value that is not valid UTF-8 is returned byte-exact, never
+/// treated as absent. Used only for a harness process's own store selection
 /// (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`), never as caller identity.
 pub fn process_env(pid: u32, name: &str) -> Option<OsString> {
+    process_env_checked(pid, name).ok().flatten()
+}
+
+/// Like [`process_env`] but distinguishes positive absence from missing
+/// knowledge: `Ok(None)` means the environment was read, held entries and none
+/// is `name`; `Err` (kind `NotFound` for a gone process, `Unsupported` for an
+/// environment that came back empty) means the answer is unknown. An empty
+/// answer cannot be told apart from an unreadable one on this OS interface (a
+/// process that genuinely has no environment may report exec metadata entries
+/// instead, and then reads as positive absence). A present entry is matched on
+/// its raw bytes, so a value that is not valid UTF-8 is still present and is
+/// returned byte-exact, never reported as absent. A caller that must not treat
+/// unknown metadata as absence (the native owner locator) holds on `Err`.
+pub fn process_env_checked(pid: u32, name: &str) -> std::io::Result<Option<OsString>> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::ffi::OsStrExt;
     let mut system = System::new();
     let target = Pid::from_u32(pid);
     system.refresh_processes_specifics(
@@ -154,12 +183,57 @@ pub fn process_env(pid: u32, name: &str) -> Option<OsString> {
         true,
         ProcessRefreshKind::nothing().with_environ(UpdateKind::Always),
     );
-    let process = system.process(target)?;
-    let prefix = format!("{name}=");
-    process.environ().iter().find_map(|entry| {
-        let text = entry.to_str()?;
-        text.strip_prefix(&prefix).map(OsString::from)
-    })
+    let process = system
+        .process(target)
+        .ok_or_else(|| Error::new(ErrorKind::NotFound, "process is gone"))?;
+    if process.environ().is_empty() {
+        return Err(Error::new(
+            ErrorKind::Unsupported,
+            "process environment is empty or unreadable",
+        ));
+    }
+    let key = name.as_bytes();
+    Ok(process.environ().iter().find_map(|entry| {
+        let bytes = entry.as_bytes();
+        match bytes.strip_prefix(key) {
+            Some([b'=', value @ ..]) => Some(OsStr::from_bytes(value).to_os_string()),
+            _ => None,
+        }
+    }))
+}
+
+/// Like [`process_env`], but also finds an entry that a process-title rewrite
+/// shifted out of the environment block.
+///
+/// Node and Electron harnesses rename their processes (`process.title`) by
+/// overwriting the original argument area; the kernel's argument count is
+/// unchanged, so the first environment entries are then reported as arguments
+/// and seem absent (ZCode's `zcode-cli` loses `HOME` this way). When `name` is
+/// not in the environment, the reported arguments after the first are searched
+/// for an exact `name=` entry. Used only for a profile-only harness's store
+/// selection, whose result is still proven canonical, owned and private.
+pub fn process_env_shifted(pid: u32, name: &str) -> Option<OsString> {
+    use std::os::unix::ffi::OsStrExt;
+    if let Some(value) = process_env(pid, name) {
+        return Some(value);
+    }
+    let mut system = System::new();
+    let target = Pid::from_u32(pid);
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[target]),
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+    );
+    let key = name.as_bytes();
+    system
+        .process(target)?
+        .cmd()
+        .iter()
+        .skip(1)
+        .find_map(|entry| match entry.as_bytes().strip_prefix(key) {
+            Some([b'=', value @ ..]) => Some(OsStr::from_bytes(value).to_os_string()),
+            _ => None,
+        })
 }
 
 #[cfg(test)]
@@ -167,6 +241,52 @@ mod tests {
     //! Facts about this very test process and a connected socket pair.
 
     use super::*;
+
+    /// A Node process that renames itself (`process.title`, as ZCode's CLI
+    /// does) shifts its first environment entries into the reported
+    /// arguments: the plain environment read misses `HOME`, the shifted read
+    /// finds the exact value, and an absent name stays absent. Needs an
+    /// explicitly prepared `BRIDGE_TEST_NODE`; skipped without it.
+    #[test]
+    fn retitled_process_environment_is_still_found() {
+        let Some(node) = std::env::var_os("BRIDGE_TEST_NODE") else {
+            eprintln!("skipped: BRIDGE_TEST_NODE is not set");
+            return;
+        };
+        let mut child = std::process::Command::new(node)
+            .args([
+                "-e",
+                "process.title = 't'; console.log('ready'); setTimeout(() => {}, 20000)",
+                "padding-one",
+                "padding-two",
+            ])
+            .env_clear()
+            .env("HOME", "/retitled/home")
+            .env("SECOND", "2")
+            .env("THIRD", "3")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.take().unwrap()),
+            &mut line,
+        )
+        .unwrap();
+        let pid = child.id();
+        let plain = process_env(pid, "HOME");
+        let shifted = process_env_shifted(pid, "HOME");
+        let absent = process_env_shifted(pid, "NOT_THERE");
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(line.trim(), "ready");
+        assert_eq!(
+            plain, None,
+            "the rewrite shifted HOME out of the environment"
+        );
+        assert_eq!(shifted.as_deref(), Some(OsStr::new("/retitled/home")));
+        assert_eq!(absent, None);
+    }
 
     /// Peer credentials of a socket pair name this process and leave the stream usable.
     #[test]
@@ -180,6 +300,19 @@ mod tests {
         let mut byte = [0u8; 1];
         (&left).read_exact(&mut byte).unwrap();
         assert_eq!(&byte, b"x");
+    }
+
+    /// Checked lookup reads this process's own environment: a present variable
+    /// is returned and an absent one is positive absence, not unknown.
+    #[test]
+    fn checked_env_reports_present_and_absent() {
+        let pid = std::process::id();
+        assert!(process_env_checked(pid, "PATH").unwrap().is_some());
+        assert!(
+            process_env_checked(pid, "BRIDGE_OS_TEST_UNSET")
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Ancestry starts with this process and its exact incarnation is alive.

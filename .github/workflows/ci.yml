@@ -1,0 +1,44 @@
+name: ci
+
+# Ordinary source checks on the supported platform. No native harness, model,
+# credential or network access beyond the locked dependency fetch is used.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install the pinned toolchain
+        run: rustup toolchain install 1.98.1 --profile minimal -c rustfmt -c clippy
+      - name: Fetch locked dependencies
+        run: cargo +1.98.1 fetch --locked
+      - name: Short project temporary directory
+        run: |
+          mkdir -p "$RUNNER_TEMP/t"
+          for name in TMPDIR TMP TEMP; do echo "$name=$RUNNER_TEMP/t" >> "$GITHUB_ENV"; done
+      - name: Node runtime for the synthetic Desktop regressions
+        run: |
+          node="$(command -v node)"
+          test -x "$node"
+          "$node" --version
+          echo "BRIDGE_TEST_NODE=$node" >> "$GITHUB_ENV"
+      - name: Format
+        run: cargo +1.98.1 fmt --all --check
+      - name: Clippy
+        run: cargo +1.98.1 clippy --offline --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo +1.98.1 test --offline --workspace
+      - name: Private Rustdoc
+        run: cargo +1.98.1 doc --offline --workspace --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Public repository checks
+        run: cargo +1.98.1 xtask check-public

@@ -1,10 +1,10 @@
 # Producer core boundary v1
 
-Contract: `bridge-producer-core-v1`, revision 3. Provider: M-008. Consumers:
-M-007 (wire/client boundary) and M-009 (native registration coordinator).
-Status: implemented core boundary candidate under frozen E-002; whole-module
-qualification is pending. Native/SDK integration is separately owned and no
-installed service or consumer migration is claimed by this artifact.
+Contract: `bridge-producer-core-v1`, revision 3. Provider: the core. Consumers: the
+wire/client boundary (`bridge-protocol`, `bridge-sdk`) and the native registration
+coordinator in `bridge-adapters`. Status: implemented. Native qualification is recorded
+in the [qualification matrix](../../../docs/qualification.md); this document claims no
+installed service and no consumer migration.
 
 ## Ownership and dependencies
 
@@ -19,11 +19,44 @@ projects, native proof algorithms, protocol/SDK algorithms, workspace/dependency
 changes, installed state and releases are excluded. No product name, tool-name
 parser, operation type or payload interpretation belongs in this boundary.
 
+## Bounded root delivery beside producer v1
+
+The legacy authenticated socket additionally supports `publish_managed`, gated
+by default-false `GrantConfig.managed_feedback`. It binds `ManagedSender`
+(full protected-relay caller address and root request id) to new keep-all
+custody in the same transaction, outside its immutable envelope/hash. The
+callback address must be within the grant's recipient allowlist. This is a
+trust delegation to the relay, never sender authority from metadata or a
+producer v1 route's destination. Ordinary legacy and all v1 publication forms
+are unchanged; there is no automatic enrollment of older events.
+
+Schema 7 stores the fixed five-invocation/five-minute lifetime, actual invocation
+counter, retained completion report and bounded feedback intent. Selection and
+pre-invoking fencing stop further automated sends; in-flight originals archive as unconfirmed at the lifetime deadline while
+their native attempts keep the existing handoff fence for late receipts. Completion atomically
+records `failed` or `unconfirmed` and an audited `disposed` delivery state,
+without erasing possible-effect history or asserting native recall. Positive
+late receipts remain evidence and may improve native delivery state, but never
+reopen the completed automatic policy. Legacy `status.delivery.report` is
+additive, durable and publisher-scoped; the existing v1 status DTO is unchanged.
+
+A separate bounded keep-all MESSAGE to the trusted sender is best effort. Its
+fixed body never includes the original payload or native diagnostic text, and
+its policy has no feedback origin. Admission failures cannot roll back original
+completion; pending notice admission expires after five minutes, and accepted
+notice custody never proves native acceptance or reading. See
+[configuration](../../../docs/configuration.md#bounded-root-messages).
+
 ## Shared per-boot authority
 
 `GrantConfig.producer_v1: Option<ProducerPolicy>` defaults to `None`; v1 mutation
 admission is opt-in and legacy grant behavior stays unchanged. ProducerPolicy
-contains only generic registration/reply-policy/lifetime/audience permissions.
+contains only generic registration/reply-policy/lifetime/audience permissions and
+the default-false `host_observations` read permission. Observation and resolution
+run only at the native adapter, using this same authority plus both recipient and
+native scope allowlists before binding/process lookup. Core capabilities always
+advertise `host_observations=false`; core refuses these operations as requiring
+native ingress and never attaches mutation reconciliation to them.
 Existing recipient, kind, mode and policy allowlists remain the publication
 constraints. Kind is bounded to the existing canonical core limit of 64 bytes;
 other opaque request/operation/event keys are at most 256 bytes.
@@ -73,7 +106,7 @@ Core-owned `VerifiedRegistration` has these semantic fields:
 | evidence_expires_at_ms | Finite native claim validity, checked again at commit time |
 
 This type is an internal trusted-Rust boundary, not a deserializable producer
-claim. M-009 owns qualification, reserved exclusive proof use and construction.
+claim. The native registration coordinator owns qualification, reserved exclusive proof use and construction.
 Core validates domains, timestamp/expiry consistency, route policy and global
 claim uniqueness; it does not authenticate native hooks or invent caller facts.
 
@@ -135,7 +168,7 @@ a durable receipt into authority. New request id for an existing operation
 requires genuine fresh evidence; same immutable binding reuses the route,
 changed binding conflicts. Closed/expired routes never reopen.
 
-M-009 may separately issue a short-lived audience-bound assertion after durable
+The native coordinator may separately issue a short-lived audience-bound assertion after durable
 registration. That assertion, its consumption and freshness remain native
 provider responsibilities. Postcommit assertion failure cannot report the
 registration as `not_committed`.
@@ -158,8 +191,10 @@ Typed methods:
 V1 ingress uses these methods; legacy Requests/Responses remain separate.
 Capability reads disclose only the authenticated producer's effective policy,
 limits and supported operation/evidence/mode variants. They spend no evidence.
-Adapter capability results advertise supported verified host contract/build/path;
-profile pins alone do not constitute live native qualification evidence. Unsupported optional capabilities refuse explicitly.
+The native adapter currently advertises an empty `native_contracts` list: it
+discloses no host build or build digest, and harness policies are operator
+configuration and do not constitute live native evidence. Unsupported optional
+capabilities refuse explicitly.
 
 Publication first authenticates and compares an existing immutable v1 intent;
 exact accepted retry returns original custody even after route closure/expiry
@@ -211,7 +246,11 @@ Retirement safely disposes only proved unhanded/reserved members with no
 unresolved possible-effect history. Operator-authorized retries of earlier
 unknown effects are not reclassified as never sent. Invoking, held, written,
 unknown and accepted effects and their late evidence remain retained; retirement
-is neither recall nor duplicate-risk retry authority. Source/product-generation
+is neither recall nor duplicate-risk retry authority. `retire_unhanded` permanently
+rejects manual retry of its members. A late known-unsent outcome closes a retired
+member only when the shared possible-effect check finds no historical risk; otherwise
+it keeps the review and a visible incident. A retired orphan row from an older build is
+excluded from selection and work listings and shows a scope-fence diagnostic. Source/product-generation
 validity remains with the producer.
 
 Coalescing, latest watermarks/lineage and batching include the delivery scope
@@ -232,9 +271,18 @@ Schema 5 to 6 is an additive transactional migration. Tables cover
 routes, random actor/destination mappings, registration-request fingerprints,
 global evidence uses, v1 publication intents, close requests, producer lifetime
 tombstones and retire receipts. Events gain a separate lifetime column; scoped
-watermark keys gain lifetime. Legacy blank lifetime rows retain their meaning.
+watermark keys gain lifetime. Legacy blank lifetime rows retain their meaning: a lifetime event uses its full nine-field
+scoped key (`scoped_watermarks`), an unscoped eight-field legacy key uses `watermarks`,
+and a malformed or mismatched lifetime refuses.
 Migrations preserve accepted payload bytes/hash/order/ids and unknown attempts.
-A newer/unknown schema refuses; no destructive rollback is invented.
+A newer/unknown schema refuses before Bridge makes any schema or journal-mode change and
+without a close-time WAL checkpoint; no destructive rollback is invented. SQLite's own
+recovery of an interrupted rollback journal may run first and restore the last committed
+content, which can write the main file or remove that journal; ordinary WAL reads or
+recovery may rewrite advisory `-shm` WAL-index metadata, while the main and WAL bytes of a
+refused WAL database are preserved. Rollback validation or any supported migration holds
+an exclusive lock through enabling WAL, then reopens for normal sharing; an existing WAL
+database validates normally.
 
 Before COMMIT, known validation/auth/capacity/fence failures have not_committed
 and leave no durable effect. Failure/ack loss at COMMIT is unknown with stable
@@ -248,5 +296,52 @@ intent/legacy collision; custody/close/retire races; retire before first publish
 reservation versus invoking fences; scope-isolated latest/batch; unknown effects
 and late evidence; crash/ack windows; schema-five migration; legacy wire/hash
 compatibility; hard capacity/redaction; correct-pass, meaningful mutant-fail and
-restored-pass on the definite source candidate. Owned core regression and generic fixture controls are recorded in Module
-candidate evidence; genuine native composition remains a separate gate.
+restored-pass on the source under test. Owned core regression and generic fixture controls
+are part of the test suite; genuine native composition is a separate gate.
+
+## Temporary native-owner backpressure
+
+Busy recipients do not exhaust transport retries. The trusted native carrier can
+report `DeferredKnownUnsent` only with positive evidence of no native effect:
+a local pre-write owner epoch/lifecycle fence, or the owner's correlated closed
+zero-effect busy/capacity receipt. Core retains the ordinary `known_unsent`
+attempt/evidence state, refunds that current owned attempt's automatic budget
+charge, and leaves the same event unhanded until its next delay and fresh
+attestation. `attempts_made` is the consumed automatic attempt budget; immutable
+attempt sequence/history still records every deferral. Ordinary known-unsent
+transport failures retain the five-attempt bound. Unknown effects are never
+automatically retried; retirement, expiry and old-attempt ownership fences remain.
+No producer API v1 wire shape or storage schema changes.
+
+
+Retained failure reports are also available through the existing root
+`bridge_me` tool when bounded delivery is enabled. Its optional
+`reports_after` cursor follows `next_after_seq`; omit it or use zero to
+start a scan. Each read returns at most twenty completed reports for the exact
+attested sender and authenticated publisher. Completion ordering preserves
+failures of older messages that finish later. Reading never acknowledges,
+deletes or retries a report, so an expired native notification remains visible
+when the sender returns. A failed backend read is explicitly unavailable,
+rather than an empty mailbox. This adds no fourth root tool or native retry.
+
+## Separate diagnostics realm
+
+An opt-in `GrantConfig::diagnostics` flag defaults false. When true, admin,
+producer v1 policy, managed feedback rights and publisher allowlists must all be
+absent/empty. The same boot `ProducerAuthorizer` excludes these credentials from every producer/native
+operation, including capabilities, old publisher status, registration, assertion
+consumption and recovery. Existing publisher/operator/native rights are unchanged.
+Diagnostics tokens also fail all legacy operator operations, including read
+listings; no broad read permission is inferred from admin or a token label.
+
+The separate typed legacy socket request is
+`{"op":"observe","token":"<protected credential>","query":{"operation":"identity","params":{}}}`.
+Only diagnostics credentials may use it. The four closed operations are identity,
+overview, deliveries and incidents; result shape is
+`{"Observation":{"observation":{"kind":"identity","data":{...}}}}`.
+See the [fixed helper contract](../../bridge-interfaces/README.md#diagnostics-observer)
+for exact parameters, content-free row fields, byte/row limits, finite scan
+cursors and failure mapping. Reads use SELECT projections in a read transaction,
+without envelope content, free text or native identity metadata; there is no
+schema migration and no producer API v1 operation/receipt change. Native-owner,
+root MCP, SDK registration and operator recovery contracts keep their meaning.

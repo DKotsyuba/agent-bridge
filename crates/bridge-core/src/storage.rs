@@ -26,6 +26,31 @@ use crate::types::{
 /// the call fails with a retryable [`CoreError::Busy`].
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Validates/migrates a rollback-journal database under an exclusive lock
+/// retained through the WAL transition. Returns whether the connection must
+/// be reopened to release SQLite's persistent exclusive WAL lock. Existing
+/// WAL files need no journal mutation and are validated by `init_schema`.
+/// Unsupported schemas fail before any journal-mode or schema write; SQLite
+/// lock failures propagate. The caller sets the busy and synchronous policy.
+fn enable_wal(connection: &mut Connection) -> Result<bool, CoreError> {
+    let mode: String = connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    if mode == "wal" {
+        return Ok(false);
+    }
+    connection.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    schema::ensure(&tx)?;
+    tx.commit()?;
+    // locking_mode=EXCLUSIVE retains the validated file's lock after COMMIT,
+    // so no writer can replace its schema between validation and WAL setup.
+    let mode: String =
+        connection.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
+    if mode != "wal" {
+        return Err(corrupt(format!("database refused WAL journaling ({mode})")));
+    }
+    Ok(true)
+}
+
 /// Default retained-row hard cap (dedup history is never evicted).
 const DEFAULT_MAX_RETAINED: usize = 5_000_000;
 
@@ -397,23 +422,50 @@ impl Storage {
     /// schema is migrated forward without touching accepted bytes, hashes
     /// or identifiers; a newer or unknown schema is refused with
     /// [`CoreError::Integrity`]. Invalid limits are refused first.
+    /// Schema ownership is checked under the actual mutation lock before
+    /// changing journal mode; refusal preserves durable DB/WAL/journal bytes,
+    /// mode and sidecar presence, except that SQLite may first roll back its
+    /// own hot rollback journal to the last committed content and remove that
+    /// journal before schema inspection. This recovery never authorizes Bridge
+    /// migration or journal conversion for an unsupported schema. SQLite may
+    /// rebuild advisory WAL-index/SHM state; these are not durable data.
+    /// Close-checkpointing is disabled before every file connection's first
+    /// access until its schema is accepted, preserving refused orphan WAL.
+    /// Success restores normal checkpoint-on-close behavior and shared access.
     pub fn open(path: impl AsRef<Path>, limits: Limits) -> Result<Self, CoreError> {
         limits.validate()?;
-        let connection = Connection::open(path)?;
+        let path = path.as_ref();
+        let mut connection = Connection::open(path)?;
+        connection.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )?;
         connection.busy_timeout(BUSY_TIMEOUT)?;
-        let mode: String =
-            connection.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
-        if mode != "wal" {
-            return Err(corrupt(format!("database refused WAL journaling ({mode})")));
-        }
         connection.pragma_update(None, "synchronous", "FULL")?;
-        Storage {
+        if enable_wal(&mut connection)? {
+            // SQLite cannot release an exclusive WAL lock by changing
+            // locking_mode to NORMAL; reopen for ordinary shared operation.
+            drop(connection);
+            connection = Connection::open(path)?;
+            connection.set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                true,
+            )?;
+            connection.busy_timeout(BUSY_TIMEOUT)?;
+            connection.pragma_update(None, "synchronous", "FULL")?;
+        }
+        let storage = Storage {
             connection,
             limits,
             producer_authorizer: None,
             universal_limits: crate::UniversalLimits::default(),
         }
-        .init_schema()
+        .init_schema()?;
+        storage.connection.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            false,
+        )?;
+        Ok(storage)
     }
 
     /// Opens an in-memory database; for tests and in-process tools.
@@ -512,8 +564,10 @@ impl Storage {
     ///   dependency cycle is refused;
     /// - a recipient whose attested capabilities are known not to include a
     ///   path the mode needs (inject needs the inject path, message the
-    ///   message path, auto both) is refused with
-    ///   [`CoreError::Unsupported`] before acceptance;
+    ///   message path, auto at least one loaded path) is refused with
+    ///   [`CoreError::Unsupported`] before acceptance; an admitted auto event
+    ///   has its effective path selected and gated at dispatch, where an
+    ///   unloaded effective path is a visible hold with no native effect;
     /// - an event that could never be rendered (forbidden controls, escaped
     ///   size over the manifest bound) is refused before acceptance;
     /// - a hard cap reached: [`CoreError::Capacity`], nothing written.
@@ -557,12 +611,16 @@ impl Storage {
     /// unreserved event past its absolute expiry becomes `expired`, an
     /// explicit disposition — never a claim that a possible native effect
     /// was recalled. Reserved, invoking, held and uncertain events are never
-    /// touched here. `now_ms` above the SQLite-safe bound is refused.
+    /// touched here. Managed delivery owns its separate deadline/report policy and
+    /// is excluded, so legacy expiry cannot make its original payload compactable.
+    /// `now_ms` above the SQLite-safe bound is refused.
     pub fn expire_due(&self, now_ms: u64) -> Result<usize, CoreError> {
         let changed = self.connection.execute(
             "UPDATE events SET state = 'expired'
              WHERE state = 'pending' AND delivery = 'unhanded'
-               AND expires_at_ms IS NOT NULL AND expires_at_ms <= ?1",
+               AND expires_at_ms IS NOT NULL AND expires_at_ms <= ?1
+               AND NOT EXISTS(SELECT 1 FROM managed_deliveries m
+                   WHERE m.publisher_id=events.publisher_id AND m.event_id=events.event_id)",
             params![to_sql(now_ms)?],
         )?;
         Ok(changed)
@@ -575,14 +633,17 @@ impl Storage {
     /// dispositions) beyond the newest `keep_newest` lose their envelope
     /// bytes; the row, frozen hash and state remain so an identical replay
     /// still returns the original receipt and dedup history is never
-    /// evicted. Delivered, held and uncertain events always keep their
-    /// bytes. Returns how many payloads were compacted.
+    /// evicted. Delivered, held, uncertain and managed events always keep their
+    /// bytes, including managed custody that was already expired at admission.
+    /// Returns how many payloads were compacted.
     pub fn compact_payloads(&mut self, keep_newest: usize) -> Result<usize, CoreError> {
         let tx = self.begin()?;
         let compacted = tx.execute(
             "UPDATE events SET envelope_json = x''
              WHERE state IN ('superseded','expired') AND length(envelope_json) > 0
                AND delivery = 'unhanded'
+               AND NOT EXISTS(SELECT 1 FROM managed_deliveries m
+                   WHERE m.publisher_id=events.publisher_id AND m.event_id=events.event_id)
                AND acceptance_seq < COALESCE((
                  SELECT MIN(s.acceptance_seq) FROM (
                    SELECT acceptance_seq FROM events e
@@ -791,6 +852,12 @@ fn creates_cycle(
 /// Refuses an event whose mode needs a path its recipient is known not to
 /// support.
 ///
+/// `inject` needs the inject path and `message` the message path. `auto`
+/// resolves per dispatch to whichever path the observed lifecycle selects
+/// (see `dispatch::resolve_mode`), so it needs only that at least one path is
+/// loaded; the effective path is gated again at dispatch, where an unloaded
+/// path is a visible hold with no native effect.
+///
 /// Support is known only after an adapter attested the recipient's loaded
 /// capabilities ([`Storage::observe_binding`] or any dispatch); an
 /// unknown recipient is accepted. This is a permanent condition, distinct
@@ -807,12 +874,12 @@ fn check_supported(tx: &Connection, envelope: &Envelope) -> Result<(), CoreError
     let Some((inject, message)) = known else {
         return Ok(());
     };
-    let (needs_inject, needs_message) = match envelope.mode {
-        crate::types::Mode::Inject => (true, false),
-        crate::types::Mode::Message => (false, true),
-        crate::types::Mode::Auto => (true, true),
+    let supported = match envelope.mode {
+        crate::types::Mode::Inject => inject,
+        crate::types::Mode::Message => message,
+        crate::types::Mode::Auto => inject || message,
     };
-    if (needs_inject && !inject) || (needs_message && !message) {
+    if !supported {
         return Err(CoreError::Unsupported(format!(
             "recipient {recipient} does not support mode {} (inject: {inject}, message: {message})",
             envelope.mode.as_str()
@@ -1241,9 +1308,131 @@ fn parse_state(value: &str) -> Result<EventState, CoreError> {
 
 #[cfg(test)]
 mod tests {
-    //! In-module checks for helpers not needing a database.
+    //! Isolated helper checks, including a real SQLite schema ownership race.
 
     use super::*;
+
+    /// A real writer changes ownership while the opener contends for its lock.
+    /// Contention must refuse without WAL mutation; a fresh attempt must fence
+    /// the newly committed version. The busy callback proves actual contention
+    /// and aborts it so the writer can commit without a lock-upgrade deadlock.
+    #[test]
+    fn wal_setup_fences_schema_changed_by_a_contending_writer() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        /// Set only by this test's opener after SQLite reports lock contention.
+        static WAITING: AtomicBool = AtomicBool::new(false);
+        /// Signals actual contention and refuses rather than holding a read lock.
+        fn busy(_attempt: i32) -> bool {
+            WAITING.store(true, Ordering::SeqCst);
+            false
+        }
+        let path = std::env::temp_dir().join(format!(
+            "schema-race-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut owner = Connection::open(&path).unwrap();
+        let tx = owner
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        schema::ensure(&tx).unwrap();
+        tx.commit().unwrap();
+        owner
+            .execute_batch(
+                "BEGIN IMMEDIATE; UPDATE schema_meta SET value='999' WHERE key='schema_version'",
+            )
+            .unwrap();
+        WAITING.store(false, Ordering::SeqCst);
+        let opened_path = path.clone();
+        let opener = std::thread::spawn(move || {
+            let mut connection = Connection::open(opened_path).unwrap();
+            connection.busy_handler(Some(busy)).unwrap();
+            enable_wal(&mut connection)
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !WAITING.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let observed = WAITING.load(Ordering::SeqCst);
+        let result = opener.join().unwrap();
+        owner.execute_batch("COMMIT").unwrap();
+        let mut next = Connection::open(&path).unwrap();
+        let rechecked = enable_wal(&mut next);
+        drop(next);
+        let mode: String = owner
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        drop(owner);
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            observed,
+            "the opener actually waited for the mutating writer"
+        );
+        assert!(matches!(result, Err(CoreError::Busy(_))));
+        assert!(matches!(rechecked, Err(CoreError::Integrity(_))));
+        assert_eq!(
+            mode, "delete",
+            "refusal cannot enable WAL after a stale check"
+        );
+        assert!(!path.with_extension("db-wal").exists());
+        assert!(!path.with_extension("db-shm").exists());
+    }
+
+    /// A preflight read can become stale before the mutation transaction.
+    /// Another thread commits a newer version after that read; the real lock
+    /// must observe it and refuse without changing bytes, mode or sidecars.
+    #[test]
+    fn wal_setup_rechecks_a_stale_preflight_under_the_mutation_lock() {
+        let path = std::env::temp_dir().join(format!(
+            "schema-stale-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut owner = Connection::open(&path).unwrap();
+        let tx = owner
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        schema::ensure(&tx).unwrap();
+        tx.commit().unwrap();
+        let mut stale = Connection::open(&path).unwrap();
+        assert_eq!(
+            schema::stored_version(&stale).unwrap(),
+            Some(schema::SCHEMA_VERSION)
+        );
+        std::thread::spawn(move || {
+            owner
+                .execute(
+                    "UPDATE schema_meta SET value='999' WHERE key='schema_version'",
+                    [],
+                )
+                .unwrap();
+        })
+        .join()
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let result = enable_wal(&mut stale);
+        let mode: String = stale
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        drop(stale);
+        let after = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(result, Err(CoreError::Integrity(_))));
+        assert_eq!(mode, "delete");
+        assert!(
+            after == before,
+            "a stale preflight cannot authorize any write"
+        );
+        assert!(!path.with_extension("db-wal").exists());
+        assert!(!path.with_extension("db-shm").exists());
+        assert!(!path.with_extension("db-journal").exists());
+    }
 
     /// Stored state text parses round-trip strictly: unknown values are
     /// errors, never defaults.

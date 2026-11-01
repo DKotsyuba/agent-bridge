@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! bridge version
+//! bridge observe [--config ABS_PATH]    (one bounded JSON stdin line and EOF)
 //! bridge operator <config> incidents [--all] [--limit N]
 //! bridge operator <config> holds [--limit N]
 //! bridge operator <config> counts
@@ -15,7 +16,7 @@
 //! bridge operator <config> resume <recipient>
 //! bridge operator <config> shutdown
 //! bridge notify <config>
-//! bridge package --from DIR --out DIR
+//! bridge package --from DIR --out DIR [--plugin-dir DIR]   (OpenCode plugin source: index.js + package.json)
 //! bridge verify <bundle> [--sums-sha256 HEX]   (attested only with the digest)
 //! bridge self-install --bundle DIR --home DIR --bin-dir DIR --sums-sha256 HEX
 //! bridge rollback --home DIR
@@ -148,6 +149,12 @@ impl From<String> for Failure {
 /// Entry point.
 fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.first().is_some_and(|command| command == "observe") {
+        let value = bridge_interfaces::observe::run(&raw[1..], &mut std::io::stdin().lock());
+        let code = if value.get("error").is_some() { 2 } else { 0 };
+        println!("{value}");
+        return ExitCode::from(code);
+    }
     let outcome = Args::parse(raw)
         .map_err(Failure::Usage)
         .and_then(|args| dispatch(&args));
@@ -186,7 +193,7 @@ fn dispatch(args: &Args) -> Result<(Value, u8), Failure> {
         "operator" => operator(args).map(|value| (value, 0)),
         "notify" => notify_command(args).map(|value| (value, 0)),
         "package" => {
-            args.closed(1, &["--from", "--out"])?;
+            args.closed(1, &["--from", "--out", "--plugin-dir"])?;
             let (manifest, sums) = install::package(
                 &args
                     .path("--from")
@@ -194,6 +201,7 @@ fn dispatch(args: &Args) -> Result<(Value, u8), Failure> {
                 &args
                     .path("--out")
                     .ok_or(Failure::Usage("--out is required".into()))?,
+                args.path("--plugin-dir").as_deref(),
             )?;
             Ok((json!({"manifest": manifest, "sums_sha256": sums}), 0))
         }

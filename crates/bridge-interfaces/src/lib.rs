@@ -31,6 +31,8 @@ pub mod install;
 pub mod lifecycle;
 pub mod mcp;
 pub mod notify;
+/// Fixed, content-free diagnostics helper over the authenticated core socket.
+pub mod observe;
 pub mod operator;
 pub mod root;
 pub mod telegram;

@@ -445,6 +445,8 @@ pub struct DeliveryEvidence {
     pub hold_reason: Option<String>,
     /// Predecessor this event still waits for.
     pub blocked_by: Option<String>,
+    /// Retained bounded-delivery result and best-effort notice evidence.
+    pub report: Option<crate::managed::DeliveryReport>,
 }
 
 /// Unvalidated wire shape of [`DeliveryEvidence`].
@@ -477,6 +479,9 @@ struct RawDeliveryEvidence {
     /// Awaited predecessor as received.
     #[serde(default)]
     blocked_by: Option<String>,
+    /// Additive bounded result; absent on old daemons and unmanaged events.
+    #[serde(default)]
+    report: Option<crate::managed::DeliveryReport>,
 }
 
 impl TryFrom<RawDeliveryEvidence> for DeliveryEvidence {
@@ -518,6 +523,9 @@ impl TryFrom<RawDeliveryEvidence> for DeliveryEvidence {
             numbers.extend(incident.review_deadline_ms);
         }
         check_ranges(&numbers)?;
+        if let Some(report) = &raw.report {
+            report.validate()?;
+        }
         Ok(DeliveryEvidence {
             attempt_state: raw.attempt_state,
             effective_mode: raw.effective_mode,
@@ -529,6 +537,7 @@ impl TryFrom<RawDeliveryEvidence> for DeliveryEvidence {
             incident: raw.incident,
             hold_reason: raw.hold_reason,
             blocked_by: raw.blocked_by,
+            report: raw.report,
         })
     }
 }
@@ -739,7 +748,7 @@ pub struct AuditEntry {
 }
 
 /// Appends an operator audit row.
-fn audit(
+pub(crate) fn audit(
     tx: &Connection,
     now_ms: u64,
     actor: &str,
@@ -855,7 +864,10 @@ impl Storage {
     /// domains; an unaccepted key returns `None`. A local read transaction
     /// joins the existing receipt/evidence with envelope length and retained
     /// latest scope, including compacted rows. No payload bytes are loaded or
-    /// returned, and no expiry, GC, delivery or incident mutation occurs.
+    /// returned. Legacy eight-field scopes read `watermarks`; a lifetime's
+    /// nine-field scope must match its stored lifetime and reads only its
+    /// full-key `scoped_watermarks` row. No scope is guessed or truncated.
+    /// No expiry, GC, delivery or incident mutation occurs.
     /// Eligibility is only the existing terminal-unhanded nonempty guard;
     /// keep-newest may retain it and nothing here establishes native recall.
     /// Invalid identifiers, malformed retained scope or corrupt rows fail.
@@ -873,29 +885,41 @@ impl Storage {
             return Ok(None);
         };
         let delivery = self.delivery_evidence(publisher, event_id)?;
-        let (expiry, bytes, policy, scope): (Option<i64>, i64, String, String) = tx.query_row(
-            "SELECT expires_at_ms, length(envelope_json), policy_class, scope_key
+        let (expiry, bytes, policy, scope, lifetime): (Option<i64>, i64, String, String, String) = tx.query_row(
+            "SELECT expires_at_ms, length(envelope_json), policy_class, scope_key, delivery_scope_key
              FROM events WHERE publisher_id = ?1 AND event_id = ?2",
             params![publisher, event_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )?;
         let latest_watermark = if policy == "latest" {
             let fields: Vec<_> = scope.split('\u{1f}').collect();
-            if fields.len() != 8 || fields[0] != publisher || fields[6] != "latest" {
+            if fields.len() != if lifetime.is_empty() { 8 } else { 9 }
+                || fields[0] != publisher
+                || fields[6] != "latest"
+                || (!lifetime.is_empty() && fields[8] != lifetime)
+            {
                 return Err(corrupt("invalid retained latest scope".into()));
             }
-            tx.query_row(
-                "SELECT revision FROM watermarks
+            let revision: Option<i64> = if lifetime.is_empty() {
+                tx.query_row(
+                    "SELECT revision FROM watermarks
                  WHERE publisher_id = ?1 AND recipient = ?2 AND kind = ?3
                    AND mode = ?4 AND project = ?5 AND task = ?6 AND stream_id = ?7",
-                params![
-                    fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[7]
-                ],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-            .map(from_sql)
-            .transpose()?
+                    params![
+                        fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[7]
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+            } else {
+                tx.query_row(
+                    "SELECT revision FROM scoped_watermarks WHERE scope_key = ?1",
+                    params![scope],
+                    |row| row.get(0),
+                )
+                .optional()?
+            };
+            revision.map(from_sql).transpose()?
         } else {
             None
         };
@@ -1151,18 +1175,23 @@ impl Storage {
     /// Reads the delivery evidence of an event for its publisher.
     ///
     /// Returns `None` when the event was never accepted. Reports distinct
-    /// tiers, the newest attempt, the open incident, the visible hold and
-    /// the predecessor still awaited; none of it is a delivered flag.
+    /// tiers, the newest attempt, the open incident, the visible hold,
+    /// bounded completion report and predecessor still awaited; none of it is a delivered flag. An old
+    /// unhanded row in a retired lifetime reports a visible scope fence even
+    /// when no recipient-wide hold exists; it cannot reenter dispatch.
     pub fn delivery_evidence(
         &self,
         publisher: &str,
         event_id: &str,
     ) -> Result<Option<DeliveryEvidence>, CoreError> {
-        let row: Option<(String, i64, String, Option<String>, i64)> = self
+        let row: Option<(String, i64, String, Option<String>, i64, bool)> = self
             .connection
             .query_row(
-                "SELECT delivery, attempts_made, recipient, predecessor, predecessor_waived
-                 FROM events WHERE publisher_id = ?1 AND event_id = ?2",
+                "SELECT delivery, attempts_made, recipient, predecessor, predecessor_waived,
+                     EXISTS (SELECT 1 FROM delivery_scopes s
+                         WHERE s.producer = e.publisher_id AND s.scope_key = e.delivery_scope_key
+                           AND s.closed_ms IS NOT NULL AND s.action = 'retire_unhanded')
+                 FROM events e WHERE publisher_id = ?1 AND event_id = ?2",
                 params![publisher, event_id],
                 |row| {
                     Ok((
@@ -1171,11 +1200,12 @@ impl Storage {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((state, attempts, recipient, predecessor, waived)) = row else {
+        let Some((state, attempts, recipient, predecessor, waived, retired)) = row else {
             return Ok(None);
         };
         let state = DeliveryState::parse(&state)?;
@@ -1241,7 +1271,9 @@ impl Storage {
                 })
             })
             .transpose()?;
-        let hold_reason = if state == DeliveryState::Unhanded {
+        let hold_reason = if state == DeliveryState::Unhanded && retired {
+            Some("delivery scope retired; automatic delivery and manual retry are fenced".into())
+        } else if state == DeliveryState::Unhanded {
             self.connection
                 .query_row(
                     "SELECT reason FROM recipient_holds WHERE recipient = ?1",
@@ -1266,7 +1298,9 @@ impl Storage {
             }
             _ => None,
         };
-        if attempt.is_none()
+        let report = crate::managed::report_in(&self.connection, publisher, event_id)?;
+        if report.is_none()
+            && attempt.is_none()
             && tiers.is_empty()
             && incident.is_none()
             && hold_reason.is_none()
@@ -1291,6 +1325,7 @@ impl Storage {
             incident,
             hold_reason,
             blocked_by,
+            report,
         }))
     }
 
@@ -1302,8 +1337,13 @@ impl Storage {
     /// settles it at its declared tier without another send: native
     /// acceptance, context observation and application processing mark the
     /// event accepted, hook emission marks it hook-submitted, and
-    /// known-unsent returns it to the bounded retry policy. The evidence
-    /// applies to the attempt's whole frozen manifest. `detail` must name
+    /// known-unsent settles each still-owned member: ordinary lifetimes use
+    /// the bounded retry policy, while `retire_unhanded` lifetimes retain any
+    /// historical possible effect in review with an incident or dispose only
+    /// proved zero-effect work; retired members never return to rotation.
+    /// Evidence applies to the whole frozen manifest, including members now
+    /// disposed or owned by a newer attempt, whose state/incidents stay unchanged.
+    /// `detail` must name
     /// the observed fact. Tiers other than these are produced only by
     /// [`Storage::record_outcome`].
     pub fn record_evidence(
@@ -1364,11 +1404,19 @@ impl Storage {
             return Ok(EvidenceEffect::AlreadyRecorded);
         }
         let (current, owner) = event_state(&tx, publisher, event_id)?;
+        let completed_managed: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM managed_deliveries
+            WHERE publisher_id=?1 AND event_id=?2 AND outcome!='active')",
+            params![publisher, event_id],
+            |row| row.get(0),
+        )?;
         let settles = owner == Some(attempt_seq)
-            && matches!(
+            && (matches!(
                 current,
                 DeliveryState::Invoking | DeliveryState::Held | DeliveryState::Review
-            )
+            ) || (owner == Some(attempt_seq)
+                && completed_managed
+                && current == DeliveryState::Disposed))
             && matches!(
                 record.state,
                 AttemptState::Invoking
@@ -1378,8 +1426,7 @@ impl Storage {
             );
         let effect = match outcome {
             Some(outcome) if settles => {
-                let late = record.state == AttemptState::OutcomeUnknown;
-                apply_outcome(&tx, &record, outcome, late, now_ms)?;
+                apply_outcome(&tx, &record, outcome, now_ms)?;
                 EvidenceEffect::Applied(event_state(&tx, publisher, event_id)?.0)
             }
             _ => EvidenceEffect::Recorded,
@@ -1396,7 +1443,8 @@ impl Storage {
     /// operator, the note and `duplicate_risk` recorded permanently; the
     /// event returns to rotation with a fresh automatic budget, and its next
     /// attempt carries the duplicate-risk flag. This never replays by
-    /// itself.
+    /// itself. A `retire_unhanded` lifetime permanently fences retry; refusal
+    /// preserves incidents, evidence and audit history without mutation.
     pub fn authorize_manual_retry(
         &mut self,
         publisher: &str,
@@ -1408,11 +1456,35 @@ impl Storage {
         operator_text("operator", operator)?;
         operator_text("note", note)?;
         let tx = self.begin()?;
+        let completed: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM managed_deliveries
+            WHERE publisher_id=?1 AND event_id=?2 AND outcome!='active')",
+            params![publisher, event_id],
+            |r| r.get(0),
+        )?;
+        if completed {
+            return Err(CoreError::Fence(
+                "bounded delivery has already completed".into(),
+            ));
+        }
         let (current, owner) = event_state(&tx, publisher, event_id)?;
         if !matches!(current, DeliveryState::Review | DeliveryState::Held) {
             return Err(CoreError::Fence(format!(
                 "event {publisher}/{event_id} has no unresolved possible hand-off to retry"
             )));
+        }
+        let retired: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM events e JOIN delivery_scopes s
+                 ON s.producer = e.publisher_id AND s.scope_key = e.delivery_scope_key
+             WHERE e.publisher_id = ?1 AND e.event_id = ?2
+               AND s.closed_ms IS NOT NULL AND s.action = 'retire_unhanded')",
+            params![publisher, event_id],
+            |row| row.get(0),
+        )?;
+        if retired {
+            return Err(CoreError::Fence(
+                "retired delivery scope cannot be retried".into(),
+            ));
         }
         let resolution = format!("manual retry authorized by {operator}: {note}");
         tx.execute(
@@ -1785,8 +1857,9 @@ impl Storage {
     /// hand-off deadline may have handed off: it becomes `outcome_unknown`
     /// with a retained incident and is never retried automatically. A held
     /// or unreceipted attempt past its recheck deadline becomes an overdue
-    /// incident (the event stays held; nothing is resent). Returns
-    /// `(reclaimed, unknown, overdue)`.
+    /// incident (the event stays held; nothing is resent). A late hold whose
+    /// managed members already completed becomes retained unknown evidence without
+    /// reopening incidents or renewing rechecks. Returns `(reclaimed, unknown, overdue)`.
     pub fn expire_attempt_leases(
         &mut self,
         now_ms: u64,
@@ -1825,7 +1898,6 @@ impl Storage {
                 Outcome::OutcomeUnknown {
                     reason: "hand-off deadline passed; the effect cannot be established".into(),
                 },
-                false,
                 now_ms,
             )?;
         }
@@ -1852,7 +1924,32 @@ impl Storage {
                     "the native side still holds the event past its recheck deadline",
                 )
             };
+            let mut waiting = Vec::new();
             for member in &record.members {
+                let completed: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM managed_deliveries
+                     WHERE publisher_id=?1 AND event_id=?2 AND outcome!='active')",
+                    params![member.publisher, member.event_id],
+                    |row| row.get(0),
+                )?;
+                if !completed {
+                    waiting.push(member);
+                }
+            }
+            if waiting.is_empty() {
+                // A callback can report a hold after the original's policy deadline.
+                // Keep that evidence/fence, but never recreate completed recovery work.
+                apply_outcome(
+                    &tx,
+                    &record,
+                    Outcome::OutcomeUnknown {
+                        reason: "bounded delivery completed before late native hold receipt".into(),
+                    },
+                    now_ms,
+                )?;
+                continue;
+            }
+            for member in waiting {
                 open_incident_in(
                     &tx,
                     &member.publisher,
@@ -1880,9 +1977,11 @@ impl Storage {
     /// lease and recheck handling, and escalation of long recipient holds,
     /// missing predecessors and expired predecessors to incidents.
     pub fn run_maintenance(&mut self, now_ms: u64) -> Result<MaintenanceReport, CoreError> {
+        self.maintain_managed(now_ms)?;
         let expired_events = self.expire_due(now_ms)?;
         let (reclaimed_reservations, unknown_handoffs, overdue_rechecks) =
             self.expire_attempt_leases(now_ms)?;
+        self.maintain_managed(now_ms)?;
         let escalated_holds = self.escalate_holds(now_ms)?;
         Ok(MaintenanceReport {
             expired_events,

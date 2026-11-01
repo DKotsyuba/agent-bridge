@@ -1,6 +1,6 @@
 # Universal producer wire v1 — canonical boundary proposal
 
-Contract: `bridge-producer-wire-v1`, revision 3. Provider M-007; consumers M-008 and M-009. This planning artifact fixes proposed names and JSON fields before source implementation. It requires explicit reciprocal agreement and Epic freeze; it does not claim implemented operations or qualification. DOC-015 governs durable semantics; DOC-017 governs optional assertion/lifetime semantics. This artifact supplies their exact DTO/wire boundary. All identifiers/payloads remain product-independent.
+Contract: `bridge-producer-wire-v1`, revision 4. Provider: `bridge-protocol` and `bridge-sdk`; consumers: the core and the native adapters. This document defines the exact DTO and wire boundary of the universal producer API v1; durable semantics are described in the [core contract](../../bridge-core/docs/producer-core-v1.md) and the [native ingress contract](../../bridge-adapters/docs/producer-native-v1.md), and the onboarding sequence in [Producer integration](../../../docs/producer-integration.md). All identifiers and payloads are product-independent.
 
 ## Transport and typed envelope
 
@@ -8,7 +8,39 @@ One UTF-8 NDJSON request and one response per protected Unix stream exchange. En
 
 The protocol exports `Request`, `Operation`, `Response`, `OperationResult`, each operation's `*Params` and `*Result`, receipts/status views and the enums named below at crate root. Public `decode_request`, `encode_request`, `decode_response`, `encode_response` and validation methods apply the same bounds; decoding rejects duplicate JSON keys recursively, unknown envelope/DTO fields, incomplete/non-object frames and trailing JSON. The bounded original host metadata object is the only open-map exception. Unknown metadata keys are not caller authority.
 
-Operations: `capabilities`, `register_call`, `publish`, `status`, `close_route`, `consume_assertion`, `retire_delivery_scope`. Last two are separately capability-gated. `host_observations` is false in this baseline and has no operation or implied capability.
+Operations: `capabilities`, `register_call`, `publish`, `status`, `close_route`, `consume_assertion`, `retire_delivery_scope`, `observe_recipient`, `resolve_recipient`. Assertion consumption, delivery scopes and host observations are separately capability-gated. Host observations are adapter-only and default off; core always advertises false.
+
+### Exact native reads
+
+`observe_recipient` takes `{address: String}` and returns
+`RecipientObservation {address, sampled_at_ms, observation}`. The address is the
+canonical encoding of exactly the requested recipient. `observation` is either
+`{state: "observed", lifecycle: "active"|"inactive"|"awaiting_input"|"unknown",
+capabilities: {inject: bool, message: bool}}` or `{state: "unavailable"}`.
+The positive i64-range Unix millisecond sample time is read time, not last-hook
+freshness. Unknown/unavailable never implies idle, finished or dead; capability
+flags never promise future native delivery.
+
+`resolve_recipient` takes `ResolveRecipientParams {host: Host, native_session_id:
+String, expected_store: String, expected_harness_pid: u32,
+expected_harness_start_time_secs: u64}`. Session ids are 1–256 control-free UTF-8
+bytes; stores are absolute canonical paths of at most 4096 control-free UTF-8
+bytes. PIDs are 1–i32::MAX; start seconds are 1–i64::MAX. It returns
+`ResolveRecipientResult {sampled_at_ms, resolution}`, where `resolution` is
+`{state: "resolved", address: String}` or `{state: "unavailable"}`. The SDK
+validates canonical encoding, the exact request/operation, and the requested
+harness/session. Host id and logical store namespace come from daemon policy.
+
+Both reads require `producer_v1.host_observations=true`, recipient permission and
+native namespace scope before binding/process lookup. They neither enumerate nor
+create bindings, spend evidence, send, write custody/journals or expose private
+process facts. Expected fields only filter an existing protected binding; any
+missing/mismatching/retired fact returns unavailable. Resolution checks the actual
+canonical store, live UID, executable, process-selected store environment, exact
+PID/start seconds and unchanged final binding snapshot. Seconds are Bridge's
+existing precision: consumers requiring stronger process ownership must validate
+their own birth proof before and after lookup. A resolved address cannot authenticate
+an invocation. Read errors carry no mutation effect or reconciliation key.
 
 ## Scalar values, canonicalization and secrets
 
@@ -19,9 +51,9 @@ Operations: `capabilities`, `register_call`, `publish`, `status`, `close_route`,
 - All present timestamp/sequence/revision integers are 1..i64::MAX. Optional absence/null is no explicit expiry. Mode is `message`, `inject`, `auto`; reply policy is `self`, `shared_session`.
 - Policy is tagged `type`: `keep_all`, `latest` with `stream` and `revision`, or `batch` with `group`. Default is `{type:"keep_all"}`. Stream/group opaque keys do not have product meaning.
 - Destination is tagged `type`: `route` with `route_key`, or `address` with `address` (exactly one form).
-- Canonical address has four slash-separated components: host/native-harness/store/session. Native harness spellings are `codex` and `claude-code`. Components encode `%` as `%25` and `/` as `%2F`; strict percent decoding and component validation must match existing core address behavior. V1 normalization re-encodes canonical uppercase escapes. No core crate dependency enters the public implementation.
-- Native metadata `Host` enum wire values are `codex` and `claude_code`. This new DTO maps explicitly to legacy `Harness::Codex`/`ClaudeCode`; it changes no existing envelope/hash serialization.
-- Registration frame limit <=128KiB, core frame <=512KiB, response <=4MiB, rendered manifest <=96KiB; capabilities may advertise lower grant/effective limits. Oversize refuses rather than truncating.
+- Canonical address has four slash-separated components: host/native-harness/store/session. The native harness is an open canonical name of 1–32 bytes of `[a-z0-9-]` starting with a letter: the built-in spellings are `codex`, `claude-code` and `opencode`, and a profile-only harness uses its own identifier (see [harness profiles](../../../docs/harness-profiles.md)); whether a harness is served is the service's decision, never the parser's. Components encode `%` as `%25` and `/` as `%2F`; strict percent decoding and component validation must match existing core address behavior. V1 normalization re-encodes canonical uppercase escapes. No core crate dependency enters the public implementation.
+- Native metadata `Host` enum wire values are `codex`, `claude_code` and `opencode`. The DTO maps explicitly to core `Harness::CODEX`/`CLAUDE_CODE`/`OPENCODE`; existing host envelope/hash serialization stays unchanged. A metadata contract is not an address harness: a profile-only harness has a canonical address name but no `Host` value.
+- Registration frame limit <=128KiB, core frame <=512KiB, response <=4MiB, rendered manifest <=96KiB (98304 bytes, a source bound, not a native qualification); capabilities may advertise lower grant/effective limits. Oversize refuses rather than truncating.
 - Unordered constraint sets are sorted/deduplicated in canonical fingerprint material; duplicate allowed-mode/kind entries in a wire request are invalid. Omitted `allowed_kinds` is a stable inherit-policy sentinel, not a later grant snapshot. First effective constraints are stored separately.
 
 The protocol provides deterministic SHA-256 normalized publication `intent_hash` from typed normalized `PublishParams`. It excludes outer request ID and credentials, includes destination TAG and route key/canonical address, event ID, kind, payload, mode, policy, sorted metadata, absolute expiry and optional delivery scope. Domain separator is `bridge-producer-intent-v1\n` before canonical UTF-8 JSON. `envelope_hash` remains the distinct legacy core-resolved event hash. No historical hash changes. SDK verifies returned intent hash and event/destination binding before releasing producer intent.
@@ -48,7 +80,7 @@ The protocol provides deterministic SHA-256 normalized publication `intent_hash`
 
 `ProducerConstraints`: `allowed_modes`, `allowed_policies`, `allowed_kinds`, `reply_policies`, `direct_address` boolean, `native_scopes` bounded opaque configuration strings. These facts disclose only this authenticated producer's configured permissions. They do not authorize operations themselves.
 
-`NativeContract`: `host`, `build_label`, `build_digest` (lowercase 64-hex SHA-256), `paths`. `HostPathCapability`: `path` (`direct_mcp` or `nested_inner_mcp`), `supported` boolean, `reason` optional bounded machine reason. Configured support is not a substitute for a qualification receipt. Baseline nested support is false until independent matching inner-call records are qualified; no outer `functions.exec` proof is shared across calls.
+`NativeContract`: `host`, `build_label`, `build_digest` (lowercase 64-hex SHA-256), `paths`. `HostPathCapability`: `path` (`direct_mcp` or `nested_inner_mcp`), `supported` boolean, `reason` optional bounded machine reason. Configured support is not a substitute for a qualification receipt. Baseline nested support is false until independent matching inner-call records are qualified; no outer `functions.exec` proof is shared across calls. The native adapter currently advertises an empty `native_contracts` list: no configured host build is disclosed and no native build digest is advertised, so no `NativeContract` entry appears.
 
 The protected hook's native `tool_name` must positively classify an actual supported host MCP invocation. Known outer wrapper, non-MCP or missing/unqualified name refuses `unsupported_host_path`. This is host grammar, not a producer/tool catalog.
 
@@ -68,7 +100,7 @@ The protected hook's native `tool_name` must positively classify an actual suppo
 | `assertion_audience` | Optional configured generic audience string |
 | `invocation_key` | Optional trusted-frontend opaque key; required iff assertion audience supplied |
 
-`CallEvidence` is tagged `type`: `native` with `host` and `metadata` original bounded JSON object, or `sealed` with redacted `proof`. The SDK metadata parser produces an unverified candidate only. Kernel peer/host build/store/protected hook join and one authoritative reserve/commit/finalize evidence-use path are provider responsibilities. No public DTO can itself assert verified authority.
+`CallEvidence` is tagged `type`: `native` with `host` and `metadata` original bounded JSON object, or `sealed` with redacted `proof`. The SDK metadata parser produces an unverified candidate only. Kernel peer/marked harness/store/protected hook join and one authoritative reserve/commit/finalize evidence-use path are provider responsibilities. No public DTO can itself assert verified authority.
 
 `RegistrationResult`: `receipt: RegistrationReceipt`, `evidence_state: CallerEvidenceState`, `assertion: Option<FreshAssertion>`. Evidence-state strings are `verified_at_registration`, `historical`, `fresh_assertion_available`. Historical returns no fresh assertion. Fresh availability requires an actual still-valid separately issued ephemeral assertion, not receipt lookup.
 
@@ -148,11 +180,11 @@ SDK-local `ClientError` distinguishes validated service `ApiError` from invalid 
 
 ## SDK package boundary and executable checks
 
-`bridge-protocol`: std + existing locked serde/serde_json/sha2; public DTOs, strict bounds/canonicalization/fingerprints only. `bridge-sdk`: std synchronous Unix transport + existing locked socket2 0.6.5 for a bounded nonblocking connect + protocol + serde_json as needed; no core, storage, native adapter, host process inspection, framework/runtime or sibling producer dependency. Root alone provisions manifests/dependencies.
+`bridge-protocol`: std + existing locked serde/serde_json/sha2; public DTOs, strict bounds/canonicalization/fingerprints only. `bridge-sdk`: std synchronous Unix transport + existing locked socket2 0.6.5 for a bounded nonblocking connect + protocol + serde_json as needed; no core, storage, native adapter, host process inspection, framework/runtime or sibling producer dependency.
 
 Seven SDK modules: `config`, `native_meta`, `registration`, `publication`, `status`, `transport`, `client`. Facade uses caller-persisted IDs and immutable params; no SDK database/domain outbox/background worker/connection pool. Native metadata extraction accepts the trusted framework object explicitly, never arguments/cwd/environment.
 
-Canonical executable fixture artifact after authorized implementation: `crates/bridge-protocol/tests/wire-v1.json`. It covers every op/result, validation failures, normalization/default stability and immutable response binding. Module boundaries require correct-pass/mutant-fail/restored-pass proof. Independent pinned producer builds must exclude core/storage/native/framework; unknown-producer composition and live host receipts are separate M-010/root gates. Existing bridge-client/legacy API and core hashes remain untouched.
+The executable fixture is `crates/bridge-protocol/tests/wire-v1.json`. It covers every operation and result, validation failures, normalization and default stability, and immutable response binding. An independently pinned producer build must exclude core, storage, native and framework code; composition with an unknown producer and live host receipts are separate qualification steps (see the [qualification matrix](../../../docs/qualification.md)). The legacy `bridge-client` API and core hashes are unchanged.
 
 ## Shared canonical fingerprint helpers
 
@@ -161,3 +193,14 @@ Canonical executable fixture artifact after authorized implementation: `crates/b
 `publication_intent_fingerprint(&PublishParams) -> Result<String, ProtocolError>` is the sole protocol-owned normalized intent hash described above; SDK and core use the same helper, never separate lookalike algorithms. Canonical helper input is validated typed data and canonical JSON field/map order, not caller JSON formatting. `ProtocolError` represents pure validation/decoding/encoding failures with bounded static field/reason text and no original credential/body/value leakage; it is distinct from authenticated service `ApiError`.
 
 Counts and capacities (`attempts_made`, all four retirement counters, route/assertion capacities) are 0..i64::MAX and may legitimately be zero. Positive timestamp/sequence/revision bounds do not apply to them. Byte limits remain positive. A missing attempt sequence is null, never numeric zero.
+
+## Diagnostics separation
+
+Diagnostics-only daemon grants (`diagnostics = true`) do not authenticate as
+producer v1 principals. Every operation in this document, including capability
+and native observation reads, refuses those credentials before registry refresh,
+proof spending, assertion issuance/consumption or custody mutation. Existing
+producer and native rights are unchanged. The separate fixed legacy `observe`
+request and one-shot CLI have their own
+[diagnostics contract](../../bridge-interfaces/README.md#diagnostics-observer);
+no producer v1 operation, SDK message or receipt gains diagnostic/admin authority.

@@ -1,308 +1,117 @@
 # Agent Bridge
 
-Shared communication service for the Agent MCP family, Codex and Claude Code.
+Agent Bridge is a local, durable message service for coding-agent sessions. A
+producer (an agent tool, a CLI, a background worker) publishes an event addressed
+to one exact native session of Codex, Claude Code or managed OpenCode; Bridge keeps it in a
+SQLite custody store, delivers it through the host's own native path, and
+reports honestly what is known. A delivery whose outcome is uncertain is
+retained and surfaced for a manual decision; it is never repeated
+automatically.
 
-This workspace composes the core (M-001), native adapters (M-002) and
-restricted interfaces and packaging (M-006). The authoritative
-requirements, decisions, work decomposition and acceptance records are
-maintained through Agent Tasks with project alias `agent-bridge`; the family
-documentation repository is `../agent-docs/agent-bridge`.
+| | |
+|---|---|
+| Version | 0.5.0 (not published to crates.io; build from source) |
+| Producer API | v1 (`bridge-protocol` / `bridge-sdk`), plus the legacy publisher and operator socket API |
+| Database | storage schema 7, forward migration only |
+| Platform | **macOS on Apple silicon (`aarch64-apple-darwin`) only** |
+| Toolchain | Rust 1.98.1, pinned by `rust-toolchain.toml` |
+| License | [MIT](LICENSE) |
 
-The agreed delivery modes are `inject`, `message` and `auto`:
-`auto` selects `inject` for an active recipient and `message` for an inactive one.
-An uncertain delivery is retained and reported for manual resolution; it is not
-automatically repeated after a possible handoff.
+## What it does
 
-## Workspace layout
+- **Exact routing.** An address names one host, harness, native store and
+  session; nothing is routed by working directory, "latest chat" or process name.
+- **Three delivery modes.** `inject` hands the message to the recipient's own
+  hook while it is active, `message` queues it through a native message path
+  while it is idle, and `auto` chooses per delivery. Both requested and
+  effective modes are recorded.
+  OpenCode supports only `message` through its native owner and lifecycle plugin;
+  it has no `inject` or context-injection path.
+- **Durable custody and honest evidence.** A receipt proves custody only.
+  Native acceptance, hook emission, context observation and application
+  processing are separate, never inferred from each other.
+- **Visible holds.** A dead, unknown, permission-waiting or unqualified
+  recipient is a visible hold with a reason, not a silent drop or a guess.
+- **Operator recovery.** Incidents, audited retry/dispose/waive decisions,
+  pause/resume and stream-lineage transfer, plus an outbound-only Telegram
+  notifier.
+- **Producer SDK.** A dependency-light Rust protocol crate and synchronous
+  client for new producers, with no producer-specific code in Bridge.
 
-- `crates/bridge-core` — the service library and daemon:
-  - `types`: canonical event identity — exact native logical address
-    (host / harness / native store namespace / native session id,
-    percent-encoded losslessly in the canonical text form), envelope with
-    keep_all / latest / batch policy, bounded payload and metadata,
-    once-normalized absolute expiry, deterministic canonical serialization
-    and the frozen SHA-256 identity-content hash. Every component is
-    revalidated at every trust boundary, **including `Deserialize`**
-    (envelope, address, ids, expiry, hashes, receipts, delivery evidence),
-    and every u64 that reaches SQLite (revisions, expiries, counters,
-    timestamps, epochs) is range-checked before any signed conversion.
-  - `schema` / `storage`: SQLite durable custody (WAL, synchronous FULL, busy
-    timeout) with idempotent publication — identical replay returns the
-    original receipt, changed identity-content conflicts, monotonic
-    acceptance order, latest-stream watermarks scoped by the full coalescing
-    group, supersession of older *pending* snapshots only, admission quotas
-    (non-terminal cap with at least one slot, a quarter for larger caps, reserved
-    for keep_all, per-publisher,
-    per-recipient snapshot reserve with keep_all exempt, and a hard cap on retained dedup history that is never
-    evicted), pending-only expiry, payload compaction that keeps dedup
-    identity, and producer-lineage authority: one authenticated producer
-    owns each `latest` lineage (the coalescing scope without the
-    publisher); any other producer is declined before acceptance, and
-    authority passes only through an audited operator transfer that never
-    rewrites event ids, watermarks, attempts or evidence. A transfer
-    validates every scope field with the publication domain rules and the
-    canonical recipient, holds the previous owner's unhanded or reserved
-    `latest` events visibly (retained `lineage_authority_lost` incident) so
-    they are never selected or invoked afterwards, and is *refused* while
-    another producer's event in the lineage is invoking, in review or held
-    by the native side: a possible native effect cannot be recalled, so the
-    operator must first resolve it with the audited disposition. Identity
-    is the Bridge-stamped publisher only. Two processes sharing one grant
-    are one producer, so a same-publisher restart that reuses lower
-    revisions is indistinguishable from stale input and stays superseded;
-    the supported declared signals are a new stream id or an audited
-    transfer to a different publisher identity — cross-publisher isolation
-    does not cover this case. The schema is versioned (current: 6); the additive
-    5-to-6 migration preserves accepted bytes, hashes, identifiers and uncertain
-    attempt history. Versions 2, 3 and 4 migrate forward in one transaction
-    without touching accepted
-    bytes, hashes or identifiers (lineage owners are backfilled from the
-    retained events and watermarks; a lineage with several historical
-    producers migrates as *ambiguous* and fences publication and dispatch
-    until an operator resolves it), a version-3 attempt that may have
-    reached a carrier, or that has an open version-3 `unknown_handoff`
-    incident, becomes a `review` event; every version-3 incident (any kind) is
-    carried into the live table with its number, kind, reason and dates, open
-    ones stay open whatever their kind (including `held_unknown_lifecycle`; the
-    event is dispatchable only if its attempt evidence and any open
-    `unknown_handoff` allow it), a same-kind duplicate open row is resolved with
-    a pointer to the kept one, a
-    `migrated_unverified` incident is added only where no carried open
-    `unknown_handoff` already reports the uncertainty, the old rows stay in
-    `incidents_v3`, and unknown/newer/foreign databases are refused untouched.
-  - `framing`: allowlisted source-tag wrappers with escaped, bounded
-    manifests, a separate source block per member, forbidden-control
-    rejection and the fixed external-data/no-authority statement. An event
-    that could never be rendered is refused at publication.
-  - `dispatch`: fenced attempts over an ordered frozen manifest (see
-    below).
-  - `recovery`: evidence tiers, retained incidents (reason, age, deadlines,
-    responsible source, blocked dependents computed from live state),
-    audited operator recovery, reconciliation.
-  - `wire` / `service`: the authenticated local socket service and its
-    lifecycle (see below). `src/bin/bridge-daemon.rs` is the daemon.
-- `crates/bridge-client` — the shared typed client: `PublishRequest`
-  (validating builder), `BridgeClient` (publish / status plus the operator
-  operations, bounded reads and writes, one safe reconnect after an idle
-  close, every response revalidated) and re-exports of the canonical types.
-- `crates/bridge-adapters` — native Codex / Claude Code adapters: protected
-  caller registry and root-caller ABI, quiet root hooks (`bridge-hook`),
-  OS-confined Codex queue and Claude `later` message carriers, and the
-  `bridge-native-daemon`. See `crates/bridge-adapters/README.md` for its
-  trust model, configuration and unqualified native gaps.
-- `crates/bridge-interfaces` — the restricted root MCP (`bridge-root-mcp`
-  frontend + `bridge-root-relay`: attested `bridge_me` / `bridge_send` /
-  `bridge_status` only), the operator CLI over core counts, incidents,
-  audited same-event recovery and audited stream-lineage transfer,
-  outbound-only owner notification (Telegram) with a durable send ledger,
-  and packaging, install, rollback, process lifecycle and doctor
-  (`bridge`). See `crates/bridge-interfaces/README.md` for the
-  operator, Telegram and install guides and its evidence levels.
-- `xtask` — `cargo xtask package` (release bundle) and `cargo xtask
-  qualify --prefix ABS` (isolated install/lifecycle qualification);
-  `install.sh` installs a bundle after checking its attested digest;
-  `family.toml` declares the family profile (`not_verified`).
+## Support and limits
 
-## Dispatch contract (what an adapter implements and calls)
+Bridge supports macOS on Apple silicon only. The core and library crates use
+Unix sockets and Unix file semantics. A separate [Linux ARM64 development
+candidate](docs/linux-agent-ide.md) has bounded build/process evidence and explicit
+remaining native owner/wake qualification; it is not a supported release. Windows
+is unsupported. Native-host
+support is per exact build and is explicit in the [qualification
+matrix](docs/qualification.md): configuring a harness policy enables a harness, it
+is not a qualification result. Nested inner-call MCP paths, host observations and
+generic detached Claude consumers are not supported; live Telegram delivery has
+not been qualified.
 
-An **attempt** owns an ordered list of pending events of one recipient and
-freezes, before anything leaves the process: the exact recipient, the actual
-acting actor's native id, the endpoint epoch, the granted capabilities, the
-requested and effective path, the rendered manifest bytes with their SHA-256,
-the hand-off deadline and the proof reference of the attestation. A carrier or
-hook can only send exactly `AttemptRecord::manifest`.
+## Quick start
 
-- `Attestation::verified(address, actor_id, epoch, lifecycle, capabilities,
-  proof_ref)` — built **only by the protected adapter binding**, after it
-  validated the actor, address, epoch and lifecycle against native evidence
-  (no public fields, no `Deserialize`: a request body or a config file cannot
-  mint one). Core fails closed on a stale epoch, a different address, an actor
-  that is not the addressed actor (a child sharing the root session never
-  consumes root data; a child with its own attested address receives its own),
-  a missing capability, and any lifecycle other than `Active` / `Inactive`.
-  Core cannot itself verify the adapter's proof; labels, PIDs and
-  configuration are never accepted as native proof.
-- `Storage::reserve_next(att, path, now, timing)` →
-  `Selection::{Attempt, Idle, Held(reason)}`; `Storage::mark_invoking(fence,
-  fresh_att, now)` → `Invoked::{Invoking, Released(reason)}` re-checks epoch,
-  pause, capability, lifecycle and expiry and persists `invoking` before the
-  hand-off; `Storage::drain_inject(att, now, timing)` does both in one
-  transaction for a qualified hook (write `manifest` to the hook reply only
-  after it returns).
-- `Storage::record_outcome(fence, Outcome, now)`: `NativeAccepted`,
-  `NativeHeld{recheck_ms}`, `WrittenNoReceipt{evidence, receipt_deadline_ms}`,
-  `HookSubmitted`, `KnownUnsent{non-empty proof}`, `OutcomeUnknown`,
-  `PermanentRefusal`. Late positive evidence for an older or uncertain attempt:
-  `Storage::record_evidence(publisher, event, attempt, EvidenceTier, detail,
-  now)` (native accepted, hook emitted, context observed, application
-  processed, known-unsent proof; `ReceiptTokenPossession` is an annotation
-  only). `Storage::observe_binding(att, now)` tells core which paths a
-  recipient has loaded so unsupported modes are refused **before** acceptance.
-- `DispatchCarrier { attest, send }` plus `dispatch::dispatch_message` /
-  `service::start_with_carriers` drive the message path; inject has no carrier
-  (a hook drains it).
-
-Rules enforced by core: one possibly-handed-off attempt per event; `auto`
-resolves per dispatch (active → inject at the hook, positively inactive →
-message), requested and effective modes both recorded, never both paths;
-pause blocks the message path at reservation *and* again before invocation (a
-natural hook never wakes anyone and is not blocked); unknown, disconnected,
-awaiting-input and failed attestation are visible holds, never idle; an
-`invoking` attempt past its deadline, a lost carrier result or a panic becomes
-`outcome_unknown` with a retained incident and is **never retried
-automatically**; a positively known-unsent attempt is closed before a bounded
-retry with doubling delay (exhaustion refuses the event with an incident);
-held and written-without-receipt hand-offs are non-terminal with recheck
-deadlines and overdue incidents; only an audited operator decision
-(`authorize_manual_retry` on the *same* event with the duplicate risk recorded
-forever, `dispose_event`, `waive_predecessor`) or positive evidence resolves an
-incident. Dependents declared with `predecessor` metadata are accepted even if
-the predecessor has not arrived, and wait for positive predecessor evidence, a
-superseding snapshot or an audited disposition/waiver — never for time; a
-predecessor that expired raises a `predecessor_expired` incident on the
-dependent, which stays blocked until a waiver or disposition; cycles are
-refused. Selection is keep_all first with age-based anti-starvation
-of snapshots, independent traffic is never blocked behind a dependent, batch
-siblings are frozen together in acceptance order only inside one scope
-(publisher, recipient, kind, mode, project, task, group), and an in-flight
-manifest is immutable.
-
-## Service and protocol
-
-ndjson over a Unix stream socket. Every ingress is authenticated by a grant
-token (constant-time over all grants, tokens at least 16 bytes, unique, never
-printed — request and grant `Debug` redact them) before validation, dedup or
-status disclosure. Two disjoint realms:
-
-- **publisher grants** (the identity is also the source tag): `publish`,
-  `status` of their own events; allowlists for recipients, kinds, modes and
-  policies. The restricted root orchestrator backend uses a *publisher* grant
-  forcing `keep_all` and its exact recipients; an external root token is never
-  a core credential.
-- **operator grants** (`admin = true`, empty allowlists, cannot publish):
-  `incidents`, `incidents_page`, `retention`, `holds`, `counts`, `authorize_retry`, `dispose`,
-  `waive_predecessor`, `evidence`, `pause`, `resume`, `transfer_lineage`,
-  `shutdown`; every decision is audited with the grant's identity.
-
-Operator reads preserve the existing `incidents` and `counts` shapes.
-`BridgeClient::incidents_page(token, include_closed, limit, after_seq, through_seq)`
-starts with `after_seq = 0`, `through_seq = None`, then carries the returned
-fixed high-water and `next_after_seq`. Pages contain at most 200 incidents in
-stable sequence order; a final page has no next cursor. Row states are live,
-so restart the finite scan to include newly inserted or reopened incidents.
-Invalid, reversed or out-of-range cursors are refused. Reading a page neither
-closes an incident nor reports it to an owner.
-
-`BridgeClient::retention(token, publisher, event_id)` returns an exact nullable
-storage view: retained custody identity, bounded delivery evidence, original
-expiry, envelope byte count, compacted/tombstone flag, logical payload GC
-eligibility and the event's exact-scoped latest watermark. It loads no payload
-bytes. An absent key returns `None`; publisher and ordinary root grants cannot
-read it. Expiry and collection describe storage dispositions, never recall of
-a possible or accepted native effect. GC eligibility uses the existing
-terminal superseded/expired, unhanded, nonempty-payload guard; keep-newest may
-still retain eligible bytes. Reads do not trigger expiry or collection, and
-dedup rows, hashes and watermarks remain retained after payload compaction.
-The canonical revision-2 boundary is `docs/operator-queries-v2.md` in the
-registered Agent Tasks project. Interface presentation and notification ledger
-traversal belong to M-006 and require separate composition verification.
-
-Lifecycle: socket ownership refuses a live endpoint, preserves every foreign
-path (regular file, symlink, directory, unprovable socket) and removes a stale
-socket only after a connection attempt was positively refused and the inode is
-unchanged; the socket is created `0600`; only the service's own inode is
-removed at stop. Frames are limited incrementally *before* allocation;
-connections are capped, idle/stalled readers and non-reading writers time out;
-stopping fences new work under the custody lock (nothing is accepted after the
-stop returned), wakes and drains in-flight connections, and is bounded even
-with a hung carrier. SIGTERM/SIGINT stop the daemon cleanly (a second signal
-exits immediately); the maintenance loop survives panics, a carrier whose
-attestation panics only holds its own recipient, and each dispatch pass takes a
-rotating window of recipients, so idle or blocked recipients with unchanging
-work cannot pin the window (no exact coverage bound is promised while the
-workload keeps changing).
-
-Logging is JSON lines on stderr without tokens, payloads or config text.
-
-## Building and testing
-
-Pinned toolchain `1.98.1` (see `rust-toolchain.toml`).
+Prerequisites: macOS on Apple silicon, Xcode command line tools, and
+[rustup](https://rustup.rs). The pinned toolchain installs from
+`rust-toolchain.toml`.
 
 ```sh
-cargo +1.98.1 build --offline --workspace
-cargo +1.98.1 test --offline --workspace
-cargo +1.98.1 clippy --offline --workspace --all-targets -- -D warnings
+rustup toolchain install 1.98.1 --profile minimal -c rustfmt -c clippy
+cargo +1.98.1 fetch --locked
+BRIDGE_TEST_NODE="$(command -v node)" cargo +1.98.1 test --offline --workspace
+cargo +1.98.1 xtask package          # prints the bundle manifest and sums_sha256
+```
+
+Then follow [Getting started](docs/getting-started.md) to install the bundle,
+write private configuration, install the hooks and send a first message.
+
+## Documentation
+
+- [Linux ARM64 Agent IDE integration candidate](docs/linux-agent-ide.md): runnable paths, native configuration and remaining owner/wake qualification.
+
+- [Getting started](docs/getting-started.md): prerequisites, build, test, package, install, first run.
+- [Configuration](docs/configuration.md): daemon, adapter, producer-permission and interfaces files.
+- [Harness profiles](docs/harness-profiles.md): connecting a harness by configuration, without Bridge code changes.
+- [Architecture](docs/architecture.md): custody, dispatch contract, service and lifecycle rules.
+- [Producer integration](docs/producer-integration.md): onboarding a new producer with the protocol or SDK.
+- [Qualification and support matrix](docs/qualification.md): what was observed, on which builds.
+- [Native adapters](crates/bridge-adapters/README.md): trust model, delivery paths, qualification probes.
+- [Interfaces](crates/bridge-interfaces/README.md): root MCP, operator recovery, Telegram, install and rollback.
+- [Producer SDK](crates/bridge-sdk/README.md): synchronous client and packaging notes.
+- Contracts: [wire v1](crates/bridge-protocol/docs/wire-v1.md), [core v1](crates/bridge-core/docs/producer-core-v1.md), [native ingress v1](crates/bridge-adapters/docs/producer-native-v1.md).
+- Project: [Contributing](CONTRIBUTING.md), [Security](SECURITY.md), [Changelog](CHANGELOG.md), [agent.md](agent.md), [AGENTS.md](AGENTS.md).
+
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| `crates/bridge-core` | service library and `bridge-daemon`: types, SQLite storage, framing, dispatch, recovery, wire service |
+| `crates/bridge-client` | typed legacy publisher and operator client |
+| `crates/bridge-protocol` | dependency-light v1 wire DTOs, validation and fingerprints |
+| `crates/bridge-sdk` | synchronous v1 producer client |
+| `crates/bridge-adapters` | Codex, Claude Code and managed OpenCode adapters, lifecycle plugin, `bridge-hook`, `bridge-native-daemon`, qualification probes |
+| `crates/bridge-interfaces` | restricted root MCP and relay, `bridge` operator and install CLI |
+| `xtask` | `cargo xtask package`, `qualify` and `check-public` |
+| `install.sh` | installer for a locally built bundle |
+
+## Checks
+
+```sh
 cargo +1.98.1 fmt --all --check
+cargo +1.98.1 clippy --offline --workspace --all-targets -- -D warnings
+BRIDGE_TEST_NODE="$(command -v node)" cargo +1.98.1 test --offline --workspace
 RUSTDOCFLAGS="-D warnings" cargo +1.98.1 doc --offline --workspace --no-deps --document-private-items
+cargo +1.98.1 xtask check-public
 ```
 
-Tests use only isolated synthetic state (fresh temporary databases, private
-short-lived sockets, scripted synthetic carriers); no working sessions or
-installed applications are touched.
-
-## Running the daemon
-
-```sh
-cargo +1.98.1 run --offline --bin bridge-daemon -- path/to/bridge.toml
-```
-
-```toml
-database = "/path/to/bridge.db"
-socket = "/path/to/bridge.sock"
-
-[limits]
-max_admitted_events = 10000
-# optional, defaults shown:
-# max_pending_per_publisher = 10000
-# max_pending_latest_per_recipient = 128
-# max_retained_events = 5000000
-# max_connections = 64
-# idle_timeout_ms = 60000
-# request_timeout_ms = 10000
-# write_timeout_ms = 10000
-
-[[grant]]            # `[[grants]]` is accepted as well
-token = "<unguessable secret, at least 16 bytes>"
-publisher = "agent-run"          # also the source tag
-recipients = ["host-id/codex/native-store-namespace/thread-id"]
-kinds = ["worker.completed"]
-modes = ["message", "auto"]
-policies = ["keep_all", "latest"]
-
-[[grant]]
-token = "<a different unguessable secret>"
-publisher = "bridge-ops"
-admin = true                     # operator realm: no allowlists
-recipients = []
-kinds = []
-modes = []
-policies = []
-```
-
-Address components in `recipients` are percent-encoded when they contain
-`/` or `%`; the encoding is lossless and injective. The daemon starts without
-native carriers: events stay pending, visibly, until a qualified adapter drives
-them.
-
-## Scope and open gaps
-
-This workspace implements standalone Bridge (decision D-003). The core, native
-adapters and interfaces retain their independently scoped evidence. See
-`crates/bridge-adapters/README.md` for the qualified native builds and scope,
-and `crates/bridge-interfaces/README.md` for root, operator and package evidence.
-The exact combined package requires separate joint and loaded-host qualification.
-Remaining limits are explicit:
-
-- core dispatch tests use scripted synthetic carriers and trust the adapter's
-  `Attestation`; native evidence belongs to the exact builds and scopes recorded
-  by the adapter qualification, and does not alone qualify this composition;
-- the optional receipt-token tier is recorded as an annotation only (no
-  per-producer predeclared release/GC contract);
-- operator notification channels (Telegram) are not part of core: incidents are
-  durable and listed; `bridge notify` reports them to a configured owner chat,
-  and an unconfigured channel reports the owner as not notified; no live
-  Telegram delivery has been qualified;
-- the root MCP has no `bridge.ack`: core issues no recipient receipt token and
-  no producer has predeclared a receipt tier;
-- wall-clock regressions are not modeled (leases and deadlines use the service
-  clock as given).
+Tests use isolated synthetic state: fresh temporary databases, private
+short-lived sockets and scripted carriers. They touch no installed application,
+no session store and no network. Set `TMPDIR` to a short directory you own
+(Unix socket paths are limited to about 100 bytes) and `BRIDGE_TEST_NODE` to an
+absolute Node.js executable: the full workspace tests need Node for the deterministic
+Desktop regressions (CI uses the runner's preinstalled Node). Node is not needed to
+build, run or integrate Bridge or the SDK. Native qualification probes
+need real harness builds and paid models, never run in `cargo test` or CI, and
+are described in the [adapter guide](crates/bridge-adapters/README.md).

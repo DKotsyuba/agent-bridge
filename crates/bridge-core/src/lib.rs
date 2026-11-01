@@ -18,6 +18,7 @@
 //!   contract.
 //! - [`recovery`]: evidence tiers, retained incidents, audited operator
 //!   recovery and reconciliation.
+//! - [`managed`]: opt-in bounded root delivery, retained reports and sender feedback.
 //! - [`service`]: the authenticated local socket service and its lifecycle.
 //!
 //! Boundary note: storage callers pass an already-authenticated publisher
@@ -26,6 +27,9 @@
 
 pub mod dispatch;
 pub mod framing;
+pub mod managed;
+/// Fixed content-free diagnostics types and transactional store projections.
+pub mod observation;
 pub mod producer;
 pub mod recovery;
 pub mod schema;

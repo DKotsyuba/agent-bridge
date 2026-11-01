@@ -2,7 +2,7 @@
 //!
 //! A local Unix-stream socket speaking one JSON object per line (ndjson).
 //! Every ingress is authenticated by a grant token before anything else
-//! happens. Two disjoint credential realms exist:
+//! happens. Three disjoint credential realms exist:
 //!
 //! - **publisher grants** bind one publisher identity and the recipients,
 //!   kinds, modes and policies it may use; they can only `publish` and read
@@ -13,6 +13,9 @@
 //! - **operator grants** (`admin = true`) carry empty allowlists, can never
 //!   publish or read publisher status, and alone can list incidents, record
 //!   audited recovery decisions, pause recipients and stop the daemon.
+//! - **diagnostics grants** (`diagnostics = true`) have empty allowlists and
+//!   only the fixed `observe` projections. They cannot authenticate as producers
+//!   on the public or private native channel and cannot use operator routes.
 //!
 //! There is deliberately no generic RPC surface. Bridge stamps the publisher
 //! identity from the authenticated grant — a request never asserts its own
@@ -95,7 +98,9 @@ pub struct Config {
 /// A publisher grant binds a secret token to exactly one publisher identity
 /// and to the recipients, kinds, modes and policies that publisher may use;
 /// its `publisher` identity is also the source tag Bridge renders around its
-/// events. An operator grant (`admin = true`) must carry empty allowlists.
+/// events. Operator (`admin = true`) and diagnostics-only grants must carry
+/// empty allowlists. Diagnostics cannot carry admin, producer v1 or managed
+/// feedback authority.
 /// The token is supplied out-of-band; possession of the token plus socket
 /// access is the caller's authentication.
 #[derive(Clone, Serialize, Deserialize)]
@@ -117,9 +122,16 @@ pub struct GrantConfig {
     /// operations, never publishing.
     #[serde(default)]
     pub admin: bool,
+    /// Diagnostics-only realm: fixed content-free reads, never producer/native
+    /// or operator authority. Defaults false; incompatible with all other rights.
+    #[serde(default)]
+    pub diagnostics: bool,
     /// Opt-in v1 permissions; absence preserves all legacy grant behavior.
     #[serde(default)]
     pub producer_v1: Option<crate::ProducerPolicy>,
+    /// Trust this relay to bind attested native origins for bounded root delivery.
+    #[serde(default)]
+    pub managed_feedback: bool,
 }
 
 impl std::fmt::Debug for GrantConfig {
@@ -133,7 +145,9 @@ impl std::fmt::Debug for GrantConfig {
             .field("modes", &self.modes)
             .field("policies", &self.policies)
             .field("admin", &self.admin)
+            .field("diagnostics", &self.diagnostics)
             .field("producer_v1", &self.producer_v1)
+            .field("managed_feedback", &self.managed_feedback)
             .finish()
     }
 }
@@ -145,9 +159,21 @@ impl GrantConfig {
     /// must be well-formed at load time so authorization decisions never
     /// run on malformed allowlist entries; a publisher identity must also be
     /// usable as a source tag; the token must be at least 16 bytes; an
-    /// operator grant must have empty allowlists. Returns the first
+    /// operator/diagnostics grant must have empty allowlists; diagnostics also
+    /// forbids admin, producer v1 and managed feedback authority. Returns the first
     /// problem as [`CoreError::InvalidEnvelope`].
     pub fn validate(&self) -> Result<(), CoreError> {
+        if self.diagnostics && (self.admin || self.producer_v1.is_some() || self.managed_feedback) {
+            return Err(CoreError::InvalidEnvelope(
+                "diagnostics grants cannot carry operator, producer or managed feedback rights"
+                    .into(),
+            ));
+        }
+        if self.admin && self.managed_feedback {
+            return Err(CoreError::InvalidEnvelope(
+                "operator grants cannot bind managed senders".into(),
+            ));
+        }
         if let Some(policy) = &self.producer_v1 {
             if self.admin {
                 return Err(CoreError::InvalidEnvelope(
@@ -177,7 +203,7 @@ impl GrantConfig {
                 self.publisher
             )));
         }
-        if self.admin {
+        if self.admin || self.diagnostics {
             if !(self.recipients.is_empty()
                 && self.kinds.is_empty()
                 && self.modes.is_empty()
@@ -304,17 +330,43 @@ impl std::fmt::Debug for Token {
 
 /// One bounded request line received on the local socket.
 ///
-/// New operator page/retention reads remain separate from legacy listings,
-/// publisher status and all mutations; each operation authenticates its realm.
+/// Diagnostic observation, operator page/retention reads, legacy listings,
+/// publisher status and mutations each authenticate their separate realm.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
+    /// Fixed content-free diagnostic read, authenticated in its own realm.
+    Observe {
+        /// Diagnostics-only bearer token; admin credentials are refused.
+        token: Token,
+        /// Closed operation and bounded page parameters.
+        query: crate::observation::ObservationQuery,
+    },
     /// Publish (or idempotently replay) one event under custody.
     Publish {
         /// Publisher-grant bearer token.
         token: Token,
         /// The event body; publisher is stamped from the grant.
         event: Box<PublishBody>,
+    },
+    /// Publish with grant-authorized attested origin and fixed delivery bounds.
+    PublishManaged {
+        /// Publisher-grant credential; managed_feedback must be enabled.
+        token: Token,
+        /// Exact immutable event, unchanged by the separate policy association.
+        event: Box<PublishBody>,
+        /// Trusted relay origin, never inferred from metadata.
+        sender: crate::managed::ManagedSender,
+    },
+    /// Read retained reports for an exact sender through a trusted relay grant.
+    SenderReports {
+        /// Managed-relay credential; never an operator or ordinary publisher.
+        token: Token,
+        /// Relay-attested native sender, never accepted from root tool arguments.
+        sender: NativeAddress,
+        /// Exclusive completion cursor; zero begins a fresh scan.
+        #[serde(default)]
+        after_seq: u64,
     },
     /// Look up the caller's own publication status.
     Status {
@@ -479,10 +531,20 @@ pub enum Request {
 /// existing response shapes keep their meaning and never establish native recall.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
+    /// Typed content-free diagnostic observation, at most 1 MiB encoded.
+    Observation {
+        /// Fixed result kind and matching data.
+        observation: crate::observation::Observation,
+    },
     /// Custody accepted (freshly or as an identical replay).
     Published {
         /// The durable custody receipt.
         receipt: CustodyReceipt,
+    },
+    /// Read-only sender-scoped retained delivery reports.
+    SenderReports {
+        /// Bounded ascending completion page without payload content.
+        page: crate::managed::SenderReportPage,
     },
     /// Status of the caller's own event.
     Status {
@@ -541,10 +603,12 @@ impl Response {
     /// so a damaged or hostile line is never trusted for its numbers.
     pub fn validate(&self) -> Result<(), CoreError> {
         match self {
+            Response::Observation { observation } => observation.validate(),
             Response::Incidents { incidents } => {
                 incidents.iter().try_for_each(IncidentView::validate)
             }
             Response::IncidentsPage { page } => page.validate(),
+            Response::SenderReports { page } => page.validate(),
             Response::Retention { retention } => {
                 retention.as_ref().map_or(Ok(()), |view| view.validate())
             }
@@ -716,7 +780,11 @@ pub fn start_with_carriers(
     storage
         .install_producer_authorizer(Arc::clone(&authorizer))
         .map_err(|_| CoreError::InvalidEnvelope("cannot install producer authority".into()))?;
-    for grant in config.grants.iter().filter(|grant| !grant.admin) {
+    for grant in config
+        .grants
+        .iter()
+        .filter(|grant| !grant.admin && !grant.diagnostics)
+    {
         storage.register_source_tag(&grant.publisher, &grant.publisher)?;
     }
     claim_socket(&config.socket)?;
@@ -1281,11 +1349,52 @@ fn respond(
 /// Authenticates each parsed request before reading or changing shared state.
 ///
 /// Publisher operations stay scoped to their grant. New operator pages and exact
-/// retention reads cannot mutate recovery state or disclose payload bytes;
+/// retention/diagnostic reads cannot mutate recovery state or disclose payload bytes;
 /// invalid input/storage failures become structured refusals.
 fn serve(state: &ServiceState, request: Request) -> Result<Response, Refusal> {
     match request {
-        Request::Publish { token, event } => serve_publish(state, &token, &event),
+        Request::Observe { token, query } => {
+            let grant = authenticate(state, &token)?;
+            if !grant.diagnostics {
+                return Err(Refusal::new("forbidden", "diagnostics grant required"));
+            }
+            let storage = lock_storage(&state.storage);
+            let observation = storage.observe(&query).map_err(|_| {
+                Refusal::new("invalid", "diagnostic observation unavailable or invalid")
+            })?;
+            Ok(Response::Observation { observation })
+        }
+        Request::Publish { token, event } => serve_publish(state, &token, &event, None),
+        Request::PublishManaged {
+            token,
+            event,
+            sender,
+        } => serve_publish(state, &token, &event, Some(&sender)),
+        Request::SenderReports {
+            token,
+            sender,
+            after_seq,
+        } => {
+            let grant = publisher(state, &token)?;
+            let address = sender.to_canonical_string();
+            if !grant.managed_feedback
+                || !grant
+                    .recipients
+                    .iter()
+                    .any(|entry| entry == "*" || entry == &address)
+            {
+                return Err(Refusal::new(
+                    "forbidden",
+                    "grant cannot read this sender's reports",
+                ));
+            }
+            let page = lock_storage(&state.storage).sender_reports(
+                &grant.publisher,
+                &sender,
+                after_seq,
+            )?;
+            Ok(Response::SenderReports { page })
+        }
         Request::Status { token, event_id } => serve_status(state, &token, &event_id),
         Request::Shutdown { token } => {
             let grant = operator(state, &token)?;
@@ -1546,13 +1655,18 @@ fn operator<'a>(state: &'a ServiceState, token: &str) -> Result<&'a GrantConfig,
     }
 }
 
-/// Authenticates a token and requires a publisher grant.
+/// Authenticates a token and requires a publisher grant; diagnostics and admin
+/// realms cannot publish or read publisher status, even with a known event id.
 fn publisher<'a>(state: &'a ServiceState, token: &str) -> Result<&'a GrantConfig, Refusal> {
     let grant = authenticate(state, token)?;
-    if grant.admin {
+    if grant.admin || grant.diagnostics {
         Err(Refusal::new(
             "forbidden",
-            "operator grants cannot publish or read publisher status",
+            if grant.diagnostics {
+                "diagnostics grants cannot publish or read publisher status"
+            } else {
+                "operator grants cannot publish or read publisher status"
+            },
         ))
     } else {
         Ok(grant)
@@ -1564,8 +1678,24 @@ fn serve_publish(
     state: &ServiceState,
     token: &str,
     body: &PublishBody,
+    sender: Option<&crate::managed::ManagedSender>,
 ) -> Result<Response, Refusal> {
     let grant = publisher(state, token)?;
+    if let Some(sender) = sender {
+        sender.address.validate()?;
+        let address = sender.address.to_canonical_string();
+        if !grant.managed_feedback
+            || !grant
+                .recipients
+                .iter()
+                .any(|entry| entry == "*" || entry == &address)
+        {
+            return Err(Refusal::new(
+                "forbidden",
+                "grant cannot bind this managed feedback origin",
+            ));
+        }
+    }
 
     let recipient_text = body.recipient.to_canonical_string();
     let authorize = |allowed: bool, what: &str| -> Result<(), Refusal> {
@@ -1623,7 +1753,10 @@ fn serve_publish(
     if !state.running.load(Ordering::SeqCst) {
         return Err(stopping());
     }
-    let outcome = storage.publish(&envelope, current_unix_millis())?;
+    let outcome = match sender {
+        Some(sender) => storage.publish_managed(&envelope, sender, current_unix_millis())?,
+        None => storage.publish(&envelope, current_unix_millis())?,
+    };
     log_event(
         "info",
         "publish",

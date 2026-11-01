@@ -6,7 +6,8 @@ product packaging for Agent Bridge. Everything here consumes `bridge-core`,
 incident, attempt or hook store, no direct database access, no native
 dispatch.
 
-Qualification status: **not_verified**. See [Evidence levels](#evidence-levels).
+Qualification status: **not_verified**. See [Evidence levels](#evidence-levels) and the
+[qualification matrix](../../docs/qualification.md).
 
 ## Executables
 
@@ -40,6 +41,14 @@ while the caller's binding epoch is unchanged. Then the relay requires:
    never redirected to the parent;
 2. a configured `[[root.callers]]` scope;
 3. valid closed arguments.
+
+With `[root].bounded_delivery=true` and core relay grant
+`managed_feedback=true`, new root sends stop after at most five actual sends
+or five minutes (a shorter explicit expiry still applies). The attested sender
+gets one bounded best-effort native MESSAGE on failure/unconfirmed outcome;
+`bridge_status` retains the authoritative report and original evidence even if
+that sender is unavailable. Existing configurations default to the legacy
+policy; see [bounded root messages](../../docs/configuration.md#bounded-root-messages).
 
 For address-based personal messaging, set `recipients = ["*"]` in the root
 publisher grant and its root caller policies. This permits every well-formed
@@ -116,10 +125,10 @@ Launch `bridge-root-mcp <adapter-channel-socket> <relay-socket>` as an MCP
 server of the harness. The relay socket's directory must be `0700`.
 
 - **Claude Code**: an `mcpServers` entry with that command and arguments.
-- **Codex 0.162 (observed binary, not qualified)**: MCP tool calls under
-  `approval_policy = "never"` fail with "requires approval". The loaded
-  build carries per-server `enabled_tools`, `default_tools_approval_mode`
-  and per-tool `tools.<name>.approval_mode`. The scoped choice is:
+- **Codex 0.162**: MCP tool calls under `approval_policy = "never"` fail with
+  "requires approval". The loaded build carries per-server `enabled_tools`,
+  `default_tools_approval_mode` and per-tool `tools.<name>.approval_mode`. The
+  scoped choice is:
 
   ```toml
   [mcp_servers.agent-bridge-root]
@@ -131,11 +140,13 @@ server of the harness. The relay socket's directory must be `0700`.
   # same for bridge_send and bridge_status
   ```
 
-  The variant semantics are inferred from strings in the binary and are
-  **not qualified**; do not change the global approval policy. A host
-  qualification must show that only the named tools are pre-approved (an
-  unlisted tool still requires approval). Until then native root-caller
-  acceptance remains blocked.
+  Root-caller attestation and direct v1 delivery were observed on the Codex
+  build named in the [qualification matrix](../../docs/qualification.md). What is
+  not fully qualified is the specific `approval_mode` semantics: the probes show the
+  parsed value and the host refusing an unlisted tool, not that this value alone
+  is what permits the listed ones. Do not change the global approval policy, and
+  confirm on your own build that only the named tools are pre-approved (an unlisted
+  tool must still require approval).
 
 ## Operator recovery guide
 
@@ -300,7 +311,7 @@ authorized test delivery; none has happened.
 
 ```sh
 cargo xtask package                     # prints manifest + sums_sha256
-./install.sh --bundle /ABS/dist/agent-bridge-0.1.0+LABEL --sums-sha256 HEX \
+./install.sh --bundle /ABS/dist/agent-bridge-0.5.0+LABEL --sums-sha256 HEX \
   --home /ABS/home --bin-dir /ABS/bin
 bridge service start core  --home H --state S --config daemon.toml
 bridge service start relay --home H --state S --config interfaces.toml
@@ -348,9 +359,10 @@ bridge service stop relay|core --home H --state S
 - Rollback switches program code only. The custody database, incidents,
   audit and configuration stay; a release with an older core schema than
   one already activated is refused (no live-schema downgrade, no snapshot
-  restore). This composition's core writes storage schema 5 (stream
-  lineage authority); once a schema-5 release has been activated, the
-  floor is 5 and any schema-4 release is refused for install and rollback.
+  restore). This composition's core writes storage schema 7 (bounded root
+  reports, producer v1 routes, lifetimes and stream lineage authority); once
+  a schema-7 release has been activated, the floor is 7 and any older-schema
+  release is refused for install and rollback.
 - `doctor` exit codes: 0 no failed check, 2 a check failed, 3 invalid
   invocation. Declared adapter capabilities and Telegram are always
   `not_verified`; the overall qualification is `not_verified`.
@@ -385,9 +397,9 @@ bridge service stop relay|core --home H --state S
 - `tests/root_composition.rs`: real core service, adapter registry and
   channel, real `bridge-root-mcp`, `bridge-root-relay` and `bridge`
   executables with kernel peer identities. The harness is a labeled
-  stand-in (the test executable qualified in an owned profile); it is **not**
+  stand-in (the test executable, recognized under an owned harness policy and store); it is **not**
   native Claude or Codex evidence.
-- `tests/operator_counts.rs`: real schema-5 core service and the real
+- `tests/operator_counts.rs`: real current-schema core service and the real
   `bridge` CLI: complete counts, CLI lineage transfer with the incident it
   creates, more than 200 open incidents against the bounded doctor sample,
   publisher-credential refusal, pre-request validation and a silent core
@@ -398,6 +410,96 @@ bridge service stop relay|core --home H --state S
 - `cargo xtask qualify --prefix ABS`: the packaged release in one isolated
   prefix (tamper refusal, install, version/hash, start, doctor, upgrade,
   rollback, restart, stop).
-- Not established: native caller attestation on a real loaded harness,
-  Codex per-tool approval behaviour, real Telegram delivery, installed-host
-  operation.
+- Not established by these tests: native caller attestation on other builds,
+  the exact Codex per-tool `approval_mode` semantics, real Telegram delivery
+  and installed-host operation on your machine. See the
+  [qualification matrix](../../docs/qualification.md) for what was observed.
+
+
+Retained failure reports are also available through the existing root
+`bridge_me` tool when bounded delivery is enabled. Its optional
+`reports_after` cursor follows `next_after_seq`; omit it or use zero to
+start a scan. Each read returns at most twenty completed reports for the exact
+attested sender and authenticated publisher. Completion ordering preserves
+failures of older messages that finish later. Reading never acknowledges,
+deletes or retries a report, so an expired native notification remains visible
+when the sender returns. A failed backend read is explicitly unavailable,
+rather than an empty mailbox. This adds no fourth root tool or native retry.
+
+## Diagnostics observer
+
+`bridge observe [--config ABS_PATH]` is a fixed one-shot observer helper. It
+requires an explicit absolute interfaces config path and its dedicated
+`[observer].token_file`, read by the existing protected credential reader. There
+is no default operator credential, direct database access, daemon autostart or
+recovery. The daemon must separately configure an exclusive `diagnostics = true`
+grant; admin and publisher credentials are refused by this endpoint. The helper
+never provisions grants. See [configuration](../../docs/configuration.md).
+
+Stdin is exactly one UTF-8 JSON line followed by EOF, at most 16 KiB including
+newline. Unknown fields, operations, extra lines, unsupported schema versions and
+arbitrary argv fail closed. The embedding process owns the stdin/process deadline
+and must close stdin; socket I/O keeps the existing client's 10-second write and
+30-second response-phase deadlines with one safe read-only reconnect. These are
+per-phase limits, not an overall helper deadline. The native caller should invoke
+an approved fixed executable and fixed `observe` argv, never a shell or a
+caller-selected request method.
+
+```json
+{"schema_version":1,"operation":"deliveries","params":{"limit":100,"after_seq":0}}
+```
+
+Only these operations exist:
+
+| Operation | Closed parameters | Success kind and data |
+|---|---|---|
+| `identity` | `{}` | `identity`: `product`, `version`, `core_schema`, `capabilities` (the four fixed operation names) |
+| `overview` | `{}` | `bridge_overview`: existing `counts`, `retention`, `coverage` |
+| `deliveries` | optional `limit` (1..200, default 100), `after_seq` (default 0), `through_seq` | `delivery_page`: `deliveries`, `through_seq`, nullable `next_after_seq`, `coverage` |
+| `incidents` | delivery page parameters plus `include_closed` (default false) | `incident_page`: `incidents`, `through_seq`, nullable `next_after_seq`, `coverage` |
+
+Success emits exactly one compact JSON line:
+`{"schema_version":1,"kind":"delivery_page","data":{...}}`.
+Failure emits exactly one compact JSON line with no `data`:
+`{"schema_version":1,"kind":"delivery_page","error":{"code":"observer_denied","outcome":"blocked","detail":"Bridge observation could not be read"}}`.
+Malformed input without a valid operation uses kind `observation_error`. Codes
+are `invalid_input`, `unsupported_schema`, `invalid_operation`,
+`invalid_arguments`, `observer_unconfigured`, `invalid_config`,
+`invalid_credential`, `observer_denied`, `observation_rejected`,
+`bridge_unavailable`, `invalid_response` and `response_too_large`. Outcomes are
+`blocked` or `unavailable`; read-only transport loss never creates an uncertain
+mutation. `outcome_unknown` is reserved for a future contract requiring it, not
+invented as delivery evidence. Exit status is 0 on success, 2 on any structured
+failure. Raw stderr, parser input, credentials and payloads are never emitted.
+
+Retention contains `events`, `payload_compacted`, `envelope_bytes`, nullable
+`oldest_accepted_at_ms` and `newest_accepted_at_ms`. `coverage` is always
+`retained_history`; the result claims neither complete native history nor recall.
+
+Delivery rows contain `acceptance_seq`, `publisher`, `event_id`, `route_name`
+(harness product only), `custody_state`, `delivery_state`, `requested_mode`,
+nullable `attempt_seq`, `attempts_made`, `duplicate_risk`, `not_before_ms`,
+`accepted_at_ms`, nullable `expires_at_ms`, `envelope_bytes`, `payload_compacted`
+and `evidence_tiers`. Publisher plus event ID is the stable event/delivery key;
+acceptance sequence is the stable scan order. Attempt budget consumption is
+separate from immutable attempt history. Evidence tiers distinguish native
+acceptance, hook emission, receipt-token possession, context observation and
+application processing; possession or helper receipt never means comprehension.
+
+Incident rows contain only `incident_seq`, `publisher`, `event_id`, nullable
+`attempt_seq`, `state`, `created_ms`, `updated_ms`, nullable `next_check_ms` and
+`review_deadline_ms`, and `duplicate_risk`. Reasons, resolution notes, native
+assertions, raw addresses and host/session/store metadata are excluded. No
+observation selects message content, arguments, environment or receipt tokens.
+
+Both pages fix the first read's inclusive `through_seq`; continue with that
+value and `next_after_seq`. A missing next cursor ends the scan. New rows wait
+for a new scan; row states remain live within each read transaction, so restart
+to see reopened incidents. Each page is bounded by 200 rows and 64 KiB of encoded
+rows, and every complete service/helper frame, including wrappers and newline,
+is at most 1 MiB. Unicode and JSON escaping count as encoded bytes. Byte-limited
+pages advance only to the last emitted row and never skip the lookahead row.
+Reads do not update last-seen, claim attempts, settle incidents or launch models.
+
+The synthetic test suite exercises the local contract; it does not qualify any
+live installed Agent Hub, native harness or provider composition.

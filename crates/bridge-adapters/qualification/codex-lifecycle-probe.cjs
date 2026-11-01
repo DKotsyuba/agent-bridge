@@ -1045,9 +1045,8 @@ async function main(probe) {
     '[[grant]]', `token = "${admin.token}"`, 'publisher = "bridge-probe-ops"', 'admin = true',
     'recipients = []', 'kinds = []', 'modes = []', 'policies = []',
     '[adapters]', `channel = "${channel}"`, `host_id = "${host}"`,
-    '[[adapters.profiles]]', `namespace = "${namespace}"`, 'harness = "Codex"', `store = "${store}"`,
-    '[[adapters.profiles.executables]]', `path = "${codex}"`, `sha256 = "${probe.checks.codex_sha256}"`,
-    'version = "probe"', 'inject = true', 'message = true', ''].join('\n'), { mode: 0o600 });
+    '[[adapters.harnesses]]', `namespace = "${namespace}"`, 'harness = "Codex"',
+    'inject = true', 'message = true', ''].join('\n'), { mode: 0o600 });
   const daemon = probe.spawn('daemon', path.join(bin, 'bridge-native-daemon'), [config]);
   probe.checks.daemon_started = await probe.until(() => fs.existsSync(channel) && fs.existsSync(core), 10000);
   if (!probe.checks.daemon_started) throw new Error('daemon did not start');

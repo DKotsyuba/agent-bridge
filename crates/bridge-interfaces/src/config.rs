@@ -1,7 +1,7 @@
 //! Interfaces configuration and protected secret files.
 //!
 //! One closed TOML file configures every interface process: the root relay
-//! (`[root]`), the operator CLI (`[operator]`), the outbound owner channel
+//! (`[root]`), the operator CLI (`[operator]`), observer (`[observer]`), outbound owner channel
 //! (`[telegram]`) and its notification ledger (`[notify]`). Unknown keys
 //! are refused at every level. The file holds only paths and allowlists;
 //! secret values live in separate protected files ([`read_secret`]). A
@@ -48,6 +48,10 @@ pub struct InterfacesConfig {
     /// Operator CLI section; absent disables operator commands.
     #[serde(default)]
     pub operator: Option<OperatorConfig>,
+    /// Dedicated diagnostics helper credential; absent disables observation.
+    /// Never falls back to the operator or root credential.
+    #[serde(default)]
+    pub observer: Option<ObserverConfig>,
     /// Root relay section; absent means the relay refuses to start.
     #[serde(default)]
     pub root: Option<RootConfig>,
@@ -68,10 +72,22 @@ pub struct OperatorConfig {
     pub token_file: PathBuf,
 }
 
+/// `[observer]`: a protected diagnostics-only credential, separate from admin.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObserverConfig {
+    /// Absolute protected token file read with the existing secure reader.
+    pub token_file: PathBuf,
+}
+
 /// `[root]`: the restricted root relay.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RootConfig {
+    /// Opt in to five sends/five minutes and durable best-effort sender reports.
+    /// Requires the core publisher grant managed_feedback capability.
+    #[serde(default)]
+    pub bounded_delivery: bool,
     /// Relay socket path; its directory must be private (0700, owner).
     pub socket: PathBuf,
     /// Protected file holding the relay's core *publisher* grant token.
@@ -204,6 +220,9 @@ impl InterfacesConfig {
     /// follow [`TelegramConfig::check`] and [`NotifyConfig::check`]. Error
     /// texts are fixed and never quote configured values.
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(observer) = &self.observer {
+            absolute("observer.token_file", &observer.token_file)?;
+        }
         absolute("core_socket", &self.core_socket)?;
         if let Some(operator) = &self.operator {
             absolute("operator.token_file", &operator.token_file)?;
@@ -590,9 +609,9 @@ kinds = ["root.note"]
     fn caller_scope_matches_exactly() {
         let config: InterfacesConfig = toml::from_str(&sample("")).unwrap();
         let policy = &config.root.unwrap().callers[0];
-        let inside = NativeAddress::new("h", Harness::ClaudeCode, "ns", "s1").unwrap();
-        let other_store = NativeAddress::new("h", Harness::ClaudeCode, "ns2", "s1").unwrap();
-        let other_harness = NativeAddress::new("h", Harness::Codex, "ns", "s1").unwrap();
+        let inside = NativeAddress::new("h", Harness::CLAUDE_CODE, "ns", "s1").unwrap();
+        let other_store = NativeAddress::new("h", Harness::CLAUDE_CODE, "ns2", "s1").unwrap();
+        let other_harness = NativeAddress::new("h", Harness::CODEX, "ns", "s1").unwrap();
         assert!(policy.matches(&inside));
         assert!(!policy.matches(&other_store));
         assert!(!policy.matches(&other_harness));

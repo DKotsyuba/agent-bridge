@@ -41,8 +41,20 @@ const REQUIRED = ['frozen_before_producer', 'frozen_after_probe', 'network_fence
   'isolation_verified', 'inventories_ready', 'unsupported_capabilities_honest', 'native_calls_registered', 'actor_scopes_distinct',
   'custody_bound', 'native_arrival', 'no_cross_talk', 'no_unexpected_tools', 'native_hooks_clean',
   'usage_measured', 'restart_recovery_historical', 'route_close_replay', 'accepted_replay_after_close', 'own_queue_removed', 'threads_archived_cleanup'];
-/** Approved short project temporary root; no alternate system tmp is allowed. */
-const TEMP_ROOT = '/Users/pluto/projects/tmp/agent-bridge/t';
+/** Project temporary root: the absolute directory named by `TMPDIR`, which must
+ * be short enough for Unix sockets and owned by the operator. `TMP` and `TEMP`
+ * must name the same directory so no child falls back to a system temporary
+ * directory. Empty when `TMPDIR` is unset or relative.
+ */
+const TEMP_ROOT = path.isAbsolute(process.env.TMPDIR || '') ? path.resolve(process.env.TMPDIR) : '';
+
+/** Whether `TMPDIR`, `TMP` and `TEMP` all name the one configured project root.
+ * @returns {boolean} False when any is unset, relative or different.
+ */
+function tempRootConfigured() {
+  return TEMP_ROOT !== '' && [process.env.TMPDIR, process.env.TMP, process.env.TEMP]
+    .every(value => path.isAbsolute(value || '') && path.resolve(value) === TEMP_ROOT);
+}
 
 /** Copies a native child environment while dropping Desktop-only capabilities.
  * @param {NodeJS.ProcessEnv} environment Inherited root execution environment.
@@ -319,9 +331,10 @@ async function queueReadback(probe, settings, flags, thread, marker, cleanup = f
  * @param {Settings} settings Original root-native executable/store selection.
  * @param {{dir:string,checks:object}} previous Explicit old owned proof.
  * @returns {Promise<import('./probe-lib.cjs').Probe>} Supplement lifecycle result.
- * @throws {Error} Proof scope/identity or original Bridge exit facts are invalid.
+ * @throws {Error} The temporary root is unconfigured, or proof scope/identity or original Bridge exit facts are invalid.
  */
 function cleanupExisting(settings, previous) {
+  if (!tempRootConfigured()) throw new Error('one absolute project temporary root required');
   const facts = previous.checks, pairs = facts && facts.message_native_readback;
   if (!previous.dir || !previous.dir.startsWith(`${TEMP_ROOT}/`) || path.resolve(previous.dir) !== previous.dir
       || !facts || !facts.freeze || facts.freeze.candidate !== settings.frozen.candidate
@@ -570,9 +583,8 @@ async function main(probe, settings) {
     `recipients=${JSON.stringify(threads.map(thread => `${host}/codex/${namespace}/${thread}`))}`, `kinds=${JSON.stringify([kind])}`,
     'modes=["inject","message"]', 'policies=["keep_all"]', '[grant.producer_v1]', 'registration=true', 'reply_policies=["self"]',
     `native_scopes=${JSON.stringify([`${host}/codex/${namespace}`])}`, '[adapters]', `channel=${JSON.stringify(channel)}`, `host_id=${JSON.stringify(host)}`,
-    '[[adapters.profiles]]', `namespace=${JSON.stringify(namespace)}`, 'harness="Codex"', `store=${JSON.stringify(settings.codex_store)}`,
-    '[[adapters.profiles.executables]]', `path=${JSON.stringify(settings.codex_executable)}`, `sha256=${JSON.stringify(probe.sha256(settings.codex_executable))}`,
-    'version="universal-probe"', 'inject=true', 'message=true', ''].join('\n'), { mode: 0o600 });
+    '[[adapters.harnesses]]', `namespace=${JSON.stringify(namespace)}`, 'harness="Codex"',
+    'inject=true', 'message=true', ''].join('\n'), { mode: 0o600 });
   /** Starts one root-owned Bridge incarnation with the same private config.
    * @param {string} label New process/log identity.
    * @returns {import('node:child_process').ChildProcess} Owned daemon process.
@@ -583,9 +595,7 @@ async function main(probe, settings) {
   const capabilities = await exchange(channel, token.token, `capabilities-${nonce}`, 'capabilities', {});
   probe.checks.capabilities = capabilities;
   probe.checks.unsupported_capabilities_honest = capabilities.features && capabilities.features.host_observations === false
-    && Array.isArray(capabilities.native_contracts) && capabilities.native_contracts.length > 0
-    && capabilities.native_contracts.every(contract => Array.isArray(contract.paths)
-      && contract.paths.some(item => item.path === 'nested_inner_mcp' && item.supported === false));
+    && Array.isArray(capabilities.native_contracts) && capabilities.native_contracts.length === 0;
   if (!probe.checks.unsupported_capabilities_honest) throw new Error('unsupported native capability projection mismatch');
   const inventories = await Promise.all(owners.map((owner, index) => inventory(probe, owner, threads[index], tool)));
   probe.checks.inventories = inventories; probe.checks.inventories_ready = inventories.every(item => item.ready === true);
@@ -712,8 +722,8 @@ function selfTest() {
 if (require.main === module) {
   if (process.argv[2] === '--self-test') selfTest();
   else if (process.argv[2] === '--cleanup-existing') {
-    if ([process.env.TMPDIR, process.env.TMP, process.env.TEMP].some(value => value !== TEMP_ROOT)) {
-      console.error('approved project temporary root required'); process.exitCode = 2;
+    if (!tempRootConfigured()) {
+      console.error('one absolute project temporary root required: set TMPDIR, TMP and TEMP to it'); process.exitCode = 2;
     } else {
       const settings = JSON.parse(privateText(process.argv[3], 1024 * 1024));
       const previous = JSON.parse(fs.readFileSync(process.argv[4], 'utf8'));
@@ -721,8 +731,8 @@ if (require.main === module) {
     }
   }
   else if (process.env.BRIDGE_UNIVERSAL_PAID !== '1') { console.error('root model authorization required'); process.exitCode = 2; }
-  else if ([process.env.TMPDIR, process.env.TMP, process.env.TEMP].some(value => value !== TEMP_ROOT)) {
-    console.error('approved project temporary root required'); process.exitCode = 2;
+  else if (!tempRootConfigured()) {
+    console.error('one absolute project temporary root required: set TMPDIR, TMP and TEMP to it'); process.exitCode = 2;
   } else {
     const settings = JSON.parse(privateText(process.argv[2], 1024 * 1024));
     run('m2u', 15 * 60000, REQUIRED, probe => main(probe, settings));
