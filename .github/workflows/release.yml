@@ -155,7 +155,8 @@ jobs:
           gh release download "$GITHUB_REF_NAME" --pattern install.sh
           test -s "bridge-sdk-${GITHUB_REF_NAME#v}.tar.gz"
           test -s install.sh
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" > release.json
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" > releases.json
+          jq --arg tag "$GITHUB_REF_NAME" '[.[] | select(.tag_name == $tag and .draft)] | if length == 1 then .[0] else error("expected one draft") end' releases.json > release.json
           for file in agent-bridge-"${GITHUB_REF_NAME#v}"-*.tar.gz "bridge-sdk-${GITHUB_REF_NAME#v}.tar.gz" install.sh; do
             digest="$(jq -r --arg name "$file" '.assets[] | select(.name == $name) | .digest' release.json)"
             test "${#digest}" = 71
