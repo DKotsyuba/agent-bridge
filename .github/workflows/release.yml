@@ -1,0 +1,159 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  GH_REPO: ${{ github.repository }}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Check version, exact commit and successful CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          test "$GITHUB_REF_NAME" = "v$version"
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&event=push&per_page=100" > "$RUNNER_TEMP/runs.json"
+          run_id="$(jq -r '[.workflow_runs[] | select(.head_sha == env.GITHUB_SHA and .head_branch == "main" and .status == "completed" and .conclusion == "success")][0].id // empty' "$RUNNER_TEMP/runs.json")"
+          test -n "$run_id"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100" > "$RUNNER_TEMP/jobs.json"
+          jq -e '[.jobs[] | select(.conclusion == "success") | .name] as $n | ($n | any(contains("macos-15"))) and ($n | any(contains("ubuntu-24.04")))' "$RUNNER_TEMP/jobs.json" > /dev/null
+      - name: Create or resume draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - "$GITHUB_REF_NAME" > "$RUNNER_TEMP/notes.md" <<'PY'
+          import re, sys
+          version = re.escape(sys.argv[1][1:])
+          text = open('CHANGELOG.md', encoding='utf-8').read()
+          match = re.search(r'^## \[' + version + r'\][^\n]*\n(.*?)(?=^## |\Z)', text, re.M | re.S)
+          if not match or not match.group(1).strip():
+              raise SystemExit('Missing or empty release notes')
+          print(match.group(1).strip())
+          PY
+          if gh release view "$GITHUB_REF_NAME" --json isDraft -q .isDraft > "$RUNNER_TEMP/draft"; then
+            test "$(cat "$RUNNER_TEMP/draft")" = true
+          else
+            gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md"
+          fi
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux-x86_64
+            target: x86_64-linux
+          - os: macos-15
+            platform: macos-arm64
+            target: aarch64-macos
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Prepare toolchain and isolated environment
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.98.1 --profile minimal
+          cargo +1.98.1 fetch --locked
+          mkdir -p "$RUNNER_TEMP/t"
+          for name in TMPDIR TMP TEMP; do echo "$name=$RUNNER_TEMP/t" >> "$GITHUB_ENV"; done
+          node="$(command -v node)"
+          test -x "$node"
+          echo "BRIDGE_TEST_NODE=$node" >> "$GITHUB_ENV"
+      - name: Qualify isolated install and lifecycle
+        run: cargo +1.98.1 xtask qualify --prefix "$RUNNER_TEMP/t/qualification"
+      - name: Build and verify release bundle
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+          label="$(git rev-parse --short=12 HEAD)"
+          bundle="$RUNNER_TEMP/bundle"
+          cargo +1.98.1 xtask package --label "$label" --out "$bundle" > "$RUNNER_TEMP/package.json"
+          sums="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sums_sha256"])' "$RUNNER_TEMP/package.json")"
+          python3 -c 'import json,os,sys; assert json.load(open(sys.argv[1]))["manifest"]["target"] == os.environ["TARGET"]' "$RUNNER_TEMP/package.json"
+          target/release/bridge verify "$bundle" --sums-sha256 "$sums"
+          mkdir -p "$RUNNER_TEMP/final"
+          ./install.sh --bundle "$bundle" --sums-sha256 "$sums" --home "$RUNNER_TEMP/final/home" --bin-dir "$RUNNER_TEMP/final/bin"
+          "$RUNNER_TEMP/final/bin/bridge" version > "$RUNNER_TEMP/version.json"
+          python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["version"] == sys.argv[2] and v["build_label"] == sys.argv[3]' "$RUNNER_TEMP/version.json" "${GITHUB_REF_NAME#v}" "$label"
+          cp install.sh "$RUNNER_TEMP/install.sh"
+          printf '%s  bundle/SHA256SUMS\n' "$sums" > "$RUNNER_TEMP/bundle-SHA256SUMS.sha256"
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/agent-bridge-${GITHUB_REF_NAME#v}-$PLATFORM.tar.gz" bundle install.sh bundle-SHA256SUMS.sha256
+      - name: Build SDK source archive
+        if: matrix.platform == 'linux-x86_64'
+        run: python3 scripts/release-sdk.py --out "$RUNNER_TEMP/bridge-sdk-${GITHUB_REF_NAME#v}.tar.gz"
+      - name: Upload SDK and installer to draft
+        if: matrix.platform == 'linux-x86_64'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(gh release view "$GITHUB_REF_NAME" --json isDraft -q .isDraft)" = true
+          gh release upload "$GITHUB_REF_NAME" "$RUNNER_TEMP/bridge-sdk-${GITHUB_REF_NAME#v}.tar.gz" install.sh
+      - name: Upload platform archive to draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          test "$(gh release view "$GITHUB_REF_NAME" --json isDraft -q .isDraft)" = true
+          gh release upload "$GITHUB_REF_NAME" "$RUNNER_TEMP/agent-bridge-${GITHUB_REF_NAME#v}-$PLATFORM.tar.gz"
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check archives and publish draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          test "$(gh release view "$GITHUB_REF_NAME" --json isDraft -q .isDraft)" = true
+          for platform in linux-x86_64 macos-arm64; do
+            name="agent-bridge-${GITHUB_REF_NAME#v}-$platform.tar.gz"
+            gh release download "$GITHUB_REF_NAME" --pattern "$name"
+            test -s "$name"
+          done
+          gh release download "$GITHUB_REF_NAME" --pattern "bridge-sdk-${GITHUB_REF_NAME#v}.tar.gz"
+          gh release download "$GITHUB_REF_NAME" --pattern install.sh
+          test -s "bridge-sdk-${GITHUB_REF_NAME#v}.tar.gz"
+          test -s install.sh
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" > release.json
+          for file in agent-bridge-"${GITHUB_REF_NAME#v}"-*.tar.gz "bridge-sdk-${GITHUB_REF_NAME#v}.tar.gz" install.sh; do
+            digest="$(jq -r --arg name "$file" '.assets[] | select(.name == $name) | .digest' release.json)"
+            test "${#digest}" = 71
+            test "${digest:0:7}" = sha256:
+            printf '%s  %s\n' "${digest#sha256:}" "$file" >> checksums.sha256
+          done
+          sha256sum --check checksums.sha256
+          gh release upload "$GITHUB_REF_NAME" checksums.sha256
+          gh release edit "$GITHUB_REF_NAME" --draft=false

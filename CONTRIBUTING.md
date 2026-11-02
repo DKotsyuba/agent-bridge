@@ -69,6 +69,19 @@ Describe what the code does and what was actually observed; do not claim a
 qualification that was not run, and keep personal paths, session identifiers and
 logs out of the repository.
 
+## Tagged releases
+
+Update the workspace and plugin versions, lockfile, current-version examples and
+changelog together. Push the release commit to `main` and wait for its macOS and
+Linux `ci` jobs to succeed before pushing an annotated `v<version>` tag.
+The [release workflow](.github/workflows/release.yml) refuses a different version
+or a commit without those successful checks. It builds both platform bundles,
+exercises isolated install/upgrade/rollback, installs the exact final bundle,
+tests the standalone SDK source archive and publishes only after both jobs pass.
+Assets are staged in a draft and never overwritten; a partial failed upload
+requires inspecting that draft before recovery. Each platform archive contains
+the bundle, installer and digest of its own `bundle/SHA256SUMS`.
+
 ## Commits and pull requests
 
 Use [Conventional Commits](https://www.conventionalcommits.org/) such as

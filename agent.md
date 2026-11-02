@@ -10,7 +10,7 @@ process.
 Agent Bridge is a local durable message service for Codex, Claude Code and managed OpenCode
 sessions: producers publish events to an exact native address, Bridge keeps them
 in SQLite custody and delivers them through native hooks or queues, and every
-uncertain outcome is retained for a manual decision. Source version 0.5.0,
+uncertain outcome is retained for a manual decision. Source version 0.5.1,
 producer API v1, storage schema 7. macOS Apple silicon is the supported release
 platform; Linux x86_64/ARM64 are source and local-install candidates with separate
 native qualification requirements.

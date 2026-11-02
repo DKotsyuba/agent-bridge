@@ -6,6 +6,16 @@ source, and the crates are not published to crates.io.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-02
+
+### Added
+
+- A separately authorized read-only diagnostics CLI with bounded identity,
+  overview, delivery and incident reads; diagnostics cannot publish or recover work.
+- Tagged GitHub releases gated on successful macOS and Linux source checks,
+  isolated package lifecycle checks and exact-bundle installation. Standalone
+  SDK archives retain workspace dependency identities and pass their own tests.
+
 ### Changed
 
 - Accept local Linux x86_64/ARM64 bundles with the existing pre-execution
