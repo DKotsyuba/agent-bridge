@@ -33,6 +33,10 @@ jobs:
           node="$(command -v node)"
           test -x "$node"
           "$node" --version
+          if [ "$(uname -s)" = Linux ]; then
+            stat -Lc 'Node uid=%u gid=%g mode=%a mtime=%Y ctime=%Z' "$node"
+            if command -v getcap >/dev/null; then getcap "$node"; fi
+          fi
           echo "BRIDGE_TEST_NODE=$node" >> "$GITHUB_ENV"
       - name: Format
         run: cargo +1.98.1 fmt --all --check

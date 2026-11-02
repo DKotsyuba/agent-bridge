@@ -762,6 +762,44 @@ fn render(result: Result<(VerifiedCaller, Option<String>), CorrelationError>) ->
     }
 }
 
+/// Records only boolean Node-hop prerequisites for an owned synthetic caller.
+/// No environment values, paths, proofs or input payloads are returned.
+fn node_hop_diagnostics() -> Value {
+    use std::os::unix::fs::MetadataExt;
+
+    let chain = bridge_adapters::os::ancestry(std::process::id());
+    let Some(parent) = chain.get(1) else {
+        return json!({"parent_present": false});
+    };
+    let declared = bridge_adapters::os::process_env_checked(parent.pid, "CODEX_MCP_NODE_PATH");
+    let pipe = bridge_adapters::os::process_env_checked(parent.pid, "CODEX_APP_TOOLS_PIPE_PATH");
+    let metadata = parent
+        .exe
+        .as_ref()
+        .and_then(|path| std::fs::metadata(path).ok());
+    let named = declared
+        .as_ref()
+        .ok()
+        .and_then(|value| value.as_ref())
+        .and_then(|path| Path::new(path).canonicalize().ok());
+    let executable = parent
+        .exe
+        .as_ref()
+        .and_then(|path| path.canonicalize().ok());
+    json!({
+        "parent_present": true,
+        "parent_uid_matches": parent.uid == chain.first().and_then(|facts| facts.uid),
+        "executable_owner_trusted": metadata.as_ref().is_some_and(|m| m.uid() == 0 || Some(m.uid()) == parent.uid),
+        "executable_not_writable": metadata.as_ref().is_some_and(|m| m.mode() & 0o022 == 0),
+        "executable_older_than_process": metadata.as_ref().is_some_and(|m| i128::from(m.mtime().max(m.ctime())) < i128::from(parent.start_time)),
+        "environment_readable": declared.is_ok() && pipe.is_ok(),
+        "declared_runtime_matches": named.is_some() && named == executable,
+        "pipe_present": pipe.is_ok_and(|value| value.is_some()),
+        "child_parent_stamp_matches": bridge_adapters::os::process_env(std::process::id(), "BRIDGE_DESKTOP_PARENT_PID")
+            .is_some_and(|value| value.to_str() == Some(parent.pid.to_string().as_str())),
+    })
+}
+
 /// The MCP-server stand-in (a harness-launched frontend): attest native
 /// `_meta` (or a `bridge_call_token` hook token) from stdin through the
 /// registry, optionally sealing, and print.
@@ -791,7 +829,12 @@ fn mcp(socket: &str, seal: bool) {
             attestor.attest(&meta, now).map(|caller| (caller, None))
         }
     });
-    println!("{}", render(result));
+    let failed = result.is_err();
+    let mut rendered = render(result);
+    if failed {
+        rendered["node_hop_diagnostics"] = node_hop_diagnostics();
+    }
+    println!("{rendered}");
 }
 
 /// The relay stand-in (not a harness descendant): redeem a sealed proof
