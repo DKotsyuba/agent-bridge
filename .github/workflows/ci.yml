@@ -32,11 +32,14 @@ jobs:
         run: |
           node="$(command -v node)"
           test -x "$node"
-          "$node" --version
           if [ "$(uname -s)" = Linux ]; then
             stat -Lc 'Node uid=%u gid=%g mode=%a mtime=%Y ctime=%Z' "$node"
-            if command -v getcap >/dev/null; then getcap "$node"; fi
+            # The image's shared Node may be world-writable. Prepare an owned
+            # synthetic runtime before testing the unchanged executable gate.
+            install -m 700 "$node" "$RUNNER_TEMP/t/node"
+            node="$RUNNER_TEMP/t/node"
           fi
+          "$node" --version
           echo "BRIDGE_TEST_NODE=$node" >> "$GITHUB_ENV"
       - name: Format
         run: cargo +1.98.1 fmt --all --check
