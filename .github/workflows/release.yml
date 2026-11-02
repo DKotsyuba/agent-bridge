@@ -27,11 +27,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          commit="$(git rev-parse HEAD)"
+          test "$(git rev-parse "$GITHUB_SHA^{commit}")" = "$commit"
           version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
           test "$GITHUB_REF_NAME" = "v$version"
-          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&event=push&per_page=100" > "$RUNNER_TEMP/runs.json"
-          run_id="$(jq -r '[.workflow_runs[] | select(.head_sha == env.GITHUB_SHA and .head_branch == "main" and .status == "completed" and .conclusion == "success")][0].id // empty' "$RUNNER_TEMP/runs.json")"
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$commit&event=push&per_page=100" > "$RUNNER_TEMP/runs.json"
+          run_id="$(jq -r --arg commit "$commit" '[.workflow_runs[] | select(.head_sha == $commit and .head_branch == "main" and .status == "completed" and .conclusion == "success")][0].id // empty' "$RUNNER_TEMP/runs.json")"
           test -n "$run_id"
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100" > "$RUNNER_TEMP/jobs.json"
           jq -e '[.jobs[] | select(.conclusion == "success") | .name] as $n | ($n | any(contains("macos-15"))) and ($n | any(contains("ubuntu-24.04")))' "$RUNNER_TEMP/jobs.json" > /dev/null
