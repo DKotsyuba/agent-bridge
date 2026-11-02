@@ -9,3 +9,5 @@ Full guide: [agent.md](agent.md). Process: [CONTRIBUTING.md](CONTRIBUTING.md).
 - Document every declaration; add no dependencies; tests use synthetic state only (no real sessions, models or network); native probes are manual and out of CI.
 - The owner approved Linux-only `listenfd =1.0.2` for safe inherited socket ownership; keep its use at single-threaded frontend startup and retain kernel parent/UID checks. Other new dependencies still require review.
 - Keep docs public: relative links, no personal paths or private identifiers.
+
+- The owner approved Linux-only `tungstenite =0.30.0` with handshake only for the protected live Codex App Server route; no TLS features or new network listeners. Keep exact peer/incarnation and registry fences. Other new dependencies still require review.

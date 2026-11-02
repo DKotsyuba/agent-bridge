@@ -1,0 +1,665 @@
+//! Linux App Server transport for an already attested Codex process.
+//!
+//! The sole mutating request is never retried: after its write begins an
+//! uncorrelated or malformed response is an unknown outcome.
+
+use std::fs;
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use bridge_core::Mode;
+use bridge_core::dispatch::Outcome;
+use bridge_core::service::current_unix_millis;
+use serde_json::{Value, json};
+use tungstenite::{Message, WebSocket, client::client_with_config, protocol::WebSocketConfig};
+
+use crate::os;
+use crate::registry::RecipientBinding;
+
+/// Maximum assembled frame or message size in bytes.
+const LIMIT: usize = 1 << 20;
+
+/// A socket path and frozen process incarnation selected by discovery.
+#[derive(Clone)]
+pub(crate) struct Endpoint {
+    /// Canonical, protected socket path.
+    path: PathBuf,
+    /// Process and session facts captured by recipient validation.
+    binding: RecipientBinding,
+    /// Local process owner required of the socket peer.
+    uid: u32,
+}
+
+/// The native thread states in which a message can be considered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum State {
+    /// The native thread is idle.
+    Idle,
+    /// The thread is active without a pending user interaction.
+    Active,
+}
+
+/// Validates an owned private directory without following its final symlink.
+fn private_directory(path: &Path, uid: u32) -> Result<(), String> {
+    let m = fs::symlink_metadata(path).map_err(|_| "native control directory unavailable")?;
+    if !m.is_dir() || m.uid() != uid || m.mode() & 0o077 != 0 {
+        return Err("native control directory is not private and owned".into());
+    }
+    if fs::canonicalize(path).map_err(|_| "native control directory unresolved")? != path {
+        return Err("native control directory is not canonical".into());
+    }
+    Ok(())
+}
+
+/// Finds only the recipient's own control socket; malformed presence is an error.
+pub(crate) fn locate(binding: &RecipientBinding) -> Result<Option<Endpoint>, String> {
+    let uid = os::process_facts(std::process::id())
+        .and_then(|f| f.uid)
+        .ok_or("process owner unavailable")?;
+    let store = fs::canonicalize(&binding.store).map_err(|_| "recipient store unavailable")?;
+    let dir = store.join("app-server-control");
+    match fs::symlink_metadata(&dir) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("native control directory unavailable".into()),
+        Ok(_) => private_directory(&dir, uid)?,
+    }
+    let source = dir.join("app-server-control.sock");
+    let meta = match fs::symlink_metadata(&source) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("native control socket unavailable".into()),
+        Ok(m) => m,
+    };
+    if meta.uid() != uid || !(meta.file_type().is_socket() || meta.file_type().is_symlink()) {
+        return Err("native control socket has invalid ownership or type".into());
+    }
+    let path = fs::canonicalize(&source).map_err(|_| "native control socket unresolved")?;
+    let parent = path.parent().ok_or("native control socket has no parent")?;
+    private_directory(parent, uid)?;
+    let target = fs::symlink_metadata(&path).map_err(|_| "native control socket unavailable")?;
+    if !target.file_type().is_socket() || target.uid() != uid || target.mode() & 0o777 != 0o600 {
+        return Err("native control socket is not owned mode 0600".into());
+    }
+    let endpoint = Endpoint {
+        path,
+        binding: binding.clone(),
+        uid,
+    };
+    let stream = os::connect_unix(&endpoint.path, Instant::now() + Duration::from_secs(3))
+        .map_err(|_| "native control socket connection failed")?;
+    endpoint.verify_peer(&stream)?;
+    Ok(Some(endpoint))
+}
+
+impl Endpoint {
+    /// Checks the kernel peer and its frozen process incarnation.
+    fn verify_peer(&self, stream: &UnixStream) -> Result<(), String> {
+        let peer = os::peer_identity(stream).map_err(|_| "native control peer unavailable")?;
+        let facts =
+            os::process_facts(self.binding.harness.0).ok_or("native process unavailable")?;
+        if peer.pid != self.binding.harness.0
+            || peer.uid != self.uid
+            || facts.uid != Some(self.uid)
+            || facts.start_time != self.binding.harness.1
+            || facts.exe.as_deref() != Some(self.binding.executable.as_path())
+        {
+            return Err("native control peer incarnation changed".into());
+        }
+        Ok(())
+    }
+
+    /// Reads metadata only, under one connection and exchange timeout.
+    pub(crate) fn state(&self, thread: &str, timeout: Duration) -> Result<State, String> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or("invalid timeout")?;
+        let mut ws = self.open(deadline)?;
+        read_state(&mut ws, thread).map_err(|_| "native thread state unavailable".into())
+    }
+
+    /// Opens and initializes a deadline-bound WebSocket to the verified peer.
+    fn open(&self, deadline: Instant) -> Result<WebSocket<DeadlineStream>, String> {
+        let stream = os::connect_unix(&self.path, deadline).map_err(|_| "native connect failed")?;
+        self.verify_peer(&stream)?;
+        let config = WebSocketConfig::default()
+            .max_message_size(Some(LIMIT))
+            .max_frame_size(Some(LIMIT))
+            .write_buffer_size(0)
+            .max_write_buffer_size(LIMIT + 1024);
+        let (mut ws, _) = client_with_config(
+            "ws://localhost/",
+            DeadlineStream { stream, deadline },
+            Some(config),
+        )
+        .map_err(|_| "native WebSocket handshake failed")?;
+        request(
+            &mut ws,
+            json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"agent_bridge_live","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}}),
+        )?;
+        let reply = response(&mut ws, 1)?;
+        if !reply.get("result").is_some_and(Value::is_object) || reply.get("error").is_some() {
+            return Err("native initialization refused".into());
+        }
+        request(&mut ws, json!({"method":"initialized","params":{}}))?;
+        Ok(ws)
+    }
+}
+
+/// Stream wrapper that reapplies the remaining absolute deadline to each syscall.
+struct DeadlineStream {
+    /// Connected kernel socket.
+    stream: UnixStream,
+    /// Absolute monotonic I/O deadline.
+    deadline: Instant,
+}
+impl DeadlineStream {
+    /// Returns a positive remaining time or a timeout error.
+    fn remaining(&self) -> io::Result<Duration> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            Err(io::ErrorKind::TimedOut.into())
+        } else {
+            Ok(remaining)
+        }
+    }
+}
+impl Read for DeadlineStream {
+    /// Reads without allowing successive calls to extend the deadline.
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.remaining()?))?;
+        self.stream.read(buf)
+    }
+}
+impl Write for DeadlineStream {
+    /// Writes without allowing successive calls to extend the deadline.
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        self.stream.write(buf)
+    }
+    /// Flushes the underlying stream within the remaining deadline.
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        self.stream.flush()
+    }
+}
+
+/// Writes a bounded JSON message, withholding native payloads from errors.
+fn request(ws: &mut WebSocket<DeadlineStream>, value: Value) -> Result<(), String> {
+    let text = value.to_string();
+    if text.len() > LIMIT {
+        return Err("native request exceeds limit".into());
+    }
+    ws.send(Message::Text(text.into()))
+        .map_err(|_| "native request failed".into())
+}
+
+/// Waits for one exact response, ignoring notifications but refusing requests.
+fn response(ws: &mut WebSocket<DeadlineStream>, id: u64) -> Result<Value, String> {
+    loop {
+        if Instant::now() >= ws.get_ref().deadline {
+            return Err("native response timed out".into());
+        }
+        match ws.read().map_err(|_| "native response unavailable")? {
+            Message::Text(text) => {
+                let v: Value =
+                    serde_json::from_str(&text).map_err(|_| "malformed native response")?;
+                if v.get("method").is_some() {
+                    if v.get("id").is_some() {
+                        return Err("native server requested input".into());
+                    }
+                    continue;
+                }
+                if v.get("id").and_then(Value::as_u64) != Some(id) {
+                    return Err("native response id mismatch".into());
+                }
+                return Ok(v);
+            }
+            Message::Ping(_) | Message::Pong(_) => continue,
+            _ => return Err("unexpected native frame".into()),
+        }
+    }
+}
+
+/// Separates a lifecycle hold from other failures before the handoff.
+enum StateError {
+    /// The native lifecycle requires holding the message.
+    Lifecycle,
+    /// Preflight failed before a trustworthy lifecycle was obtained.
+    Other,
+}
+
+/// Reads the requested thread's native lifecycle, rejecting pending interaction.
+fn read_state(ws: &mut WebSocket<DeadlineStream>, thread: &str) -> Result<State, StateError> {
+    request(
+        ws,
+        json!({"id":2,"method":"thread/read","params":{"threadId":thread,"includeTurns":false}}),
+    )
+    .map_err(|_| StateError::Other)?;
+    let result = response(ws, 2).map_err(|_| StateError::Other)?;
+    if result.get("error").is_some()
+        || result.pointer("/result/thread/id").and_then(Value::as_str) != Some(thread)
+    {
+        return Err(StateError::Other);
+    }
+    let status = &result["result"]["thread"]["status"];
+    match status.get("type").and_then(Value::as_str) {
+        Some("idle")
+            if status
+                .get("activeFlags")
+                .is_none_or(|flags| flags.as_array().is_some_and(Vec::is_empty)) =>
+        {
+            Ok(State::Idle)
+        }
+        Some("active")
+            if status
+                .get("activeFlags")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty) =>
+        {
+            Ok(State::Active)
+        }
+        _ => Err(StateError::Lifecycle),
+    }
+}
+
+/// Frozen message and the absolute core deadline in Unix milliseconds.
+pub(crate) struct Handoff<'a> {
+    /// Native thread identifier.
+    pub thread: &'a str,
+    /// Frozen client message identifier.
+    pub client_id: &'a str,
+    /// Frozen message text.
+    pub text: &'a str,
+    /// Requested dispatch mode.
+    pub mode: Mode,
+    /// Absolute core deadline in Unix milliseconds.
+    pub deadline_ms: u64,
+    /// Maximum duration of this exchange.
+    pub timeout: Duration,
+}
+
+/// Performs one handoff; the final fence runs immediately before the first write.
+pub(crate) fn deliver(
+    endpoint: &Endpoint,
+    handoff: &Handoff<'_>,
+    final_check: impl FnOnce() -> Result<(), String>,
+) -> Outcome {
+    let budget = Duration::from_millis(handoff.deadline_ms.saturating_sub(current_unix_millis()))
+        .min(handoff.timeout);
+    let Some(deadline) = Instant::now().checked_add(budget) else {
+        return Outcome::KnownUnsent {
+            evidence: "invalid native deadline; nothing sent".into(),
+        };
+    };
+    let mut ws = match endpoint.open(deadline) {
+        Ok(ws) => ws,
+        Err(_) => {
+            return Outcome::KnownUnsent {
+                evidence: "native connection failed before handoff".into(),
+            };
+        }
+    };
+    match read_state(&mut ws, handoff.thread) {
+        Ok(State::Idle) => {}
+        Ok(State::Active) if handoff.mode == Mode::Message => {}
+        Ok(State::Active) | Err(StateError::Lifecycle) => {
+            return Outcome::DeferredKnownUnsent {
+                evidence: "native lifecycle unavailable or changed before handoff".into(),
+            };
+        }
+        Err(StateError::Other) => {
+            return Outcome::KnownUnsent {
+                evidence: "native thread read failed before handoff".into(),
+            };
+        }
+    }
+    let payload = json!({"id":3,"method":"turn/start","params":{"threadId":handoff.thread,"clientUserMessageId":handoff.client_id,"input":[{"type":"text","text":handoff.text}]}}).to_string();
+    if payload.len() > LIMIT || Instant::now() >= deadline {
+        return Outcome::KnownUnsent {
+            evidence: "native handoff exceeded its limit before writing".into(),
+        };
+    }
+    if endpoint.verify_peer(&ws.get_ref().stream).is_err()
+        || final_check().is_err()
+        || Instant::now() >= deadline
+    {
+        return Outcome::DeferredKnownUnsent {
+            evidence: "native recipient changed before handoff; nothing sent".into(),
+        };
+    }
+    if ws.send(Message::Text(payload.into())).is_err() {
+        return Outcome::OutcomeUnknown {
+            reason: "native handoff write began without a receipt".into(),
+        };
+    }
+    match response(&mut ws, 3) {
+        Ok(value) if valid_turn(&value) => Outcome::NativeAccepted {
+            evidence: "native turn/start accepted a turn (not processing confirmation)".into(),
+        },
+        _ => Outcome::OutcomeUnknown {
+            reason: "native handoff has no valid correlated receipt".into(),
+        },
+    }
+}
+
+/// Checks the correlated receipt identity/status and bounded opaque item metadata.
+fn valid_turn(value: &Value) -> bool {
+    if value.get("error").is_some() {
+        return false;
+    }
+    let t = &value["result"]["turn"];
+    t.get("id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control))
+        && matches!(
+            t.get("status").and_then(Value::as_str),
+            Some("completed" | "interrupted" | "failed" | "inProgress")
+        )
+        && t.get("items")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().all(valid_item))
+        && t.get("error").is_none_or(Value::is_null)
+        && ["completedAt", "durationMs", "startedAt"]
+            .iter()
+            .all(|key| {
+                t.get(key)
+                    .is_none_or(|v| v.is_null() || v.as_i64().is_some())
+            })
+        && t.get("rootTurnId")
+            .is_none_or(|v| v.is_null() || v.is_string())
+        && t.get("itemsView")
+            .is_none_or(|v| matches!(v.as_str(), Some("notLoaded" | "summary" | "full")))
+}
+
+/// Checks bounded display-item identities without interpreting their payloads.
+/// The exact RPC response's turn identity/status establish native acceptance;
+/// unrelated tool output, messages and other display fields grant no authority.
+fn valid_item(item: &Value) -> bool {
+    ["id", "type"].iter().all(|key| {
+        item.get(key).and_then(Value::as_str).is_some_and(|value| {
+            !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+        })
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    //! Synthetic native socket exchanges, without a real Codex process.
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread;
+
+    /// Unique fixture suffix within the test process.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    /// Creates a private socket with this test process as the attested peer.
+    fn fixture() -> (PathBuf, UnixListener, RecipientBinding) {
+        let dir = std::env::temp_dir().join(format!(
+            "live-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let control = dir.join("app-server-control");
+        fs::create_dir(&control).unwrap();
+        fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).unwrap();
+        let target_dir = std::env::temp_dir()
+            .parent()
+            .unwrap()
+            .join(dir.file_name().unwrap());
+        fs::create_dir(&target_dir).unwrap();
+        fs::set_permissions(&target_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = target_dir.join("s");
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(socket, control.join("app-server-control.sock")).unwrap();
+        let facts = os::process_facts(std::process::id()).unwrap();
+        let binding = RecipientBinding {
+            harness: (facts.pid, facts.start_time),
+            epoch: 1,
+            store: dir.clone(),
+            executable: facts.exe.unwrap(),
+            transcript: None,
+            desktop_message_only: false,
+            gateway: false,
+        };
+        (dir, listener, binding)
+    }
+
+    /// Runs one scripted protocol exchange and returns whether a mutation arrived.
+    fn exchange(status: Value, reply: Option<Value>, fence: bool, mode: Mode) -> (Outcome, bool) {
+        exchange_thread(status, reply, fence, mode, "thread-1")
+    }
+
+    /// Exchanges with a chosen thread ID in the preflight response.
+    fn exchange_thread(
+        status: Value,
+        reply: Option<Value>,
+        fence: bool,
+        mode: Mode,
+        returned_thread: &'static str,
+    ) -> (Outcome, bool) {
+        let (dir, listener, binding) = fixture();
+        let worker = thread::spawn(move || {
+            drop(listener.accept().unwrap().0); // discovery peer verification
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let init = ws.read().unwrap();
+            assert!(init.to_text().unwrap().contains("initialize"));
+            ws.send(Message::Text(
+                json!({"id":1,"result":{}}).to_string().into(),
+            ))
+            .unwrap();
+            let _initialized = ws.read().unwrap();
+            let read = ws.read().unwrap();
+            assert!(read.to_text().unwrap().contains("thread/read"));
+            ws.send(Message::Text(
+                json!({"id":2,"result":{"thread":{"id":returned_thread,"status":status}}})
+                    .to_string()
+                    .into(),
+            ))
+            .unwrap();
+            match ws.read() {
+                Ok(Message::Text(text)) if text.contains("turn/start") => {
+                    if let Some(reply) = reply {
+                        ws.send(Message::Text(reply.to_string().into())).unwrap();
+                    }
+                    true
+                }
+                _ => false,
+            }
+        });
+        let endpoint = locate(&binding).unwrap().unwrap();
+        let handoff = Handoff {
+            thread: "thread-1",
+            client_id: "client-1",
+            text: "hello",
+            mode,
+            deadline_ms: current_unix_millis() + 3000,
+            timeout: Duration::from_secs(3),
+        };
+        let outcome = deliver(&endpoint, &handoff, || {
+            if fence { Ok(()) } else { Err("changed".into()) }
+        });
+        let wrote = worker.join().unwrap();
+        let target_dir = std::env::temp_dir()
+            .parent()
+            .unwrap()
+            .join(dir.file_name().unwrap());
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(target_dir).unwrap();
+        (outcome, wrote)
+    }
+
+    /// A correlated valid turn accepts; changed lifecycle or fence sends nothing.
+    #[test]
+    fn native_handoff_classifies_receipts_and_fences() {
+        let valid =
+            json!({"id":3,"result":{"turn":{"id":"turn-1","items":[],"status":"inProgress"}}});
+        let (result, wrote) = exchange(
+            json!({"type":"idle"}),
+            Some(valid.clone()),
+            true,
+            Mode::Auto,
+        );
+        assert!(wrote && matches!(result, Outcome::NativeAccepted { .. }));
+        let (result, wrote) = exchange(
+            json!({"type":"active","activeFlags":[]}),
+            Some(
+                json!({"id":3,"result":{"turn":{"id":"turn-1","items":[{"id":"item-1","type":"mcpToolCall","tool":"fixture","result":{"content":[]}}],"status":"inProgress"}}}),
+            ),
+            true,
+            Mode::Message,
+        );
+        assert!(wrote && matches!(result, Outcome::NativeAccepted { .. }));
+        let (result, wrote) = exchange_thread(
+            json!({"type":"idle"}),
+            None,
+            true,
+            Mode::Message,
+            "other-thread",
+        );
+        assert!(!wrote && matches!(result, Outcome::KnownUnsent { .. }));
+        for reply in [
+            json!({"id":3,"error":{"code":-1,"message":"no"}}),
+            json!({"id":3,"result":{"turn":{"id":"turn-1","items":[{"type":"agentMessage"}],"status":"inProgress"}}}),
+        ] {
+            let (result, wrote) =
+                exchange(json!({"type":"idle"}), Some(reply), true, Mode::Message);
+            assert!(wrote && matches!(result, Outcome::OutcomeUnknown { .. }));
+        }
+        let (result, wrote) = exchange(
+            json!({"type":"active","activeFlags":[]}),
+            Some(valid),
+            true,
+            Mode::Auto,
+        );
+        assert!(!wrote && matches!(result, Outcome::DeferredKnownUnsent { .. }));
+        let (result, wrote) = exchange(
+            json!({"type":"active","activeFlags":["waitingOnApproval"]}),
+            None,
+            true,
+            Mode::Message,
+        );
+        assert!(!wrote && matches!(result, Outcome::DeferredKnownUnsent { .. }));
+        let (result, wrote) = exchange(json!({"type":"idle"}), None, false, Mode::Message);
+        assert!(!wrote && matches!(result, Outcome::DeferredKnownUnsent { .. }));
+        let (result, wrote) = exchange(json!({"type":"idle"}), None, true, Mode::Message);
+        assert!(wrote && matches!(result, Outcome::OutcomeUnknown { .. }));
+        let (result, wrote) = exchange(
+            json!({"type":"idle"}),
+            Some(
+                json!({"id":4,"result":{"turn":{"id":"turn-1","items":[],"status":"inProgress"}}}),
+            ),
+            true,
+            Mode::Message,
+        );
+        assert!(wrote && matches!(result, Outcome::OutcomeUnknown { .. }));
+    }
+
+    /// A recipient that starts waiting after eligibility is deferred without a mutation.
+    #[test]
+    fn lifecycle_changes_after_idle_probe_are_deferred() {
+        let (dir, listener, binding) = fixture();
+        let worker = thread::spawn(move || {
+            drop(listener.accept().unwrap().0); // discovery peer verification
+            let mut mutations = 0;
+            for status in [
+                json!({"type":"idle"}),
+                json!({"type":"active","activeFlags":["waitingOnApproval"]}),
+            ] {
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut ws = tungstenite::accept(stream).unwrap();
+                let init = ws.read().unwrap();
+                assert!(init.to_text().unwrap().contains("initialize"));
+                ws.send(Message::Text(
+                    json!({"id":1,"result":{}}).to_string().into(),
+                ))
+                .unwrap();
+                let _initialized = ws.read().unwrap();
+                let read = ws.read().unwrap();
+                assert!(read.to_text().unwrap().contains("thread/read"));
+                ws.send(Message::Text(
+                    json!({"id":2,"result":{"thread":{"id":"thread-1","status":status}}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+                if matches!(ws.read(), Ok(Message::Text(text)) if text.contains("turn/start")) {
+                    mutations += 1;
+                }
+            }
+            mutations
+        });
+        let endpoint = locate(&binding).unwrap().unwrap();
+        let initial = endpoint.state("thread-1", Duration::from_secs(3)).unwrap();
+        let handoff = Handoff {
+            thread: "thread-1",
+            client_id: "client-1",
+            text: "hello",
+            mode: Mode::Auto,
+            deadline_ms: current_unix_millis() + 3000,
+            timeout: Duration::from_secs(3),
+        };
+        let outcome = deliver(&endpoint, &handoff, || Ok(()));
+        let mutations = worker.join().unwrap();
+        let target_dir = std::env::temp_dir()
+            .parent()
+            .unwrap()
+            .join(dir.file_name().unwrap());
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(target_dir).unwrap();
+        assert_eq!(initial, State::Idle);
+        assert!(matches!(outcome, Outcome::DeferredKnownUnsent { .. }));
+        assert_eq!(mutations, 0);
+    }
+
+    /// An incorrect frozen incarnation cannot select an otherwise owned socket.
+    #[test]
+    fn rejects_wrong_peer_incarnation() {
+        let (dir, listener, mut binding) = fixture();
+        binding.harness.1 += 1;
+        assert!(locate(&binding).is_err());
+        drop(listener);
+        let target_dir = std::env::temp_dir()
+            .parent()
+            .unwrap()
+            .join(dir.file_name().unwrap());
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(target_dir).unwrap();
+    }
+    /// A live process with matching UID and incarnation cannot impersonate the socket peer.
+    #[test]
+    fn rejects_wrong_kernel_peer_pid() {
+        let (dir, listener, mut binding) = fixture();
+        let mut child = std::process::Command::new("/usr/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let facts = os::process_facts(child.id()).unwrap();
+        binding.harness = (facts.pid, facts.start_time);
+        binding.executable = facts.exe.unwrap();
+        let refused = locate(&binding).is_err();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        drop(listener);
+        let target_dir = std::env::temp_dir()
+            .parent()
+            .unwrap()
+            .join(dir.file_name().unwrap());
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(target_dir).unwrap();
+        assert!(refused);
+    }
+}

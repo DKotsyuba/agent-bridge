@@ -538,6 +538,13 @@ fn root_hook_drains_manifest_first_and_children_never_drain() {
         "{context}"
     );
     assert!(context.contains(PUBLISHER));
+    // The hook can read the flushed bytes before the server persists its
+    // post-write outcome. Wait for that positive receipt, not scheduling luck.
+    assert!(eventually(10_000, || lab
+        .attempt("evt-inject")
+        .is_some_and(
+            |attempt| attempt.state == AttemptState::HookSubmitted
+        )));
     let attempt = lab.attempt("evt-inject").unwrap();
     assert_eq!(attempt.state, AttemptState::HookSubmitted);
     assert_eq!(

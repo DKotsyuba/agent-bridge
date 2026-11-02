@@ -487,6 +487,16 @@ mod tests {
         assert!(name.exists(), "a live endpoint is never replaced");
         drop(live);
         assert!(name.exists(), "the dead socket file is left behind");
+        // A concurrent spawn can briefly inherit the listener before exec
+        // closes CLOEXEC descriptors. Prove kernel refusal before reclaiming.
+        let dead_deadline = Instant::now() + Duration::from_secs(5);
+        while !dead_socket(&name) {
+            assert!(
+                Instant::now() < dead_deadline,
+                "fixture socket did not become dead"
+            );
+            std::thread::yield_now();
+        }
         let open = Arc::new(AtomicBool::new(true));
         let flag = Arc::clone(&open);
         let relay =

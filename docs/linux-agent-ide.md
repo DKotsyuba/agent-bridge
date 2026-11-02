@@ -242,10 +242,17 @@ parent check. Although the actual SDK has `ctx.session.prompt`, this bundle does
 not treat a same-process socket as a parent or claim a built-in OpenCode owner.
 Without a real Tool Test owner, automatic wake is unavailable.
 
-On Linux a missing confinement launcher disables only Codex's legacy queue helper;
-a positively verified owner remains eligible. No owner plus no confinement holds
-before any native attempt. Missing/malformed/stale owner evidence never falls back.
-Do not create a fake `sandbox-exec` or substitute an unconfining executable.
+On Linux a missing confinement launcher disables only Codex's legacy queue helper.
+A positively verified owner remains eligible. Managed Codex can also use its
+protected live App Server control socket as described in the
+[adapter delivery paths](../crates/bridge-adapters/README.md#delivery-paths).
+Its kernel peer must be the exact attested harness, not an invented parent.
+The route sends one native `turn/start`; it holds on unloaded, waiting or unknown
+state and records acceptance separately from model processing. Explicit MESSAGE
+uses native idle or active input semantics; it does not claim an atomic idle-only
+owner receipt. No qualified route holds before any native attempt. A present
+malformed or stale owner locator never falls back. Do not create a fake
+`sandbox-exec` or substitute an unconfining executable.
 
 Tool Test must retain, for each real host, the exact bundle/source/config hashes,
 genuine MCP metadata and corresponding lifecycle identity, one accepted IDE job,

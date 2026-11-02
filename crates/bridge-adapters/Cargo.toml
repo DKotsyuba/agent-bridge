@@ -21,6 +21,7 @@ toml = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 listenfd.workspace = true
+tungstenite.workspace = true
 
 [dev-dependencies]
 # The crate's own fixture feature for its tests only: integration tests build

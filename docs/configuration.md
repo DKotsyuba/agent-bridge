@@ -237,6 +237,20 @@ owner running a trusted, unchanged executable) until you delete the table. Prefe
 replacing the legacy entries with one `[[adapters.harnesses]]` entry per harness. Note that a
 policy now applies to every build of the harness, not only to the digests you listed.
 
+### Managed Linux Codex App Server
+
+No new configuration field is needed for a managed live Codex daemon exposing
+`<native-store>/app-server-control/app-server-control.sock`. Bridge verifies its
+protected path and exact kernel peer PID/UID/process incarnation, reads metadata
+for the exact recipient thread and delivers MESSAGE through one native
+`turn/start`. The socket must be owned mode `0600` inside a private owned
+canonical directory; the owned control-directory link is resolved and checked.
+Unloaded, waiting and unknown states hold; no private session store is resumed
+by this route. An explicit native owner locator still takes precedence and
+cannot fall back if its proof fails. See the
+[adapter contract](../crates/bridge-adapters/README.md#delivery-paths) for fences,
+AUTO's non-atomic idle check and conservative uncertain-outcome handling.
+
 ### Native owner route
 
 A supervisor that launched and owns a live Codex, Claude Code or OpenCode process may publish a

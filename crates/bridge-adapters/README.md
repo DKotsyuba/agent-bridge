@@ -20,7 +20,7 @@ touched by anything here, and nothing in this crate installs a hook for you.
 | `bridge-hook` | the harness hook command; forwards one hook event, prints Bridge context only when handed one, always exits 0 |
 | `registry` | harness incarnations, endpoint epochs, owner lifecycle, single-use call records, root-caller ABI |
 | `server` / `client` | the private adapter channel and its clients (`RegistryAttestor`) |
-| `codex` | `message` via one `thread/queue/add` in an OS-confined queue-only App Server helper |
+| `codex` | `message` through a protected live Linux App Server, application frontend, native owner or confined CLI queue helper |
 | `claude` | `message` via the authenticated native peer send with `priority = "later"` |
 | `owner_only` / `plugins/opencode` | message-only `<harness>_input` via the exact native owner, for OpenCode and every profile-only harness; OpenCode plugin lifecycle observations, no OpenCode inject/context path |
 
@@ -183,6 +183,25 @@ touched by anything here, and nothing in this crate installs a hook for you.
   or malformed is refused before any write. A positive native success
   is acceptance only. Any failure after the message request starts is unknown,
   retained and never followed by a second ordinary-queue send.
+- **Managed Linux Codex message**: for an ordinary live binding, the native
+  control socket under `<store>/app-server-control/` may point to the actual
+  private daemon socket. Both directories and socket ownership are checked;
+  the connected kernel peer must be the binding's exact PID, UID and process
+  birth, with its unchanged executable and canonical store revalidated.
+  Read-only `thread/read` must return this exact thread ID in a loaded idle or
+  active state without approval/input flags. The sole mutation is `turn/start`
+  carrying the frozen manifest and a correlation ID, with no model, permission
+  or configuration overrides. Explicit MESSAGE uses the native API's idle or
+  active input semantics. AUTO requires idle registry and native observations;
+  the API has no atomic idle-only precondition, so this is not the native
+  owner's strict `wake_only` contract. Unknown, unloaded and waiting states
+  hold. A final binding/epoch/lifecycle fence runs immediately before writing.
+  Once that write begins, a missing or invalid correlated receipt is unknown;
+  no retry, route fallback or second mutation is made. A valid turn receipt
+  proves native acceptance only. Display items in the receipt grant no further
+  authority and their payloads are never interpreted or logged. This route
+  follows an explicitly configured owner and application routing; malformed
+  present evidence cannot select a helper fallback.
 - **Codex CLI message**: `sandbox-exec -p '(version 1)(allow default)(deny
   network*)(deny process-fork)' <the binding's Codex executable> app-server --listen
   stdio://` with a scrubbed environment and `CODEX_HOME` = the attested store;
@@ -198,7 +217,8 @@ touched by anything here, and nothing in this crate installs a hook for you.
   no queue effect. Queue acceptance is storage,
   not delivery; `clientUserMessageId` never deduplicates. Without the launcher
   this helper route is unavailable. A separately verified native owner or application
-  route remains eligible; no owner plus no confinement holds without a native attempt.
+  or protected live App Server route remains eligible. Without any qualified
+  native route, the event is held before a native attempt.
 - **Claude message**: the descriptor in `<store>/sessions` must name the
   session *and* the attested harness PID (the per-process
   `sessions/<pid>.json` that 2.1.296 writes is read directly; only when it

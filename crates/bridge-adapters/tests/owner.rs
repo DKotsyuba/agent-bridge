@@ -829,7 +829,11 @@ fn unreadable_environment_is_not_positive_absence() {
             .is_none()
     );
     let me = bridge_adapters::os::process_facts(std::process::id()).unwrap();
-    if me.uid != Some(0) {
+    // A private PID namespace can run its init as this test user. Only a
+    // genuinely root-owned process proves the foreign unreadable case.
+    if me.uid != Some(0)
+        && bridge_adapters::os::process_facts(1).is_some_and(|init| init.uid == Some(0))
+    {
         assert!(bridge_adapters::os::process_env_checked(1, name).is_err());
     }
     let gone = named.id();

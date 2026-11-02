@@ -288,7 +288,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn connect_to_a_full_listen_queue_is_bounded() {
-        use std::os::unix::net::UnixListener;
         use std::time::{Duration, Instant};
 
         let name = format!(
@@ -301,16 +300,37 @@ mod tests {
         let directory = std::env::temp_dir().join(name);
         std::fs::create_dir(&directory).unwrap();
         let socket = directory.join("s");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+        let listener = {
+            let _entered = runtime.enter();
+            let listener = tokio::net::UnixSocket::new_stream().unwrap();
+            listener.bind(&socket).unwrap();
+            listener.listen(1).unwrap()
+        };
         let mut queued = Vec::new();
         let mut full = false;
         for _ in 0..8192 {
-            match connect_unix(&socket, Instant::now() + Duration::from_millis(20)) {
+            // Only kernel EAGAIN proves a full backlog. A short expired
+            // deadline under parallel test load is not queue readiness.
+            let connected = runtime.block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    tokio::net::UnixStream::connect(&socket),
+                )
+                .await
+                .expect("fixture connection timed out before queue state was established")
+            });
+            match connected {
                 Ok(stream) => queued.push(stream),
-                Err(_) => {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     full = true;
                     break;
                 }
+                Err(error) => panic!("fixture connect failed before proving full queue: {error}"),
             }
         }
         let started = Instant::now();

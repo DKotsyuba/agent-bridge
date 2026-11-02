@@ -4,8 +4,9 @@ What is supported, what was actually observed, and on which exact builds. Read
 this before relying on Bridge with a native host.
 
 **How to read it.** *Qualified* means the behavior was observed by running an
-owned test fixture or probe against the exact build named in the row, on macOS with
-Apple silicon, with the evidence checked by its own required checks. It is a result
+owned test fixture or probe against the exact build and platform named in the row,
+with the evidence checked by its own required checks. Historical rows without a
+separate platform name describe macOS with Apple silicon. It is a result
 about that build and that scope at the time it was run, not a property of "Codex" or
 "Claude Code" or "OpenCode" in general and not a release guarantee. A harness policy you configure
 (`[[adapters.harnesses]]` with a namespace and the capabilities you assert; no store path or
@@ -33,8 +34,8 @@ The historical native observations below do not qualify the new delivery policy.
 |---|---|
 | macOS Apple silicon | Supported target. Source checks and the isolated package lifecycle run here. |
 | macOS Intel | Not a target and not exercised. |
-| Linux ARM64 | Development candidate: offline release build, protected native MCP process/IPC and synthetic owner-boundary checks are exercised. OpenCode 2.2.5 native plugin setup is separate evidence. The legacy Codex helper is unavailable; automatic delivery needs a genuine native owner. Real host attribution, native wake and processing remain Tool Test qualification, not PASS. See the [handoff](linux-agent-ide.md). |
-| Linux x86_64 | Development candidate: local source checks, protected native IPC fixtures and 30 isolated package/install/lifecycle checks are exercised on Ubuntu 24.04 with Rust 1.98.1. Install, upgrade, rollback, database preservation and final socket cleanup passed. These are local observations, not a GitHub CI result or live native-host qualification. Real owner wake and same-session processing remain unqualified; ARM64 receipts are separate. |
+| Linux ARM64 | Development candidate: offline release build, protected native MCP process/IPC and synthetic owner-boundary checks are exercised. OpenCode 2.2.5 native plugin setup is separate evidence. The legacy Codex helper is unavailable; native-owner and protected live App Server routes require their own platform qualification. Real host attribution, native wake and processing remain Tool Test qualification, not PASS. See the [handoff](linux-agent-ide.md). |
+| Linux x86_64 | Development candidate: local source checks, protected native IPC fixtures and 30 isolated package/install/lifecycle checks are exercised on Ubuntu 24.04 with Rust 1.98.1. Install, upgrade, rollback, database preservation and final socket cleanup passed. The managed Codex live App Server observation below additionally qualifies its stated local route. This does not qualify native-owner wake or other Linux harness builds; ARM64 receipts are separate. |
 | Windows | Not supported. |
 
 ## Source checks (no host, no model)
@@ -52,6 +53,34 @@ upgrade, rollback, restart and stop. It touches no installation, harness store o
 and uses no network or model. It is package and lifecycle evidence only.
 
 ## Native host matrix
+
+### Managed Linux Codex live App Server
+
+A local Bridge 0.5.1 candidate with the protected live App Server carrier was
+exercised on Linux x86_64 with Codex 0.166.0 on 2026-11-02. Both services ran as
+ordinary user systemd services. The native root caller was attested through the
+real harness connection. Active INJECT was handed out by the real hook, appeared
+in the sender's context and recorded `hook_emitted` with one attempt.
+
+The MESSAGE recipient was positively `idle` in its exact live native server
+before publication. One native `turn/start` accepted the frozen manifest and
+made that same thread active without a new human prompt. Its persisted native
+input carried the exact client correlation ID and matched the manifest SHA-256;
+the native turn completed. The recipient then returned the requested test
+acknowledgement through Bridge to the active sender. Relay audit metadata matched
+the recipient session, and the acknowledgement appeared in the sender's context.
+MESSAGE's custody evidence recorded `native_accepted` with one attempt and no
+uncertainty. INJECT was repeated successfully after the candidate activation.
+Existing custody identifiers and hashes survived activation and the database
+integrity check passed.
+
+This observes the loaded managed App Server path and actual two-way exchange,
+not an arbitrary standalone CLI, unloaded thread, cross-account transport,
+ARM64 host or the owner protocol's atomic `wake_only` contract. The route reads
+native thread metadata and holds on unknown or waiting states. Core context and
+processing tiers remain separate: this manual native observation does not mint
+`context_observed` or `processed` receipts in the producer protocol. The local
+candidate is distinct from the previously published 0.5.1 release archives.
 
 ### Managed OpenCode owner wake
 

@@ -6,6 +6,14 @@ source, and the crates are not published to crates.io.
 
 ## [Unreleased]
 
+### Fixed
+
+- Deliver MESSAGE to loaded managed Linux Codex threads through their protected
+  live App Server, including waking an idle recipient. Verify the exact kernel
+  peer and binding before one native input; never retry an uncertain handoff.
+- Defer live native lifecycle changes without consuming transport retries, and
+  synchronize kernel queue and hook-receipt fixtures on positive observations.
+
 ## [0.5.1] - 2026-11-02
 
 ### Added

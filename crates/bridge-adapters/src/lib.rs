@@ -38,6 +38,9 @@
 pub mod claude;
 pub mod client;
 pub mod codex;
+/// Linux MESSAGE transport over the attested live Codex App Server.
+#[cfg(target_os = "linux")]
+pub(crate) mod codex_live;
 pub mod desktop;
 pub mod native_mcp;
 pub mod os;

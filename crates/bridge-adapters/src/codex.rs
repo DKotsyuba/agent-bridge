@@ -7,6 +7,10 @@
 //! woken, only while positively idle, through that owner ([`crate::owner`]),
 //! which is selected before the helper and application routes and has no
 //! fallback to them.
+//! Linux managed hosts may instead use the protected live App Server socket,
+//! whose kernel peer must be the exact attested harness incarnation. One native
+//! `turn/start` supplies MESSAGE input to idle or active threads; it does not
+//! claim the owner protocol's strict atomic wake-only guarantee.
 //!
 //! The helper is the Codex executable the recipient's binding records (a process
 //! fact), started for exactly one hand-off as
@@ -109,7 +113,7 @@ impl CodexQueueCarrier {
     fn binding_for(
         &self,
         attempt: &AttemptRecord,
-    ) -> Result<(NativeAddress, RecipientBinding, Route), Outcome> {
+    ) -> Result<(NativeAddress, RecipientBinding, Route, Lifecycle), Outcome> {
         let unsent = |reason: String| Outcome::KnownUnsent {
             evidence: format!("no helper started: {reason}"),
         };
@@ -118,9 +122,16 @@ impl CodexQueueCarrier {
         if address.harness != Harness::CODEX {
             return Err(unsent("not a Codex recipient".into()));
         }
-        let (attestation, binding, route) = self.message_recipient(&address).map_err(unsent)?;
+        let (attestation, binding, route) =
+            self.message_recipient(&address, false).map_err(unsent)?;
+        let defer_changes = match &route {
+            Route::Owner(_) => true,
+            #[cfg(target_os = "linux")]
+            Route::LiveAppServer(_) => true,
+            _ => false,
+        };
         let changed = |reason: &str| {
-            if matches!(route, Route::Owner(_)) {
+            if defer_changes {
                 Outcome::DeferredKnownUnsent {
                     evidence: reason.into(),
                 }
@@ -143,7 +154,7 @@ impl CodexQueueCarrier {
                 "recipient lifecycle changed before message hand-off",
             ));
         }
-        Ok((address, binding, route))
+        Ok((address, binding, route, lifecycle))
     }
 
     /// Starts a background evidence refresh (never hashing here), then takes an
@@ -163,9 +174,13 @@ impl CodexQueueCarrier {
     /// A present native owner locator is selected before every legacy route and
     /// holds when it cannot be proven. An absent owner permits the legacy helper only
     /// while its confinement launcher exists; missing confinement never disables an owner.
+    /// Linux live App Server discovery follows explicit owner/application routes
+    /// and precedes the helper. Its metadata preflight holds on unavailable,
+    /// unloaded, awaiting-input or malformed native thread state.
     fn message_recipient(
         &self,
         address: &NativeAddress,
+        _probe_native_state: bool,
     ) -> Result<(Attestation, RecipientBinding, Route), String> {
         let mut candidate = { lock_registry(&self.registry).message_candidate(address)? };
         let result = if candidate.needs_gateway() {
@@ -186,14 +201,30 @@ impl CodexQueueCarrier {
                     || crate::os::process_env(result.1.harness.0, "CODEX_APP_TOOLS_PIPE_PATH")
                         .is_some()
                 {
-                    self.desktop_directory.as_ref()
+                    return self.desktop_directory.as_ref()
                         .and_then(|directory| crate::desktop::frontend_for(directory, result.1.harness))
                         .map(Route::Application)
-                        .ok_or_else(|| "registered Codex application frontend not available yet (transient hold)".into())
-                } else if self.sandbox.is_file() {
+                        .ok_or_else(|| "registered Codex application frontend not available yet (transient hold)".into());
+                }
+                #[cfg(target_os = "linux")]
+                if let Some(endpoint) = crate::codex_live::locate(&result.1)? {
+                    // This read never resumes or starts a thread. A present but
+                    // unqualified live route holds instead of falling back.
+                    // Before reservation this is an eligibility hold. During
+                    // send, deliver performs the typed lifecycle check itself;
+                    // a normal state change must not spend a transport retry.
+                    if _probe_native_state {
+                        endpoint.state(
+                            &address.native_session_id,
+                            self.timeout.min(Duration::from_secs(3)),
+                        )?;
+                    }
+                    return Ok(Route::LiveAppServer(endpoint));
+                }
+                if self.sandbox.is_file() {
                     Ok(Route::Helper)
                 } else {
-                    Err("Codex queue helper unavailable: no confinement launcher".into())
+                    Err("Codex queue helper unavailable: no confinement launcher or live App Server".into())
                 }
             },
             || lock_registry(&self.registry).message_current(&candidate),
@@ -257,7 +288,7 @@ impl DispatchCarrier for CodexQueueCarrier {
         if recipient.harness != Harness::CODEX {
             return Err("not a Codex recipient".into());
         }
-        let (attestation, _, route) = self.message_recipient(recipient)?;
+        let (attestation, _, route) = self.message_recipient(recipient, true)?;
         if matches!(route, Route::Owner(_)) && attestation.lifecycle() != Lifecycle::Inactive {
             return Err("native owner recipient is not positively idle".into());
         }
@@ -268,6 +299,9 @@ impl DispatchCarrier for CodexQueueCarrier {
     /// message route when the attested harness exposes it; CLI recipients use
     /// the confined queue helper. A selected application route never falls back
     /// after a failed or ambiguous exchange, preventing duplicate delivery.
+    /// Linux live App Server delivery uses one native `turn/start` under exact
+    /// peer, process, endpoint and lifecycle fences; its acceptance does not
+    /// establish context observation or processing.
     ///
     /// A native owner route, selected before the helper and application routes
     /// when the recipient's environment names an owner socket, hands the
@@ -286,7 +320,7 @@ impl DispatchCarrier for CodexQueueCarrier {
     /// exactly the one that stood right after the spend, and the journal accepts
     /// it; an accepted or possibly delivered hand-off never restores it.
     fn send(&mut self, attempt: &AttemptRecord) -> Outcome {
-        let (address, binding, route) = match self.binding_for(attempt) {
+        let (address, binding, route, _lifecycle) = match self.binding_for(attempt) {
             Ok(found) => found,
             Err(outcome) => return outcome,
         };
@@ -358,6 +392,37 @@ impl DispatchCarrier for CodexQueueCarrier {
                 }
                 return outcome;
             }
+            #[cfg(target_os = "linux")]
+            Route::LiveAppServer(endpoint) => {
+                return crate::codex_live::deliver(
+                    &endpoint,
+                    &crate::codex_live::Handoff {
+                        thread: &address.native_session_id,
+                        client_id: &client_id,
+                        text: &attempt.manifest,
+                        mode: attempt.requested_mode,
+                        deadline_ms: attempt.deadline_ms,
+                        timeout: self.timeout,
+                    },
+                    || {
+                        let candidate =
+                            lock_registry(&self.registry).message_candidate(&address)?;
+                        let (attestation, current) = candidate.validate()?;
+                        if current.epoch != binding.epoch
+                            || current.harness != binding.harness
+                            || current.store != binding.store
+                            || current.executable != binding.executable
+                            || attestation.lifecycle() != _lifecycle
+                        {
+                            return Err(
+                                "recipient binding or lifecycle changed before live hand-off"
+                                    .into(),
+                            );
+                        }
+                        lock_registry(&self.registry).message_current(&candidate)
+                    },
+                );
+            }
             Route::Helper => {}
         }
         let helper = Helper {
@@ -380,6 +445,9 @@ pub(crate) enum Route {
     Application(PathBuf),
     /// The recipient's native owner socket, validated by [`crate::owner`].
     Owner(PathBuf),
+    /// The exact live Linux harness's protected native App Server transport.
+    #[cfg(target_os = "linux")]
+    LiveAppServer(crate::codex_live::Endpoint),
 }
 
 /// Runs all route discovery/probing in `pick` before the final in-memory
