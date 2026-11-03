@@ -14,8 +14,8 @@ set -euo pipefail
 umask 077
 bundle=''
 sums=''
-home=${AGENT_BRIDGE_HOME:-"$HOME/.agent-bridge"}
-bin_dir="$HOME/.local/bin"
+home=${AGENT_BRIDGE_HOME:-${HOME:+"$HOME/.agent-bridge"}}
+bin_dir=${HOME:+"$HOME/.local/bin"}
 usage='install.sh --bundle ABS_DIR --sums-sha256 HEX [--home ABS_PATH] [--bin-dir ABS_PATH]'
 while (($#)); do
   case "$1" in
@@ -53,7 +53,8 @@ bundle="$work/bundle"
 [[ -d "$bundle" && ! -L "$bundle" && -d "$bundle/bin" && ! -L "$bundle/bin" \
   && -f "$bundle/SHA256SUMS" && ! -L "$bundle/SHA256SUMS" ]] \
   || { echo 'Bundle root, bin or SHA256SUMS is a link or missing; nothing was executed' >&2; exit 1; }
-actual=$("${checksum[@]}" "$bundle/SHA256SUMS" | awk '{print $1}')
+# Hash stdin so checksum tools do not escape unusual pathnames in their output.
+actual=$("${checksum[@]}" < "$bundle/SHA256SUMS" | awk '{print $1}')
 [[ "$actual" == "$sums" ]] || { echo 'SHA256SUMS does not match the attested digest; nothing was executed' >&2; exit 1; }
 expected=(release-manifest.json bin/bridge bin/bridge-root-mcp bin/bridge-root-relay bin/bridge-native-daemon bin/bridge-hook bin/bridge-daemon)
 # A 0.3 bundle also carries the OpenCode plugin; a legacy bundle has no `plugins`.
@@ -67,7 +68,7 @@ for name in "${expected[@]}"; do
   [[ -f "$bundle/$name" && ! -L "$bundle/$name" ]] || { echo "Missing $name; nothing was executed" >&2; exit 1; }
   hash=$(awk -v n="$name" '$2 == n {count++; h=$1} END {if (count != 1) exit 1; print h}' "$bundle/SHA256SUMS") \
     || { echo "SHA256SUMS must list $name exactly once" >&2; exit 1; }
-  [[ "$("${checksum[@]}" "$bundle/$name" | awk '{print $1}')" == "$hash" ]] \
+  [[ "$("${checksum[@]}" < "$bundle/$name" | awk '{print $1}')" == "$hash" ]] \
     || { echo "Checksum mismatch for $name; nothing was executed" >&2; exit 1; }
 done
 # Refuse every unlisted entry, including hidden files and links, before any

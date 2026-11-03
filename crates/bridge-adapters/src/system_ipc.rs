@@ -243,6 +243,8 @@ pub(crate) enum WireOutcome {
     KnownUnsent { evidence: String },
     /// A temporary refusal with positive proof of no effect.
     DeferredKnownUnsent { evidence: String },
+    /// A correlated resume was accepted; no message byte was written.
+    ResumeAcceptedNoMessage { evidence: String },
     /// A possible hand-off with unknown effect.
     OutcomeUnknown { reason: String },
     /// Permanent refusal before acceptance.
@@ -265,6 +267,9 @@ impl From<Outcome> for WireOutcome {
             Outcome::HookSubmitted { evidence } => Self::HookSubmitted { evidence },
             Outcome::KnownUnsent { evidence } => Self::KnownUnsent { evidence },
             Outcome::DeferredKnownUnsent { evidence } => Self::DeferredKnownUnsent { evidence },
+            Outcome::ResumeAcceptedNoMessage { evidence } => {
+                Self::ResumeAcceptedNoMessage { evidence }
+            }
             Outcome::OutcomeUnknown { reason } => Self::OutcomeUnknown { reason },
             Outcome::PermanentRefusal { reason } => Self::PermanentRefusal { reason },
         }
@@ -287,6 +292,9 @@ impl From<WireOutcome> for Outcome {
             WireOutcome::HookSubmitted { evidence } => Self::HookSubmitted { evidence },
             WireOutcome::KnownUnsent { evidence } => Self::KnownUnsent { evidence },
             WireOutcome::DeferredKnownUnsent { evidence } => Self::DeferredKnownUnsent { evidence },
+            WireOutcome::ResumeAcceptedNoMessage { evidence } => {
+                Self::ResumeAcceptedNoMessage { evidence }
+            }
             WireOutcome::OutcomeUnknown { reason } => Self::OutcomeUnknown { reason },
             WireOutcome::PermanentRefusal { reason } => Self::PermanentRefusal { reason },
         }
@@ -380,6 +388,19 @@ pub(crate) fn write_frame(
 #[cfg(test)]
 mod tests {
     //! Synthetic socketpair framing tests; no native session is contacted.
+
+    /// The private wire preserves correlated resume acceptance as a distinct outcome.
+    #[test]
+    fn resume_accepted_outcome_round_trips() {
+        let original = bridge_core::dispatch::Outcome::ResumeAcceptedNoMessage {
+            evidence: "correlated receipt".into(),
+        };
+        let wire = super::WireOutcome::from(original.clone());
+        let value = serde_json::to_value(wire).unwrap();
+        assert_eq!(value["kind"], "resume_accepted_no_message");
+        let decoded: super::WireOutcome = serde_json::from_value(value).unwrap();
+        assert_eq!(bridge_core::dispatch::Outcome::from(decoded), original);
+    }
 
     use super::*;
     use std::net::Shutdown;

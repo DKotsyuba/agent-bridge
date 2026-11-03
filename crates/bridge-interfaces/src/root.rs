@@ -737,9 +737,9 @@ fn disposed_native(delivery: &DeliveryEvidence) -> &'static str {
 /// (`disposed: true` after a disposition; no manual resolution left to do)
 /// while the earlier outcome remains unknown. `context` and `processed` are
 /// `observed` only when that exact tier was recorded; `uncertainty` is set
-/// for a possible handoff with an unknown result or any open incident
-/// (manual resolution, never an automatic resend). Tier details are
-/// withheld; names and times only.
+/// for a possible handoff with an unknown result or an open incident, except a
+/// provably unsent managed retry hold that clears on a new binding. Tier
+/// details are withheld; names and times only.
 pub fn status_view(delivery: Option<&DeliveryEvidence>) -> Value {
     let Some(delivery) = delivery else {
         return json!({
@@ -781,7 +781,23 @@ pub fn status_view(delivery: Option<&DeliveryEvidence>) -> Value {
         }
     };
     let earlier = EARLIER_HAND_OFF;
-    let uncertainty = if delivery.delivery == DeliveryState::Review || delivery.incident.is_some() {
+    let retry_hold = delivery.delivery == DeliveryState::Unhanded
+        && unresolved_hand_off(delivery).is_none()
+        && delivery
+            .incident
+            .as_ref()
+            .is_some_and(|incident| incident.kind == "managed_retry_epoch_exhausted");
+    let hold_reason = delivery.hold_reason.as_deref().or(if retry_hold {
+        delivery
+            .incident
+            .as_ref()
+            .map(|incident| incident.reason.as_str())
+    } else {
+        None
+    });
+    let uncertainty = if !retry_hold
+        && (delivery.delivery == DeliveryState::Review || delivery.incident.is_some())
+    {
         // An open incident (for example retries exhausted or a permanent refusal
         // after a duplicate-risk retry) must not hide an earlier unresolved
         // hand-off: its reason then also states it.
@@ -834,7 +850,7 @@ pub fn status_view(delivery: Option<&DeliveryEvidence>) -> Value {
             "state": serde_json::to_value(delivery.delivery).unwrap_or(Value::Null),
             "effective_mode": delivery.effective_mode,
             "attempts_made": delivery.attempts_made,
-            "hold_reason": delivery.hold_reason,
+            "hold_reason": hold_reason,
             "blocked_by": delivery.blocked_by,
         },
         "native": native,
@@ -1076,6 +1092,42 @@ mod tests {
         assert_eq!(view["native"], "not_handed");
         assert_eq!(view["context"], "not_available");
         assert!(view["uncertainty"].is_null());
+    }
+
+    /// A bounded retry hold is visible without hiding an earlier possible handoff.
+    #[test]
+    fn managed_retry_hold_is_visible_and_preserves_real_uncertainty() {
+        let reason = "message remains pending until a new attested endpoint epoch";
+        let safe = with_incident(
+            evidence(
+                "unhanded",
+                2,
+                Some(("known_unsent", false)),
+                &[(1, "known_unsent"), (2, "known_unsent")],
+            ),
+            "managed_retry_epoch_exhausted",
+            reason,
+        );
+        let view = status_view(Some(&safe));
+        assert_eq!(view["native"], "not_handed");
+        assert_eq!(view["delivery"]["hold_reason"], reason);
+        assert!(view["uncertainty"].is_null());
+
+        let earlier_unknown = with_incident(
+            evidence(
+                "unhanded",
+                2,
+                Some(("known_unsent", true)),
+                &[(1, "unknown"), (2, "known_unsent")],
+            ),
+            "managed_retry_epoch_exhausted",
+            reason,
+        );
+        let view = status_view(Some(&earlier_unknown));
+        assert!(
+            !view["uncertainty"].is_null(),
+            "an earlier possible delivery stays visible"
+        );
     }
 
     /// Caller attestation failures map to a single `caller_` class carrying the

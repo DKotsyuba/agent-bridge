@@ -130,7 +130,7 @@ pub struct GrantConfig {
     /// Opt-in v1 permissions; absence preserves all legacy grant behavior.
     #[serde(default)]
     pub producer_v1: Option<crate::ProducerPolicy>,
-    /// Trust this relay to bind attested native origins for bounded root delivery.
+    /// Trust this relay to bind attested native origins for managed root delivery.
     #[serde(default)]
     pub managed_feedback: bool,
 }

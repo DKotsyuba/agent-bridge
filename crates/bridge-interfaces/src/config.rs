@@ -84,7 +84,7 @@ pub struct ObserverConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RootConfig {
-    /// Opt in to five sends/five minutes and durable best-effort sender reports.
+    /// Opt in to managed durable root delivery and best-effort sender reports.
     /// Requires the core publisher grant managed_feedback capability.
     #[serde(default)]
     pub bounded_delivery: bool,

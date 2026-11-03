@@ -1101,12 +1101,16 @@ fn dispatch_message(shared: &Coordinator, source: u32, target_uid: u32, target: 
             RPC_TIMEOUT,
         )? {
             Response::Binding { binding } => binding,
-            Response::Held { .. } | Response::Failed {} => {
+            response @ (Response::Held { .. } | Response::Failed {}) => {
+                let reason = match response {
+                    Response::Held { reason } => crate::system_worker::safe_hold_reason(&reason),
+                    _ => "target unavailable",
+                };
                 shared.ack(
                     source,
                     Request::RecordHold {
                         target: target.clone(),
-                        reason: "target unavailable".into(),
+                        reason: reason.into(),
                         now_ms: current_unix_millis(),
                     },
                     RPC_TIMEOUT,
@@ -2022,6 +2026,74 @@ mod tests {
         );
         assert!(shared.fatal.load(Ordering::SeqCst));
         assert!(shared.state.lock().unwrap().tickets.contains_key(&ticket));
+    }
+
+    /// Held reasons are recorded only after validating the worker's category.
+    #[test]
+    fn message_hold_diagnostics_filter_worker_responses() {
+        for (reason, expected) in [
+            (
+                "native thread state unavailable",
+                "native thread state unavailable",
+            ),
+            ("secret /private/path payload", "target unavailable"),
+        ] {
+            let (incoming_tx, incoming_rx) = mpsc::sync_channel(8);
+            let (source_coord, source_worker) = UnixStream::pair().unwrap();
+            let (target_coord, target_worker) = UnixStream::pair().unwrap();
+            let mut links = BTreeMap::new();
+            links.insert(
+                1000,
+                Link::new(source_coord, 7, 1000, incoming_tx.clone()).unwrap(),
+            );
+            links.insert(2000, Link::new(target_coord, 7, 2000, incoming_tx).unwrap());
+            let (source_tx, source_rx) = mpsc::sync_channel(8);
+            let (target_tx, target_rx) = mpsc::sync_channel(8);
+            let source = Link::new(source_worker, 7, 0, source_tx).unwrap();
+            let target = Link::new(target_worker, 7, 0, target_tx).unwrap();
+            let shared = coordinator(links);
+            let dispatcher_shared = Arc::clone(&shared);
+            let dispatcher =
+                std::thread::spawn(move || dispatch_incoming(dispatcher_shared, incoming_rx));
+            let target_thread = std::thread::spawn(move || {
+                let Incoming::Request {
+                    request_id,
+                    request: Request::AttestMessage { .. },
+                    ..
+                } = target_rx.recv_timeout(Duration::from_secs(3)).unwrap()
+                else {
+                    panic!("attest request")
+                };
+                target
+                    .respond(
+                        request_id,
+                        Response::Held {
+                            reason: reason.into(),
+                        },
+                    )
+                    .unwrap();
+            });
+            let source_thread = std::thread::spawn(move || {
+                let Incoming::Request {
+                    request_id,
+                    request: Request::RecordHold { reason, .. },
+                    ..
+                } = source_rx.recv_timeout(Duration::from_secs(3)).unwrap()
+                else {
+                    panic!("hold request")
+                };
+                assert_eq!(reason, expected);
+                source.respond(request_id, Response::Ok {}).unwrap();
+            });
+            dispatch_message(&shared, 1000, 2000, binding().address);
+            source_thread.join().unwrap();
+            target_thread.join().unwrap();
+            shared.fatal.store(true, Ordering::SeqCst);
+            for link in shared.links.values() {
+                link.close();
+            }
+            dispatcher.join().unwrap();
+        }
     }
 
     /// Exercises a callback racing the response while routing through two fake workers.

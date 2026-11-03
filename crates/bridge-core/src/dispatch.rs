@@ -40,9 +40,19 @@ const KEEP_ALL_BOOST_MS: i64 = 30_000;
 /// Largest number of events frozen into one manifest.
 const MAX_MANIFEST_MEMBERS: usize = 32;
 
-/// Automatic attempts allowed for one event before it is refused as
-/// exhausted. Manual authorization resets the budget.
+/// Automatic attempts allowed for one ordinary event before refusal, and
+/// proven no-message outcomes allowed per managed event and endpoint epoch.
 const MAX_AUTOMATIC_ATTEMPTS: u32 = 5;
+
+/// Maximum released pre-invocation reservations per managed event and epoch.
+const MAX_RELEASED_RESERVATIONS: u32 = 20;
+
+/// Internal route discriminator set by the protected Codex worker. It carries
+/// no identity or authorization authority.
+const LIVE_RESUME_ROUTE: &str = "codex-live-resume:";
+
+/// Durable attempt-note marker for a correlated resume without a message write.
+const RESUME_ACCEPTED_TIER: &str = "resume_accepted_no_message";
 
 /// Delay before the first automatic retry of a known-unsent attempt;
 /// doubled for every further attempt up to [`RETRY_CAP_MS`].
@@ -106,7 +116,8 @@ pub enum AttemptState {
     WrittenNoReceipt,
     /// Hook payload handed out; model context not yet proven.
     HookSubmitted,
-    /// Positively known never-sent; ordinary bounded retry may follow.
+    /// The message was not handed off; the note records any separate native
+    /// activity, such as a positively accepted resume.
     KnownUnsent,
     /// Possible hand-off with unknown effect; never automatically retried.
     OutcomeUnknown,
@@ -435,6 +446,12 @@ pub enum Outcome {
         /// Positive correlated refusal or local pre-write fence evidence.
         evidence: String,
     },
+    /// A correlated native resume was accepted, while no message byte was
+    /// written. This may have started native work; it is not zero-effect proof.
+    ResumeAcceptedNoMessage {
+        /// Positive correlated resume evidence; must be non-empty.
+        evidence: String,
+    },
     /// Possible hand-off, unknown effect; retained for reconciliation.
     OutcomeUnknown {
         /// Why the outcome could not be established.
@@ -594,7 +611,11 @@ const ELIGIBLE: &str = "e.state = 'pending' AND e.delivery = 'unhanded' AND e.re
     AND e.not_before_ms <= ?2 AND (e.expires_at_ms IS NULL OR e.expires_at_ms > ?2)
     AND NOT EXISTS (SELECT 1 FROM managed_deliveries m
         WHERE m.publisher_id=e.publisher_id AND m.event_id=e.event_id
-          AND (m.outcome!='active' OR m.deadline_ms<=?2 OR m.sends_made>=5))
+          AND (m.outcome!='active' OR
+               (m.feedback_sender IS NULL AND (m.deadline_ms<=?2 OR m.sends_made>=5))))
+    AND NOT EXISTS (SELECT 1 FROM incidents i
+        WHERE i.publisher_id=e.publisher_id AND i.event_id=e.event_id
+          AND i.kind='managed_retry_epoch_exhausted' AND i.state='open')
     AND (e.predecessor IS NULL OR e.predecessor_waived = 1 OR EXISTS (
         SELECT 1 FROM events p
         WHERE p.publisher_id = e.publisher_id AND p.event_id = e.predecessor
@@ -603,6 +624,14 @@ const ELIGIBLE: &str = "e.state = 'pending' AND e.delivery = 'unhanded' AND e.re
     AND NOT EXISTS (SELECT 1 FROM delivery_scopes s
         WHERE s.producer = e.publisher_id AND s.scope_key = e.delivery_scope_key
           AND s.closed_ms IS NOT NULL AND s.action = 'retire_unhanded')";
+
+/// A resume-tagged route cannot spend another wake on an event that already
+/// has a positively accepted resume. The tag is supplied by the protected
+/// adapter and is never treated as identity or authority.
+const RESUME_HISTORY_GATE: &str = " AND NOT EXISTS (
+    SELECT 1 FROM attempt_members am JOIN attempts a ON a.attempt_seq=am.attempt_seq
+    WHERE am.publisher_id=e.publisher_id AND am.event_id=e.event_id
+      AND a.note LIKE 'resume_accepted_no_message:%')";
 
 /// The requested modes a path may take for the observed lifecycle.
 ///
@@ -645,7 +674,7 @@ fn stored_epoch(connection: &Connection, recipient: &str) -> Result<Option<u64>,
 }
 
 /// Records an attested epoch and the loaded capabilities, refusing a stale
-/// epoch.
+/// epoch and resolving managed retry holds only on a newer epoch.
 ///
 /// An equal epoch is the same endpoint; a greater epoch is a legitimate
 /// renewal of the same logical session and fences every older attempt; a
@@ -659,7 +688,8 @@ fn fence_binding(
 ) -> Result<(), CoreError> {
     let recipient = attestation.address.to_canonical_string();
     let epoch = attestation.endpoint_epoch;
-    if let Some(stored) = stored_epoch(tx, &recipient)?
+    let previous = stored_epoch(tx, &recipient)?;
+    if let Some(stored) = previous
         && epoch < stored
     {
         return Err(CoreError::Fence(format!(
@@ -683,6 +713,34 @@ fn fence_binding(
             to_sql(now_ms)?
         ],
     )?;
+    if previous.is_none_or(|stored| epoch > stored) {
+        tx.execute(
+            "UPDATE incidents SET state='resolved',updated_ms=?1,resolved_ms=?1,
+             resolution='new attested endpoint epoch' WHERE kind='managed_retry_epoch_exhausted'
+             AND state='open' AND EXISTS (
+               SELECT 1 FROM events e JOIN attempts a ON a.attempt_seq=incidents.attempt_seq
+               WHERE e.publisher_id=incidents.publisher_id AND e.event_id=incidents.event_id
+                 AND e.recipient=?2 AND a.endpoint_epoch<?3)",
+            params![to_sql(now_ms)?, recipient, to_sql(epoch)?],
+        )?;
+        // A new binding can arrive after the resume outcome was persisted.
+        // Only shorten the delay when that outcome is still the latest attempt.
+        tx.execute(
+            "UPDATE events AS e SET not_before_ms=MIN(not_before_ms,?1)
+             WHERE e.recipient=?2 AND e.state='pending' AND e.delivery='unhanded'
+               AND EXISTS (
+                 SELECT 1 FROM attempts a WHERE a.attempt_seq=(
+                   SELECT MAX(am.attempt_seq) FROM attempt_members am
+                   WHERE am.publisher_id=e.publisher_id AND am.event_id=e.event_id)
+                   AND a.state='known_unsent' AND a.endpoint_epoch<?3
+                   AND a.note LIKE 'resume_accepted_no_message:%')",
+            params![
+                to_sql(now_ms.saturating_add(RETRY_BASE_MS))?,
+                recipient,
+                to_sql(epoch)?
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -1046,6 +1104,37 @@ pub(crate) fn release_reservation(
     Ok(())
 }
 
+/// Finds a managed original's exhausted no-message or released-reservation
+/// budget for an epoch. Existing history is read without modification.
+fn managed_epoch_exhausted(
+    tx: &Connection,
+    publisher: &str,
+    event: &str,
+    epoch: u64,
+) -> Result<Option<u64>, CoreError> {
+    for (state, limit) in [
+        ("known_unsent", MAX_AUTOMATIC_ATTEMPTS),
+        ("closed", MAX_RELEASED_RESERVATIONS),
+    ] {
+        let seq: Option<i64> = tx
+            .query_row(
+                "SELECT am.attempt_seq FROM attempt_members am
+                 JOIN attempts a ON a.attempt_seq=am.attempt_seq
+                 JOIN managed_deliveries m ON m.publisher_id=am.publisher_id AND m.event_id=am.event_id
+                 WHERE am.publisher_id=?1 AND am.event_id=?2 AND a.endpoint_epoch=?3
+                   AND a.state=?4 AND m.feedback_sender IS NOT NULL AND m.outcome='active'
+                 ORDER BY am.attempt_seq DESC LIMIT 1 OFFSET ?5",
+                params![publisher, event, to_sql(epoch)?, state, limit - 1],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(seq) = seq {
+            return Ok(Some(from_sql(seq)?));
+        }
+    }
+    Ok(None)
+}
+
 /// Reserves the next attempt inside the caller's transaction.
 ///
 /// Shared by [`Storage::reserve_next`] and [`Storage::drain_inject`]; see
@@ -1061,11 +1150,17 @@ fn reserve_in(
     let recipient = attestation.address.to_canonical_string();
     let now = to_sql(now_ms)?;
     fence_binding(tx, attestation, now_ms)?;
+    let resume_gate =
+        if mode == EffectiveMode::Message && attestation.proof_ref.starts_with(LIVE_RESUME_ROUTE) {
+            RESUME_HISTORY_GATE
+        } else {
+            ""
+        };
     let hold = gate(tx, attestation, mode)?;
     if let Some(reason) = hold {
         let waiting: bool = tx.query_row(
             &format!(
-                "SELECT EXISTS (SELECT 1 FROM events e WHERE {ELIGIBLE} AND e.mode IN {})",
+                "SELECT EXISTS (SELECT 1 FROM events e WHERE {ELIGIBLE}{resume_gate} AND e.mode IN {})",
                 widest_modes(mode)
             ),
             params![recipient, now],
@@ -1091,7 +1186,7 @@ fn reserve_in(
                 &format!(
                     "SELECT e.publisher_id, e.event_id, e.policy_class, e.scope_key, e.lineage_key
                      FROM events e
-                     WHERE {ELIGIBLE} AND e.mode IN {modes}
+                     WHERE {ELIGIBLE}{resume_gate} AND e.mode IN {modes}
                      ORDER BY e.accepted_at_ms
                               - CASE e.policy_class WHEN 'keep_all' THEN {KEEP_ALL_BOOST_MS} ELSE 0 END,
                               e.acceptance_seq
@@ -1119,6 +1214,20 @@ fn reserve_in(
             crate::storage::hold_for_lineage(tx, &publisher, &event, &reason, now_ms)?;
             continue;
         }
+        if let Some(seq) =
+            managed_epoch_exhausted(tx, &publisher, &event, attestation.endpoint_epoch)?
+        {
+            open_incident_in(
+                tx,
+                &publisher,
+                &event,
+                Some(seq),
+                "managed_retry_epoch_exhausted",
+                "message remains pending until a new attested endpoint epoch",
+                now_ms,
+            )?;
+            continue;
+        }
         break (publisher, event, policy_class, scope);
     };
 
@@ -1126,7 +1235,7 @@ fn reserve_in(
     if policy_class == "batch" {
         let mut statement = tx.prepare(&format!(
             "SELECT e.publisher_id, e.event_id FROM events e
-             WHERE {ELIGIBLE} AND e.mode IN {modes} AND e.scope_key = ?3
+             WHERE {ELIGIBLE}{resume_gate} AND e.mode IN {modes} AND e.scope_key = ?3
              ORDER BY e.acceptance_seq LIMIT {MAX_MANIFEST_MEMBERS}"
         ))?;
         candidates = statement
@@ -1200,9 +1309,11 @@ fn reserve_in(
     for (publisher, event_id, _, _) in &members {
         let managed: Option<i64> = tx
             .query_row(
-                "SELECT deadline_ms FROM managed_deliveries
-             WHERE publisher_id=?1 AND event_id=?2",
-                params![publisher, event_id],
+                "SELECT CASE WHEN m.feedback_sender IS NULL THEN m.deadline_ms
+                  ELSE COALESCE(e.expires_at_ms,?3) END
+                 FROM managed_deliveries m JOIN events e USING(publisher_id,event_id)
+                 WHERE m.publisher_id=?1 AND m.event_id=?2",
+                params![publisher, event_id, to_sql(crate::MAX_SQLITE_INT)?],
                 |row| row.get(0),
             )
             .optional()?;
@@ -1247,7 +1358,7 @@ fn reserve_in(
         )?;
         tx.execute(
             "UPDATE events SET delivery = 'reserved', attempt_seq = ?1,
-                 attempts_made = attempts_made + 1
+                 attempts_made = MIN(attempts_made + 1, 4294967295)
              WHERE publisher_id = ?2 AND event_id = ?3",
             params![to_sql(attempt_seq)?, publisher, event_id],
         )?;
@@ -1280,8 +1391,11 @@ fn invoke_in(tx: &Connection, attempt_seq: u64, now_ms: u64) -> Result<(), CoreE
     }
     let bounded: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM attempt_members a
-        JOIN managed_deliveries m USING(publisher_id,event_id) WHERE a.attempt_seq=?1
-        AND (m.outcome!='active' OR m.deadline_ms<=?2 OR m.sends_made>=5))",
+        JOIN managed_deliveries m USING(publisher_id,event_id)
+        JOIN events e USING(publisher_id,event_id) WHERE a.attempt_seq=?1
+        AND (m.outcome!='active' OR
+             (m.feedback_sender IS NULL AND (m.deadline_ms<=?2 OR m.sends_made>=5)) OR
+             (m.feedback_sender IS NOT NULL AND e.expires_at_ms<=?2)))",
         params![to_sql(attempt_seq)?, to_sql(now_ms)?],
         |r| r.get(0),
     )?;
@@ -1290,7 +1404,7 @@ fn invoke_in(tx: &Connection, attempt_seq: u64, now_ms: u64) -> Result<(), CoreE
             "bounded delivery no longer permits invocation".into(),
         ));
     }
-    tx.execute("UPDATE managed_deliveries SET sends_made=sends_made+1 WHERE EXISTS(
+    tx.execute("UPDATE managed_deliveries SET sends_made=MIN(sends_made+1,4294967295) WHERE EXISTS(
         SELECT 1 FROM attempt_members a WHERE a.attempt_seq=?1 AND a.publisher_id=managed_deliveries.publisher_id
         AND a.event_id=managed_deliveries.event_id)",params![to_sql(attempt_seq)?])?;
     tx.execute(
@@ -1415,8 +1529,8 @@ impl Storage {
     /// the attempt is released untouched and [`Invoked::Released`] explains
     /// why; nothing was invoked. A forged or stale fence, a wrong state or
     /// an expired lease or completed/exhausted managed policy is a
-    /// [`CoreError::Fence`] refusal. Managed native-call budget is charged in
-    /// the same transaction as the possible-effect transition.
+    /// [`CoreError::Fence`] refusal. Managed native calls are counted in the
+    /// same transaction as the possible-effect transition.
     pub fn mark_invoking(
         &mut self,
         fence: &AttemptFence,
@@ -1451,6 +1565,14 @@ impl Storage {
             return release(
                 tx,
                 "the attested endpoint no longer matches the reserved address or epoch".into(),
+            );
+        }
+        if record.proof_ref.starts_with(LIVE_RESUME_ROUTE)
+            != attestation.proof_ref.starts_with(LIVE_RESUME_ROUTE)
+        {
+            return release(
+                tx,
+                "the native resume route changed since reservation".into(),
             );
         }
         if stored_epoch(&tx, &record.fence.recipient)? != Some(record.fence.endpoint_epoch) {
@@ -1551,21 +1673,29 @@ impl Storage {
     ///   an audited disposition;
     /// - `KnownUnsent` needs non-empty positive evidence, closes the
     ///   attempt before settling each member it still owns. Outside a retired
-    ///   lifetime, the bounded retry delay/budget applies, or a replaced
-    ///   snapshot is superseded. In a `retire_unhanded` lifetime, a member with
+    ///   lifetime, the bounded retry delay applies; managed originals with no
+    ///   possible prior effect remain pending and pause after a finite per-epoch
+    ///   budget. Other work keeps its retry budget. A replaced snapshot is
+    ///   superseded. In a `retire_unhanded` lifetime, a member with
     ///   any retained possible-effect history stays in review with an incident;
     ///   only proved zero-effect work is disposed. Neither returns to rotation.
     ///
-    /// - `DeferredKnownUnsent` requires the same positive zero-effect proof,
-    ///   but temporary busy/epoch changes refund the current budget charge and
-    ///   wait for a fresh attestation rather than exhausting transport retries.
+    /// - `DeferredKnownUnsent` requires the same positive zero-effect proof.
+    ///   Other work refunds the temporary deferral's budget charge; managed
+    ///   originals count it for retry backoff and wait for fresh attestation.
+    /// - `ResumeAcceptedNoMessage` records a distinct positive resume in the
+    ///   attempt note, refunds only this attempt's transport charge, and never
+    ///   claims the resume was effect-free. A new attested epoch permits a
+    ///   one-second message retry; the same event cannot resume again.
     ///
     /// Evidence is retained for every frozen member; disposed or newer-owned
     /// members and their incidents are unchanged.
     ///
     /// A late outcome for an `outcome_unknown` attempt may only be positive
     /// (accepted, hook submitted, known-unsent with proof, refusal): it
-    /// resolves that attempt's own incident without another send. If an audited
+    /// resolves that attempt's own incident without another send. A late
+    /// confirmed resume is accepted without changing the unknown message state.
+    /// If an audited
     /// retry has since given the events to a newer attempt, the late outcome is
     /// kept as evidence only: it never closes, opens or changes the newer
     /// attempt's incidents or delivery state. A held or unreceipted
@@ -1593,6 +1723,20 @@ impl Storage {
                     other.as_str()
                 )));
             }
+        }
+        if late && let Outcome::ResumeAcceptedNoMessage { evidence } = &outcome {
+            if evidence.trim().is_empty()
+                || !record.proof_ref.starts_with(LIVE_RESUME_ROUTE)
+                || record.effective_mode != EffectiveMode::Message
+            {
+                return Err(CoreError::Fence(
+                    "accepted resume requires its message route and positive evidence".into(),
+                ));
+            }
+            to_sql(now_ms)?;
+            // A late resume receipt cannot settle the possible message effect.
+            // Keep the unknown attempt, its incidents and every member unchanged.
+            return Ok(record);
         }
         let archived_hold = if late
             && matches!(
@@ -1767,8 +1911,8 @@ impl Storage {
 ///
 /// Every outcome changes each member's delivery state and raises incidents
 /// only while this attempt still owns that member, and only
-/// closes incidents that this attempt raised. The attempt row and its
-/// evidence tier are always recorded.
+/// closes incidents that this attempt raised. The attempt row and evidence
+/// are retained; a confirmed resume uses a distinct note, not a no-effect tier.
 pub(crate) fn apply_outcome(
     tx: &Transaction<'_>,
     record: &AttemptRecord,
@@ -1777,7 +1921,11 @@ pub(crate) fn apply_outcome(
 ) -> Result<(), CoreError> {
     let seq = record.fence.attempt_seq;
     let now = to_sql(now_ms)?;
-    let deferred = matches!(&outcome, Outcome::DeferredKnownUnsent { .. });
+    let resumed = matches!(&outcome, Outcome::ResumeAcceptedNoMessage { .. });
+    let deferred = matches!(
+        &outcome,
+        Outcome::DeferredKnownUnsent { .. } | Outcome::ResumeAcceptedNoMessage { .. }
+    );
     let (state, tier, detail, recheck) = match &outcome {
         Outcome::NativeAccepted { evidence } => (
             AttemptState::NativeAccepted,
@@ -1823,6 +1971,23 @@ pub(crate) fn apply_outcome(
                 None,
             )
         }
+        Outcome::ResumeAcceptedNoMessage { evidence } => {
+            if evidence.trim().is_empty()
+                || record.state != AttemptState::Invoking
+                || !record.proof_ref.starts_with(LIVE_RESUME_ROUTE)
+                || record.effective_mode != EffectiveMode::Message
+            {
+                return Err(CoreError::Fence(
+                    "accepted resume requires its message route and positive evidence".into(),
+                ));
+            }
+            (
+                AttemptState::KnownUnsent,
+                RESUME_ACCEPTED_TIER,
+                evidence.clone(),
+                None,
+            )
+        }
         Outcome::OutcomeUnknown { reason } => (
             AttemptState::OutcomeUnknown,
             "unknown",
@@ -1848,16 +2013,18 @@ pub(crate) fn apply_outcome(
             to_sql(seq)?,
         ],
     )?;
-    for member in &record.members {
-        record_evidence_row(
-            tx,
-            &member.publisher,
-            &member.event_id,
-            seq,
-            tier,
-            &detail,
-            now_ms,
-        )?;
+    if !resumed {
+        for member in &record.members {
+            record_evidence_row(
+                tx,
+                &member.publisher,
+                &member.event_id,
+                seq,
+                tier,
+                &detail,
+                now_ms,
+            )?;
+        }
     }
 
     // Snapshot ownership before terminal transitions clear it. Evidence above
@@ -1937,12 +2104,16 @@ pub(crate) fn apply_outcome(
             }
         }
         AttemptState::KnownUnsent => {
-            return_unsent(tx, record, now_ms, deferred)?;
+            return_unsent(tx, record, now_ms, deferred, resumed)?;
             resolve_attempt_incidents(
                 tx,
                 record,
                 &owned_members,
-                "positive evidence: known unsent",
+                if resumed {
+                    "resume accepted; message not sent"
+                } else {
+                    "positive evidence: known unsent"
+                },
                 now_ms,
             )?;
         }
@@ -2003,25 +2174,29 @@ fn resolve_attempt_incidents(
 /// Retired lifetimes dispose zero-effect members or retain all possible
 /// historical effects in review with an incident; they never reenter rotation.
 /// Completed managed policies retain late no-send evidence without reactivation.
-/// A positive temporary deferral refunds only this owned zero-effect attempt's
-/// budget charge; immutable attempt history and all retirement fences remain.
-/// Other members get the bounded retry delay;
-/// one that has used its automatic transport-failure budget is refused with an incident; a
-/// snapshot that a newer revision has meanwhile replaced is superseded
-/// instead of retried.
+/// A managed original with no possible prior message effect stays queued after
+/// a proven no-send, with exponential delays and a finite per-epoch budget.
+/// Other members retain their transport-failure budget; temporary deferrals and
+/// accepted resumes refund their respective charge without clearing history.
+/// Immutable attempt history and retirement fences remain. A replaced snapshot
+/// is superseded instead of retried.
 fn return_unsent(
     tx: &Transaction<'_>,
     record: &AttemptRecord,
     now_ms: u64,
     deferred: bool,
+    resumed: bool,
 ) -> Result<(), CoreError> {
     for member in &record.members {
-        let row: Option<(i64, String, Option<i64>, bool)> = tx
+        let row: Option<(i64, String, Option<i64>, bool, bool)> = tx
             .query_row(
                 "SELECT e.attempts_made, e.scope_key, e.revision, EXISTS (
                  SELECT 1 FROM delivery_scopes s WHERE s.producer = e.publisher_id
                  AND s.scope_key = e.delivery_scope_key AND s.closed_ms IS NOT NULL
-                 AND s.action = 'retire_unhanded') FROM events e
+                 AND s.action = 'retire_unhanded'), EXISTS (
+                 SELECT 1 FROM managed_deliveries m WHERE m.publisher_id=e.publisher_id
+                 AND m.event_id=e.event_id AND m.feedback_sender IS NOT NULL AND m.outcome='active')
+                 FROM events e
              WHERE e.publisher_id = ?1 AND e.event_id = ?2 AND e.attempt_seq = ?3
                AND NOT EXISTS(SELECT 1 FROM managed_deliveries m WHERE m.publisher_id=e.publisher_id
                  AND m.event_id=e.event_id AND m.outcome!='active')",
@@ -2030,13 +2205,55 @@ fn return_unsent(
                     member.event_id,
                     to_sql(record.fence.attempt_seq)?
                 ],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((attempts, scope, revision, retired)) = row else {
+        let Some((attempts, scope, revision, retired, original)) = row else {
             continue;
         };
-        let attempts = if deferred {
+        if (original || resumed) && !retired {
+            // Inspect the shared history predicate without counting this closed
+            // known-unsent attempt's still-owned transient delivery state.
+            tx.execute(
+                "UPDATE events SET delivery='unhanded' WHERE publisher_id=?1 AND event_id=?2 AND attempt_seq=?3",
+                params![member.publisher, member.event_id, to_sql(record.fence.attempt_seq)?],
+            )?;
+            let possible: bool = tx.query_row(
+                &format!(
+                    "SELECT {} FROM events e WHERE publisher_id=?1 AND event_id=?2",
+                    crate::universal::POSSIBLE_EFFECT
+                ),
+                params![member.publisher, member.event_id],
+                |row| row.get(0),
+            )?;
+            if possible {
+                tx.execute(
+                    "UPDATE events SET delivery='review',attempt_seq=NULL WHERE publisher_id=?1 AND event_id=?2",
+                    params![member.publisher, member.event_id],
+                )?;
+                if resumed && !original {
+                    open_incident_in(
+                        tx,
+                        &member.publisher,
+                        &member.event_id,
+                        Some(record.fence.attempt_seq),
+                        "resume_prior_message_effect",
+                        "an earlier message handoff remains possible; automatic delivery is fenced",
+                        now_ms,
+                    )?;
+                }
+                continue;
+            }
+        }
+        let attempts = if deferred && (!original || resumed) {
             let refunded = attempts
                 .checked_sub(1)
                 .filter(|value| *value >= 0)
@@ -2101,6 +2318,26 @@ fn return_unsent(
             continue;
         }
         let attempts = u32::try_from(from_sql(attempts)?).unwrap_or(u32::MAX);
+        if original
+            && stored_epoch(tx, &record.fence.recipient)?
+                .is_none_or(|epoch| epoch <= record.fence.endpoint_epoch)
+            && let Some(seq) = managed_epoch_exhausted(
+                tx,
+                &member.publisher,
+                &member.event_id,
+                record.fence.endpoint_epoch,
+            )?
+        {
+            open_incident_in(
+                tx,
+                &member.publisher,
+                &member.event_id,
+                Some(seq),
+                "managed_retry_epoch_exhausted",
+                "message remains pending until a new attested endpoint epoch",
+                now_ms,
+            )?;
+        }
         let newer: bool = match revision {
             Some(revision) => tx.query_row(
                 "SELECT EXISTS (SELECT 1 FROM events WHERE scope_key = ?1 AND revision > ?2
@@ -2116,7 +2353,7 @@ fn return_unsent(
                  WHERE publisher_id = ?1 AND event_id = ?2",
                 params![member.publisher, member.event_id],
             )?;
-        } else if attempts >= MAX_AUTOMATIC_ATTEMPTS {
+        } else if !original && attempts >= MAX_AUTOMATIC_ATTEMPTS {
             tx.execute(
                 "UPDATE events SET delivery = 'refused', attempt_seq = NULL
                  WHERE publisher_id = ?1 AND event_id = ?2",
@@ -2136,7 +2373,18 @@ fn return_unsent(
                 "UPDATE events SET delivery = 'unhanded', attempt_seq = NULL, not_before_ms = ?1
                  WHERE publisher_id = ?2 AND event_id = ?3",
                 params![
-                    to_sql(now_ms.saturating_add(retry_delay_ms(attempts)))?,
+                    to_sql(
+                        now_ms.saturating_add(
+                            if resumed
+                                && stored_epoch(tx, &record.fence.recipient)?
+                                    .is_some_and(|epoch| epoch > record.fence.endpoint_epoch)
+                            {
+                                RETRY_BASE_MS
+                            } else {
+                                retry_delay_ms(attempts)
+                            }
+                        )
+                    )?,
                     member.publisher,
                     member.event_id
                 ],

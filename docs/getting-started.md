@@ -10,6 +10,13 @@ prebuilt bundle, unpack it into a new directory yourself, take its digest from t
 release notes through a channel you trust, and use it in step 3 in place of a local
 build.
 
+This installer sets up one account's private release and executable links; it
+does not create a systemd service or configure other accounts. A multi-account
+Linux deployment uses a separately root-managed, globally accessible coordinator
+and each account's own relay and configuration; see [Linux system service](configuration.md#linux-system-service).
+Use the host's trusted system release mechanism for updates rather than treating
+a root-owned private home as a globally accessible installation.
+
 ## 1. Prerequisites
 
 | Need | Why |
@@ -50,13 +57,13 @@ cargo +1.98.1 xtask package
 
 This builds every binary in release mode (offline, locked) and writes a verified
 bundle, including exactly the OpenCode plugin's `index.js` and `package.json`,
-to `dist/agent-bridge-0.5.1+<label>`, where the label is the 12-digit Git
+to `dist/agent-bridge-0.6.2+<label>`, where the label is the 12-digit Git
 commit (`-dirty` when the tree has changes; pass `--label NAME` outside a Git
 checkout). It prints the manifest and `sums_sha256`. Install with that digest,
 passed exactly as printed:
 
 ```sh
-./install.sh --bundle "$PWD/dist/agent-bridge-0.5.1+<label>" --sums-sha256 <sums_sha256> \
+./install.sh --bundle "$PWD/dist/agent-bridge-0.6.2+<label>" --sums-sha256 <sums_sha256> \
   --home "$HOME/.agent-bridge" --bin-dir "$HOME/.local/bin"
 ```
 

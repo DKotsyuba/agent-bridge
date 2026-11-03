@@ -43,8 +43,9 @@ while the caller's binding epoch is unchanged. Then the relay requires:
 3. valid closed arguments.
 
 With `[root].bounded_delivery=true` and core relay grant
-`managed_feedback=true`, new root sends stop after at most five actual sends
-or five minutes (a shorter explicit expiry still applies). The attested sender
+`managed_feedback=true`, root sends remain queued while the recipient is
+unavailable, subject to an explicit expiry if provided. Repeated proven no-send
+attempts are held after a bounded per-binding budget. The attested sender
 gets one bounded best-effort native MESSAGE on failure/unconfirmed outcome;
 `bridge_status` retains the authoritative report and original evidence even if
 that sender is unavailable. Existing configurations default to the legacy
@@ -311,7 +312,7 @@ authorized test delivery; none has happened.
 
 ```sh
 cargo xtask package                     # prints manifest + sums_sha256
-./install.sh --bundle /ABS/dist/agent-bridge-0.5.1+LABEL --sums-sha256 HEX \
+./install.sh --bundle /ABS/dist/agent-bridge-0.6.2+LABEL --sums-sha256 HEX \
   --home /ABS/home --bin-dir /ABS/bin
 bridge service start core  --home H --state S --config daemon.toml
 bridge service start relay --home H --state S --config interfaces.toml

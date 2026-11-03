@@ -1116,12 +1116,11 @@ struct Binding {
     /// Missing values read as None and are omitted when writing old-shaped rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     desktop_idle_transcript: Option<(u64, u64)>,
-    /// Positive-idle proof of a live Codex Desktop owner, bound to its exact
-    /// stable transcript, enabling the MESSAGE-only gateway route after the
-    /// harness incarnation ends (see the `gateway` module). Stamped only by an
-    /// owner hook that leaves the lifecycle `Inactive` and cleared by every other
-    /// lifecycle, renewal, retirement and a spent hand-off; absent in journals of
-    /// older builds (such rows are never gateway-eligible) and omitted when none.
+    /// Positive-idle proof bound to the exact stable transcript. Desktop routes
+    /// use it for the MESSAGE-only gateway; a retired Linux managed-server
+    /// binding may retain it only after its own previously idle SessionEnd.
+    /// The latter is never a Desktop gateway proof. Missing old facts grant no
+    /// new authority; renewal and non-idle observations clear the proof.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     wake: Option<WakeProof>,
     /// Journal compatibility only: a row written by the removed vendor-signature
@@ -1261,6 +1260,7 @@ pub struct RecipientBinding {
 /// bindings retain their capabilities; retired Codex Desktop exceptions supply no
 /// inject, caller or call authority. Both the carrier routes and the native owner
 /// route start from this snapshot and then separately prove their own route.
+#[derive(Clone)]
 pub(crate) struct MessageCandidate {
     /// Exact private binding, including its unchanged tombstone epoch.
     binding: Binding,
@@ -1272,6 +1272,86 @@ pub(crate) struct MessageCandidate {
 }
 
 impl MessageCandidate {
+    /// Checks a retired Codex session's same live process, private store and
+    /// MESSAGE-only qualification. This alone does not authorize a resume.
+    #[cfg(target_os = "linux")]
+    fn live_resume_binding(&self) -> Result<(Attestation, RecipientBinding), String> {
+        let binding = &self.binding;
+        if binding.address.harness != Harness::CODEX
+            || !binding.retired
+            || binding.desktop_idle_message
+            || self.committed_gateway().is_some()
+            || !binding.capabilities.message
+            || !self.policy.message
+            || os::process_env(binding.harness.0, "CODEX_APP_TOOLS_PIPE_PATH").is_some()
+            || os::process_env(binding.harness.0, "BRIDGE_NATIVE_OWNER_SOCKET").is_some()
+        {
+            return Err("no qualified live-server idle proof".into());
+        }
+        self.live_check()?;
+        let attestation = Attestation::verified(
+            binding.address.clone(),
+            binding.address.native_session_id.clone(),
+            binding.epoch,
+            Lifecycle::Inactive,
+            Capabilities {
+                inject: false,
+                message: true,
+            },
+            proof(format!(
+                "codex-live-resume:{}@{}:epoch{}",
+                binding.harness.0, binding.harness.1, binding.epoch
+            )),
+        )
+        .map_err(|error| error.to_string())?;
+        Ok((
+            attestation,
+            RecipientBinding {
+                harness: binding.harness,
+                epoch: binding.epoch,
+                store: binding.store.clone(),
+                executable: binding.executable.clone(),
+                transcript: binding.transcript.clone(),
+                desktop_message_only: false,
+                gateway: false,
+            },
+        ))
+    }
+
+    /// Proves the exact prior idle transcript before an unloaded-thread resume.
+    /// The caller must additionally check the native state and registry snapshot.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn validate_live_resume(&self) -> Result<(Attestation, RecipientBinding), String> {
+        if self.binding.wake.is_none() {
+            return Err("live-server idle proof was already spent".into());
+        }
+        let facts = self.live_resume_binding()?;
+        self.proves_idle()?;
+        Ok(facts)
+    }
+
+    /// Derives the exact snapshot expected after journaled proof consumption.
+    /// This snapshot grants nothing until the registry confirms it is current.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn after_live_resume_spend(&self) -> Self {
+        let mut candidate = self.clone();
+        candidate.binding.wake = None;
+        candidate
+    }
+
+    /// Rechecks the same process after a correlated resume; the transcript may
+    /// change during resume, so the caller must check native idle and the complete
+    /// original registry snapshot before sending a message.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn validate_live_resume_after(
+        &self,
+    ) -> Result<(Attestation, RecipientBinding), String> {
+        if self.binding.wake.is_some() {
+            return Err("live-server idle proof was not spent".into());
+        }
+        self.live_resume_binding()
+    }
+
     /// Revalidates exact PID/start, owner, recorded executable and the harness's
     /// own canonical owner-only store. Retired candidates additionally require the
     /// app capability and the same owned regular transcript under sessions,
@@ -1396,6 +1476,31 @@ fn retained_transcript(binding: &Binding, owner_uid: u32) -> Option<(u64, u64)> 
     let meta = std::fs::symlink_metadata(path).ok()?;
     (meta.is_file() && meta.uid() == owner_uid && meta.nlink() == 1)
         .then_some((meta.dev(), meta.ino()))
+}
+
+/// Records an exact inactive Codex transcript at its own managed-server end.
+/// Other actors, lifecycle states, changed paths and disabled MESSAGE refuse.
+#[cfg(target_os = "linux")]
+fn live_end_idle_proof(
+    binding: &Binding,
+    kind: HookKind,
+    role: ActorRole,
+    retained_path: bool,
+    owner_uid: u32,
+    policy: &HarnessPolicy,
+) -> Option<WakeProof> {
+    if kind != HookKind::SessionEnd
+        || role != ActorRole::Root
+        || binding.address.harness != Harness::CODEX
+        || binding.lifecycle != Lifecycle::Inactive
+        || !retained_path
+        || binding.desktop_idle_message
+        || !binding.capabilities.message
+        || !policy.message
+    {
+        return None;
+    }
+    gateway::read_stamp(binding, owner_uid)
 }
 
 /// Versioned bounded route snapshot. It contains no publisher tokens, native
@@ -2426,6 +2531,15 @@ impl Registry {
             // retire it truthfully; there is no idle exception for a child.
             binding.retired = true;
         }
+        #[cfg(target_os = "linux")]
+        let live_end_idle = live_end_idle_proof(
+            binding,
+            kind,
+            role,
+            retained_path,
+            owner_uid,
+            &matched.policy,
+        );
         binding.lifecycle = next_lifecycle(binding.lifecycle, kind, role, &matched.policy, payload);
         // ponytail: one bounded transcript read per idle hook under the lock (head line up to 1 MiB, last 64 KiB); stamp from a worker if hook rates ever matter.
         // The proof is re-stamped only by a positive owner idle event, never by an
@@ -2447,6 +2561,12 @@ impl Registry {
             // The narrow retired-Desktop idle exception keeps the proof stamped at
             // the positive idle before the end; every other end clears it.
             binding.wake = prior_wake;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(live_end_idle) = live_end_idle {
+            // The existing gateway explicitly rejects this retired non-Desktop
+            // shape. Preserve a separate exact idle stamp for the live server.
+            binding.wake = Some(live_end_idle);
         }
         let binding = binding.clone();
         if let Err(error) = self.persist_routes() {
@@ -3000,6 +3120,38 @@ impl Registry {
             || (binding.retired && !binding.desktop_idle_message)
         {
             return Err("message binding unavailable".into());
+        }
+        let policy = self
+            .policy(address.harness)
+            .ok_or("message policy changed")?
+            .clone();
+        Ok(MessageCandidate {
+            binding: binding.clone(),
+            policy,
+            owner_uid: self.owner_uid,
+        })
+    }
+
+    /// Copies only a retired Codex live-server candidate with an idle stamp.
+    /// Validation and native I/O happen outside the lock; ordinary recipient,
+    /// caller, inject and Desktop routes remain unavailable for this snapshot.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn live_resume_candidate(
+        &self,
+        address: &NativeAddress,
+    ) -> Result<MessageCandidate, String> {
+        let binding = self
+            .bindings
+            .get(&address.to_canonical_string())
+            .ok_or("no message binding")?;
+        if self.message_disabled.contains(&address.harness)
+            || binding.pending
+            || address.harness != Harness::CODEX
+            || !binding.retired
+            || binding.desktop_idle_message
+            || binding.wake.is_none()
+        {
+            return Err("no retired live-server candidate".into());
         }
         let policy = self
             .policy(address.harness)

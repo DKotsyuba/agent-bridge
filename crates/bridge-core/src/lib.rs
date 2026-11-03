@@ -18,7 +18,7 @@
 //!   contract.
 //! - [`recovery`]: evidence tiers, retained incidents, audited operator
 //!   recovery and reconciliation.
-//! - [`managed`]: opt-in bounded root delivery, retained reports and sender feedback.
+//! - [`managed`]: opt-in durable root delivery, retained reports and sender feedback.
 //! - [`service`]: the authenticated local socket service and its lifecycle.
 //!
 //! Boundary note: storage callers pass an already-authenticated publisher

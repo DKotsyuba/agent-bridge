@@ -1,7 +1,7 @@
 //! Linux App Server transport for an already attested Codex process.
 //!
-//! The sole mutating request is never retried: after its write begins an
-//! uncorrelated or malformed response is an unknown outcome.
+//! Only a route with a protected idle proof may resume an unloaded thread.
+//! An unconfirmed resume or message write has an unknown outcome and is not retried.
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -40,6 +40,8 @@ pub(crate) enum State {
     Idle,
     /// The thread is active without a pending user interaction.
     Active,
+    /// The exact stored thread is not loaded in this server.
+    NotLoaded,
 }
 
 /// Validates an owned private directory without following its final symlink.
@@ -116,7 +118,7 @@ impl Endpoint {
             .checked_add(timeout)
             .ok_or("invalid timeout")?;
         let mut ws = self.open(deadline)?;
-        read_state(&mut ws, thread).map_err(|_| "native thread state unavailable".into())
+        read_state(&mut ws, thread, 2).map_err(|_| "native thread state unavailable".into())
     }
 
     /// Opens and initializes a deadline-bound WebSocket to the verified peer.
@@ -231,13 +233,17 @@ enum StateError {
 }
 
 /// Reads the requested thread's native lifecycle, rejecting pending interaction.
-fn read_state(ws: &mut WebSocket<DeadlineStream>, thread: &str) -> Result<State, StateError> {
+fn read_state(
+    ws: &mut WebSocket<DeadlineStream>,
+    thread: &str,
+    id: u64,
+) -> Result<State, StateError> {
     request(
         ws,
-        json!({"id":2,"method":"thread/read","params":{"threadId":thread,"includeTurns":false}}),
+        json!({"id":id,"method":"thread/read","params":{"threadId":thread,"includeTurns":false}}),
     )
     .map_err(|_| StateError::Other)?;
-    let result = response(ws, 2).map_err(|_| StateError::Other)?;
+    let result = response(ws, id).map_err(|_| StateError::Other)?;
     if result.get("error").is_some()
         || result.pointer("/result/thread/id").and_then(Value::as_str) != Some(thread)
     {
@@ -260,6 +266,13 @@ fn read_state(ws: &mut WebSocket<DeadlineStream>, thread: &str) -> Result<State,
         {
             Ok(State::Active)
         }
+        Some("notLoaded")
+            if status
+                .get("activeFlags")
+                .is_none_or(|flags| flags.as_array().is_some_and(Vec::is_empty)) =>
+        {
+            Ok(State::NotLoaded)
+        }
         _ => Err(StateError::Lifecycle),
     }
 }
@@ -274,6 +287,8 @@ pub(crate) struct Handoff<'a> {
     pub text: &'a str,
     /// Requested dispatch mode.
     pub mode: Mode,
+    /// True only for the separately attested retired live-server idle route.
+    pub allow_resume: bool,
     /// Absolute core deadline in Unix milliseconds.
     pub deadline_ms: u64,
     /// Maximum duration of this exchange.
@@ -284,7 +299,8 @@ pub(crate) struct Handoff<'a> {
 pub(crate) fn deliver(
     endpoint: &Endpoint,
     handoff: &Handoff<'_>,
-    final_check: impl FnOnce() -> Result<(), String>,
+    pre_resume: impl FnOnce() -> Result<(), String>,
+    mut final_check: impl FnMut() -> Result<(), String>,
 ) -> Outcome {
     let budget = Duration::from_millis(handoff.deadline_ms.saturating_sub(current_unix_millis()))
         .min(handoff.timeout);
@@ -301,10 +317,60 @@ pub(crate) fn deliver(
             };
         }
     };
-    match read_state(&mut ws, handoff.thread) {
-        Ok(State::Idle) => {}
-        Ok(State::Active) if handoff.mode == Mode::Message => {}
-        Ok(State::Active) | Err(StateError::Lifecycle) => {
+    let mut resumed = false;
+    match read_state(&mut ws, handoff.thread, 2) {
+        Ok(State::Idle) if !handoff.allow_resume => {}
+        Ok(State::Active) if !handoff.allow_resume && handoff.mode == Mode::Message => {}
+        Ok(State::NotLoaded) => {
+            if !handoff.allow_resume
+                || endpoint.verify_peer(&ws.get_ref().stream).is_err()
+                || Instant::now() >= deadline
+                || pre_resume().is_err()
+            {
+                return Outcome::DeferredKnownUnsent {
+                    evidence: "native resume is not qualified; nothing sent".into(),
+                };
+            }
+            // Proof persistence may have taken time. Recheck the exact spent
+            // snapshot and kernel peer immediately before the resume write.
+            if endpoint.verify_peer(&ws.get_ref().stream).is_err()
+                || final_check().is_err()
+                || Instant::now() >= deadline
+            {
+                return Outcome::DeferredKnownUnsent {
+                    evidence: "native recipient changed before resume; nothing sent".into(),
+                };
+            }
+            let resume = json!({"id":4,"method":"thread/resume","params":{"threadId":handoff.thread,"excludeTurns":true}});
+            if request(&mut ws, resume).is_err()
+                || !response(&mut ws, 4).is_ok_and(|value| {
+                    value.get("error").is_none()
+                        && value.pointer("/result/thread/id").and_then(Value::as_str)
+                            == Some(handoff.thread)
+                })
+            {
+                return Outcome::OutcomeUnknown {
+                    reason: "native resume has no valid correlated receipt".into(),
+                };
+            }
+            resumed = true;
+            // SessionStart may renew the epoch during resume. Never send under
+            // the old attempt if the complete frozen registry snapshot changed.
+            if endpoint.verify_peer(&ws.get_ref().stream).is_err()
+                || final_check().is_err()
+                || Instant::now() >= deadline
+            {
+                return Outcome::ResumeAcceptedNoMessage {
+                    evidence: "native resume accepted; recipient changed before message".into(),
+                };
+            }
+            if !matches!(read_state(&mut ws, handoff.thread, 5), Ok(State::Idle)) {
+                return Outcome::ResumeAcceptedNoMessage {
+                    evidence: "native resume accepted; thread is not idle before message".into(),
+                };
+            }
+        }
+        Ok(State::Idle | State::Active) | Err(StateError::Lifecycle) => {
             return Outcome::DeferredKnownUnsent {
                 evidence: "native lifecycle unavailable or changed before handoff".into(),
             };
@@ -317,16 +383,29 @@ pub(crate) fn deliver(
     }
     let payload = json!({"id":3,"method":"turn/start","params":{"threadId":handoff.thread,"clientUserMessageId":handoff.client_id,"input":[{"type":"text","text":handoff.text}]}}).to_string();
     if payload.len() > LIMIT || Instant::now() >= deadline {
-        return Outcome::KnownUnsent {
-            evidence: "native handoff exceeded its limit before writing".into(),
+        return if resumed {
+            Outcome::ResumeAcceptedNoMessage {
+                evidence: "native resume accepted; message limit or deadline reached".into(),
+            }
+        } else {
+            Outcome::KnownUnsent {
+                evidence: "native handoff exceeded its limit before writing".into(),
+            }
         };
     }
+    // Recheck the same frozen binding immediately before the message write.
     if endpoint.verify_peer(&ws.get_ref().stream).is_err()
         || final_check().is_err()
         || Instant::now() >= deadline
     {
-        return Outcome::DeferredKnownUnsent {
-            evidence: "native recipient changed before handoff; nothing sent".into(),
+        return if resumed {
+            Outcome::ResumeAcceptedNoMessage {
+                evidence: "native resume accepted; recipient changed before message".into(),
+            }
+        } else {
+            Outcome::DeferredKnownUnsent {
+                evidence: "native recipient changed before handoff; nothing sent".into(),
+            }
         };
     }
     if ws.send(Message::Text(payload.into())).is_err() {
@@ -433,7 +512,7 @@ mod tests {
 
     /// Runs one scripted protocol exchange and returns whether a mutation arrived.
     fn exchange(status: Value, reply: Option<Value>, fence: bool, mode: Mode) -> (Outcome, bool) {
-        exchange_thread(status, reply, fence, mode, "thread-1")
+        exchange_thread(status, reply, fence, mode, "thread-1", false)
     }
 
     /// Exchanges with a chosen thread ID in the preflight response.
@@ -443,6 +522,7 @@ mod tests {
         fence: bool,
         mode: Mode,
         returned_thread: &'static str,
+        allow_resume: bool,
     ) -> (Outcome, bool) {
         let (dir, listener, binding) = fixture();
         let worker = thread::spawn(move || {
@@ -483,12 +563,18 @@ mod tests {
             client_id: "client-1",
             text: "hello",
             mode,
+            allow_resume,
             deadline_ms: current_unix_millis() + 3000,
             timeout: Duration::from_secs(3),
         };
-        let outcome = deliver(&endpoint, &handoff, || {
-            if fence { Ok(()) } else { Err("changed".into()) }
-        });
+        let outcome = deliver(
+            &endpoint,
+            &handoff,
+            || Err("not eligible".into()),
+            || {
+                if fence { Ok(()) } else { Err("changed".into()) }
+            },
+        );
         let wrote = worker.join().unwrap();
         let target_dir = std::env::temp_dir()
             .parent()
@@ -526,6 +612,7 @@ mod tests {
             true,
             Mode::Message,
             "other-thread",
+            false,
         );
         assert!(!wrote && matches!(result, Outcome::KnownUnsent { .. }));
         for reply in [
@@ -550,6 +637,16 @@ mod tests {
             Mode::Message,
         );
         assert!(!wrote && matches!(result, Outcome::DeferredKnownUnsent { .. }));
+        let (result, wrote) = exchange(json!({"type":"notLoaded"}), None, true, Mode::Message);
+        assert!(!wrote && matches!(result, Outcome::DeferredKnownUnsent { .. }));
+        for status in [
+            json!({"type":"idle"}),
+            json!({"type":"active","activeFlags":[]}),
+        ] {
+            let (result, wrote) =
+                exchange_thread(status, None, true, Mode::Message, "thread-1", true);
+            assert!(!wrote && matches!(result, Outcome::DeferredKnownUnsent { .. }));
+        }
         let (result, wrote) = exchange(json!({"type":"idle"}), None, false, Mode::Message);
         assert!(!wrote && matches!(result, Outcome::DeferredKnownUnsent { .. }));
         let (result, wrote) = exchange(json!({"type":"idle"}), None, true, Mode::Message);
@@ -609,10 +706,16 @@ mod tests {
             client_id: "client-1",
             text: "hello",
             mode: Mode::Auto,
+            allow_resume: false,
             deadline_ms: current_unix_millis() + 3000,
             timeout: Duration::from_secs(3),
         };
-        let outcome = deliver(&endpoint, &handoff, || Ok(()));
+        let outcome = deliver(
+            &endpoint,
+            &handoff,
+            || Err("not eligible".into()),
+            || Ok(()),
+        );
         let mutations = worker.join().unwrap();
         let target_dir = std::env::temp_dir()
             .parent()
@@ -623,6 +726,127 @@ mod tests {
         assert_eq!(initial, State::Idle);
         assert!(matches!(outcome, Outcome::DeferredKnownUnsent { .. }));
         assert_eq!(mutations, 0);
+    }
+
+    /// Resume requires the same binding and fresh idle; an unconfirmed resume stays unknown.
+    #[test]
+    fn unloaded_thread_resumes_without_crossing_a_changed_binding() {
+        for case in ["ready", "renewed", "waiting", "lost", "wrong", "denied"] {
+            let changed = case == "renewed";
+            let (dir, listener, binding) = fixture();
+            let fence = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let server_fence = std::sync::Arc::clone(&fence);
+            let worker = thread::spawn(move || {
+                drop(listener.accept().unwrap().0);
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut ws = tungstenite::accept(stream).unwrap();
+                let _ = ws.read().unwrap();
+                ws.send(Message::Text(
+                    json!({"id":1,"result":{}}).to_string().into(),
+                ))
+                .unwrap();
+                let _ = ws.read().unwrap();
+                let _ = ws.read().unwrap();
+                ws.send(Message::Text(json!({"id":2,"result":{"thread":{"id":"thread-1","status":{"type":"notLoaded"}}}}).to_string().into())).unwrap();
+                let Ok(Message::Text(resume)) = ws.read() else {
+                    return (false, false);
+                };
+                let resume: Value = serde_json::from_str(&resume).unwrap();
+                if resume["method"] != "thread/resume" {
+                    return (false, false);
+                }
+                assert_eq!(
+                    resume["params"],
+                    json!({"threadId":"thread-1","excludeTurns":true})
+                );
+                server_fence.store(changed, Ordering::SeqCst);
+                if case == "lost" {
+                    return (true, false);
+                }
+                let resumed_thread = if case == "wrong" {
+                    "other-thread"
+                } else {
+                    "thread-1"
+                };
+                ws.send(Message::Text(
+                    json!({"id":4,"result":{"thread":{"id":resumed_thread}}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+                let Ok(Message::Text(read)) = ws.read() else {
+                    return (true, false);
+                };
+                let read: Value = serde_json::from_str(&read).unwrap();
+                assert_eq!(read["method"], "thread/read");
+                let status = if case == "waiting" {
+                    json!({"type":"active","activeFlags":["waitingOnApproval"]})
+                } else {
+                    json!({"type":"idle"})
+                };
+                ws.send(Message::Text(
+                    json!({"id":5,"result":{"thread":{"id":"thread-1","status":status}}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+                let started =
+                    matches!(ws.read(), Ok(Message::Text(text)) if text.contains("turn/start"));
+                if started {
+                    ws.send(Message::Text(json!({"id":3,"result":{"turn":{"id":"turn-1","items":[],"status":"inProgress"}}}).to_string().into())).unwrap();
+                }
+                (true, started)
+            });
+            let endpoint = locate(&binding).unwrap().unwrap();
+            let handoff = Handoff {
+                thread: "thread-1",
+                client_id: "client-1",
+                text: "hello",
+                mode: Mode::Message,
+                allow_resume: true,
+                deadline_ms: current_unix_millis() + 3000,
+                timeout: Duration::from_secs(3),
+            };
+            let outcome = deliver(
+                &endpoint,
+                &handoff,
+                || {
+                    if case == "denied" {
+                        Err("no idle proof".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                || {
+                    if fence.load(Ordering::SeqCst) {
+                        Err("changed".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            let (resumed, started) = worker.join().unwrap();
+            let target_dir = std::env::temp_dir()
+                .parent()
+                .unwrap()
+                .join(dir.file_name().unwrap());
+            fs::remove_dir_all(dir).unwrap();
+            fs::remove_dir_all(target_dir).unwrap();
+            assert_eq!(resumed, case != "denied", "{case}");
+            assert_eq!(started, case == "ready", "{case}");
+            assert!(
+                match case {
+                    "ready" => matches!(outcome, Outcome::NativeAccepted { .. }),
+                    "lost" | "wrong" => matches!(outcome, Outcome::OutcomeUnknown { .. }),
+                    "denied" => matches!(outcome, Outcome::DeferredKnownUnsent { .. }),
+                    _ => matches!(outcome, Outcome::ResumeAcceptedNoMessage { .. }),
+                },
+                "{case}: {outcome:?}"
+            );
+        }
     }
 
     /// An incorrect frozen incarnation cannot select an otherwise owned socket.

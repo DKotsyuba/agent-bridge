@@ -139,7 +139,7 @@ impl CodexQueueCarrier {
         let defer_changes = match &route {
             Route::Owner(_) => true,
             #[cfg(target_os = "linux")]
-            Route::LiveAppServer(_) => true,
+            Route::LiveAppServer(_) | Route::LiveResume(_, _) => true,
             _ => false,
         };
         let changed = |reason: &str| {
@@ -153,6 +153,14 @@ impl CodexQueueCarrier {
         };
         if binding.epoch != attempt.fence.endpoint_epoch {
             return Err(changed("the endpoint epoch changed since the reservation"));
+        }
+        if attestation.actor_id() != attempt.actor
+            || attestation.proof_ref() != attempt.proof_ref
+            || attestation.capabilities().as_text() != attempt.granted
+        {
+            return Err(changed(
+                "the frozen recipient route changed since the reservation",
+            ));
         }
         let lifecycle = attestation.lifecycle();
         let allowed = if matches!(route, Route::Owner(_)) {
@@ -194,6 +202,32 @@ impl CodexQueueCarrier {
         address: &NativeAddress,
         _probe_native_state: bool,
     ) -> Result<(Attestation, RecipientBinding, Route), String> {
+        #[cfg(target_os = "linux")]
+        {
+            let candidate = {
+                lock_registry(&self.registry)
+                    .live_resume_candidate(address)
+                    .ok()
+            };
+            if let Some(candidate) = candidate {
+                let (attestation, binding) = candidate.validate_live_resume()?;
+                let endpoint = crate::codex_live::locate(&binding)?
+                    .ok_or("qualified native control socket unavailable")?;
+                if endpoint.state(
+                    &address.native_session_id,
+                    self.timeout.min(Duration::from_secs(3)),
+                )? != crate::codex_live::State::NotLoaded
+                {
+                    return Err("retired live-server thread is not unloaded".into());
+                }
+                lock_registry(&self.registry).message_current(&candidate)?;
+                return Ok((
+                    attestation,
+                    binding,
+                    Route::LiveResume(endpoint, Box::new(candidate)),
+                ));
+            }
+        }
         let mut candidate = { lock_registry(&self.registry).message_candidate(address)? };
         let result = if candidate.needs_gateway() {
             self.gateway_recipient(address, &mut candidate)?
@@ -226,10 +260,13 @@ impl CodexQueueCarrier {
                     // send, deliver performs the typed lifecycle check itself;
                     // a normal state change must not spend a transport retry.
                     if _probe_native_state {
-                        endpoint.state(
+                        let state = endpoint.state(
                             &address.native_session_id,
                             self.timeout.min(Duration::from_secs(3)),
                         )?;
+                        if state == crate::codex_live::State::NotLoaded {
+                            return Err("native thread unloaded without an idle-end proof".into());
+                        }
                     }
                     return Ok(Route::LiveAppServer(endpoint));
                 }
@@ -420,9 +457,11 @@ impl DispatchCarrier for CodexQueueCarrier {
                         client_id: &client_id,
                         text: &attempt.manifest,
                         mode: attempt.requested_mode,
+                        allow_resume: false,
                         deadline_ms: attempt.deadline_ms,
                         timeout: self.timeout,
                     },
+                    || Err("not a resume route".into()),
                     || {
                         let candidate =
                             lock_registry(&self.registry).message_candidate(&address)?;
@@ -440,6 +479,55 @@ impl DispatchCarrier for CodexQueueCarrier {
                         }
                         lock_registry(&self.registry).message_current(&candidate)
                     },
+                );
+            }
+            #[cfg(target_os = "linux")]
+            Route::LiveResume(endpoint, candidate) => {
+                let spent_candidate = candidate.after_live_resume_spend();
+                let fence = || -> Result<(), String> {
+                    let (attestation, current) = spent_candidate.validate_live_resume_after()?;
+                    if current.epoch != binding.epoch
+                        || current.harness != binding.harness
+                        || current.store != binding.store
+                        || current.executable != binding.executable
+                        || attestation.lifecycle() != _lifecycle
+                        || attestation.proof_ref() != attempt.proof_ref
+                    {
+                        return Err("live resume binding changed".into());
+                    }
+                    lock_registry(&self.registry).message_current(&spent_candidate)
+                };
+                return crate::codex_live::deliver(
+                    &endpoint,
+                    &crate::codex_live::Handoff {
+                        thread: &address.native_session_id,
+                        client_id: &client_id,
+                        text: &attempt.manifest,
+                        mode: attempt.requested_mode,
+                        allow_resume: true,
+                        deadline_ms: attempt.deadline_ms,
+                        timeout: self.timeout,
+                    },
+                    || {
+                        candidate.validate_live_resume()?;
+                        {
+                            let mut registry = lock_registry(&self.registry);
+                            registry.message_current(&candidate)?;
+                            // Spend the exact idle proof durably before resume: even
+                            // another pending message cannot repeat an unknown wake.
+                            let spent = registry.spend_wake(&address, binding.epoch)?;
+                            if let Err(error) = registry.message_current(&spent_candidate) {
+                                registry.restore_wake(&address, spent);
+                                return Err(error);
+                            }
+                        }
+                        // Journal I/O may overlap a transcript update. Re-read
+                        // the spent stamp outside the lock, then fence the exact
+                        // post-spend snapshot again before the resume write.
+                        candidate.proves_idle()?;
+                        lock_registry(&self.registry).message_current(&spent_candidate)
+                    },
+                    fence,
                 );
             }
             Route::Helper => {}
@@ -467,6 +555,12 @@ pub(crate) enum Route {
     /// The exact live Linux harness's protected native App Server transport.
     #[cfg(target_os = "linux")]
     LiveAppServer(crate::codex_live::Endpoint),
+    /// A retired, previously idle session with an exact live-server proof.
+    #[cfg(target_os = "linux")]
+    LiveResume(
+        crate::codex_live::Endpoint,
+        Box<crate::registry::MessageCandidate>,
+    ),
 }
 
 /// Runs all route discovery/probing in `pick` before the final in-memory

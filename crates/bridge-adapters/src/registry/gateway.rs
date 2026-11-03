@@ -20,8 +20,8 @@
 //!   owner itself leaves the lifecycle positively `Inactive` on a Desktop harness
 //!   and is cleared by every other lifecycle and a renewal. A `SessionEnd` that
 //!   keeps the existing narrow retired-Desktop idle exception keeps the proof
-//!   stamped before it; any other `SessionEnd` clears it, and a retired binding
-//!   without that exception is never eligible.
+//!   stamped before it. On Linux a separate retired managed-server shape can
+//!   retain an exact end stamp, but it never qualifies for this Desktop gateway.
 //! - **Exact stable thread.** The stamp binds the transcript's device and inode,
 //!   its length, its nanosecond modification and status-change times (a write
 //!   anywhere in the file moves them, and a program cannot set the status-change
@@ -528,6 +528,180 @@ mod tests {
     /// The uid that owns the files this test creates.
     fn uid() -> u32 {
         os::process_facts(std::process::id()).unwrap().uid.unwrap()
+    }
+
+    /// A managed-end stamp needs a real prior idle and never enables the Desktop gateway.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_end_stamp_requires_own_idle_and_is_not_a_gateway() {
+        let store = store("managed-end");
+        let path = store.join("sessions").join("t.jsonl");
+        std::fs::write(
+            &path,
+            format!("{}\n", json!({"type":"session_meta","payload":{"id":"t1"}})),
+        )
+        .unwrap();
+        let mut binding = binding_for(&store, "t1", &path);
+        binding.retired = true;
+        let policy = HarnessPolicy {
+            harness: Harness::CODEX,
+            namespace: "ns".into(),
+            inject: true,
+            message: true,
+            executable_markers: Vec::new(),
+            store_env: None,
+            store_home: None,
+            child_address: None,
+            caller_proof: Vec::new(),
+        };
+        let stamp = live_end_idle_proof(
+            &binding,
+            HookKind::SessionEnd,
+            ActorRole::Root,
+            true,
+            uid(),
+            &policy,
+        )
+        .expect("own previously idle session end");
+        assert!(
+            live_end_idle_proof(
+                &binding,
+                HookKind::SessionEnd,
+                ActorRole::Child,
+                true,
+                uid(),
+                &policy
+            )
+            .is_none()
+        );
+        assert!(
+            live_end_idle_proof(
+                &binding,
+                HookKind::Stop,
+                ActorRole::Root,
+                true,
+                uid(),
+                &policy
+            )
+            .is_none()
+        );
+        assert!(
+            live_end_idle_proof(
+                &binding,
+                HookKind::SessionEnd,
+                ActorRole::Root,
+                false,
+                uid(),
+                &policy
+            )
+            .is_none()
+        );
+        binding.lifecycle = Lifecycle::AwaitingInput;
+        assert!(
+            live_end_idle_proof(
+                &binding,
+                HookKind::SessionEnd,
+                ActorRole::Root,
+                true,
+                uid(),
+                &policy
+            )
+            .is_none()
+        );
+        binding.lifecycle = Lifecycle::Unknown;
+        assert!(
+            live_end_idle_proof(
+                &binding,
+                HookKind::SessionEnd,
+                ActorRole::Root,
+                true,
+                uid(),
+                &policy
+            )
+            .is_none()
+        );
+        binding.lifecycle = Lifecycle::Inactive;
+        binding.wake = Some(stamp);
+        let value = serde_json::to_value(&binding).unwrap();
+        let candidate = MessageCandidate {
+            binding: serde_json::from_value(value).unwrap(),
+            policy: policy.clone(),
+            owner_uid: uid(),
+        };
+        assert!(candidate.proves_idle().is_ok());
+        assert!(!candidate.needs_gateway());
+        assert!(!candidate.needs_idle_proof());
+        let config = RegistryConfig {
+            host_id: "h".into(),
+            harnesses: Vec::new(),
+            profiles: Vec::new(),
+            intermediates: Vec::new(),
+            max_call_age_ms: 600_000,
+            relays: Vec::new(),
+            audiences: Vec::new(),
+            legacy_owner_relays: 0,
+        };
+        let mut registry = Registry::new(config.clone(), uid()).unwrap();
+        let routes = store.join("routes");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&routes)
+            .unwrap();
+        let journal = routes.join("c.bindings.json");
+        registry.attach_journal(&journal, 1).unwrap();
+        registry.policies.push(policy);
+        registry
+            .bindings
+            .insert(binding.address.to_canonical_string(), binding.clone());
+        registry.persist_routes().unwrap();
+        assert!(
+            registry.message_candidate(&binding.address).is_err(),
+            "ordinary route remains closed"
+        );
+        assert!(
+            registry.live_resume_candidate(&binding.address).is_ok(),
+            "dedicated snapshot needs further live verification"
+        );
+        let spent_snapshot = candidate.after_live_resume_spend();
+        registry
+            .spend_wake(&binding.address, binding.epoch)
+            .unwrap();
+        assert!(
+            registry.message_current(&candidate).is_err(),
+            "old snapshot was fenced"
+        );
+        assert!(
+            registry.message_current(&spent_snapshot).is_ok(),
+            "exact spent snapshot is current"
+        );
+        assert!(
+            registry
+                .spend_wake(&binding.address, binding.epoch)
+                .is_err(),
+            "a second message cannot spend the same proof"
+        );
+        assert!(
+            registry.live_resume_candidate(&binding.address).is_err(),
+            "a missing stamp is not authority"
+        );
+        let mut restored = Registry::new(config, uid()).unwrap();
+        restored.attach_journal(&journal, 10).unwrap();
+        assert!(
+            restored.bindings[&binding.address.to_canonical_string()]
+                .wake
+                .is_none(),
+            "restart keeps the proof spent"
+        );
+        std::fs::write(
+            &path,
+            format!(
+                "{}\nchanged\n",
+                json!({"type":"session_meta","payload":{"id":"t1"}})
+            ),
+        )
+        .unwrap();
+        assert!(candidate.proves_idle().is_err());
+        std::fs::remove_dir_all(store).unwrap();
     }
 
     /// The stamp names the exact thread, file identity, length and tail: it is

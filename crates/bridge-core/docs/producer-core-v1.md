@@ -30,9 +30,12 @@ trust delegation to the relay, never sender authority from metadata or a
 producer v1 route's destination. Ordinary legacy and all v1 publication forms
 are unchanged; there is no automatic enrollment of older events.
 
-Schema 7 stores the fixed five-invocation/five-minute lifetime, actual invocation
-counter, retained completion report and bounded feedback intent. Selection and
-pre-invoking fencing stop further automated sends; in-flight originals archive as unconfirmed at the lifetime deadline while
+Schema 7 stores the explicit expiry, actual invocation counter, retained completion
+report and bounded feedback intent. Managed root originals without an explicit
+expiry remain queued through recipient unavailability. Confirmed no-send retries
+are limited per binding; exhausting that budget holds the original until a newer
+binding is observed. Selection and pre-invoking fencing stop unsafe sends;
+in-flight originals archive as unconfirmed at their explicit expiry while
 their native attempts keep the existing handoff fence for late receipts. Completion atomically
 records `failed` or `unconfirmed` and an audited `disposed` delivery state,
 without erasing possible-effect history or asserting native recall. Positive

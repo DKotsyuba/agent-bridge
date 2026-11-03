@@ -189,13 +189,19 @@ touched by anything here, and nothing in this crate installs a hook for you.
   the connected kernel peer must be the binding's exact PID, UID and process
   birth, with its unchanged executable and canonical store revalidated.
   Read-only `thread/read` must return this exact thread ID in a loaded idle or
-  active state without approval/input flags. The sole mutation is `turn/start`
+  active state without approval/input flags. For that ordinary route, `turn/start`
   carrying the frozen manifest and a correlation ID, with no model, permission
   or configuration overrides. Explicit MESSAGE uses the native API's idle or
   active input semantics. AUTO requires idle registry and native observations;
   the API has no atomic idle-only precondition, so this is not the native
-  owner's strict `wake_only` contract. Unknown, unloaded and waiting states
-  hold. A final binding/epoch/lifecycle fence runs immediately before writing.
+  owner's strict `wake_only` contract. A separately attested retired Linux route
+  can resume a `notLoaded` thread only with its own prior idle transcript proof,
+  the same live process and no owner/Desktop override. The proof is spent in the
+  journal before `thread/resume`; the exact binding and native idle state are
+  checked again before any `turn/start`. A renewed epoch requires a fresh attempt.
+  Resume can itself continue a configured goal. An unconfirmed resume is unknown
+  and its proof is never retried. Waiting, unknown and unproven states hold. A
+  final binding/epoch/lifecycle fence runs immediately before writing.
   Once that write begins, a missing or invalid correlated receipt is unknown;
   no retry, route fallback or second mutation is made. A valid turn receipt
   proves native acceptance only. Display items in the receipt grant no further

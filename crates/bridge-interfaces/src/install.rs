@@ -42,7 +42,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -748,9 +748,14 @@ pub fn self_install(
     activation(home, &state, &manifest, reused)
 }
 
-/// Launchers still to create; refuses a foreign file at any launcher path.
+/// Plans missing launchers, requesting mode `0700` for new directories without
+/// changing existing ones; refuses a foreign file at any launcher path.
 fn launcher_plan(home: &Path, bin_dir: &Path) -> Result<Vec<(PathBuf, PathBuf)>, String> {
-    std::fs::create_dir_all(bin_dir).map_err(|error| error.to_string())?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(bin_dir)
+        .map_err(|error| error.to_string())?;
     let mut missing = Vec::new();
     for name in BINARIES {
         let link = bin_dir.join(name);
@@ -1192,6 +1197,35 @@ mod tests {
         let (old, sums_old) = bundle(dir, "c", "old", 3);
         let error = self_install(&old, &home, &bin, &sums_old).unwrap_err();
         assert!(error.contains("downgrade"), "{error}");
+    }
+
+    /// New launcher directories exclude group/other access, while reinstalling
+    /// into an existing directory leaves its permissions unchanged.
+    #[test]
+    fn new_launcher_directories_are_private_and_existing_permissions_are_preserved() {
+        let scratch = TestDir::new("ilauncher");
+        let dir = scratch.path();
+        let home = dir.join("home");
+        let parent = dir.join("launchers");
+        let bin = parent.join("bin");
+        let (one, sums) = bundle(dir, "a", "one", 4);
+        self_install(&one, &home, &bin, &sums).unwrap();
+        for path in [&parent, &bin] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "{} must be private",
+                path.display()
+            );
+        }
+
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(self_install(&one, &home, &bin, &sums).unwrap().reused);
+        assert_eq!(
+            std::fs::metadata(&bin).unwrap().permissions().mode() & 0o777,
+            0o775,
+            "an existing launcher directory must not be changed"
+        );
     }
 
     /// A pre-existing foreign launcher file refuses the install and is left

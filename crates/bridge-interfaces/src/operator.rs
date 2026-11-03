@@ -75,6 +75,10 @@ pub fn classify(kind: &str) -> (&'static str, &'static str) {
             "held",
             "recipient unknown, disconnected or paused: restore or resume the exact session, or dispose its waiting events.",
         ),
+        "managed_retry_epoch_exhausted" => (
+            "held",
+            "message is retained after repeated known-unsent attempts; delivery resumes when the exact session obtains a new attested endpoint epoch.",
+        ),
         "permanent_refusal" | "retries_exhausted" => (
             "refused",
             "this attempt was refused; an earlier hand-off may remain unknown. Inspect the retained evidence, then dispose this event with an audited note. Refused events cannot be retried; retry --accept-duplicate-risk applies only to review or held events. A new notification requires a separate explicit decision and does not resolve an earlier possible effect.",
@@ -347,6 +351,7 @@ mod tests {
         assert_eq!(classify("receipt_overdue").0, "overdue");
         assert_eq!(classify("held_overdue").0, "overdue");
         assert_eq!(classify("recipient_held").0, "held");
+        assert_eq!(classify("managed_retry_epoch_exhausted").0, "held");
         assert_eq!(classify("retries_exhausted").0, "refused");
         assert!(
             classify("retries_exhausted")

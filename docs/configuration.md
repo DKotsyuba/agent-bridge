@@ -123,12 +123,13 @@ also permit that sender address. Original kinds/modes/policies remain checked;
 the capability separately permits core-generated `bridge.delivery_report`
 MESSAGE events back to that permitted address.
 
-New managed messages allow at most five actual native invocations and five
-minutes from initial custody, including busy or unavailable recipients. An
-explicit shorter expiry shortens that window. An in-flight invocation is archived as unconfirmed at that deadline while
-its native attempt/fence remains intact for a later receipt; time never proves
-a possible native effect absent. Only positive unsent
-outcomes retry. At completion the original leaves admission/delivery rotation
+Managed root messages remain in custody while a recipient is unavailable;
+they do not expire after five minutes. An explicitly supplied expiry still
+applies. Known-unsent attempts are bounded per verified binding; after that
+budget is exhausted the original remains held until a newer binding is observed.
+An in-flight invocation at expiry is archived as unconfirmed while its native
+attempt/fence remains intact for a later receipt; time never proves a possible
+native effect absent. Only positive unsent outcomes retry. At completion the original leaves admission/delivery rotation
 with its full payload, immutable hash, identity and evidence retained. Its
 status includes a durable `report`: `failed` for a known no-effect history or
 `unconfirmed` when any handoff may have occurred. Late positive evidence may
@@ -283,8 +284,12 @@ protected path and exact kernel peer PID/UID/process incarnation, reads metadata
 for the exact recipient thread and delivers MESSAGE through one native
 `turn/start`. The socket must be owned mode `0600` inside a private owned
 canonical directory; the owned control-directory link is resolved and checked.
-Unloaded, waiting and unknown states hold; no private session store is resumed
-by this route. An explicit native owner locator still takes precedence and
+An unloaded thread can be resumed only when its own prior idle and exact retained
+transcript were recorded at its `SessionEnd`, the same live server is verified,
+and the one-shot proof is durably spent before `thread/resume`. A confirmed
+resume may renew the binding; Bridge rechecks it before sending. An unconfirmed
+resume is retained as unknown. Waiting, unknown, or unproven states hold.
+An explicit native owner locator still takes precedence and
 cannot fall back if its proof fails. See the
 [adapter contract](../crates/bridge-adapters/README.md#delivery-paths) for fences,
 AUTO's non-atomic idle check and conservative uncertain-outcome handling.

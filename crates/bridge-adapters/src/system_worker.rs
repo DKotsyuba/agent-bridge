@@ -45,6 +45,49 @@ const ACTIVE: u8 = 3;
 /// No further operations may start.
 const STOPPING: u8 = 4;
 
+/// Maps only known static attestation failures to safe, coarse diagnostics.
+fn attestation_hold_reason(reason: &str) -> &'static str {
+    match reason {
+        "no message binding" | "no attested binding for this recipient (unknown, not inactive)" => {
+            "session not bound"
+        }
+        "message binding unavailable"
+        | "retired Desktop message evidence unavailable"
+        | "the recipient session ended (unknown, not inactive)"
+        | "a retired recipient cannot use a native owner route" => {
+            "session binding unavailable or retired"
+        }
+        "native thread state unavailable" => "native thread state unavailable",
+        "native control directory unavailable"
+        | "native control directory unresolved"
+        | "native control directory is not private and owned"
+        | "native control directory is not canonical"
+        | "native control socket unavailable"
+        | "native control socket unresolved"
+        | "native control socket has no parent"
+        | "native control socket has invalid ownership or type"
+        | "native control socket is not owned mode 0600"
+        | "native control socket connection failed"
+        | "native connect failed" => "native control socket unavailable",
+        "native control peer unavailable" | "native control peer incarnation changed" => {
+            "native control peer ownership unavailable"
+        }
+        _ => "target unavailable",
+    }
+}
+
+/// Accepts only fixed diagnostic categories from an untrusted worker.
+pub(crate) fn safe_hold_reason(reason: &str) -> &'static str {
+    match reason {
+        "session not bound" => "session not bound",
+        "session binding unavailable or retired" => "session binding unavailable or retired",
+        "native thread state unavailable" => "native thread state unavailable",
+        "native control socket unavailable" => "native control socket unavailable",
+        "native control peer ownership unavailable" => "native control peer ownership unavailable",
+        _ => "target unavailable",
+    }
+}
+
 /// Converts locally verified observations to non-authoritative wire data.
 fn facts(attestation: &Attestation) -> BindingFacts {
     BindingFacts {
@@ -391,19 +434,19 @@ impl Worker {
                 .lock()
                 .map_err(|_| "carrier unavailable")?
                 .attest(target)
-                .map_err(|_| "target unavailable")
+                .map_err(|reason| attestation_hold_reason(&reason))
         } else if target.harness == Harness::CLAUDE_CODE {
             self.claude
                 .lock()
                 .map_err(|_| "carrier unavailable")?
                 .attest(target)
-                .map_err(|_| "target unavailable")
+                .map_err(|reason| attestation_hold_reason(&reason))
         } else {
             self.owner
                 .lock()
                 .map_err(|_| "carrier unavailable")?
                 .attest(target)
-                .map_err(|_| "target unavailable")
+                .map_err(|reason| attestation_hold_reason(&reason))
         }
     }
 
@@ -665,8 +708,8 @@ impl Worker {
                 Ok(attestation) => Response::Binding {
                     binding: facts(&attestation),
                 },
-                Err(_) => Response::Held {
-                    reason: "target unavailable".into(),
+                Err(reason) => Response::Held {
+                    reason: safe_hold_reason(reason).into(),
                 },
             },
             Request::SendMessage {
@@ -1065,6 +1108,42 @@ mod tests {
 
     use super::*;
     use bridge_core::dispatch::{AttemptFence, MemberRef};
+
+    /// Static categories survive both filters; arbitrary upstream content never does.
+    #[test]
+    fn attestation_diagnostics_are_closed_and_safe() {
+        for (input, expected) in [
+            ("no message binding", "session not bound"),
+            (
+                "message binding unavailable",
+                "session binding unavailable or retired",
+            ),
+            (
+                "native thread state unavailable",
+                "native thread state unavailable",
+            ),
+            (
+                "native control socket connection failed",
+                "native control socket unavailable",
+            ),
+            (
+                "native control peer incarnation changed",
+                "native control peer ownership unavailable",
+            ),
+            ("secret /private/path payload", "target unavailable"),
+        ] {
+            assert_eq!(attestation_hold_reason(input), expected);
+            assert_eq!(safe_hold_reason(attestation_hold_reason(input)), expected);
+        }
+        assert_eq!(
+            safe_hold_reason("native control peer incarnation changed"),
+            "target unavailable"
+        );
+        assert_eq!(
+            safe_hold_reason("native thread state unavailable: secret"),
+            "target unavailable"
+        );
+    }
 
     /// Removes only the unique synthetic tree created by one test.
     struct DatabaseScratch(PathBuf);

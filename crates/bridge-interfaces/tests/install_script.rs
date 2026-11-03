@@ -73,19 +73,46 @@ fn scratch() -> PathBuf {
     root.canonicalize().unwrap()
 }
 
-/// Runs `install.sh` on `root/bundle` with the attested digest `sums`.
-fn install(root: &std::path::Path, sums: &str) -> std::process::Output {
+/// Builds the installer command for `root/bundle` and the attested `sums`.
+fn install_command(root: &std::path::Path, sums: &str) -> Command {
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
-    Command::new("/bin/bash")
-        .arg(&script)
+    let mut command = Command::new("/bin/bash");
+    command
+        .arg(script)
         .args(["--bundle"])
         .arg(root.join("bundle"))
         .args(["--sums-sha256", sums, "--home"])
         .arg(root.join("home"))
         .arg("--bin-dir")
-        .arg(root.join("bin"))
+        .arg(root.join("bin"));
+    command
+}
+
+/// Runs the installer command with its default environment.
+fn install(root: &std::path::Path, sums: &str) -> std::process::Output {
+    install_command(root, sums).output().unwrap()
+}
+
+/// Explicit installation paths work without HOME, and a temporary path with
+/// backslashes or a newline does not alter the checksum utility's output.
+#[test]
+fn explicit_paths_and_unusual_temporary_directory_work_without_home() {
+    if !supported() {
+        return;
+    }
+    let root = scratch();
+    let sums = bundle(&root);
+    let tmp = root.join("tmp \\ directory\nnext");
+    std::fs::create_dir(&tmp).unwrap();
+    let output = install_command(&root, &sums)
+        .env_remove("HOME")
+        .env("TMPDIR", &tmp)
         .output()
-        .unwrap()
+        .unwrap();
+    let ran = root.join("ran").exists();
+    std::fs::remove_dir_all(root).unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(ran, "the verified bridge did not run");
 }
 
 /// The installer executes a verified private copy of `bridge`, never the

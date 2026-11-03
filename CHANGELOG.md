@@ -4,6 +4,21 @@ All notable changes to Agent Bridge are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions describe the
 source, and the crates are not published to crates.io.
 
+## [0.6.2] - 2026-11-03
+
+### Changed
+
+- Keep managed root messages in custody through recipient downtime, with
+  bounded known-unsent retries per verified endpoint and explicit expiry.
+- Allow a previously idle Linux Codex session to resume through its verified
+  live App Server using a one-shot proof; uncertain wake or message outcomes
+  remain held. Native unloaded-session qualification remains separate.
+
+### Fixed
+
+- Make the local installer handle unset `HOME` and unusual temporary paths, and
+  create new launcher directories privately under inherited Linux ACLs.
+
 ## [0.6.1] - 2026-11-03
 
 ### Added

@@ -1,4 +1,4 @@
-//! Bounded root delivery and retained failure reports, separate from envelope identity.
+//! Durable root delivery and retained failure reports, separate from envelope identity.
 //!
 //! Only grant-authorized ingress supplies the verified sender. Feedback is an
 //! ordinary bounded MESSAGE with no return sender, so failures cannot recurse.
@@ -14,9 +14,9 @@ use crate::{
     PublishOutcome, Storage,
 };
 
-/// Maximum actual native invocations, including positive busy deferrals.
+/// Maximum native invocations of a best-effort feedback notice.
 pub const MAX_SENDS: u32 = 5;
-/// Absolute automatic-delivery lifetime, in milliseconds from custody.
+/// Maximum lifetime of a best-effort feedback notice, in milliseconds.
 pub const DELIVERY_WINDOW_MS: u64 = 5 * 60_000;
 /// Maximum original/report records processed in one maintenance transaction.
 const BATCH: usize = 200;
@@ -41,7 +41,7 @@ pub struct DeliveryReport {
     pub reason: String,
     /// Unix milliseconds when automation stopped; late evidence stays separate.
     pub completed_at_ms: u64,
-    /// Actual native invocations, including busy receipts.
+    /// Native invocations including busy receipts, saturated at `u32::MAX`.
     pub sends_made: u32,
     /// Deterministic notice identity, absent for notices themselves.
     pub feedback_event_id: Option<String>,
@@ -55,7 +55,6 @@ impl DeliveryReport {
         if !matches!(self.outcome.as_str(), "failed" | "unconfirmed")
             || self.reason.len() > 256
             || self.completed_at_ms > crate::MAX_SQLITE_INT
-            || self.sends_made > MAX_SENDS
             || !matches!(
                 self.feedback_state.as_str(),
                 "pending"
@@ -81,7 +80,7 @@ impl DeliveryReport {
 
 /// Installs policy only for newly committed custody, preserving old replay/hash semantics.
 impl Storage {
-    /// Atomically publishes a root event and binds its attested sender and fixed limits.
+    /// Atomically publishes a root event and binds its attested sender and explicit expiry.
     /// Existing legacy custody replays unchanged and never acquires a guessed origin.
     /// New managed replays must keep the same sender and request id.
     pub fn publish_managed(
@@ -125,14 +124,9 @@ impl Storage {
                 ));
             }
         } else {
-            let deadline =
-                envelope
-                    .expires_at
-                    .map_or(now_ms.saturating_add(DELIVERY_WINDOW_MS), |expires| {
-                        expires
-                            .unix_millis()
-                            .min(now_ms.saturating_add(DELIVERY_WINDOW_MS))
-                    });
+            let deadline = envelope
+                .expires_at
+                .map_or(crate::MAX_SQLITE_INT, |expires| expires.unix_millis());
             tx.execute("INSERT INTO managed_deliveries(publisher_id,event_id,feedback_sender,request_id,deadline_ms)
                 VALUES(?1,?2,?3,?4,?5)", params![envelope.publisher.as_str(),envelope.event_id.as_str(),
                 address,sender.request_id,to_sql(deadline)?])?;
@@ -168,7 +162,7 @@ impl Storage {
             )?;
             let notice = feedback_id(&publisher, &event);
             let body = format!(
-                "Bridge delivery {} for request {}. Automatic delivery stopped after at most 5 attempts / 5 minutes. The original message and evidence are retained. Check bridge_status with the same request_id.{}",
+                "Bridge delivery {} for request {}. Automatic delivery stopped. The original message and evidence are retained. Check bridge_status with the same request_id.{}",
                 if outcome == "failed" {
                     "failed"
                 } else {
@@ -286,17 +280,23 @@ pub(crate) fn report_in(
 /// event, delivery, owning attempt, sends, deadline and feedback-origin presence.
 type CompletionCandidate = (String, String, String, Option<i64>, u32, i64, bool);
 
-/// Atomically records bounded completion without erasing historical possible effects.
-/// In-flight invocations keep their native attempt/fence while the original archives as unconfirmed.
+/// Records completion without erasing historical possible effects. Active root
+/// originals use only their explicit expiry, including rows written by older
+/// versions; feedback notices retain their stored deadline and attempt limit.
+/// In-flight invocations keep their native attempt/fence when archived unconfirmed.
 pub(crate) fn complete_in(tx: &Transaction<'_>, now_ms: u64) -> Result<(), CoreError> {
     let rows: Vec<CompletionCandidate> = tx.prepare(
-        "SELECT e.publisher_id,e.event_id,e.delivery,e.attempt_seq,m.sends_made,m.deadline_ms,
+        "SELECT e.publisher_id,e.event_id,e.delivery,e.attempt_seq,m.sends_made,
+         CASE WHEN m.feedback_sender IS NULL THEN m.deadline_ms ELSE COALESCE(e.expires_at_ms,?3) END,
          m.feedback_sender IS NOT NULL FROM events e JOIN managed_deliveries m USING(publisher_id,event_id)
          WHERE m.outcome='active'
-         AND (e.delivery NOT IN('held','invoking') OR m.deadline_ms<=?1) AND (e.delivery IN('accepted','hook_submitted','refused','review','disposed')
-             OR m.deadline_ms<=?1 OR m.sends_made>=5 OR e.state!='pending')
-         ORDER BY m.deadline_ms,e.publisher_id,e.event_id LIMIT ?2")?
-        .query_map(params![to_sql(now_ms)?,BATCH],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)))?
+         AND (e.delivery NOT IN('held','invoking') OR
+              CASE WHEN m.feedback_sender IS NULL THEN m.deadline_ms ELSE COALESCE(e.expires_at_ms,?3) END<=?1)
+         AND (e.delivery IN('accepted','hook_submitted','refused','review','disposed') OR
+              CASE WHEN m.feedback_sender IS NULL THEN m.deadline_ms ELSE COALESCE(e.expires_at_ms,?3) END<=?1 OR
+              (m.feedback_sender IS NULL AND m.sends_made>=5) OR e.state!='pending')
+         ORDER BY 6,e.publisher_id,e.event_id LIMIT ?2")?
+        .query_map(params![to_sql(now_ms)?,BATCH,to_sql(crate::MAX_SQLITE_INT)?],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)))?
         .collect::<Result<_,_>>()?;
     for (publisher, event, mut delivery, owner, sends, deadline, has_sender) in rows {
         let deadline = from_sql(deadline)?;
@@ -331,7 +331,7 @@ pub(crate) fn complete_in(tx: &Transaction<'_>, now_ms: u64) -> Result<(), CoreE
         let outcome = if possible { "unconfirmed" } else { "failed" };
         let reason = if possible {
             "Automatic delivery stopped; native handoff remains unconfirmed"
-        } else if sends >= MAX_SENDS {
+        } else if !has_sender && sends >= MAX_SENDS {
             "Five native attempts ended with positive no-send evidence"
         } else if now_ms >= deadline {
             "Delivery deadline reached before native acceptance"
