@@ -67,6 +67,8 @@ pub struct CodexQueueCarrier {
     sandbox: PathBuf,
     /// Bound for one helper exchange.
     timeout: Duration,
+    /// Source UID for the current coordinated hand-off, absent in standalone mode.
+    source_uid: Option<u32>,
     /// Protected adapter directory containing registered frontend sockets.
     desktop_directory: Option<PathBuf>,
     /// Test seam: runs at the last pre-write boundary of a gateway hand-off,
@@ -82,9 +84,19 @@ impl CodexQueueCarrier {
             registry,
             sandbox,
             timeout,
+            source_uid: None,
             desktop_directory: None,
             gateway_pause: None,
         }
+    }
+
+    /// Sends one frozen attempt with source-qualified native correlation.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn send_scoped(&mut self, source_uid: u32, attempt: &AttemptRecord) -> Outcome {
+        self.source_uid = Some(source_uid);
+        let outcome = self.send(attempt);
+        self.source_uid = None;
+        outcome
     }
 
     /// Installs a deterministic pause for race regressions: `pause` runs in a
@@ -324,11 +336,18 @@ impl DispatchCarrier for CodexQueueCarrier {
             Ok(found) => found,
             Err(outcome) => return outcome,
         };
-        let client_id = format!(
-            "agent-bridge-{}-{}",
-            attempt.fence.attempt_seq,
-            prefix_within(&attempt.fence.manifest_hash, 16)
-        );
+        let client_id = match self.source_uid {
+            Some(uid) => format!(
+                "agent-bridge-{uid}-{}-{}",
+                attempt.fence.attempt_seq,
+                prefix_within(&attempt.fence.manifest_hash, 16)
+            ),
+            None => format!(
+                "agent-bridge-{}-{}",
+                attempt.fence.attempt_seq,
+                prefix_within(&attempt.fence.manifest_hash, 16)
+            ),
+        };
         match route {
             Route::Owner(socket) => {
                 return crate::owner::deliver(

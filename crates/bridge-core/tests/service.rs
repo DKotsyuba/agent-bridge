@@ -1011,3 +1011,65 @@ fn diagnostics_realm_denies_every_legacy_request_and_producer_authority() {
     running.shutdown();
     running.join();
 }
+
+/// Coordinated ingress preserves historical reads while fencing new mutations.
+#[test]
+fn coordinated_ingress_fences_new_work_and_socket_shutdown() {
+    let dir = TempDir::new("coordinated");
+    let mut config = test_config(&dir);
+    config.socket = std::env::temp_dir().join(format!("sc-{}.sock", std::process::id()));
+    let socket = config.socket.clone();
+    let running = service::start_coordinated(config).unwrap();
+    let mut client = bridge_client::BridgeClient::connect(&socket).unwrap();
+    assert_eq!(
+        client.publish(GRANT_TOKEN, &body("new")).unwrap_err().class,
+        "busy"
+    );
+    assert_eq!(
+        client
+            .pause(ADMIN_TOKEN, &body("new").recipient, "fixture")
+            .unwrap_err()
+            .class,
+        "busy"
+    );
+    assert_eq!(client.shutdown(OTHER_TOKEN).unwrap_err().class, "auth");
+    assert_eq!(
+        client.shutdown(ADMIN_TOKEN).unwrap_err().class,
+        "unsupported"
+    );
+    assert!(running.is_running());
+
+    running.activate_ingress().unwrap();
+    let accepted = client.publish(GRANT_TOKEN, &body("existing")).unwrap();
+    running.fence_ingress();
+    assert_eq!(
+        client
+            .status(GRANT_TOKEN, "existing")
+            .unwrap()
+            .0
+            .unwrap()
+            .acceptance_seq,
+        accepted.acceptance_seq
+    );
+    let replay = client.publish(GRANT_TOKEN, &body("existing")).unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.acceptance_seq, accepted.acceptance_seq);
+    let mut changed = body("existing");
+    changed.payload = "changed".into();
+    assert_eq!(
+        client.publish(GRANT_TOKEN, &changed).unwrap_err().class,
+        "conflict"
+    );
+    assert_eq!(
+        client.publish(GRANT_TOKEN, &body("new")).unwrap_err().class,
+        "busy"
+    );
+    running.activate_ingress().unwrap();
+    assert!(!client.publish(GRANT_TOKEN, &body("new")).unwrap().replayed);
+    running.shutdown();
+    assert!(running.activate_ingress().is_err());
+    running.join();
+    let mut lock = socket.into_os_string();
+    lock.push(".lock");
+    std::fs::remove_file(lock).unwrap();
+}

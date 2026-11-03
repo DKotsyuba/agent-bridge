@@ -21,10 +21,11 @@
 //! identity from the authenticated grant — a request never asserts its own
 //! publisher or operator identity.
 //!
-//! Lifecycle: bounded connection admission and per-connection timeouts, a
-//! maintenance thread that reconciles leases and rechecks and drives
-//! registered carriers, and a stop that fences new work under the storage
-//! lock, drains in-flight requests and removes only this instance's socket.
+//! Lifecycle: bounded connection admission and per-connection timeouts, an
+//! optional maintenance thread that reconciles leases and drives carriers,
+//! and a stop that fences new work under the storage lock. Coordinated mode
+//! leaves maintenance and ingress activation to its external owner. A stop
+//! drains in-flight requests and removes only this instance's socket.
 //! Structured logging is JSON lines on stderr; token values are never
 //! logged.
 
@@ -674,8 +675,8 @@ pub struct Running {
     state: Arc<ServiceState>,
     /// The accept loop.
     accept_thread: JoinHandle<()>,
-    /// The reconciliation and dispatch loop.
-    maintenance_thread: JoinHandle<()>,
+    /// The reconciliation and dispatch loop, absent under an external coordinator.
+    maintenance_thread: Option<JoinHandle<()>>,
 }
 
 /// A carrier owned by the dispatch loop.
@@ -692,6 +693,8 @@ struct ServiceState {
     /// `false` once a stop was requested; new work is refused under the
     /// storage lock after that.
     running: AtomicBool,
+    /// A coordinator owns unit shutdown and separately activates ingress.
+    coordinated: bool,
     /// The configured socket path.
     socket_path: PathBuf,
     /// Identity (device, inode) of the socket file this instance bound, so
@@ -749,6 +752,25 @@ pub fn start_with_carriers(
     config: Config,
     carriers: Vec<BoxedCarrier>,
 ) -> Result<Running, CoreError> {
+    start_inner(config, carriers, false)
+}
+
+/// Starts an account-owned socket with ingress fenced and no maintenance loop.
+///
+/// The external coordinator must reconcile state and call
+/// [`Running::activate_ingress`] before admitting new mutations. Existing
+/// status and exact replays remain available; legacy socket shutdown is
+/// unsupported because the coordinator owns the unit lifecycle.
+pub fn start_coordinated(config: Config) -> Result<Running, CoreError> {
+    start_inner(config, Vec::new(), true)
+}
+
+/// Starts the common socket and storage with the selected lifecycle owner.
+fn start_inner(
+    config: Config,
+    carriers: Vec<BoxedCarrier>,
+    coordinated: bool,
+) -> Result<Running, CoreError> {
     let mut tokens: Vec<&str> = Vec::new();
     for grant in &config.grants {
         grant.validate()?;
@@ -776,6 +798,7 @@ pub fn start_with_carriers(
     // is touched: a loser changes nothing.
     let endpoint_lock = acquire_endpoint_lock(&config.socket)?;
     let mut storage = Storage::open(&config.database, config.limits)?;
+    storage.set_ingress_active(!coordinated);
     storage.universal_limits = config.universal_limits;
     storage
         .install_producer_authorizer(Arc::clone(&authorizer))
@@ -805,6 +828,7 @@ pub fn start_with_carriers(
         authorizer,
         limits: config.limits,
         running: AtomicBool::new(true),
+        coordinated,
         socket_path: config.socket.clone(),
         socket_identity: identity,
         active_connections: AtomicUsize::new(0),
@@ -827,14 +851,20 @@ pub fn start_with_carriers(
         .name("bridge-accept".into())
         .spawn(move || accept_loop(listener, accept_state))
         .map_err(|error| io_failure(format!("cannot spawn accept thread: {error}")))?;
-    let maintenance_state = Arc::clone(&state);
-    let maintenance_thread = std::thread::Builder::new()
-        .name("bridge-maintenance".into())
-        .spawn(move || maintenance_loop(&maintenance_state))
-        .map_err(|error| {
-            state.stop();
-            io_failure(format!("cannot spawn maintenance thread: {error}"))
-        })?;
+    let maintenance_thread = if coordinated {
+        None
+    } else {
+        let maintenance_state = Arc::clone(&state);
+        Some(
+            std::thread::Builder::new()
+                .name("bridge-maintenance".into())
+                .spawn(move || maintenance_loop(&maintenance_state))
+                .map_err(|error| {
+                    state.stop();
+                    io_failure(format!("cannot spawn maintenance thread: {error}"))
+                })?,
+        )
+    };
     Ok(Running {
         socket_path: config.socket,
         state,
@@ -854,10 +884,42 @@ impl Running {
         &self.socket_path
     }
 
-    /// Whether the service still accepts work (no stop was requested by
-    /// [`Running::shutdown`] or an operator over the socket).
+    /// Whether the service has not been asked to stop.
+    ///
+    /// Coordinated ingress can still be fenced while this returns `true`.
     pub fn is_running(&self) -> bool {
         self.state.running.load(Ordering::SeqCst)
+    }
+
+    /// Enables new socket mutations after coordinator reconciliation.
+    ///
+    /// Activation serializes with publishes and fails once shutdown has begun.
+    pub fn activate_ingress(&self) -> Result<(), CoreError> {
+        let mut storage = lock_storage(&self.state.storage);
+        if !self.state.running.load(Ordering::SeqCst) {
+            return Err(CoreError::Busy("service is shutting down".into()));
+        }
+        storage.set_ingress_active(true);
+        Ok(())
+    }
+
+    /// Fences new socket mutations, preserving reads and exact replays.
+    ///
+    /// On return all earlier storage mutations have finished; no later new
+    /// mutation is admitted until [`Running::activate_ingress`].
+    pub fn fence_ingress(&self) {
+        lock_storage(&self.state.storage).set_ingress_active(false);
+    }
+
+    /// Runs one bounded storage reconciliation without invoking any carrier.
+    ///
+    /// `now_ms` is the coordinator's Unix time in milliseconds. Errors are
+    /// returned to the coordinator; no network or adapter call holds the lock.
+    pub fn run_maintenance(
+        &self,
+        now_ms: u64,
+    ) -> Result<crate::recovery::MaintenanceReport, CoreError> {
+        lock_storage(&self.state.storage).run_maintenance(now_ms)
     }
 
     /// Requests a drained stop (idempotent).
@@ -877,10 +939,10 @@ impl Running {
     /// at its deadline, never a replay), and the timeout is logged.
     pub fn join(self) {
         let deadline = Instant::now() + DRAIN_TIMEOUT;
-        for (name, handle) in [
-            ("accept", self.accept_thread),
-            ("maintenance", self.maintenance_thread),
-        ] {
+        for (name, handle) in std::iter::once(("accept", self.accept_thread)).chain(
+            self.maintenance_thread
+                .map(|handle| ("maintenance", handle)),
+        ) {
             while !handle.is_finished() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -914,8 +976,8 @@ impl Running {
     ///
     /// For in-process adapters (a qualified hook calling
     /// [`Storage::drain_inject`], evidence reporting) that must act on the
-    /// same store the service uses. The lock is the same one that fences
-    /// shutdown, so do not hold it across slow work.
+    /// same store the service uses. The lock also fences shutdown and ingress;
+    /// never perform adapter or other IPC while the closure holds it.
     pub fn with_storage<T>(&self, action: impl FnOnce(&mut Storage) -> T) -> T {
         action(&mut lock_storage(&self.state.storage))
     }
@@ -1398,6 +1460,11 @@ fn serve(state: &ServiceState, request: Request) -> Result<Response, Refusal> {
         Request::Status { token, event_id } => serve_status(state, &token, &event_id),
         Request::Shutdown { token } => {
             let grant = operator(state, &token)?;
+            if state.coordinated {
+                return Err(
+                    CoreError::Unsupported("shutdown is owned by the coordinator".into()).into(),
+                );
+            }
             state.stop();
             log_event(
                 "info",
@@ -1625,6 +1692,7 @@ fn mutate(
     if !state.running.load(Ordering::SeqCst) {
         return Err(stopping());
     }
+    storage.check_ingress()?;
     action(&mut storage)?;
     Ok(Response::Done)
 }
@@ -1757,6 +1825,7 @@ fn serve_publish(
         Some(sender) => storage.publish_managed(&envelope, sender, current_unix_millis())?,
         None => storage.publish(&envelope, current_unix_millis())?,
     };
+    drop(storage);
     log_event(
         "info",
         "publish",

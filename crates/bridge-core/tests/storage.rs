@@ -383,3 +383,31 @@ fn fault_kill_during_commit_recovers_on_reopen() {
         .unwrap();
     assert_eq!(after.receipt.acceptance_seq, 1);
 }
+
+/// A local recipient freeze preserves identity replay and conflict semantics.
+#[test]
+fn frozen_recipient_allows_only_exact_replays() {
+    let mut storage = Storage::open_in_memory(Limits::new(100)).unwrap();
+    let original = keep_all("frozen", "original", None);
+    let first = storage.publish(&original, 1_000).unwrap();
+    storage.freeze_recipient(&original.recipient).unwrap();
+    let replay = storage.publish(&original, 2_000).unwrap();
+    assert!(replay.receipt.replayed);
+    assert_eq!(replay.receipt.acceptance_seq, first.receipt.acceptance_seq);
+    assert!(matches!(
+        storage.publish(&keep_all("frozen", "changed", None), 2_000),
+        Err(CoreError::Conflict { .. })
+    ));
+    assert!(matches!(
+        storage.publish(&keep_all("new", "body", None), 2_000),
+        Err(CoreError::Busy(_))
+    ));
+    storage.unfreeze_recipient(&original.recipient).unwrap();
+    assert!(
+        !storage
+            .publish(&keep_all("new", "body", None), 2_000)
+            .unwrap()
+            .receipt
+            .replayed
+    );
+}

@@ -10,6 +10,7 @@
 //! from the per-event delivery state (`delivery`), which only the dispatch
 //! module changes.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -411,6 +412,49 @@ pub struct Storage {
     pub(crate) producer_authorizer: Option<std::sync::Arc<crate::ProducerAuthorizer>>,
     /// Durable v1 identity admission capacities, never a product job TTL.
     pub(crate) universal_limits: crate::UniversalLimits,
+    /// In-memory admission fences, serialized with publications by the owner.
+    admission: Admission,
+}
+
+/// Volatile admission fences; the service holds the storage mutex while using them.
+pub(crate) struct Admission {
+    /// Whether new socket-origin mutations may be accepted.
+    ingress_active: bool,
+    /// Canonical recipients temporarily fenced from new custody.
+    frozen_recipients: HashSet<String>,
+}
+
+impl Admission {
+    /// Refuses a new mutation while coordinated ingress is fenced.
+    pub(crate) fn check_ingress(&self) -> Result<(), CoreError> {
+        if self.ingress_active {
+            Ok(())
+        } else {
+            Err(CoreError::Busy("coordinated ingress is fenced".into()))
+        }
+    }
+
+    /// Refuses new custody for inactive ingress or a frozen recipient.
+    fn check_recipient(&self, recipient: &crate::NativeAddress) -> Result<(), CoreError> {
+        self.check_ingress()?;
+        if self
+            .frozen_recipients
+            .contains(&recipient.to_canonical_string())
+        {
+            return Err(CoreError::Busy("recipient admission is frozen".into()));
+        }
+        Ok(())
+    }
+}
+
+impl Default for Admission {
+    /// Standalone stores begin active with no recipient freezes.
+    fn default() -> Self {
+        Self {
+            ingress_active: true,
+            frozen_recipients: HashSet::new(),
+        }
+    }
 }
 
 impl Storage {
@@ -459,6 +503,7 @@ impl Storage {
             limits,
             producer_authorizer: None,
             universal_limits: crate::UniversalLimits::default(),
+            admission: Admission::default(),
         }
         .init_schema()?;
         storage.connection.set_db_config(
@@ -480,6 +525,7 @@ impl Storage {
             limits,
             producer_authorizer: None,
             universal_limits: crate::UniversalLimits::default(),
+            admission: Admission::default(),
         }
         .init_schema()
     }
@@ -504,6 +550,48 @@ impl Storage {
         Ok(self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?)
+    }
+
+    /// Begins a write transaction alongside a borrow of its admission fence.
+    pub(crate) fn begin_admission(&mut self) -> Result<(Transaction<'_>, &Admission), CoreError> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Ok((tx, &self.admission))
+    }
+
+    /// Sets the local ingress fence while the service holds its storage lock.
+    pub(crate) fn set_ingress_active(&mut self, active: bool) {
+        self.admission.ingress_active = active;
+    }
+
+    /// Rejects new socket mutations when coordinated ingress is inactive.
+    pub(crate) fn check_ingress(&self) -> Result<(), CoreError> {
+        self.admission.check_ingress()
+    }
+
+    /// Freezes new custody for one canonical recipient until unfrozen.
+    ///
+    /// Existing identical replays and conflicts retain their original results.
+    /// The fence is local to this store, in memory, and resets on restart.
+    pub fn freeze_recipient(&mut self, recipient: &crate::NativeAddress) -> Result<(), CoreError> {
+        recipient.validate()?;
+        self.admission
+            .frozen_recipients
+            .insert(recipient.to_canonical_string());
+        Ok(())
+    }
+
+    /// Removes a local recipient admission freeze; existing custody is unchanged.
+    pub fn unfreeze_recipient(
+        &mut self,
+        recipient: &crate::NativeAddress,
+    ) -> Result<(), CoreError> {
+        recipient.validate()?;
+        self.admission
+            .frozen_recipients
+            .remove(&recipient.to_canonical_string());
+        Ok(())
     }
 
     /// Registers the allowlisted source tag for a publisher.
@@ -570,6 +658,8 @@ impl Storage {
     ///   unloaded effective path is a visible hold with no native effect;
     /// - an event that could never be rendered (forbidden controls, escaped
     ///   size over the manifest bound) is refused before acceptance;
+    /// - a locally frozen recipient or fenced coordinated ingress refuses
+    ///   new custody with [`CoreError::Busy`], without changing replays;
     /// - a hard cap reached: [`CoreError::Capacity`], nothing written.
     ///
     /// `now_ms` is supplied by the caller (single clock source at the
@@ -583,8 +673,8 @@ impl Storage {
         envelope.validate()?;
         check_renderable(envelope)?;
         let limits = self.limits;
-        let tx = self.begin()?;
-        let outcome = publish_in(&tx, envelope, now_ms, limits, "")?;
+        let (tx, admission) = self.begin_admission()?;
+        let outcome = publish_in(&tx, envelope, now_ms, limits, "", admission)?;
         tx.commit()?;
         Ok(outcome)
     }
@@ -665,13 +755,15 @@ const MAX_CHAIN: usize = 1_000;
 /// The caller owns commit/ack uncertainty. Empty lifetime preserves legacy
 /// keys; a validated producer lifetime isolates latest/batch and lineage keys.
 /// The caller validates envelope and renderability before calling; this helper
-/// owns admission/state changes and never commits the caller's transaction.
+/// checks the in-memory fence after replay/conflict detection, owns
+/// admission/state changes and never commits the caller's transaction.
 pub(crate) fn publish_in(
     tx: &Connection,
     envelope: &Envelope,
     now_ms: u64,
     limits: Limits,
     lifetime: &str,
+    admission: &Admission,
 ) -> Result<PublishOutcome, CoreError> {
     let now = to_sql(now_ms)?;
     let expiry = envelope
@@ -709,6 +801,8 @@ pub(crate) fn publish_in(
             submitted_hash: hash.as_str().to_string(),
         });
     }
+
+    admission.check_recipient(&envelope.recipient)?;
 
     if let Some(predecessor) = predecessor
         && creates_cycle(

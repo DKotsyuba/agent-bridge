@@ -42,12 +42,30 @@ pub mod codex;
 #[cfg(target_os = "linux")]
 pub(crate) mod codex_live;
 pub mod desktop;
+/// Shared native daemon configuration.
+pub mod native_config;
 pub mod native_mcp;
 pub mod os;
 pub mod owner;
 pub mod owner_only;
 pub mod registry;
 pub mod server;
+
+/// Private coordinator protocol for the Linux system service.
+#[cfg(target_os = "linux")]
+pub(crate) mod system_ipc;
+
+/// Linux system service and its per-user workers.
+#[cfg(target_os = "linux")]
+pub mod system;
+
+/// Private full-duplex coordinator transport.
+#[cfg(target_os = "linux")]
+pub(crate) mod system_link;
+
+/// Per-user worker for the Linux system service.
+#[cfg(target_os = "linux")]
+pub(crate) mod system_worker;
 
 pub use client::{ChannelClient, HookRun, RegistryAttestor};
 pub use registry::{

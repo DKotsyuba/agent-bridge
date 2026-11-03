@@ -4,7 +4,21 @@ All notable changes to Agent Bridge are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions describe the
 source, and the crates are not published to crates.io.
 
-## [Unreleased]
+## [0.6.1] - 2026-11-03
+
+### Added
+
+- Coordinate native delivery across configured Linux accounts from one system
+  service while retaining each account's existing custody and client sockets.
+- Publish signed provenance for platform release archives and expose the
+  attestation bundle alongside each archive.
+
+### Changed
+
+- Preserve source-scoped receipts and late evidence during cross-account
+  delivery, and fence new work while verified recipient capabilities change.
+- Keep existing standalone and macOS modes; native cross-account qualification
+  remains a separate real-host check.
 
 ### Fixed
 

@@ -82,7 +82,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use bridge_core::dispatch::{AttemptFence, AttemptRecord, Attestation, DispatchCarrier, Outcome};
+use bridge_core::dispatch::{AttemptRecord, Attestation, DispatchCarrier, Outcome};
 use bridge_core::framing::MAX_FRAMED_BYTES;
 use bridge_core::recovery::EvidenceTier;
 use bridge_core::service::{current_unix_millis, log_event};
@@ -91,7 +91,7 @@ use serde_json::{Value, json};
 
 use crate::os;
 use crate::registry::{MessageCandidate, RecipientBinding, Registry};
-use crate::server::{Custody, lock_registry, with_custody};
+use crate::server::{Custody, DeliveryRef, DeliverySink, LocalDelivery, lock_registry};
 
 /// Largest manifest this carrier writes in one inbox message, in bytes.
 ///
@@ -186,10 +186,23 @@ enum Waiting {
     },
 }
 
+/// Confirms that a transcript result still belongs to the same no-receipt state.
+fn same_no_receipt(waiting: &Waiting, manifest: &str, from: &str, deadline_ms: u64) -> bool {
+    matches!(
+        waiting,
+        Waiting::NoReceipt {
+            manifest: current,
+            from: origin,
+            deadline_ms: deadline,
+            ..
+        } if current == manifest && origin == from && *deadline == deadline_ms
+    )
+}
+
 /// One correlated hand-off.
 struct Pending {
-    /// The attempt's fence.
-    fence: AttemptFence,
+    /// Original source and fence for late outcomes and evidence.
+    delivery: DeliveryRef,
     /// Frozen recipient proof; late receipts revalidate the exact process,
     /// executable and store without requiring its old lifecycle to stay current.
     recipient: Arc<MessageCandidate>,
@@ -203,8 +216,8 @@ type BoundCallback = (PathBuf, (u64, u64));
 /// Callback listeners and correlation shared by the carrier and its
 /// background threads.
 struct Hub {
-    /// Custody for late outcomes.
-    custody: Arc<dyn Custody>,
+    /// Original-source routing for bindings and late outcomes.
+    delivery: Arc<dyn DeliverySink>,
     /// In-flight hand-offs by message id.
     pending: Mutex<HashMap<String, Pending>>,
     /// Per-attempt callback socket path and its bound inode `(dev, ino)`,
@@ -246,6 +259,8 @@ struct Frame<'a> {
     from: &'a Path,
     /// Exact manifest text.
     manifest: &'a str,
+    /// Absolute hand-off deadline in Unix epoch milliseconds.
+    deadline_ms: u64,
 }
 
 /// The Claude `later` message carrier.
@@ -545,6 +560,54 @@ impl Hub {
         removed
     }
 
+    /// Expires a still-overdue callback and releases its coordinator ticket.
+    fn expire_callback(&self, msg_id: &str, now: u64) {
+        let delivery = {
+            let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+            let expired = pending
+                .get(msg_id)
+                .is_some_and(|entry| match &entry.waiting {
+                    Waiting::Held { until_ms } => now > *until_ms,
+                    Waiting::NoReceipt { deadline_ms, .. } => now > *deadline_ms,
+                    Waiting::First(_) => false,
+                });
+            if expired {
+                pending.remove(msg_id).map(|entry| entry.delivery)
+            } else {
+                None
+            }
+        };
+        if let Some(delivery) = delivery {
+            self.release(msg_id);
+            if self.delivery.callback_closed(&delivery).is_err() {
+                log_event("warn", "claude_callback_close_unrecorded", &[]);
+            }
+        }
+    }
+
+    /// Takes only the unchanged no-receipt entry observed by a transcript scan.
+    fn take_observed(
+        &self,
+        msg_id: &str,
+        delivery: &DeliveryRef,
+        manifest: &str,
+        from: &str,
+        deadline_ms: u64,
+    ) -> bool {
+        let taken = {
+            let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+            let unchanged = pending.get(msg_id).is_some_and(|entry| {
+                entry.delivery == *delivery
+                    && same_no_receipt(&entry.waiting, manifest, from, deadline_ms)
+            });
+            unchanged && pending.remove(msg_id).is_some()
+        };
+        if taken {
+            self.release(msg_id);
+        }
+        taken
+    }
+
     /// Whether a callback slot is free for the next hand-off; when all
     /// `max_callbacks` are in use, first releases held hand-offs past their
     /// recheck horizon ([`Hub::expire`]: memory only, no transcript or other
@@ -605,17 +668,17 @@ impl Hub {
             })
             .collect();
         for id in expired {
-            self.release(&id);
+            self.expire_callback(&id, now);
         }
     }
 
     /// Records an attestation with a changed capability in core; returns
     /// whether core stored it (a refusal or unattached custody is logged).
     fn observe(&self, attestation: &Attestation) -> bool {
-        let observed = with_custody(self.custody.as_ref(), |storage| {
-            storage.observe_binding(attestation, current_unix_millis())
-        });
-        let stored = matches!(observed, Some(Ok(())));
+        let stored = self
+            .delivery
+            .observe_binding(attestation, current_unix_millis())
+            .is_ok();
         if !stored {
             log_event("warn", "claude_capability_change_unrecorded", &[]);
         }
@@ -849,52 +912,39 @@ impl Hub {
                 },
             },
         };
-        let fence = entry.fence.clone();
+        let delivery = entry.delivery.clone();
         let settled = !matches!(late, Outcome::NativeHeld { .. });
         drop(pending);
-        if settled {
-            self.release(msg_id);
+        if settled && !self.release(msg_id) {
+            return;
         }
-        self.record(&fence, late);
+        self.record(&delivery, late);
     }
 
-    /// Records one late outcome into core.
-    fn record(&self, fence: &AttemptFence, outcome: Outcome) {
-        let recorded = with_custody(self.custody.as_ref(), |storage| {
-            storage.record_outcome(fence, outcome, current_unix_millis())
-        });
-        match recorded {
-            Some(Ok(_)) => {}
-            Some(Err(error)) => {
-                log_event(
-                    "warn",
-                    "claude_late_outcome_refused",
-                    &[("error", &error.to_string())],
-                );
-            }
-            None => log_event("warn", "claude_late_outcome_unrecorded", &[]),
+    /// Routes a late outcome to its original source without holding the pending lock.
+    fn record(&self, delivery: &DeliveryRef, outcome: Outcome) {
+        if self
+            .delivery
+            .record_outcome(delivery, outcome, current_unix_millis())
+            .is_err()
+        {
+            log_event("warn", "claude_late_outcome_unrecorded", &[]);
         }
     }
 
-    /// Records one positive evidence tier for an attempt in core.
+    /// Routes positive evidence to its original source without holding the pending lock.
     fn evidence(
         &self,
-        fence: &AttemptFence,
+        delivery: &DeliveryRef,
         member: &(String, String),
         tier: EvidenceTier,
         detail: &str,
     ) {
-        let recorded = with_custody(self.custody.as_ref(), |storage| {
-            storage.record_evidence(
-                &member.0,
-                &member.1,
-                fence.attempt_seq,
-                tier,
-                detail,
-                current_unix_millis(),
-            )
-        });
-        if !matches!(recorded, Some(Ok(_))) {
+        if self
+            .delivery
+            .record_evidence(delivery, member, tier, detail, current_unix_millis())
+            .is_err()
+        {
             log_event("warn", "claude_transcript_evidence_unrecorded", &[]);
         }
     }
@@ -913,14 +963,14 @@ impl Hub {
         let now = current_unix_millis();
         /// One written-without-receipt hand-off copied out of the pending
         /// map, so transcripts are read without holding its lock: message
-        /// id, attempt fence, exact manifest, transcript path (if reported),
+        /// id, source and attempt fence, exact manifest, transcript path (if reported),
         /// addressed session id, this attempt's own `from`
         /// (`uds:<callback>`), the core member `(publisher, event_id)` that
         /// evidence is recorded against, and the closure deadline (Unix
         /// epoch ms).
         type Candidate = (
             String,
-            AttemptFence,
+            DeliveryRef,
             String,
             Option<PathBuf>,
             String,
@@ -943,7 +993,7 @@ impl Hub {
                         deadline_ms,
                     } => Some((
                         id.clone(),
-                        entry.fence.clone(),
+                        entry.delivery.clone(),
                         manifest.clone(),
                         transcript.clone(),
                         session.clone(),
@@ -960,21 +1010,21 @@ impl Hub {
                 .collect()
         };
         for id in expired {
-            self.release(&id);
+            self.expire_callback(&id, now);
         }
-        for (id, fence, manifest, transcript, session, from, member, deadline) in candidates {
+        for (id, delivery, manifest, transcript, session, from, member, deadline) in candidates {
             let found = transcript.as_deref().is_some_and(|path| {
                 transcript_has_handoff(path, &manifest, self.uid, &session, &from)
             });
-            if found && self.release(&id) {
+            if found && self.take_observed(&id, &delivery, &manifest, &from, deadline) {
                 self.evidence(
-                    &fence,
+                    &delivery,
                     &member,
                     EvidenceTier::ContextObserved,
                     "native transcript of the attested session holds this attempt's peer message (origin from its own callback) containing the exact manifest as conversation input",
                 );
             } else if now > deadline {
-                self.release(&id);
+                self.expire_callback(&id, now);
             }
         }
     }
@@ -1078,11 +1128,20 @@ impl ClaudeLaterCarrier {
         custody: Arc<dyn Custody>,
         timing: ClaudeTiming,
     ) -> std::io::Result<Self> {
+        Self::new_with_delivery(registry, Arc::new(LocalDelivery::new(custody)), timing)
+    }
+
+    /// Constructs a carrier that routes observations and late evidence to the supplied sink.
+    pub(crate) fn new_with_delivery(
+        registry: Arc<Mutex<Registry>>,
+        delivery: Arc<dyn DeliverySink>,
+        timing: ClaudeTiming,
+    ) -> std::io::Result<Self> {
         let uid = os::process_facts(std::process::id())
             .and_then(|facts| facts.uid)
             .ok_or_else(|| std::io::Error::other("own uid unreadable"))?;
         let hub = Arc::new(Hub {
-            custody,
+            delivery,
             pending: Mutex::new(HashMap::new()),
             callbacks: Mutex::new(HashMap::new()),
             max_callbacks: timing.max_callbacks,
@@ -1136,7 +1195,12 @@ impl ClaudeLaterCarrier {
     /// deferred without consuming transport retries; other pre-write failures
     /// are ordinary known-unsent. No inbox frame, callback
     /// socket or second route is ever used after this route is selected.
-    fn send_owner(&self, attempt: &AttemptRecord, address: &NativeAddress) -> Outcome {
+    fn send_owner(
+        &self,
+        attempt: &AttemptRecord,
+        address: &NativeAddress,
+        source_uid: Option<u32>,
+    ) -> Outcome {
         let (attestation, binding, socket) = match self.owner_route(address) {
             Ok(found) => found,
             Err(reason) => {
@@ -1159,11 +1223,7 @@ impl ClaudeLaterCarrier {
             Harness::CLAUDE_CODE,
             &crate::owner::Handoff {
                 thread_id: &address.native_session_id,
-                call_id: &format!(
-                    "agent-bridge-{}-{}",
-                    attempt.fence.attempt_seq,
-                    crate::registry::prefix_within(&attempt.fence.manifest_hash, 16)
-                ),
+                call_id: &owner_call_id(attempt, source_uid),
                 text: &attempt.manifest,
                 deadline_ms: attempt.deadline_ms,
             },
@@ -1172,8 +1232,9 @@ impl ClaudeLaterCarrier {
 
     /// Writes the authenticated `later` frame of `frame`. On failure
     /// returns the outcome: known-unsent while no byte can have left,
-    /// unknown once the write started. Connect has a five-second deadline;
-    /// exact process/executable/store and registry stamp are revalidated after
+    /// unknown after a partial write. Connect and write share a five-second
+    /// cap and the attempt deadline; exact process/executable/store and registry
+    /// stamp are revalidated after
     /// connecting, immediately before authenticated native input.
     fn write_frames(&self, frame: &Frame<'_>) -> Result<(), Outcome> {
         let Frame {
@@ -1184,11 +1245,14 @@ impl ClaudeLaterCarrier {
             msg_id,
             from,
             manifest,
+            deadline_ms,
         } = *frame;
         let unsent = |evidence: String| Outcome::KnownUnsent { evidence };
-        let mut stream =
-            crate::desktop::connect(socket, Instant::now() + Duration::from_secs(5))
-                .map_err(|error| unsent(format!("inbox connect failed: {}", error.kind())))?;
+        let limit = Instant::now() + Duration::from_secs(5);
+        let budget = remaining_send_time(deadline_ms, limit)
+            .ok_or_else(|| unsent("inbox hand-off deadline elapsed".into()))?;
+        let mut stream = crate::desktop::connect(socket, Instant::now() + budget)
+            .map_err(|error| unsent(format!("inbox connect failed: {}", error.kind())))?;
         let peer = os::peer_identity(&stream)
             .map_err(|_| unsent("inbox peer identity unreadable".into()))?;
         let (_, binding) = recipient
@@ -1199,7 +1263,6 @@ impl ClaudeLaterCarrier {
                 "inbox endpoint is not the attested harness process".into(),
             ));
         }
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
         let frames = format!(
             "{}\n{}\n",
             json!({"type": "auth", "token": token}),
@@ -1215,109 +1278,33 @@ impl ClaudeLaterCarrier {
         lock_registry(&self.registry)
             .message_current(recipient)
             .map_err(|reason| unsent(format!("inbox binding changed before write: {reason}")))?;
-        // Once a byte may have left, failure is a possible hand-off.
-        stream
-            .write_all(frames.as_bytes())
-            .map_err(|error| Outcome::OutcomeUnknown {
-                reason: format!("inbox write interrupted: {}", error.kind()),
-            })?;
+        write_before_deadline(&mut stream, frames.as_bytes(), deadline_ms, limit)?;
         let _ = stream.shutdown(std::net::Shutdown::Write);
         Ok(())
     }
 }
 
-impl Drop for ClaudeLaterCarrier {
-    /// Removes the callback sockets this carrier bound in inbox
-    /// directories, so a stopped daemon leaves no endpoint behind.
-    /// Unresolved hand-offs stay with core (recheck deadlines, incidents).
-    fn drop(&mut self) {
-        self.hub.remove_callbacks();
-    }
-}
-
-impl DispatchCarrier for ClaudeLaterCarrier {
-    /// Attests Claude recipients from a current registry snapshot, revalidating
-    /// exact process, executable and private store outside the lock; anything
-    /// else is not this carrier's. An explicitly host-disabled carrier returns
-    /// the ordinary no-message attestation, allowing core to report no queued
-    /// work as idle without selecting or validating a delivery route.
-    ///
-    /// The attested process's session descriptor decides the message path
-    /// (`Hub::sync_message`): a positively disabled inbox withdraws the
-    /// message capability (recorded in core first, so later message
-    /// publications refuse before acceptance) and is returned as such, so
-    /// core holds visibly instead of treating the path as supported; an
-    /// inbox advertised later by the same session and incarnation (native
-    /// late binding) restores message, only if the harness policy grants it; a
-    /// descriptor not yet written, or a malformed one,
-    /// is a transient condition reported as an attestation error (a hold),
-    /// never as disabled, enabled or inactive. While every callback slot is
-    /// held by an unsettled hand-off the recipient is held too
-    /// (`Hub::callback_capacity`), before core reserves an attempt.
-    ///
-    /// A recipient whose own environment names a native owner socket is attested
-    /// through that owner route instead ([`crate::owner`]): it needs no session
-    /// descriptor or inbox, requires the exact direct-parent owner running a
-    /// trusted executable, and
-    /// any unprovable, unreadable or malformed locator is an attestation error
-    /// (a hold) with no fallback to the inbox route. Only a positively idle
-    /// lifecycle may then be woken; an absent locator keeps the behavior above.
-    fn attest(&mut self, recipient: &NativeAddress) -> Result<Attestation, String> {
-        if recipient.harness != Harness::CLAUDE_CODE {
-            return Err("not a Claude recipient".into());
-        }
-        let candidate = {
-            let mut registry = lock_registry(&self.registry);
-            registry.discover_claude_recipient(recipient)?;
-            if registry.message_is_disabled(recipient.harness) {
-                return registry
-                    .attest_recipient(recipient)
-                    .map(|(attestation, _)| attestation);
-            }
-            registry.message_candidate(recipient)?
-        };
-        let (_, binding) = candidate.validate()?;
-        if crate::owner::locator(binding.harness.0)?.is_some() {
-            let attestation = self.owner_route(recipient)?.0;
-            if attestation.lifecycle() != bridge_core::dispatch::Lifecycle::Inactive {
-                return Err("native owner recipient is not positively idle".into());
-            }
-            return Ok(attestation);
-        }
-        self.hub.sync_message(&self.registry, recipient, &binding)?;
-        self.hub.callback_capacity()?;
-        // Capability synchronization can change the snapshot, so close selection
-        // with fresh validation and an in-memory stamp check.
-        let candidate = lock_registry(&self.registry).message_candidate(recipient)?;
-        let (attestation, _) = candidate.validate()?;
-        lock_registry(&self.registry).message_current(&candidate)?;
-        Ok(attestation)
+impl ClaudeLaterCarrier {
+    /// Sends one coordinator-owned attempt and retains its source for callbacks.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn send_scoped(
+        &mut self,
+        source_uid: u32,
+        ticket: u64,
+        attempt: &AttemptRecord,
+    ) -> Outcome {
+        self.send_with_delivery(
+            attempt,
+            DeliveryRef {
+                source_uid: Some(source_uid),
+                ticket,
+                fence: attempt.fence.clone(),
+            },
+        )
     }
 
-    /// One `later` hand-off of the frozen manifest.
-    ///
-    /// Waits up to [`ClaudeTiming::receipt_wait`] for the first receipt,
-    /// then, under the pending lock that `Hub::route` also holds while it
-    /// queues a receipt, collects every receipt that raced it. The first
-    /// terminal receipt decides (`delivered` is accepted; any negative is
-    /// an unknown outcome, since it follows the write), unless a later
-    /// receipt of the window contradicts it (another status, or a `held`
-    /// after it), which is unknown; `held` alone
-    /// holds until [`ClaudeTiming::held_recheck_ms`]; silence is written
-    /// without receipt. A hand-off is never repeated here. A manifest over
-    /// [`MAX_MESSAGE_BYTES`] is a permanent refusal before the inbox is
-    /// touched (core never frames one that large).
-    ///
-    /// For an owner-routed recipient (its environment names a native owner
-    /// socket) the frozen manifest instead goes through the native owner
-    /// ([`crate::owner`]) and none of the above applies: the unchanged epoch and
-    /// a positive idle lifecycle are required, whatever the requested mode, and
-    /// every failure before the request is written (including an unreadable
-    /// environment or a bad locator) is known-unsent. After the write only a
-    /// correlated, exactly shaped receipt is anything but an unknown outcome,
-    /// which is retained and never resent; no inbox frame, callback socket or
-    /// second route is used after selection.
-    fn send(&mut self, attempt: &AttemptRecord) -> Outcome {
+    /// Performs one hand-off, retaining the original source for later observations.
+    fn send_with_delivery(&mut self, attempt: &AttemptRecord, delivery: DeliveryRef) -> Outcome {
         let unsent = |evidence: String| Outcome::KnownUnsent { evidence };
         let Ok(address) = NativeAddress::parse(&attempt.fence.recipient) else {
             return unsent("unparseable recipient".into());
@@ -1332,7 +1319,7 @@ impl DispatchCarrier for ClaudeLaterCarrier {
         };
         match crate::owner::locator(binding.harness.0) {
             Ok(None) => {}
-            Ok(Some(_)) => return self.send_owner(attempt, &address),
+            Ok(Some(_)) => return self.send_owner(attempt, &address, delivery.source_uid),
             Err(reason) => return unsent(reason),
         }
         if binding.epoch != attempt.fence.endpoint_epoch {
@@ -1364,13 +1351,11 @@ impl DispatchCarrier for ClaudeLaterCarrier {
         let Some(directory) = socket.parent() else {
             return unsent("inbox socket has no directory".into());
         };
-        let msg_id = format!(
-            "bridge_{}_{}",
+        let msg_id = message_id(
+            &self.hub.secret,
             attempt.fence.attempt_seq,
-            &self.hub.derive(&format!(
-                "msg:{}:{}",
-                attempt.fence.attempt_seq, attempt.fence.manifest_hash
-            ))[..32]
+            &attempt.fence.manifest_hash,
+            delivery.source_uid,
         );
         let callback = match self.hub.callback_for_attempt(directory, &msg_id) {
             Ok(path) => path,
@@ -1384,7 +1369,7 @@ impl DispatchCarrier for ClaudeLaterCarrier {
             .insert(
                 msg_id.clone(),
                 Pending {
-                    fence: attempt.fence.clone(),
+                    delivery,
                     recipient: Arc::clone(&candidate),
                     waiting: Waiting::First(sender),
                 },
@@ -1397,6 +1382,7 @@ impl DispatchCarrier for ClaudeLaterCarrier {
             msg_id: &msg_id,
             from: &callback,
             manifest: &attempt.manifest,
+            deadline_ms: attempt.deadline_ms,
         };
         if let Err(outcome) = self.write_frames(&frame) {
             self.hub.release(&msg_id);
@@ -1500,11 +1486,261 @@ impl DispatchCarrier for ClaudeLaterCarrier {
     }
 }
 
+/// Derives an unguessable message ID, preserving standalone IDs and callback path length.
+fn message_id(
+    secret: &[u8; 32],
+    attempt_seq: u64,
+    manifest_hash: &str,
+    source_uid: Option<u32>,
+) -> String {
+    let purpose = match source_uid {
+        Some(uid) => format!("msg:{attempt_seq}:{manifest_hash}:source:{uid}"),
+        None => format!("msg:{attempt_seq}:{manifest_hash}"),
+    };
+    let mut material = secret.to_vec();
+    material.extend_from_slice(purpose.as_bytes());
+    format!(
+        "bridge_{}_{}",
+        attempt_seq,
+        &crate::server::sha256_hex(&material)[..32]
+    )
+}
+
+/// Remaining wall-clock hand-off time capped by the monotonic transport limit.
+fn remaining_send_time(deadline_ms: u64, limit: Instant) -> Option<Duration> {
+    let wall = deadline_ms.checked_sub(current_unix_millis())?;
+    let monotonic = limit.checked_duration_since(Instant::now())?;
+    let remaining = Duration::from_millis(wall).min(monotonic);
+    (!remaining.is_zero()).then_some(remaining)
+}
+
+/// Writes within the absolute hand-off deadline, distinguishing no write from partial write.
+fn write_before_deadline(
+    stream: &mut UnixStream,
+    bytes: &[u8],
+    deadline_ms: u64,
+    limit: Instant,
+) -> Result<(), Outcome> {
+    let mut written = 0;
+    while written < bytes.len() {
+        let failure = |reason: String| {
+            if written == 0 {
+                Outcome::KnownUnsent { evidence: reason }
+            } else {
+                Outcome::OutcomeUnknown { reason }
+            }
+        };
+        let budget = remaining_send_time(deadline_ms, limit)
+            .ok_or_else(|| failure("inbox hand-off deadline elapsed".into()))?;
+        stream.set_write_timeout(Some(budget)).map_err(|error| {
+            failure(format!(
+                "inbox write timeout setup failed: {}",
+                error.kind()
+            ))
+        })?;
+        // Recheck after setting the socket option and immediately before each write.
+        if remaining_send_time(deadline_ms, limit).is_none() {
+            return Err(failure("inbox hand-off deadline elapsed".into()));
+        }
+        match stream.write(&bytes[written..]) {
+            Ok(0) => return Err(failure("inbox write returned zero".into())),
+            Ok(n) => written += n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(failure(format!(
+                    "inbox write interrupted: {}",
+                    error.kind()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Produces the existing local owner call ID or a source-scoped coordinator ID.
+fn owner_call_id(attempt: &AttemptRecord, source_uid: Option<u32>) -> String {
+    let prefix = match source_uid {
+        Some(uid) => format!("agent-bridge-{uid}"),
+        None => "agent-bridge".to_string(),
+    };
+    format!(
+        "{}-{}-{}",
+        prefix,
+        attempt.fence.attempt_seq,
+        crate::registry::prefix_within(&attempt.fence.manifest_hash, 16)
+    )
+}
+
+impl Drop for ClaudeLaterCarrier {
+    /// Removes the callback sockets this carrier bound in inbox
+    /// directories, so a stopped daemon leaves no endpoint behind.
+    /// Unresolved hand-offs stay with core (recheck deadlines, incidents).
+    fn drop(&mut self) {
+        self.hub.remove_callbacks();
+    }
+}
+
+impl DispatchCarrier for ClaudeLaterCarrier {
+    /// Attests Claude recipients from a current registry snapshot, revalidating
+    /// exact process, executable and private store outside the lock; anything
+    /// else is not this carrier's. An explicitly host-disabled carrier returns
+    /// the ordinary no-message attestation, allowing core to report no queued
+    /// work as idle without selecting or validating a delivery route.
+    ///
+    /// The attested process's session descriptor decides the message path
+    /// (`Hub::sync_message`): a positively disabled inbox withdraws the
+    /// message capability (recorded in core first, so later message
+    /// publications refuse before acceptance) and is returned as such, so
+    /// core holds visibly instead of treating the path as supported; an
+    /// inbox advertised later by the same session and incarnation (native
+    /// late binding) restores message, only if the harness policy grants it; a
+    /// descriptor not yet written, or a malformed one,
+    /// is a transient condition reported as an attestation error (a hold),
+    /// never as disabled, enabled or inactive. While every callback slot is
+    /// held by an unsettled hand-off the recipient is held too
+    /// (`Hub::callback_capacity`), before core reserves an attempt.
+    ///
+    /// A recipient whose own environment names a native owner socket is attested
+    /// through that owner route instead ([`crate::owner`]): it needs no session
+    /// descriptor or inbox, requires the exact direct-parent owner running a
+    /// trusted executable, and
+    /// any unprovable, unreadable or malformed locator is an attestation error
+    /// (a hold) with no fallback to the inbox route. Only a positively idle
+    /// lifecycle may then be woken; an absent locator keeps the behavior above.
+    fn attest(&mut self, recipient: &NativeAddress) -> Result<Attestation, String> {
+        if recipient.harness != Harness::CLAUDE_CODE {
+            return Err("not a Claude recipient".into());
+        }
+        let candidate = {
+            let mut registry = lock_registry(&self.registry);
+            registry.discover_claude_recipient(recipient)?;
+            if registry.message_is_disabled(recipient.harness) {
+                return registry
+                    .attest_recipient(recipient)
+                    .map(|(attestation, _)| attestation);
+            }
+            registry.message_candidate(recipient)?
+        };
+        let (_, binding) = candidate.validate()?;
+        if crate::owner::locator(binding.harness.0)?.is_some() {
+            let attestation = self.owner_route(recipient)?.0;
+            if attestation.lifecycle() != bridge_core::dispatch::Lifecycle::Inactive {
+                return Err("native owner recipient is not positively idle".into());
+            }
+            return Ok(attestation);
+        }
+        self.hub.sync_message(&self.registry, recipient, &binding)?;
+        self.hub.callback_capacity()?;
+        // Capability synchronization can change the snapshot, so close selection
+        // with fresh validation and an in-memory stamp check.
+        let candidate = lock_registry(&self.registry).message_candidate(recipient)?;
+        let (attestation, _) = candidate.validate()?;
+        lock_registry(&self.registry).message_current(&candidate)?;
+        Ok(attestation)
+    }
+
+    /// One `later` hand-off of the frozen manifest.
+    ///
+    /// Waits up to [`ClaudeTiming::receipt_wait`] for the first receipt,
+    /// then, under the pending lock that `Hub::route` also holds while it
+    /// queues a receipt, collects every receipt that raced it. The first
+    /// terminal receipt decides (`delivered` is accepted; any negative is
+    /// an unknown outcome, since it follows the write), unless a later
+    /// receipt of the window contradicts it (another status, or a `held`
+    /// after it), which is unknown; `held` alone
+    /// holds until [`ClaudeTiming::held_recheck_ms`]; silence is written
+    /// without receipt. A hand-off is never repeated here. A manifest over
+    /// [`MAX_MESSAGE_BYTES`] is a permanent refusal before the inbox is
+    /// touched (core never frames one that large).
+    ///
+    /// For an owner-routed recipient (its environment names a native owner
+    /// socket) the frozen manifest instead goes through the native owner
+    /// ([`crate::owner`]) and none of the above applies: the unchanged epoch and
+    /// a positive idle lifecycle are required, whatever the requested mode, and
+    /// every failure before the request is written (including an unreadable
+    /// environment or a bad locator) is known-unsent. After the write only a
+    /// correlated, exactly shaped receipt is anything but an unknown outcome,
+    /// which is retained and never resent; no inbox frame, callback socket or
+    /// second route is used after selection.
+    fn send(&mut self, attempt: &AttemptRecord) -> Outcome {
+        self.send_with_delivery(
+            attempt,
+            DeliveryRef {
+                source_uid: None,
+                ticket: 0,
+                fence: attempt.fence.clone(),
+            },
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Receipt shape parsing; callback identity uses native fixture integration tests.
 
     use super::*;
+
+    /// A transcript scan cannot settle a hand-off already changed to held.
+    #[test]
+    fn stale_transcript_candidate_does_not_replace_held_state() {
+        let waiting = Waiting::NoReceipt {
+            manifest: "body".into(),
+            transcript: None,
+            session: "session".into(),
+            from: "uds:callback".into(),
+            member: ("publisher".into(), "event".into()),
+            deadline_ms: 100,
+        };
+        assert!(same_no_receipt(&waiting, "body", "uds:callback", 100));
+        assert!(!same_no_receipt(&waiting, "body", "uds:other", 100));
+        assert!(!same_no_receipt(
+            &Waiting::Held { until_ms: 200 },
+            "body",
+            "uds:callback",
+            100,
+        ));
+    }
+
+    /// Sources get distinct secret-derived IDs without changing standalone IDs or length.
+    #[test]
+    fn scoped_message_ids_preserve_local_format() {
+        let secret = [42; 32];
+        let mut material = secret.to_vec();
+        material.extend_from_slice(b"msg:9:abc");
+        let local = message_id(&secret, 9, "abc", None);
+        assert_eq!(
+            local,
+            format!("bridge_9_{}", &crate::server::sha256_hex(&material)[..32])
+        );
+        let first = message_id(&secret, 9, "abc", Some(1000));
+        let second = message_id(&secret, 9, "abc", Some(1001));
+        assert_ne!(first, second);
+        assert_ne!(first, local);
+        assert_eq!(first.len(), local.len());
+    }
+
+    /// Expiry sends no bytes; a timeout after partial socket progress is unknown.
+    #[test]
+    fn write_respects_deadline_and_partial_effect() {
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        let limit = Instant::now() + Duration::from_secs(2);
+        assert!(matches!(
+            write_before_deadline(&mut writer, b"a", current_unix_millis(), limit),
+            Err(Outcome::KnownUnsent { .. })
+        ));
+        reader.set_nonblocking(true).unwrap();
+        assert_eq!(
+            reader.read(&mut [0u8; 1]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let bytes = vec![b'x'; 1024 * 1024];
+        let limit = Instant::now() + Duration::from_millis(100);
+        assert!(matches!(
+            write_before_deadline(&mut writer, &bytes, current_unix_millis() + 5000, limit),
+            Err(Outcome::OutcomeUnknown { .. })
+        ));
+        assert!(reader.read(&mut [0u8; 1]).unwrap() > 0);
+    }
 
     /// Malformed, unrelated and unknown-status frames are never native receipts.
     #[test]

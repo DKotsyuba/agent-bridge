@@ -18,12 +18,26 @@ use crate::server::lock_registry;
 pub struct OwnerOnlyCarrier {
     /// Shared protected lifecycle/epoch registry; never locked across owner I/O.
     registry: Arc<Mutex<Registry>>,
+    /// Source UID for a coordinated hand-off, absent for standalone delivery.
+    source_uid: Option<u32>,
 }
 
 impl OwnerOnlyCarrier {
     /// Shares the daemon's existing registry without starting a process or task.
     pub fn new(registry: Arc<Mutex<Registry>>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            source_uid: None,
+        }
+    }
+
+    /// Sends one frozen attempt with source-qualified native correlation.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn send_scoped(&mut self, source_uid: u32, attempt: &AttemptRecord) -> Outcome {
+        self.source_uid = Some(source_uid);
+        let outcome = self.send(attempt);
+        self.source_uid = None;
+        outcome
     }
 
     /// Revalidates current process/store/executable facts outside the registry
@@ -85,6 +99,11 @@ impl DispatchCarrier for OwnerOnlyCarrier {
                 evidence: "epoch or idle lifecycle changed before the owner handoff".into(),
             };
         }
+        let suffix = crate::registry::prefix_within(&attempt.fence.manifest_hash, 16);
+        let call_id = match self.source_uid {
+            Some(uid) => format!("agent-bridge-{uid}-{}-{suffix}", attempt.fence.attempt_seq),
+            None => format!("agent-bridge-{}-{suffix}", attempt.fence.attempt_seq),
+        };
         crate::owner::deliver(
             &self.registry,
             &socket,
@@ -92,11 +111,7 @@ impl DispatchCarrier for OwnerOnlyCarrier {
             address.harness,
             &crate::owner::Handoff {
                 thread_id: &address.native_session_id,
-                call_id: &format!(
-                    "agent-bridge-{}-{}",
-                    attempt.fence.attempt_seq,
-                    crate::registry::prefix_within(&attempt.fence.manifest_hash, 16)
-                ),
+                call_id: &call_id,
                 text: &attempt.manifest,
                 deadline_ms: attempt.deadline_ms,
             },

@@ -32,7 +32,6 @@
 //! refused (update its configured digest and restart). SIGTERM/SIGINT stop the
 //! channel, end the background refresh and drain the service.
 
-use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,41 +39,13 @@ use std::time::Duration;
 
 use bridge_adapters::claude::{ClaudeLaterCarrier, ClaudeTiming};
 use bridge_adapters::codex::{CodexQueueCarrier, DEFAULT_HELPER_TIMEOUT};
+use bridge_adapters::native_config::NativeConfig;
 use bridge_adapters::registry::LEGACY_OWNER_RELAYS_PREFIX;
 use bridge_adapters::server::{ChannelServer, Custody, LateCustody, private_directory};
-use bridge_adapters::{Registry, RegistryConfig, refresh_executables, stop_executable_refresh};
+use bridge_adapters::{Registry, refresh_executables, stop_executable_refresh};
 use bridge_core::dispatch::DispatchTiming;
-use bridge_core::service::{self, Config};
-use serde::Deserialize;
+use bridge_core::service::{self};
 use signal_hook::consts::{SIGINT, SIGTERM};
-
-/// The `[adapters]` table.
-#[derive(Deserialize)]
-struct AdapterConfig {
-    /// Channel socket path.
-    channel: PathBuf,
-    /// Confinement launcher for the Codex helper.
-    #[serde(default = "default_sandbox")]
-    sandbox: PathBuf,
-    /// Registry configuration.
-    #[serde(flatten)]
-    registry: RegistryConfig,
-}
-
-/// Default macOS confinement launcher.
-fn default_sandbox() -> PathBuf {
-    PathBuf::from("/usr/bin/sandbox-exec")
-}
-
-/// Whole daemon configuration.
-#[derive(Deserialize)]
-struct NativeConfig {
-    /// Core service configuration.
-    #[serde(flatten)]
-    core: Config,
-    /// Adapter configuration.
-    adapters: AdapterConfig,
-}
 
 /// Logs a startup failure and returns the failure code.
 fn fail(event: &str, detail: &str) -> ExitCode {
@@ -84,11 +55,23 @@ fn fail(event: &str, detail: &str) -> ExitCode {
 
 /// Loads the configuration, starts everything and waits for a signal.
 fn main() -> ExitCode {
-    let Some(path) = std::env::args().nth(1) else {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(target_os = "linux")]
+    if arguments.first().is_some_and(|arg| arg == "--system") {
+        return bridge_adapters::system::run_system(&arguments[1..]);
+    }
+    #[cfg(target_os = "linux")]
+    if arguments
+        .first()
+        .is_some_and(|arg| arg == "--system-worker")
+    {
+        return bridge_adapters::system::run_worker(&arguments[1..]);
+    }
+    let Some(path) = arguments.first() else {
         eprintln!("usage: bridge-native-daemon <config.toml>");
         return ExitCode::FAILURE;
     };
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Ok(text) = std::fs::read_to_string(path) else {
         return fail("config_read_failed", "configuration unreadable");
     };
     // The parse error can quote a grant token; it is withheld.

@@ -45,7 +45,7 @@ pub use universal::{RegistrationClaimState, RegistrationReconciliation, Verified
 pub use recovery::DeliveryEvidence;
 pub use service::{
     Config, GrantConfig, PublishBody, Request, Response, Running, start as start_service,
-    start_with_carriers,
+    start_coordinated, start_with_carriers,
 };
 pub use storage::{CustodyReceipt, EventState, Limits, PublishOutcome, Storage};
 pub use types::{

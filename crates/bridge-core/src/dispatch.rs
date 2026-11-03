@@ -307,6 +307,16 @@ impl Attestation {
     pub fn lifecycle(&self) -> Lifecycle {
         self.lifecycle
     }
+
+    /// The loaded native capabilities attested for this endpoint.
+    pub fn capabilities(&self) -> Capabilities {
+        self.capabilities
+    }
+
+    /// The protected binding reference supporting this attestation.
+    pub fn proof_ref(&self) -> &str {
+        &self.proof_ref
+    }
 }
 
 /// The capability that owns one attempt's transitions.
@@ -1186,7 +1196,20 @@ fn reserve_in(
 
     let attempt_seq = bump_counter(tx, "attempt_seq")?;
     let lease = now_ms.saturating_add(timing.lease_ms);
-    let deadline = now_ms.saturating_add(timing.handoff_ms);
+    let mut deadline = now_ms.saturating_add(timing.handoff_ms);
+    for (publisher, event_id, _, _) in &members {
+        let managed: Option<i64> = tx
+            .query_row(
+                "SELECT deadline_ms FROM managed_deliveries
+             WHERE publisher_id=?1 AND event_id=?2",
+                params![publisher, event_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(managed) = managed {
+            deadline = deadline.min(from_sql(managed)?);
+        }
+    }
     tx.execute(
         "INSERT INTO attempts
              (attempt_seq, state, requested_mode, effective_mode, recipient, actor,
@@ -1279,6 +1302,25 @@ fn invoke_in(tx: &Connection, attempt_seq: u64, now_ms: u64) -> Result<(), CoreE
 }
 
 impl Storage {
+    /// Returns the highest stored endpoint epoch across bindings and attempts.
+    ///
+    /// An empty store returns zero, so a coordinator can allocate epoch one.
+    /// Invalid non-positive stored epochs are reported as integrity errors.
+    pub fn max_endpoint_epoch(&self) -> Result<u64, CoreError> {
+        let (minimum, maximum): (Option<i64>, Option<i64>) = self.connection.query_row(
+            "SELECT MIN(epoch), MAX(epoch) FROM (
+                SELECT endpoint_epoch AS epoch FROM bindings
+                UNION ALL SELECT endpoint_epoch AS epoch FROM attempts
+            )",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if minimum.is_some_and(|epoch| epoch <= 0) {
+            return Err(corrupt("stored endpoint epoch is not positive".into()));
+        }
+        maximum.map_or(Ok(0), from_sql)
+    }
+
     /// Records an attested endpoint without dispatching anything.
     ///
     /// An adapter calls this when a session connects or renews, so the
@@ -1311,6 +1353,8 @@ impl Storage {
     /// registered source tag, and the attempt is stored as `reserved` with
     /// recipient, actor, endpoint epoch, granted capabilities, effective
     /// path, manifest bytes, manifest hash and hand-off deadline.
+    /// For a managed root, the frozen hand-off deadline is no later than
+    /// its absolute delivery deadline; ordinary attempts keep their timing.
     ///
     /// The path decides the requested modes taken: the message path takes
     /// `message` events and, only for a positively inactive recipient,
@@ -1525,7 +1569,9 @@ impl Storage {
     /// retry has since given the events to a newer attempt, the late outcome is
     /// kept as evidence only: it never closes, opens or changes the newer
     /// attempt's incidents or delivery state. A held or unreceipted
-    /// outcome is rechecked by `recheck_ms`, clamped to a day.
+    /// outcome is rechecked by `recheck_ms`, clamped to a day. An already
+    /// completed managed attempt also retains a late hold or unreceipted
+    /// write without reopening its completed delivery.
     pub fn record_outcome(
         &mut self,
         fence: &AttemptFence,
@@ -1548,7 +1594,29 @@ impl Storage {
                 )));
             }
         }
+        let archived_hold = if late
+            && matches!(
+                outcome,
+                Outcome::NativeHeld { .. } | Outcome::WrittenNoReceipt { .. }
+            )
+            && !record.members.is_empty()
+        {
+            let mut all_archived = true;
+            for member in &record.members {
+                let archived: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM managed_deliveries
+                     WHERE publisher_id=?1 AND event_id=?2 AND outcome!='active')",
+                    params![member.publisher, member.event_id],
+                    |row| row.get(0),
+                )?;
+                all_archived &= archived;
+            }
+            all_archived
+        } else {
+            false
+        };
         if late
+            && !archived_hold
             && !matches!(
                 outcome,
                 Outcome::NativeAccepted { .. }

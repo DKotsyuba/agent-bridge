@@ -233,7 +233,7 @@ impl Storage {
             let auth = self.producer_authorizer()?;
             let grant = auth.authenticate(credential)?;
             let limits = self.universal_limits;
-            let tx = self.begin().map_err(storage_error)?;
+            let (tx, admission) = self.begin_admission().map_err(storage_error)?;
             let now = clock();
             positive_time(now)?;
             if let Some(receipt) = replay_registration(&tx, grant.producer(), request_id, &hash)? {
@@ -248,6 +248,7 @@ impl Storage {
                 }
                 return Ok(receipt);
             }
+            admission.check_ingress().map_err(storage_error)?;
             let policy = grant
                 .policy()
                 .filter(|p| p.registration)
@@ -468,7 +469,7 @@ impl Storage {
             let grant = auth.authenticate(credential)?;
             let limits = self.limits();
             let universal = self.universal_limits;
-            let tx = self.begin().map_err(storage_error)?;
+            let (tx, admission) = self.begin_admission().map_err(storage_error)?;
             let now = clock();
             positive_time(now)?;
             if let Some((hash, receipt)) = read_intent(&tx, grant.producer(), &params.event_id)? {
@@ -579,7 +580,7 @@ impl Storage {
             )
             .map_err(storage_error)?;
             crate::framing::check_renderable(&envelope).map_err(storage_error)?;
-            let custody = publish_in(&tx, &envelope, now, limits, lifetime)
+            let custody = publish_in(&tx, &envelope, now, limits, lifetime, admission)
                 .map_err(storage_error)?
                 .receipt;
             let receipt = EventReceipt {
@@ -917,7 +918,7 @@ impl Storage {
             let auth = self.producer_authorizer()?;
             let grant = auth.authenticate(credential)?;
             let limits = self.universal_limits;
-            let tx = self.begin().map_err(storage_error)?;
+            let (tx, admission) = self.begin_admission().map_err(storage_error)?;
             let now = clock();
             positive_time(now)?;
             if let Some(raw) = replay_lifecycle::<CloseReceipt>(
@@ -932,6 +933,7 @@ impl Storage {
                     replayed: true,
                 });
             }
+            admission.check_ingress().map_err(storage_error)?;
             if grant.policy().is_none() {
                 return Err(failure(ErrorClass::Forbidden, "producer_v1_disabled"));
             }
@@ -994,7 +996,7 @@ impl Storage {
             let auth = self.producer_authorizer()?;
             let grant = auth.authenticate(credential)?;
             let limits = self.universal_limits;
-            let tx = self.begin().map_err(storage_error)?;
+            let (tx, admission) = self.begin_admission().map_err(storage_error)?;
             let now = clock();
             positive_time(now)?;
             if let Some(receipt) = replay_lifecycle::<RetireReceipt>(
@@ -1009,6 +1011,7 @@ impl Storage {
                     replayed: true,
                 });
             }
+            admission.check_ingress().map_err(storage_error)?;
             if !grant.policy().is_some_and(|p| p.delivery_scopes) {
                 return Err(failure(ErrorClass::Unsupported, "delivery_scopes_disabled"));
             }

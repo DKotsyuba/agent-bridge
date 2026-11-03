@@ -17,6 +17,33 @@ fn sender() -> ManagedSender {
     }
 }
 
+/// A delivery report has its own bounded hand-off deadline without recursion.
+#[test]
+fn managed_feedback_attempt_keeps_its_own_deadline() {
+    let mut storage = store();
+    let recipient = codex("recipient");
+    let envelope = keep_all("agent-run", "original", &recipient, Mode::Message);
+    storage
+        .publish_managed(&envelope, &sender(), 1_000)
+        .unwrap();
+    storage.run_maintenance(301_000).unwrap();
+    let notice = report(&storage).feedback_event_id.unwrap();
+    let attestation = attest(&sender().address, Lifecycle::Inactive, 1);
+    let Selection::Attempt(attempt) = storage
+        .reserve_next(
+            &attestation,
+            EffectiveMode::Message,
+            600_000,
+            &DispatchTiming::default(),
+        )
+        .unwrap()
+    else {
+        panic!("expected pending delivery report");
+    };
+    assert_eq!(attempt.members[0].event_id, notice);
+    assert_eq!(attempt.deadline_ms, 601_000);
+}
+
 /// Reserves and commits one native invocation without touching a real carrier.
 fn invoke(
     storage: &mut Storage,
@@ -803,4 +830,173 @@ fn managed_payload_survives_legacy_expiry_and_compaction() {
             .envelope_bytes
             > 0
     );
+}
+
+/// Managed root attempts are capped at their immutable deadline, unlike SDK work.
+#[test]
+fn managed_attempt_deadline_is_capped_and_blocks_late_invocation() {
+    let mut storage = store();
+    let recipient = codex("recipient");
+    let managed = keep_all("agent-run", "original", &recipient, Mode::Message);
+    storage.publish_managed(&managed, &sender(), 1_000).unwrap();
+    let attestation = attest(&recipient, Lifecycle::Inactive, 7);
+    let cutoff = 1_000 + DELIVERY_WINDOW_MS;
+    let Selection::Attempt(attempt) = storage
+        .reserve_next(
+            &attestation,
+            EffectiveMode::Message,
+            cutoff - 10,
+            &DispatchTiming::default(),
+        )
+        .unwrap()
+    else {
+        panic!("managed attempt")
+    };
+    assert_eq!(attempt.deadline_ms, cutoff);
+    assert!(matches!(
+        storage.mark_invoking(&attempt.fence, &attestation, cutoff),
+        Err(bridge_core::CoreError::Fence(_))
+    ));
+    assert_eq!(
+        storage
+            .attempt(attempt.fence.attempt_seq)
+            .unwrap()
+            .unwrap()
+            .deadline_ms,
+        cutoff
+    );
+    storage.run_maintenance(cutoff).unwrap();
+    assert_eq!(report(&storage).sends_made, 0);
+    assert_eq!(report(&storage).outcome, "failed");
+
+    let ordinary_recipient = codex("ordinary");
+    storage
+        .publish(
+            &keep_all("agent-run", "ordinary", &ordinary_recipient, Mode::Message),
+            2_000,
+        )
+        .unwrap();
+    let a = attest(&ordinary_recipient, Lifecycle::Inactive, 8);
+    let Selection::Attempt(ordinary) = storage
+        .reserve_next(
+            &a,
+            EffectiveMode::Message,
+            cutoff - 10,
+            &DispatchTiming::default(),
+        )
+        .unwrap()
+    else {
+        panic!("ordinary attempt")
+    };
+    assert_eq!(
+        ordinary.deadline_ms,
+        cutoff - 10 + DispatchTiming::default().handoff_ms
+    );
+}
+
+/// Frozen feedback remains pending and is admitted after its recipient thaws.
+#[test]
+fn managed_feedback_waits_for_recipient_unfreeze() {
+    let mut storage = store();
+    let recipient = codex("recipient");
+    storage
+        .publish_managed(
+            &keep_all("agent-run", "original", &recipient, Mode::Message),
+            &sender(),
+            1_000,
+        )
+        .unwrap();
+    storage.freeze_recipient(&sender().address).unwrap();
+    let cutoff = 1_000 + DELIVERY_WINDOW_MS;
+    storage.run_maintenance(cutoff).unwrap();
+    assert_eq!(report(&storage).feedback_state, "pending");
+    assert!(
+        storage
+            .next_pending(&sender().address.to_canonical_string(), 10)
+            .unwrap()
+            .is_empty()
+    );
+    storage.unfreeze_recipient(&sender().address).unwrap();
+    storage.run_maintenance(cutoff + 1).unwrap();
+    assert_eq!(report(&storage).feedback_state, "queued");
+    assert_eq!(
+        storage
+            .next_pending(&sender().address.to_canonical_string(), 10)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// Epoch allocation accounts for retained attempts even after bindings disappear.
+#[test]
+fn maximum_endpoint_epoch_includes_historical_attempts_and_rejects_corruption() {
+    let dir = TempDir::new("epoch-maximum");
+    let path = dir.path("state.db");
+    let mut storage = Storage::open(&path, Limits::new(100)).unwrap();
+    register_tags(&mut storage);
+    assert_eq!(storage.max_endpoint_epoch().unwrap(), 0);
+    let one = codex("one");
+    let two = codex("two");
+    storage
+        .observe_binding(&attest(&one, Lifecycle::Inactive, 5), 1_000)
+        .unwrap();
+    assert_eq!(storage.max_endpoint_epoch().unwrap(), 5);
+    storage
+        .publish(&keep_all("agent-run", "epoch", &two, Mode::Message), 1_001)
+        .unwrap();
+    let attestation = attest(&two, Lifecycle::Inactive, 12);
+    let Selection::Attempt(_) = storage
+        .reserve_next(
+            &attestation,
+            EffectiveMode::Message,
+            1_002,
+            &DispatchTiming::default(),
+        )
+        .unwrap()
+    else {
+        panic!("epoch reservation")
+    };
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute(
+        "DELETE FROM bindings WHERE recipient=?1",
+        [two.to_canonical_string()],
+    )
+    .unwrap();
+    assert_eq!(storage.max_endpoint_epoch().unwrap(), 12);
+    db.execute("UPDATE bindings SET endpoint_epoch=-1", [])
+        .unwrap();
+    assert!(matches!(
+        storage.max_endpoint_epoch(),
+        Err(bridge_core::CoreError::Integrity(_))
+    ));
+}
+
+/// Managed replays and their original sender fence survive a recipient freeze.
+#[test]
+fn frozen_managed_original_preserves_replay_and_sender_conflicts() {
+    let mut storage = store();
+    let recipient = codex("recipient");
+    let event = keep_all("agent-run", "original", &recipient, Mode::Message);
+    let first = storage.publish_managed(&event, &sender(), 1_000).unwrap();
+    storage.freeze_recipient(&recipient).unwrap();
+    let replay = storage.publish_managed(&event, &sender(), 2_000).unwrap();
+    assert!(replay.receipt.replayed);
+    assert_eq!(replay.receipt.acceptance_seq, first.receipt.acceptance_seq);
+    let other_sender = ManagedSender {
+        address: codex("other"),
+        ..sender()
+    };
+    assert!(matches!(
+        storage.publish_managed(&event, &other_sender, 2_000),
+        Err(bridge_core::CoreError::Fence(_))
+    ));
+    assert!(matches!(
+        storage.publish_managed(
+            &keep_all("agent-run", "new", &recipient, Mode::Message),
+            &sender(),
+            2_000
+        ),
+        Err(bridge_core::CoreError::Busy(_))
+    ));
 }

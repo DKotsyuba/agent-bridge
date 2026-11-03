@@ -110,8 +110,8 @@ impl Storage {
             ));
         }
         let limits = self.limits();
-        let tx = self.begin()?;
-        let result = publish_in(&tx, envelope, now_ms, limits, "")?;
+        let (tx, admission) = self.begin_admission()?;
+        let result = publish_in(&tx, envelope, now_ms, limits, "", admission)?;
         let address = sender.address.to_canonical_string();
         if result.receipt.replayed {
             let previous: Option<(Option<String>, String)> = tx.query_row(
@@ -148,7 +148,7 @@ impl Storage {
         let tx = self.begin()?;
         complete_in(&tx, now_ms)?;
         tx.commit()?;
-        let tx = self.begin()?;
+        let (tx, admission) = self.begin_admission()?;
         let pending: Vec<(String,String,String,String,i64)> = tx.prepare(
             "SELECT publisher_id,event_id,feedback_sender,request_id,completed_ms FROM managed_deliveries
              WHERE notice_state='pending' ORDER BY completed_ms,publisher_id,event_id LIMIT ?1")?
@@ -194,7 +194,7 @@ impl Storage {
             )?;
             // A failure to admit a best-effort notice never rolls back the original report.
             tx.execute_batch("SAVEPOINT feedback_admission")?;
-            let admitted = publish_in(&tx, &envelope, now_ms, limits, "");
+            let admitted = publish_in(&tx, &envelope, now_ms, limits, "", admission);
             match admitted {
                 Ok(receipt) if !receipt.receipt.replayed => {
                     tx.execute(
@@ -218,7 +218,7 @@ impl Storage {
                     tx.execute("UPDATE managed_deliveries SET notice_state='unavailable' WHERE publisher_id=?1 AND event_id=?2",
                         params![publisher,event])?;
                 }
-                Err(CoreError::Capacity { .. }) => {
+                Err(CoreError::Capacity { .. } | CoreError::Busy(_)) => {
                     tx.execute_batch("ROLLBACK TO feedback_admission; RELEASE feedback_admission")?;
                 }
                 Err(CoreError::Unsupported(_) | CoreError::Conflict { .. }) => {

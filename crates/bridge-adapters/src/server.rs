@@ -33,7 +33,10 @@ use std::time::{Duration, Instant};
 
 mod producer;
 
-use bridge_core::dispatch::{DispatchTiming, Outcome, Selection, lock_storage};
+use bridge_core::dispatch::{
+    AttemptFence, AttemptRecord, Attestation, DispatchTiming, Outcome, Selection, lock_storage,
+};
+use bridge_core::recovery::EvidenceTier;
 use bridge_core::service::{current_unix_millis, log_event};
 use bridge_core::{Harness, Storage};
 use serde::{Deserialize, Serialize};
@@ -123,6 +126,164 @@ pub fn with_custody<R>(custody: &dyn Custody, action: impl FnOnce(&mut Storage) 
         }
     });
     result
+}
+
+/// The original source store and fence for one delivery attempt.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DeliveryRef {
+    /// Source UID in coordinated mode; absent for the local standalone store.
+    pub source_uid: Option<u32>,
+    /// Coordinator-issued attempt ticket; zero in standalone mode.
+    pub ticket: u64,
+    /// Immutable fence recorded in the source store.
+    pub fence: AttemptFence,
+}
+
+/// The result of a qualified hook's request for one frozen manifest.
+pub enum HookSelection {
+    /// One attempt was committed as invoking in its source store.
+    Attempt {
+        /// The source and immutable attempt fence.
+        delivery: DeliveryRef,
+        /// The exact frozen attempt to emit.
+        record: Box<AttemptRecord>,
+    },
+    /// No attempt was selected for this hook.
+    Idle,
+}
+
+/// Narrow delivery boundary used by local adapters and the system coordinator.
+///
+/// Implementations must preserve source ownership and never hold storage or
+/// registry locks while waiting on a remote operation.
+pub trait DeliverySink: Send + Sync {
+    /// Records a verified native binding before it can authorize delivery.
+    fn observe_binding(&self, attestation: &Attestation, now_ms: u64) -> Result<(), String>;
+
+    /// Selects at most one attempt for a genuine native hook.
+    fn drain_hook(
+        &self,
+        attestation: &Attestation,
+        now_ms: u64,
+        timing: &DispatchTiming,
+    ) -> Result<HookSelection, String>;
+
+    /// Records an outcome only against its original source and fence.
+    fn record_outcome(
+        &self,
+        delivery: &DeliveryRef,
+        outcome: Outcome,
+        now_ms: u64,
+    ) -> Result<(), String>;
+
+    /// Records late evidence for a member of the original attempt.
+    fn record_evidence(
+        &self,
+        delivery: &DeliveryRef,
+        member: &(String, String),
+        tier: EvidenceTier,
+        detail: &str,
+        now_ms: u64,
+    ) -> Result<(), String>;
+
+    /// Releases coordinator correlation after a native callback expires silently.
+    fn callback_closed(&self, _delivery: &DeliveryRef) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Standalone delivery using the existing single local custody store.
+pub(crate) struct LocalDelivery {
+    /// The same store used by local producers.
+    custody: Arc<dyn Custody>,
+}
+
+impl LocalDelivery {
+    /// Wraps the existing store without changing its ownership.
+    pub(crate) fn new(custody: Arc<dyn Custody>) -> Self {
+        Self { custody }
+    }
+}
+
+impl DeliverySink for LocalDelivery {
+    /// Records the binding under the local store lock.
+    fn observe_binding(&self, attestation: &Attestation, now_ms: u64) -> Result<(), String> {
+        with_custody(self.custody.as_ref(), |storage| {
+            storage.observe_binding(attestation, now_ms)
+        })
+        .ok_or_else(|| "custody unavailable".to_string())?
+        .map_err(|error| error.to_string())
+    }
+
+    /// Commits one local hook drain before returning its manifest.
+    fn drain_hook(
+        &self,
+        attestation: &Attestation,
+        now_ms: u64,
+        timing: &DispatchTiming,
+    ) -> Result<HookSelection, String> {
+        let selected = with_custody(self.custody.as_ref(), |storage| {
+            storage.drain_inject(attestation, now_ms, timing)
+        })
+        .ok_or_else(|| "custody unavailable".to_string())?
+        .map_err(|error| error.to_string())?;
+        Ok(match selected {
+            Selection::Attempt(record) => HookSelection::Attempt {
+                delivery: DeliveryRef {
+                    source_uid: None,
+                    ticket: 0,
+                    fence: record.fence.clone(),
+                },
+                record,
+            },
+            Selection::Idle | Selection::Held(_) => HookSelection::Idle,
+        })
+    }
+
+    /// Records an outcome only in this local store.
+    fn record_outcome(
+        &self,
+        delivery: &DeliveryRef,
+        outcome: Outcome,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        if delivery.source_uid.is_some() || delivery.ticket != 0 {
+            return Err("foreign delivery on local custody".into());
+        }
+        with_custody(self.custody.as_ref(), |storage| {
+            storage.record_outcome(&delivery.fence, outcome.clone(), now_ms)
+        })
+        .ok_or_else(|| "custody unavailable".to_string())?
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    }
+
+    /// Records late evidence only in this local store.
+    fn record_evidence(
+        &self,
+        delivery: &DeliveryRef,
+        member: &(String, String),
+        tier: EvidenceTier,
+        detail: &str,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        if delivery.source_uid.is_some() || delivery.ticket != 0 {
+            return Err("foreign delivery on local custody".into());
+        }
+        with_custody(self.custody.as_ref(), |storage| {
+            storage.record_evidence(
+                &member.0,
+                &member.1,
+                delivery.fence.attempt_seq,
+                tier,
+                detail,
+                now_ms,
+            )
+        })
+        .ok_or_else(|| "custody unavailable".to_string())?
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    }
 }
 
 /// One request line on the channel.
@@ -226,6 +387,8 @@ struct ChannelState {
     registry: Arc<Mutex<Registry>>,
     /// The custody store.
     custody: Arc<dyn Custody>,
+    /// Delivery operations, local in standalone mode and routed in system mode.
+    delivery: Arc<dyn DeliverySink>,
     /// Drain timing (lease and hand-off windows).
     timing: DispatchTiming,
     /// Cleared to stop.
@@ -390,6 +553,22 @@ impl ChannelServer {
         custody: Arc<dyn Custody>,
         timing: DispatchTiming,
     ) -> std::io::Result<ChannelServer> {
+        let delivery = Arc::new(LocalDelivery::new(Arc::clone(&custody)));
+        Self::start_with_delivery(socket, registry, custody, timing, delivery)
+    }
+
+    /// Starts the channel with an explicit delivery boundary and local producer custody.
+    ///
+    /// # Errors
+    ///
+    /// Refuses an unsafe endpoint or any restored binding that cannot be recorded.
+    pub fn start_with_delivery(
+        socket: &Path,
+        registry: Arc<Mutex<Registry>>,
+        custody: Arc<dyn Custody>,
+        timing: DispatchTiming,
+        delivery: Arc<dyn DeliverySink>,
+    ) -> std::io::Result<ChannelServer> {
         let directory = socket
             .parent()
             .ok_or_else(|| std::io::Error::other("channel socket has no directory"))?;
@@ -403,12 +582,9 @@ impl ChannelServer {
             )
             .map_err(std::io::Error::other)?;
         for attestation in restored {
-            let observed = with_custody(custody.as_ref(), |storage| {
-                storage.observe_binding(&attestation, current_unix_millis())
-            });
-            match observed {
-                Some(Ok(_)) => {}
-                _ => {
+            match delivery.observe_binding(&attestation, current_unix_millis()) {
+                Ok(()) => {}
+                Err(_) => {
                     return Err(std::io::Error::other(
                         "restored recipient fence could not be recorded",
                     ));
@@ -422,6 +598,7 @@ impl ChannelServer {
         let state = Arc::new(ChannelState {
             registry,
             custody,
+            delivery,
             timing,
             running: AtomicBool::new(true),
             active: AtomicUsize::new(0),
@@ -645,17 +822,12 @@ fn serve_hook(
             return;
         }
     };
-    if let Some(attestation) = &admission.renewed {
-        let observed = with_custody(state.custody.as_ref(), |storage| {
-            storage.observe_binding(attestation, now)
-        });
-        if let Some(Err(error)) = observed {
-            log_event(
-                "warn",
-                "binding_fence_refused",
-                &[("error", &error.to_string())],
-            );
-        }
+    if let Some(attestation) = &admission.renewed
+        && state.delivery.observe_binding(attestation, now).is_err()
+    {
+        log_event("warn", "binding_fence_refused", &[]);
+        let _ = write_response(writer, &ChannelResponse::Ok);
+        return;
     }
     if let Some(token) = admission.token {
         let _ = write_response(writer, &ChannelResponse::CallToken { token });
@@ -667,21 +839,17 @@ fn serve_hook(
     };
     // Reserve + invoking + frozen manifest commit in one core transaction,
     // before any payload byte can leave.
-    let drained = with_custody(state.custody.as_ref(), |storage| {
-        storage.drain_inject(&attestation, current_unix_millis(), &state.timing)
-    });
-    let record = match drained {
-        Some(Ok(Selection::Attempt(record))) => record,
-        Some(Ok(Selection::Idle | Selection::Held(_))) => {
+    let drained = state
+        .delivery
+        .drain_hook(&attestation, current_unix_millis(), &state.timing);
+    let (delivery, record) = match drained {
+        Ok(HookSelection::Attempt { delivery, record }) => (delivery, record),
+        Ok(HookSelection::Idle) => {
             let _ = write_response(writer, &ChannelResponse::Ok);
             return;
         }
-        Some(Err(error)) => {
-            log_event("warn", "drain_refused", &[("error", &error.to_string())]);
-            let _ = write_response(writer, &ChannelResponse::Ok);
-            return;
-        }
-        None => {
+        Err(_) => {
+            log_event("warn", "drain_refused", &[]);
             let _ = write_response(writer, &ChannelResponse::Ok);
             return;
         }
@@ -730,15 +898,12 @@ fn serve_hook(
             reason: "hook reply possibly handed without a flush confirmation".into(),
         },
     };
-    let recorded = with_custody(state.custody.as_ref(), |storage| {
-        storage.record_outcome(&record.fence, outcome, current_unix_millis())
-    });
-    if let Some(Err(error)) = recorded {
-        log_event(
-            "error",
-            "hook_outcome_unrecorded",
-            &[("error", &error.to_string())],
-        );
+    if state
+        .delivery
+        .record_outcome(&delivery, outcome, current_unix_millis())
+        .is_err()
+    {
+        log_event("error", "hook_outcome_unrecorded", &[]);
     }
 }
 

@@ -22,6 +22,17 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Verify the pinned attestation action's built distribution
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          action_commit=1e69f48acb82d1966a394da916b4c1698aa569d6
+          gh api "repos/actions/attest/actions/workflows/check-dist.yml/runs?head_sha=$action_commit&event=push&per_page=100" > "$RUNNER_TEMP/attest-runs.json"
+          run_id="$(jq -r --arg commit "$action_commit" '[.workflow_runs[] | select(.head_sha == $commit and .event == "push" and .status == "completed" and .conclusion == "success")][0].id // empty' "$RUNNER_TEMP/attest-runs.json")"
+          test -n "$run_id"
+          gh api "repos/actions/attest/actions/runs/$run_id/jobs?per_page=100" > "$RUNNER_TEMP/attest-jobs.json"
+          jq -e '[.jobs[] | select(.name == "Check dist/" and .conclusion == "success") | .steps[] | select(.name == "Compare Directories" and .conclusion == "success")] | length > 0' "$RUNNER_TEMP/attest-jobs.json" > /dev/null
       - name: Check version, exact commit and successful CI
         env:
           GH_TOKEN: ${{ github.token }}
@@ -72,6 +83,8 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Prepare toolchain and isolated environment
@@ -110,9 +123,24 @@ jobs:
           cp install.sh "$RUNNER_TEMP/install.sh"
           printf '%s  bundle/SHA256SUMS\n' "$sums" > "$RUNNER_TEMP/bundle-SHA256SUMS.sha256"
           COPYFILE_DISABLE=1 tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/agent-bridge-${GITHUB_REF_NAME#v}-$PLATFORM.tar.gz" bundle install.sh bundle-SHA256SUMS.sha256
+          echo "BRIDGE_ARCHIVE=$RUNNER_TEMP/agent-bridge-${GITHUB_REF_NAME#v}-$PLATFORM.tar.gz" >> "$GITHUB_ENV"
           mkdir "$RUNNER_TEMP/archive-check"
           tar -C "$RUNNER_TEMP/archive-check" -xzf "$RUNNER_TEMP/agent-bridge-${GITHUB_REF_NAME#v}-$PLATFORM.tar.gz"
           target/release/bridge verify "$RUNNER_TEMP/archive-check/bundle" --sums-sha256 "$sums"
+      - name: Attest the final platform archive
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ env.BRIDGE_ARCHIVE }}
+      - name: Prepare the public attestation bundle
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          ATTESTATION_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          case "$ATTESTATION_PATH" in "$RUNNER_TEMP"/*) ;; *) exit 1 ;; esac
+          test -s "$ATTESTATION_PATH"
+          cp "$ATTESTATION_PATH" "$RUNNER_TEMP/agent-bridge-${GITHUB_REF_NAME#v}-$PLATFORM.sigstore.jsonl"
       - name: Build SDK source archive
         if: matrix.platform == 'linux-x86_64'
         run: python3 scripts/release-sdk.py --out "$RUNNER_TEMP/bridge-sdk-${GITHUB_REF_NAME#v}.tar.gz"
@@ -131,7 +159,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(gh release view "$GITHUB_REF_NAME" --json isDraft -q .isDraft)" = true
-          gh release upload "$GITHUB_REF_NAME" "$RUNNER_TEMP/agent-bridge-${GITHUB_REF_NAME#v}-$PLATFORM.tar.gz"
+          gh release upload "$GITHUB_REF_NAME" "$RUNNER_TEMP/agent-bridge-${GITHUB_REF_NAME#v}-$PLATFORM.tar.gz" "$RUNNER_TEMP/agent-bridge-${GITHUB_REF_NAME#v}-$PLATFORM.sigstore.jsonl"
 
   publish:
     needs: build
@@ -150,6 +178,9 @@ jobs:
             name="agent-bridge-${GITHUB_REF_NAME#v}-$platform.tar.gz"
             gh release download "$GITHUB_REF_NAME" --pattern "$name"
             test -s "$name"
+            attestation="agent-bridge-${GITHUB_REF_NAME#v}-$platform.sigstore.jsonl"
+            gh release download "$GITHUB_REF_NAME" --pattern "$attestation"
+            test -s "$attestation"
           done
           gh release download "$GITHUB_REF_NAME" --pattern "bridge-sdk-${GITHUB_REF_NAME#v}.tar.gz"
           gh release download "$GITHUB_REF_NAME" --pattern install.sh
@@ -157,7 +188,7 @@ jobs:
           test -s install.sh
           gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" > releases.json
           jq --arg tag "$GITHUB_REF_NAME" '[.[] | select(.tag_name == $tag and .draft)] | if length == 1 then .[0] else error("expected one draft") end' releases.json > release.json
-          for file in agent-bridge-"${GITHUB_REF_NAME#v}"-*.tar.gz "bridge-sdk-${GITHUB_REF_NAME#v}.tar.gz" install.sh; do
+          for file in agent-bridge-"${GITHUB_REF_NAME#v}"-*.tar.gz agent-bridge-"${GITHUB_REF_NAME#v}"-*.sigstore.jsonl "bridge-sdk-${GITHUB_REF_NAME#v}.tar.gz" install.sh; do
             digest="$(jq -r --arg name "$file" '.assets[] | select(.name == $name) | .digest' release.json)"
             test "${#digest}" = 71
             test "${digest:0:7}" = sha256:

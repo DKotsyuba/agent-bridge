@@ -1423,6 +1423,8 @@ pub struct Registry {
     config: RegistryConfig,
     /// The only user id accepted on the channel.
     owner_uid: u32,
+    /// Lower bound observed in every source database before coordinated startup.
+    epoch_floor: u64,
     /// Bindings by canonical address.
     bindings: HashMap<String, Binding>,
     /// Optional private atomic snapshot of verified recipient routes, never calls or secrets.
@@ -1464,6 +1466,18 @@ pub struct Registry {
     /// never granted, so publication
     /// refuses before acceptance.
     message_disabled: Vec<Harness>,
+}
+
+/// Chooses an endpoint epoch newer than a saved binding and the coordinated floor.
+fn next_epoch(floor: u64, previous: Option<u64>, now_ms: u64) -> Result<u64, String> {
+    let maximum = bridge_core::MAX_SQLITE_INT;
+    if floor >= maximum || previous.is_some_and(|old| old >= maximum) || now_ms > maximum {
+        return Err("recipient epoch exhausted".into());
+    }
+    Ok(now_ms
+        .max(1)
+        .max(floor + 1)
+        .max(previous.map_or(1, |old| old + 1)))
 }
 
 /// Checks that `binding` is live and is still the binding `expected` was
@@ -1659,6 +1673,7 @@ impl Registry {
         let mut registry = Registry {
             config,
             owner_uid,
+            epoch_floor: 0,
             bindings: HashMap::new(),
             journal: None,
             calls: HashMap::new(),
@@ -1683,6 +1698,16 @@ impl Registry {
         };
         registry.warm_digests();
         Ok(registry)
+    }
+
+    /// Sets the coordinated source-database floor before restoring any journal.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_epoch_floor(&mut self, floor: u64) -> Result<(), String> {
+        if self.journal.is_some() || floor >= bridge_core::MAX_SQLITE_INT {
+            return Err("recipient epoch floor cannot be installed".into());
+        }
+        self.epoch_floor = floor;
+        Ok(())
     }
 
     /// Attaches the private route journal and revalidates every saved route before
@@ -1810,7 +1835,7 @@ impl Registry {
                 {
                     continue;
                 }
-                binding.epoch = now_ms.max(binding.epoch + 1);
+                binding.epoch = next_epoch(self.epoch_floor, Some(binding.epoch), now_ms)?;
                 self.apply_policy(&mut binding, &policy);
                 if binding
                     .transcript
@@ -2345,8 +2370,8 @@ impl Registry {
             None => (true, None),
         };
         if renewed {
-            let epoch =
-                previous_epoch.map_or(now_ms.max(1), |old| now_ms.max(old.saturating_add(1)));
+            let epoch = next_epoch(self.epoch_floor, previous_epoch, now_ms)
+                .map_err(CorrelationError::Unavailable)?;
             self.evict_bindings();
             if !self.bindings.contains_key(&key) && self.bindings.len() >= DEFAULT_MAX_BINDINGS {
                 return Err(CorrelationError::Unavailable(

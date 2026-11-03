@@ -376,13 +376,14 @@ impl Registry {
         {
             return Err("the gateway route is not available".into());
         }
+        let floor = self.epoch_floor;
         let binding = self
             .bindings
             .get_mut(&key)
             .filter(|binding| **binding == snapshot.binding)
             .ok_or("the binding changed before the gateway was committed")?;
         let previous = binding.clone();
-        binding.epoch = now_ms.max(binding.epoch.saturating_add(1));
+        binding.epoch = super::next_epoch(floor, Some(binding.epoch), now_ms)?;
         if let Some(wake) = binding.wake.as_mut() {
             wake.gateway = Some(gateway);
         }

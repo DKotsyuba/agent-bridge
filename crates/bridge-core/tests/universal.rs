@@ -2033,3 +2033,156 @@ fn auto_only_grant_reaches_a_message_only_recipient_and_nothing_else() {
     assert_eq!(error.class, ErrorClass::Unsupported);
     assert_eq!(events(&sql), 1, "no loaded path created no custody");
 }
+
+/// Coordinated fencing preserves v1 replay while rejecting all new mutations.
+#[test]
+fn coordinated_v1_replays_survive_ingress_and_recipient_fences() {
+    let dir = TempDir::new("v1-coordinated");
+    let socket = std::env::temp_dir().join(format!("v1-{}.sock", std::process::id()));
+    let service = bridge_core::start_coordinated(bridge_core::Config {
+        database: dir.path("state.db"),
+        socket: socket.clone(),
+        limits: bridge_core::Limits::new(100),
+        grants: vec![grant(TOKEN, "report-maker")],
+        universal_limits: UniversalLimits::default(),
+    })
+    .unwrap();
+    service.activate_ingress().unwrap();
+    let receipt = service
+        .with_storage(|s| {
+            s.register_call(
+                TOKEN,
+                "register",
+                &registration("job"),
+                Some(&origin("use", "root")),
+                &|| 1_000,
+            )
+        })
+        .unwrap();
+    let direct = |event: &str| PublishParams {
+        destination: Destination::Address {
+            address: codex("caller").to_canonical_string(),
+        },
+        ..publication("unused", event, None)
+    };
+    let request = |id: &str, op| Request::new(id, Secret::new(TOKEN), op).unwrap();
+    let publish = request("publish", Operation::Publish(direct("event")));
+    let close = request(
+        "close",
+        Operation::CloseRoute(CloseRouteParams {
+            route_key: receipt.route_key.clone(),
+            reason: None,
+        }),
+    );
+    let retire = request(
+        "retire",
+        Operation::RetireDeliveryScope(RetireDeliveryScopeParams {
+            scope_key: "scope".into(),
+            action: RetirementAction::Preserve,
+        }),
+    );
+    for frame in [&publish, &close, &retire] {
+        assert!(fixture_exchange(&socket, frame).unwrap().success);
+    }
+    service.fence_ingress();
+    for frame in [&publish, &close, &retire] {
+        let response = fixture_exchange(&socket, frame).unwrap();
+        assert!(matches!(
+            response.result,
+            Some(OperationResult::Publish(PublishResult {
+                replayed: true,
+                ..
+            })) | Some(OperationResult::CloseRoute(CloseResult {
+                replayed: true,
+                ..
+            })) | Some(OperationResult::RetireDeliveryScope(RetireResult {
+                replayed: true,
+                ..
+            }))
+        ));
+    }
+    let fresh_publish = request("fresh", Operation::Publish(direct("new")));
+    let fresh_close = request(
+        "close-new",
+        Operation::CloseRoute(CloseRouteParams {
+            route_key: receipt.route_key.clone(),
+            reason: None,
+        }),
+    );
+    let fresh_retire = request(
+        "retire-new",
+        Operation::RetireDeliveryScope(RetireDeliveryScopeParams {
+            scope_key: "scope-new".into(),
+            action: RetirementAction::Preserve,
+        }),
+    );
+    for frame in [&fresh_publish, &fresh_close, &fresh_retire] {
+        assert_eq!(
+            fixture_exchange(&socket, frame)
+                .unwrap()
+                .error
+                .unwrap()
+                .class,
+            ErrorClass::Busy
+        );
+    }
+    assert_eq!(
+        service
+            .with_storage(|s| s.register_call(
+                TOKEN,
+                "register",
+                &registration("job"),
+                None,
+                &|| 1_001
+            ))
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(
+        service
+            .with_storage(|s| s.register_call(
+                TOKEN,
+                "register-new",
+                &registration("job-new"),
+                Some(&origin("use-new", "root")),
+                &|| 1_001
+            ))
+            .unwrap_err()
+            .class,
+        ErrorClass::Busy
+    );
+
+    service.activate_ingress().unwrap();
+    service
+        .with_storage(|s| s.freeze_recipient(&codex("caller")))
+        .unwrap();
+    assert!(fixture_exchange(&socket, &publish).unwrap().success);
+    let mut changed = direct("event");
+    changed.payload = Payload::new("different").unwrap();
+    let conflict = request("conflict", Operation::Publish(changed));
+    assert_eq!(
+        fixture_exchange(&socket, &conflict)
+            .unwrap()
+            .error
+            .unwrap()
+            .class,
+        ErrorClass::Conflict
+    );
+    assert_eq!(
+        fixture_exchange(&socket, &fresh_publish)
+            .unwrap()
+            .error
+            .unwrap()
+            .class,
+        ErrorClass::Busy
+    );
+    service
+        .with_storage(|s| s.unfreeze_recipient(&codex("caller")))
+        .unwrap();
+    assert!(fixture_exchange(&socket, &fresh_publish).unwrap().success);
+    service.shutdown();
+    service.join();
+    let mut lock = socket.into_os_string();
+    lock.push(".lock");
+    std::fs::remove_file(lock).unwrap();
+}
