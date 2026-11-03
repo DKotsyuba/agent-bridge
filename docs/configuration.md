@@ -134,6 +134,8 @@ with its full payload, immutable hash, identity and evidence retained. Its
 status includes a durable `report`: `failed` for a known no-effect history or
 `unconfirmed` when any handoff may have occurred. Late positive evidence may
 improve current native status; the report describes the outcome at completion.
+The report's legacy `sends_made` field is capped at five for older relays;
+when more calls occurred, its reason includes the recorded minimum.
 
 One best-effort native MESSAGE reports the failure/unconfirmed outcome to the
 attested sender. It contains identifiers and fixed wording, never the original

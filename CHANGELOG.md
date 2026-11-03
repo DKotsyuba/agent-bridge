@@ -4,7 +4,7 @@ All notable changes to Agent Bridge are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions describe the
 source, and the crates are not published to crates.io.
 
-## [0.6.2] - 2026-11-03
+## [0.6.3] - 2026-11-03
 
 ### Changed
 
@@ -18,6 +18,8 @@ source, and the crates are not published to crates.io.
 
 - Make the local installer handle unset `HOME` and unusual temporary paths, and
   create new launcher directories privately under inherited Linux ACLs.
+- Keep delivery reports readable by older account relays after more than five
+  native attempts.
 
 ## [0.6.1] - 2026-11-03
 

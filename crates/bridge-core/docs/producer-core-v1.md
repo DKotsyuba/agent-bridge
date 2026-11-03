@@ -42,6 +42,8 @@ without erasing possible-effect history or asserting native recall. Positive
 late receipts remain evidence and may improve native delivery state, but never
 reopen the completed automatic policy. Legacy `status.delivery.report` is
 additive, durable and publisher-scoped; the existing v1 status DTO is unchanged.
+For compatibility with older relays, its `sends_made` field is capped at five;
+when the actual count is larger, `reason` states the recorded minimum.
 
 A separate bounded keep-all MESSAGE to the trusted sender is best effort. Its
 fixed body never includes the original payload or native diagnostic text, and

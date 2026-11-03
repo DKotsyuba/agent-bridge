@@ -276,6 +276,17 @@ fn managed_feedback_busy_refunds_never_allow_a_sixth_native_call() {
             .unwrap();
     }
     assert_eq!(report(&storage).feedback_state, "failed");
+    let notice_report = storage
+        .delivery_evidence("agent-run", &notice)
+        .unwrap()
+        .unwrap()
+        .report
+        .unwrap();
+    assert_eq!(notice_report.sends_made, 5);
+    assert_eq!(
+        notice_report.reason,
+        "Five native attempts ended with positive no-send evidence"
+    );
     assert_eq!(
         storage
             .delivery_evidence("agent-run", &notice)
@@ -1203,7 +1214,10 @@ fn wake_respects_explicit_expiry_after_legacy_deadline() {
 /// a later uncertain hand-off is retained once and never automatically retried.
 #[test]
 fn wake_retries_known_unsent_past_five_then_fences_unknown() {
-    let mut storage = store();
+    let dir = TempDir::new("report-compat");
+    let path = dir.path("db");
+    let mut storage = Storage::open(&path, Limits::new(1_000)).unwrap();
+    register_tags(&mut storage);
     let recipient = codex("retry");
     let event = keep_all("agent-run", "original", &recipient, Mode::Message);
     storage.publish_managed(&event, &sender(), 1_000).unwrap();
@@ -1264,8 +1278,61 @@ fn wake_retries_known_unsent_past_five_then_fences_unknown() {
             now + 1,
         )
         .unwrap();
-    assert_eq!(report(&storage).outcome, "unconfirmed");
-    assert_eq!(report(&storage).sends_made, 13);
+    let status = storage
+        .delivery_evidence("agent-run", "original")
+        .unwrap()
+        .unwrap();
+    let result = status.report.as_ref().unwrap();
+    assert_eq!(result.outcome, "unconfirmed");
+    assert_eq!(result.sends_made, 5);
+    assert!(
+        result
+            .reason
+            .contains("at least 13 native attempts; compatibility count capped at 5")
+    );
+    assert!(result.reason.len() <= 256);
+    let wire = bridge_core::Response::Status {
+        receipt: None,
+        delivery: Some(Box::new(status.clone())),
+    };
+    let decoded: bridge_core::Response =
+        serde_json::from_slice(&serde_json::to_vec(&wire).unwrap()).unwrap();
+    decoded.validate().unwrap();
+    let mut invalid_status = status.clone();
+    invalid_status.report.as_mut().unwrap().sends_made = 6;
+    assert!(
+        serde_json::from_slice::<bridge_core::DeliveryEvidence>(
+            &serde_json::to_vec(&invalid_status).unwrap()
+        )
+        .is_err()
+    );
+    let page = storage
+        .sender_reports("agent-run", &sender().address, 0)
+        .unwrap();
+    assert_eq!(page.reports[0].report, *result);
+    let mut invalid_page = page.clone();
+    invalid_page.reports[0].report.sends_made = 6;
+    assert!(
+        bridge_core::Response::SenderReports { page: invalid_page }
+            .validate()
+            .is_err()
+    );
+    bridge_core::Response::SenderReports { page }
+        .validate()
+        .unwrap();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let stored: (u32, String) = db.query_row(
+        "SELECT sends_made,reason FROM managed_deliveries WHERE publisher_id='agent-run' AND event_id='original'",
+        [], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert_eq!(stored.0, 13);
+    assert_eq!(
+        result.reason,
+        format!(
+            "{}; at least 13 native attempts; compatibility count capped at 5",
+            stored.1
+        )
+    );
     storage.run_maintenance(now + spacing).unwrap();
     assert!(matches!(
         storage

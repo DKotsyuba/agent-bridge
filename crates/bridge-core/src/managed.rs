@@ -37,11 +37,11 @@ pub struct ManagedSender {
 pub struct DeliveryReport {
     /// `failed` means positive no-effect history; `unconfirmed` preserves uncertainty.
     pub outcome: String,
-    /// Safe fixed reason describing why automation stopped.
+    /// Safe reason; above five native attempts, includes the retained count.
     pub reason: String,
     /// Unix milliseconds when automation stopped; late evidence stays separate.
     pub completed_at_ms: u64,
-    /// Native invocations including busy receipts, saturated at `u32::MAX`.
+    /// Native invocations including busy receipts; five means five or more.
     pub sends_made: u32,
     /// Deterministic notice identity, absent for notices themselves.
     pub feedback_event_id: Option<String>,
@@ -55,6 +55,7 @@ impl DeliveryReport {
         if !matches!(self.outcome.as_str(), "failed" | "unconfirmed")
             || self.reason.len() > 256
             || self.completed_at_ms > crate::MAX_SQLITE_INT
+            || self.sends_made > MAX_SENDS
             || !matches!(
                 self.feedback_state.as_str(),
                 "pending"
@@ -240,7 +241,9 @@ fn feedback_id(publisher: &str, event: &str) -> String {
     )
 }
 
-/// Reads a retained report and its notice's current evidence without native I/O.
+/// Reads a retained report and notice evidence without native I/O or storage
+/// changes. The public count is capped at five for older relays; when capped,
+/// the safe reason includes the retained, saturated invocation count.
 pub(crate) fn report_in(
     connection: &Connection,
     publisher: &str,
@@ -266,11 +269,26 @@ pub(crate) fn report_in(
             result
         };
     }
+    let reason = if sends > MAX_SENDS {
+        let suffix = format!(
+            "; at least {sends} native attempts; compatibility count capped at {MAX_SENDS}"
+        );
+        let mut reason = reason;
+        let mut end = reason.len().min(256 - suffix.len());
+        while !reason.is_char_boundary(end) {
+            end -= 1;
+        }
+        reason.truncate(end);
+        reason.push_str(&suffix);
+        reason
+    } else {
+        reason
+    };
     Ok(Some(DeliveryReport {
         outcome,
         reason,
         completed_at_ms: from_sql(completed)?,
-        sends_made: sends,
+        sends_made: sends.min(MAX_SENDS),
         feedback_event_id,
         feedback_state,
     }))
