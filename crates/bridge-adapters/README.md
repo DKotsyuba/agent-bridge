@@ -199,6 +199,8 @@ touched by anything here, and nothing in this crate installs a hook for you.
   the same live process and no owner/Desktop override. The proof is spent in the
   journal before `thread/resume`; the exact binding and native idle state are
   checked again before any `turn/start`. A renewed epoch requires a fresh attempt.
+  If the retired thread is still loaded and natively idle, the same proof is
+  spent before `turn/start`, without resuming the thread.
   New idle-end proofs include a full-content digest for transcripts up to 256 MiB;
   unchanged content then survives metadata-only changes. Legacy proofs and larger
   transcripts still require unchanged metadata. The existing journal field carries

@@ -213,12 +213,14 @@ impl CodexQueueCarrier {
                 let (attestation, binding) = candidate.validate_live_resume()?;
                 let endpoint = crate::codex_live::locate(&binding)?
                     .ok_or("qualified native control socket unavailable")?;
-                if endpoint.state(
-                    &address.native_session_id,
-                    self.timeout.min(Duration::from_secs(3)),
-                )? != crate::codex_live::State::NotLoaded
-                {
-                    return Err("retired live-server thread is not unloaded".into());
+                if !matches!(
+                    endpoint.state(
+                        &address.native_session_id,
+                        self.timeout.min(Duration::from_secs(3)),
+                    )?,
+                    crate::codex_live::State::NotLoaded | crate::codex_live::State::Idle
+                ) {
+                    return Err("retired live-server thread is not idle or unloaded".into());
                 }
                 lock_registry(&self.registry).message_current(&candidate)?;
                 return Ok((

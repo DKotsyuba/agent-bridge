@@ -290,7 +290,9 @@ An unloaded thread can be resumed only when its own prior idle and exact retaine
 transcript were recorded at its `SessionEnd`, the same live server is verified,
 and the one-shot proof is durably spent before `thread/resume`. A confirmed
 resume may renew the binding; Bridge rechecks it before sending. An unconfirmed
-resume is retained as unknown. For new Linux idle-end proofs, Bridge also hashes
+resume is retained as unknown. If the same retired thread is still loaded and
+the live server reports it idle, Bridge spends the same proof before one
+`turn/start` without a resume. For new Linux idle-end proofs, Bridge also hashes
 the whole transcript up to 256 MiB, so metadata-only changes do not invalidate
 unchanged content. Older proofs and larger transcripts still require unchanged
 metadata; a changed transcript always holds. Waiting, unknown, or unproven states hold.

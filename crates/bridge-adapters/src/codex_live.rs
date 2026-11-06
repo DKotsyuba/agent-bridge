@@ -1,6 +1,7 @@
 //! Linux App Server transport for an already attested Codex process.
 //!
-//! Only a route with a protected idle proof may resume an unloaded thread.
+//! Only a route with a protected idle proof may resume an unloaded thread or
+//! hand off to a retired binding that the live server still reports idle.
 //! An unconfirmed resume or message write has an unknown outcome and is not retried.
 
 use std::fs;
@@ -320,6 +321,21 @@ pub(crate) fn deliver(
     let mut resumed = false;
     match read_state(&mut ws, handoff.thread, 2) {
         Ok(State::Idle) if !handoff.allow_resume => {}
+        Ok(State::Idle) if handoff.allow_resume => {
+            if endpoint.verify_peer(&ws.get_ref().stream).is_err()
+                || Instant::now() >= deadline
+                || pre_resume().is_err()
+                || endpoint.verify_peer(&ws.get_ref().stream).is_err()
+                || final_check().is_err()
+                || Instant::now() >= deadline
+                || !matches!(read_state(&mut ws, handoff.thread, 5), Ok(State::Idle))
+            {
+                return Outcome::DeferredKnownUnsent {
+                    evidence: "retired native recipient is no longer proven idle; nothing sent"
+                        .into(),
+                };
+            }
+        }
         Ok(State::Active) if !handoff.allow_resume && handoff.mode == Mode::Message => {}
         Ok(State::NotLoaded) => {
             if !handoff.allow_resume
@@ -386,6 +402,10 @@ pub(crate) fn deliver(
         return if resumed {
             Outcome::ResumeAcceptedNoMessage {
                 evidence: "native resume accepted; message limit or deadline reached".into(),
+            }
+        } else if handoff.allow_resume {
+            Outcome::DeferredKnownUnsent {
+                evidence: "retired native handoff exceeded its limit before writing".into(),
             }
         } else {
             Outcome::KnownUnsent {
@@ -726,6 +746,109 @@ mod tests {
         assert_eq!(initial, State::Idle);
         assert!(matches!(outcome, Outcome::DeferredKnownUnsent { .. }));
         assert_eq!(mutations, 0);
+    }
+
+    /// A retired binding may use its one-shot idle proof for an already loaded
+    /// idle thread, but never writes after a denied proof or a pending approval.
+    #[test]
+    fn retired_loaded_idle_requires_proof_and_current_native_idle() {
+        for case in ["idle", "proof_denied", "waiting", "oversized", "deadline"] {
+            let (dir, listener, binding) = fixture();
+            let worker = thread::spawn(move || {
+                drop(listener.accept().unwrap().0);
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut ws = tungstenite::accept(stream).unwrap();
+                let _ = ws.read().unwrap();
+                ws.send(Message::Text(
+                    json!({"id":1,"result":{}}).to_string().into(),
+                ))
+                .unwrap();
+                let _ = ws.read().unwrap();
+                let _ = ws.read().unwrap();
+                ws.send(Message::Text(
+                    json!({"id":2,"result":{"thread":{"id":"thread-1","status":{"type":"idle"}}}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+                let Ok(Message::Text(read)) = ws.read() else {
+                    return false;
+                };
+                let read: Value = serde_json::from_str(&read).unwrap();
+                assert_eq!(read["method"], "thread/read");
+                let status = if case == "waiting" {
+                    json!({"type":"active","activeFlags":["waitingOnApproval"]})
+                } else {
+                    json!({"type":"idle"})
+                };
+                ws.send(Message::Text(
+                    json!({"id":5,"result":{"thread":{"id":"thread-1","status":status}}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+                let started =
+                    matches!(ws.read(), Ok(Message::Text(text)) if text.contains("turn/start"));
+                if started {
+                    ws.send(Message::Text(json!({"id":3,"result":{"turn":{"id":"turn-1","items":[],"status":"inProgress"}}}).to_string().into())).unwrap();
+                }
+                started
+            });
+            let endpoint = locate(&binding).unwrap().unwrap();
+            let oversized = "x".repeat(LIMIT + 1);
+            let deadline_ms = current_unix_millis() + if case == "deadline" { 1000 } else { 3000 };
+            let handoff = Handoff {
+                thread: "thread-1",
+                client_id: "client-1",
+                text: if case == "oversized" {
+                    &oversized
+                } else {
+                    "hello"
+                },
+                mode: Mode::Message,
+                allow_resume: true,
+                deadline_ms,
+                timeout: Duration::from_secs(3),
+            };
+            let proofs = AtomicU64::new(0);
+            let outcome = deliver(
+                &endpoint,
+                &handoff,
+                || {
+                    proofs.fetch_add(1, Ordering::Relaxed);
+                    if case == "deadline" {
+                        let remaining = deadline_ms.saturating_sub(current_unix_millis());
+                        thread::sleep(Duration::from_millis(remaining + 25));
+                    }
+                    if case == "proof_denied" {
+                        Err("no idle proof".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                || Ok(()),
+            );
+            let started = worker.join().unwrap();
+            let target_dir = std::env::temp_dir()
+                .parent()
+                .unwrap()
+                .join(dir.file_name().unwrap());
+            fs::remove_dir_all(dir).unwrap();
+            fs::remove_dir_all(target_dir).unwrap();
+            assert_eq!(proofs.load(Ordering::Relaxed), 1, "{case}");
+            assert_eq!(started, case == "idle", "{case}");
+            assert!(
+                if case == "idle" {
+                    matches!(outcome, Outcome::NativeAccepted { .. })
+                } else {
+                    matches!(outcome, Outcome::DeferredKnownUnsent { .. })
+                },
+                "{case}: {outcome:?}"
+            );
+        }
     }
 
     /// Resume requires the same binding and fresh idle; an unconfirmed resume stays unknown.

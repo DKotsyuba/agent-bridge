@@ -65,7 +65,7 @@ fn attestation_hold_reason(reason: &str) -> &'static str {
             "idle transcript unavailable"
         }
         "native thread unloaded without an idle-end proof" => "unloaded thread lacks idle proof",
-        "retired live-server thread is not unloaded" => "retired thread is still loaded",
+        "retired live-server thread is not idle or unloaded" => "retired thread is not idle",
         "native control directory unavailable"
         | "native control directory unresolved"
         | "native control directory is not private and owned"
@@ -93,7 +93,7 @@ pub(crate) fn safe_hold_reason(reason: &str) -> &'static str {
         "idle transcript changed" => "idle transcript changed",
         "idle transcript unavailable" => "idle transcript unavailable",
         "unloaded thread lacks idle proof" => "unloaded thread lacks idle proof",
-        "retired thread is still loaded" => "retired thread is still loaded",
+        "retired thread is not idle" => "retired thread is not idle",
         "native control socket unavailable" => "native control socket unavailable",
         "native control peer ownership unavailable" => "native control peer ownership unavailable",
         _ => "target unavailable",
