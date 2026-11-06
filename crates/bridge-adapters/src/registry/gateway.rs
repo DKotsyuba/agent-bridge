@@ -30,9 +30,10 @@
 //!   descriptor whose metadata is identical before and after the read and whose
 //!   path still resolves to the same owned regular file. The gateway is attested
 //!   only if the same stamp is read again after the old incarnation is gone; any
-//!   growth, rewrite, replacement, touch or unreadable header holds. No time window
-//!   substitutes for this proof. A host that appends after its `Stop` hook merely
-//!   invalidates the stamp (a hold), never makes a thread look idle.
+//!   growth, rewrite, replacement, touch or unreadable header holds. Managed Linux
+//!   session ends additionally retain a bounded full-content digest, permitting
+//!   metadata-only changes only when every byte remains unchanged. No time window
+//!   substitutes for this proof.
 //! - **Unique live gateway.** Exactly one distinct live harness incarnation that
 //!   started after the recorded one, running the recorded executable unchanged
 //!   since it started, with the same store and the application's native pipe, owning a probe-verified
@@ -57,6 +58,10 @@ const HEAD_BYTES: u64 = 1_048_576;
 /// Number of trailing transcript bytes fingerprinted.
 const TAIL_BYTES: u64 = 65_536;
 
+/// Bound the extra whole-file hash captured for a managed Linux idle end.
+#[cfg(target_os = "linux")]
+const MAX_LIVE_HASH_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Private evidence that an address was positively idle, bound to the exact
 /// stable transcript, plus the physical gateway committed for it (if any).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,7 +75,8 @@ pub(crate) struct WakeProof {
     mtime: (i64, i64),
     /// Transcript status-change time (seconds, nanoseconds) at the positive idle.
     ctime: (i64, i64),
-    /// Lowercase hex SHA-256 of the last [`TAIL_BYTES`] of the transcript.
+    /// Tail SHA-256; managed Linux ends may append `:FULL_SHA256` for content
+    /// revalidation after metadata-only changes without a new journal field.
     tail: String,
     /// Harness incarnation `(pid, start_time)` committed as the physical gateway
     /// with the current endpoint epoch; absent until a gateway was committed.
@@ -89,6 +95,17 @@ pub(crate) struct WakeProof {
 /// for anything missing, replaced, unreadable, unnamed or changing while read;
 /// absence is never positive evidence.
 pub(super) fn read_stamp(binding: &Binding, owner_uid: u32) -> Option<WakeProof> {
+    read_stamp_inner(binding, owner_uid, false)
+}
+
+/// Captures a bounded full digest for a managed Linux session's own idle end.
+#[cfg(target_os = "linux")]
+pub(super) fn read_live_stamp(binding: &Binding, owner_uid: u32) -> Option<WakeProof> {
+    read_stamp_inner(binding, owner_uid, true)
+}
+
+/// Reads one stable stamp; optional whole-file hashing stays bounded.
+fn read_stamp_inner(binding: &Binding, owner_uid: u32, include_full: bool) -> Option<WakeProof> {
     let identity = retained_transcript(binding, owner_uid)?;
     let mut file = std::fs::File::open(binding.transcript.as_ref()?).ok()?;
     let before = file.metadata().ok()?;
@@ -108,6 +125,16 @@ pub(super) fn read_stamp(binding: &Binding, owner_uid: u32) -> Option<WakeProof>
     file.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES)))
         .ok()?;
     let tail = sha256_reader(&mut (&mut file).take(TAIL_BYTES)).ok()?;
+    #[cfg(target_os = "linux")]
+    let tail = if include_full && len <= MAX_LIVE_HASH_BYTES {
+        file.seek(SeekFrom::Start(0)).ok()?;
+        let full = sha256_reader(&mut (&mut file).take(len)).ok()?;
+        format!("{tail}:{full}")
+    } else {
+        tail
+    };
+    #[cfg(not(target_os = "linux"))]
+    let _ = include_full;
     let after = file.metadata().ok()?;
     let times = |meta: &std::fs::Metadata| {
         (
@@ -137,6 +164,25 @@ impl WakeProof {
 }
 
 impl MessageCandidate {
+    /// Computes an optional full digest outside the registry lock, only while
+    /// the exact idle-end stamp and transcript metadata are still unchanged.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn full_live_stamp(&self) -> Option<WakeProof> {
+        let old = self.binding.wake.as_ref()?;
+        if !self.binding.retired || self.binding.desktop_idle_message || old.tail.contains(':') {
+            return None;
+        }
+        let full = read_live_stamp(&self.binding, self.owner_uid)?;
+        let (tail, _) = full.tail.split_once(':')?;
+        (full.transcript == old.transcript
+            && full.len == old.len
+            && full.mtime == old.mtime
+            && full.ctime == old.ctime
+            && tail == old.tail
+            && full.gateway == old.gateway)
+            .then_some(full)
+    }
+
     /// Whether this binding can only be reached through a physical gateway: a
     /// Codex binding whose recorded incarnation is gone and which carries a
     /// positive-idle proof. A live binding qualifies the ordinary way; a retired
@@ -194,11 +240,10 @@ impl MessageCandidate {
             && os::process_env(facts.pid, "CODEX_APP_TOOLS_PIPE_PATH").is_some()
     }
 
-    /// Proves the thread is still exactly as stamped at its positive idle: the
-    /// retained transcript reads back with the same identity, length, tail
-    /// fingerprint and `session_meta` thread id. Any change, or anything
-    /// unreadable, is "not proven idle". Reads a bounded head and tail of one
-    /// file; never holds the registry lock.
+    /// Proves the thread is still exactly as stamped at its positive idle.
+    /// Managed Linux stamps can also prove unchanged full contents when only
+    /// file metadata changed; old and Desktop stamps retain strict metadata.
+    /// Reads bounded file contents and never holds the registry lock.
     ///
     /// # Errors
     ///
@@ -212,22 +257,50 @@ impl MessageCandidate {
             .ok_or("no positive idle proof for the gateway route")?;
         let current = read_stamp(&self.binding, self.owner_uid)
             .ok_or("the retained transcript is unreadable or no longer the exact thread")?;
-        if (
-            current.transcript,
-            current.len,
-            current.mtime,
-            current.ctime,
-            &current.tail,
-        ) != (
-            wake.transcript,
-            wake.len,
-            wake.mtime,
-            wake.ctime,
-            &wake.tail,
-        ) {
-            return Err("the thread transcript changed since its positive idle (not idle)".into());
+        let (tail, full) = wake
+            .tail
+            .split_once(':')
+            .map_or((wake.tail.as_str(), None), |(tail, full)| {
+                (tail, Some(full))
+            });
+        if let Some(_digest) = full {
+            #[cfg(target_os = "linux")]
+            let valid = self.binding.address.harness == Harness::CODEX
+                && self.binding.retired
+                && !self.binding.desktop_idle_message
+                && wake.gateway.is_none()
+                && _digest.len() == 64
+                && _digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+            #[cfg(not(target_os = "linux"))]
+            let valid = false;
+            if !valid {
+                return Err(
+                    "the thread transcript changed since its positive idle (not idle)".into(),
+                );
+            }
         }
-        Ok(())
+        if current.transcript == wake.transcript && current.len == wake.len && current.tail == tail
+        {
+            if current.mtime == wake.mtime && current.ctime == wake.ctime {
+                return Ok(());
+            }
+            #[cfg(target_os = "linux")]
+            if full.is_some() && self.binding.retired && !self.binding.desktop_idle_message {
+                let complete = read_live_stamp(&self.binding, self.owner_uid)
+                    .ok_or("the retained transcript is unreadable or no longer the exact thread")?;
+                if complete.transcript == wake.transcript
+                    && complete.len == wake.len
+                    && complete.tail == wake.tail
+                {
+                    return Ok(());
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = full;
+        Err("the thread transcript changed since its positive idle (not idle)".into())
     }
 
     /// The fresh logical and physical fence run *after* the one-shot proof was
@@ -346,6 +419,44 @@ impl MessageCandidate {
 }
 
 impl Registry {
+    /// Persists a full digest only if the exact idle binding still matches the
+    /// unlocked snapshot. A failed journal write restores the previous proof.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn commit_live_stamp(
+        &mut self,
+        snapshot: &MessageCandidate,
+        full: WakeProof,
+    ) -> Result<(), String> {
+        self.message_current(snapshot)?;
+        let old = snapshot.binding.wake.as_ref().ok_or("idle proof missing")?;
+        let (tail, digest) = full.tail.split_once(':').ok_or("full digest missing")?;
+        if !snapshot.binding.retired
+            || snapshot.binding.desktop_idle_message
+            || old.tail.contains(':')
+            || full.transcript != old.transcript
+            || full.len != old.len
+            || full.mtime != old.mtime
+            || full.ctime != old.ctime
+            || full.gateway != old.gateway
+            || tail != old.tail
+            || digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("full idle proof does not match snapshot".into());
+        }
+        let key = snapshot.binding.address.to_canonical_string();
+        let binding = self.bindings.get_mut(&key).ok_or("idle binding missing")?;
+        let previous = binding.clone();
+        binding.wake = Some(full);
+        if let Err(error) = self.persist_routes() {
+            self.bindings.insert(key, previous);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Commits `gateway` as the physical gateway of the snapshot's address with a
     /// fresh, strictly larger endpoint epoch, persisted in the route journal
     /// before returning. Core fences that epoch when the attestation built from
@@ -662,6 +773,21 @@ mod tests {
             registry.live_resume_candidate(&binding.address).is_ok(),
             "dedicated snapshot needs further live verification"
         );
+        let snapshot = registry.live_resume_candidate(&binding.address).unwrap();
+        let full = snapshot.full_live_stamp().expect("stable full transcript");
+        let pending_spend = registry
+            .spend_wake(&binding.address, binding.epoch)
+            .unwrap();
+        assert!(
+            registry.commit_live_stamp(&snapshot, full.clone()).is_err(),
+            "a digest finishing after proof spend cannot revive it"
+        );
+        registry.restore_wake(&binding.address, pending_spend);
+        registry.commit_live_stamp(&snapshot, full.clone()).unwrap();
+        assert!(
+            registry.commit_live_stamp(&snapshot, full).is_err(),
+            "a stale snapshot cannot overwrite the upgraded proof"
+        );
         let spent_snapshot = candidate.after_live_resume_spend();
         registry
             .spend_wake(&binding.address, binding.epoch)
@@ -701,6 +827,108 @@ mod tests {
         )
         .unwrap();
         assert!(candidate.proves_idle().is_err());
+        std::fs::remove_dir_all(store).unwrap();
+    }
+
+    /// An unchanged managed transcript can survive metadata changes, but a
+    /// same-length rewrite outside its sampled tail must still refuse wake-up.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_idle_proof_survives_metadata_only_changes() {
+        let store = store("managed-metadata");
+        let path = store.join("sessions").join("t.jsonl");
+        let header = format!("{}\n", json!({"type":"session_meta","payload":{"id":"t1"}}));
+        let contents = format!("{}{}", header, "a".repeat(70_000));
+        std::fs::write(&path, &contents).unwrap();
+        let mut binding = binding_for(&store, "t1", &path);
+        binding.retired = true;
+        let policy = HarnessPolicy {
+            harness: Harness::CODEX,
+            namespace: "ns".into(),
+            inject: true,
+            message: true,
+            executable_markers: Vec::new(),
+            store_env: None,
+            store_home: None,
+            child_address: None,
+            caller_proof: Vec::new(),
+        };
+        let old = read_stamp(&binding, uid()).unwrap();
+        let fresh = live_end_idle_proof(
+            &binding,
+            HookKind::SessionEnd,
+            ActorRole::Root,
+            true,
+            uid(),
+            &policy,
+        )
+        .unwrap();
+        binding.wake = Some(fresh);
+        let initial = MessageCandidate {
+            binding: binding.clone(),
+            policy: policy.clone(),
+            owner_uid: uid(),
+        };
+        binding.wake = Some(initial.full_live_stamp().expect("stable full transcript"));
+        let candidate = MessageCandidate {
+            binding: binding.clone(),
+            policy: policy.clone(),
+            owner_uid: uid(),
+        };
+        assert!(candidate.proves_idle().is_ok());
+
+        let archived = store.join("archived");
+        std::fs::create_dir(&archived).unwrap();
+        let archived_path = archived.join("t.jsonl");
+        std::fs::rename(&path, &archived_path).unwrap();
+        assert!(
+            candidate.proves_idle().is_err(),
+            "an archived transcript is not eligible"
+        );
+        std::fs::rename(&archived_path, &path).unwrap();
+        assert!(
+            candidate.proves_idle().is_ok(),
+            "unarchived unchanged content stays eligible"
+        );
+
+        std::fs::write(&path, &contents).unwrap();
+        let after = read_stamp(&binding, uid()).unwrap();
+        assert_eq!(
+            (old.transcript, old.len, &old.tail),
+            (after.transcript, after.len, &after.tail)
+        );
+        assert_ne!((old.mtime, old.ctime), (after.mtime, after.ctime));
+        assert!(
+            candidate.proves_idle().is_ok(),
+            "identical content stays idle"
+        );
+        binding.wake = Some(old);
+        let legacy = MessageCandidate {
+            binding,
+            policy,
+            owner_uid: uid(),
+        };
+        assert!(
+            legacy.proves_idle().is_err(),
+            "legacy stamps cannot prove unchanged content"
+        );
+
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        std::io::Seek::seek(
+            &mut file,
+            std::io::SeekFrom::Start((header.len() + 100) as u64),
+        )
+        .unwrap();
+        std::io::Write::write_all(&mut file, b"b").unwrap();
+        assert_eq!(
+            read_stamp(&candidate.binding, uid()).unwrap().tail,
+            after.tail,
+            "the altered byte is outside the sampled tail"
+        );
+        assert!(
+            candidate.proves_idle().is_err(),
+            "a changed prefix is never accepted"
+        );
         std::fs::remove_dir_all(store).unwrap();
     }
 

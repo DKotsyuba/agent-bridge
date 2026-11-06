@@ -4242,7 +4242,12 @@ mod tests {
     /// reports exactly this executable path and store for it. (A copy of
     /// `/bin/sleep` did not stay alive in a manual probe, so it cannot serve.)
     pub(super) fn live_child(path: &Path, variable: &str, store: &Path) -> LiveChild {
+        use std::os::unix::fs::PermissionsExt;
+
         std::fs::copy(std::env::current_exe().unwrap(), path).unwrap();
+        // Cargo's executable can inherit group-write ACLs; this owned fixture
+        // must satisfy the same private executable check as a real harness.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
         let metadata = std::fs::metadata(path).unwrap();
         let written = u64::try_from(metadata.mtime().max(metadata.ctime())).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);

@@ -4089,6 +4089,39 @@ fn gateway_journal(lab: &Lab) -> serde_json::Value {
     snapshot["bindings"][0].clone()
 }
 
+/// A managed Linux SessionEnd enriches its saved idle proof with a full digest
+/// through the real hook channel, without changing the journal's field shape.
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_idle_end_hook_persists_full_transcript_digest() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let lab = Lab::new("livehash");
+    let transcript = gateway_rollout(&lab, "live-hash");
+    let executable = lab.dir.0.join("bridge-fixture-private");
+    std::fs::copy(fixture_exe(), &executable).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let metadata = std::fs::metadata(&executable).unwrap();
+    let written = metadata.mtime().max(metadata.ctime());
+    while i64::try_from(now() / 1000).unwrap() <= written.saturating_add(1) {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let mut harness = Harnessed::start_from(&executable, Harness::CODEX, &lab.codex_store);
+    let facts = bridge_adapters::os::process_facts(harness.child.id()).unwrap();
+    assert_eq!(facts.exe.as_deref(), Some(executable.as_path()));
+    assert!(facts.start_time > u64::try_from(written).unwrap());
+    assert_eq!(std::fs::metadata(&executable).unwrap().mode() & 0o022, 0);
+    gateway_idle(&mut harness, &lab, "live-hash", &transcript);
+    let result = harness.hook(&lab.socket, Harness::CODEX, hook("SessionEnd", "live-hash"));
+    assert_eq!(result["status"], 0, "{result}");
+    let saved = gateway_journal(&lab);
+    assert_eq!(saved["retired"], true);
+    let digest = saved["wake"]["tail"].as_str().expect("saved idle proof");
+    let (tail, full) = digest.split_once(':').expect("complete digest");
+    assert_eq!((tail.len(), full.len()), (64, 64));
+    harness.stop();
+}
+
 /// A queued message to a positively idle Desktop thread is delivered exactly once
 /// through the current Desktop frontend after the application restarted (a new
 /// harness incarnation with no hook), without any receiver `bridge_me`, hook or

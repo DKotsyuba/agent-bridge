@@ -484,6 +484,7 @@ impl DispatchCarrier for CodexQueueCarrier {
             #[cfg(target_os = "linux")]
             Route::LiveResume(endpoint, candidate) => {
                 let spent_candidate = candidate.after_live_resume_spend();
+                let spent_wake = std::cell::RefCell::new(None);
                 let fence = || -> Result<(), String> {
                     let (attestation, current) = spent_candidate.validate_live_resume_after()?;
                     if current.epoch != binding.epoch
@@ -497,7 +498,7 @@ impl DispatchCarrier for CodexQueueCarrier {
                     }
                     lock_registry(&self.registry).message_current(&spent_candidate)
                 };
-                return crate::codex_live::deliver(
+                let outcome = crate::codex_live::deliver(
                     &endpoint,
                     &crate::codex_live::Handoff {
                         thread: &address.native_session_id,
@@ -520,6 +521,7 @@ impl DispatchCarrier for CodexQueueCarrier {
                                 registry.restore_wake(&address, spent);
                                 return Err(error);
                             }
+                            *spent_wake.borrow_mut() = Some(spent);
                         }
                         // Journal I/O may overlap a transcript update. Re-read
                         // the spent stamp outside the lock, then fence the exact
@@ -529,6 +531,15 @@ impl DispatchCarrier for CodexQueueCarrier {
                     },
                     fence,
                 );
+                // A deferred result proves no native resume was written. Give
+                // back the exact still-valid proof; unknown outcomes never do so.
+                if matches!(&outcome, Outcome::DeferredKnownUnsent { .. })
+                    && let Some(spent) = spent_wake.into_inner()
+                    && candidate.proves_idle().is_ok()
+                {
+                    lock_registry(&self.registry).restore_wake(&address, spent);
+                }
+                return outcome;
             }
             Route::Helper => {}
         }

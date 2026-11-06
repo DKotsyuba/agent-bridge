@@ -199,6 +199,10 @@ touched by anything here, and nothing in this crate installs a hook for you.
   the same live process and no owner/Desktop override. The proof is spent in the
   journal before `thread/resume`; the exact binding and native idle state are
   checked again before any `turn/start`. A renewed epoch requires a fresh attempt.
+  New idle-end proofs include a full-content digest for transcripts up to 256 MiB;
+  unchanged content then survives metadata-only changes. Legacy proofs and larger
+  transcripts still require unchanged metadata. The existing journal field carries
+  both digests: older binaries can read it but safely hold that proof until a new hook.
   Resume can itself continue a configured goal. An unconfirmed resume is unknown
   and its proof is never retried. Waiting, unknown and unproven states hold. A
   final binding/epoch/lifecycle fence runs immediately before writing.

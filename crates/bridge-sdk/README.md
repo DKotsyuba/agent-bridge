@@ -15,8 +15,8 @@ this repository, and pin both crates to the same revision:
 
 ```toml
 [dependencies]
-bridge-sdk = { git = "https://github.com/DKotsyuba/agent-bridge", tag = "v0.6.3" }
-bridge-protocol = { git = "https://github.com/DKotsyuba/agent-bridge", tag = "v0.6.3" }
+bridge-sdk = { git = "https://github.com/DKotsyuba/agent-bridge", tag = "v0.6.4" }
+bridge-protocol = { git = "https://github.com/DKotsyuba/agent-bridge", tag = "v0.6.4" }
 ```
 
 `bridge-sdk` re-exports `bridge_protocol`, so the second line is only needed when you

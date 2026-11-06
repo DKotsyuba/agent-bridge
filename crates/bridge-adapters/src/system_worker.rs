@@ -58,6 +58,14 @@ fn attestation_hold_reason(reason: &str) -> &'static str {
             "session binding unavailable or retired"
         }
         "native thread state unavailable" => "native thread state unavailable",
+        "the thread transcript changed since its positive idle (not idle)" => {
+            "idle transcript changed"
+        }
+        "the retained transcript is unreadable or no longer the exact thread" => {
+            "idle transcript unavailable"
+        }
+        "native thread unloaded without an idle-end proof" => "unloaded thread lacks idle proof",
+        "retired live-server thread is not unloaded" => "retired thread is still loaded",
         "native control directory unavailable"
         | "native control directory unresolved"
         | "native control directory is not private and owned"
@@ -82,6 +90,10 @@ pub(crate) fn safe_hold_reason(reason: &str) -> &'static str {
         "session not bound" => "session not bound",
         "session binding unavailable or retired" => "session binding unavailable or retired",
         "native thread state unavailable" => "native thread state unavailable",
+        "idle transcript changed" => "idle transcript changed",
+        "idle transcript unavailable" => "idle transcript unavailable",
+        "unloaded thread lacks idle proof" => "unloaded thread lacks idle proof",
+        "retired thread is still loaded" => "retired thread is still loaded",
         "native control socket unavailable" => "native control socket unavailable",
         "native control peer ownership unavailable" => "native control peer ownership unavailable",
         _ => "target unavailable",
@@ -1121,6 +1133,14 @@ mod tests {
             (
                 "native thread state unavailable",
                 "native thread state unavailable",
+            ),
+            (
+                "the thread transcript changed since its positive idle (not idle)",
+                "idle transcript changed",
+            ),
+            (
+                "native thread unloaded without an idle-end proof",
+                "unloaded thread lacks idle proof",
             ),
             (
                 "native control socket connection failed",

@@ -4,6 +4,15 @@ All notable changes to Agent Bridge are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions describe the
 source, and the crates are not published to crates.io.
 
+## [0.6.4] - 2026-11-06
+
+### Fixed
+
+- Keep a proven idle Linux Codex thread eligible after metadata-only transcript
+  changes when its bounded full-content digest still matches.
+- Preserve an unchanged one-shot wake proof after a definitively unsent handoff,
+  and expose safe categories for common idle-proof holds.
+
 ## [0.6.3] - 2026-11-03
 
 ### Changed

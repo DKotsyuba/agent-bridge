@@ -829,6 +829,20 @@ fn serve_hook(
         let _ = write_response(writer, &ChannelResponse::Ok);
         return;
     }
+    #[cfg(target_os = "linux")]
+    if admission.kind == crate::registry::HookKind::SessionEnd
+        && harness == Harness::CODEX
+        && admission.role == ActorRole::Root
+    {
+        let candidate = lock_registry(&state.registry)
+            .live_resume_candidate(&admission.address)
+            .ok();
+        if let Some(candidate) = candidate
+            && let Some(full) = candidate.full_live_stamp()
+        {
+            let _ = lock_registry(&state.registry).commit_live_stamp(&candidate, full);
+        }
+    }
     if let Some(token) = admission.token {
         let _ = write_response(writer, &ChannelResponse::CallToken { token });
         return;
