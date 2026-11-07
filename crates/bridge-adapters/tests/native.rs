@@ -4119,6 +4119,37 @@ fn managed_idle_end_hook_persists_full_transcript_digest() {
     let digest = saved["wake"]["tail"].as_str().expect("saved idle proof");
     let (tail, full) = digest.split_once(':').expect("complete digest");
     assert_eq!((tail.len(), full.len()), (64, 64));
+    let repeated = harness.hook(&lab.socket, Harness::CODEX, hook("SessionEnd", "live-hash"));
+    assert_eq!(repeated["status"], 0, "{repeated}");
+    let repeated = gateway_journal(&lab);
+    assert_eq!(
+        repeated["epoch"], saved["epoch"],
+        "duplicate end renews binding"
+    );
+    assert_eq!(
+        repeated["wake"], saved["wake"],
+        "duplicate end loses idle proof"
+    );
+    let mut changed = hook("SessionEnd", "live-hash");
+    changed["transcript_path"] = json!(lab.codex_store.join("sessions/other.jsonl"));
+    assert_eq!(
+        harness.hook(&lab.socket, Harness::CODEX, changed)["status"],
+        0
+    );
+    assert!(
+        gateway_journal(&lab).get("wake").is_none(),
+        "changed transcript kept idle proof"
+    );
+    let mut old_path = hook("SessionEnd", "live-hash");
+    old_path["transcript_path"] = json!(transcript);
+    assert_eq!(
+        harness.hook(&lab.socket, Harness::CODEX, old_path)["status"],
+        0
+    );
+    assert!(
+        gateway_journal(&lab).get("wake").is_none(),
+        "an end recreated a lost proof"
+    );
     harness.stop();
 }
 

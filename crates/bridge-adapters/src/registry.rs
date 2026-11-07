@@ -70,10 +70,14 @@ use crate::server::lock_registry;
 
 mod assertions;
 mod claims;
+#[cfg(target_os = "linux")]
+mod cold;
 mod executables;
 mod gateway;
 mod observations;
 pub(crate) use claims::EvidenceClaim;
+#[cfg(target_os = "linux")]
+pub(crate) use cold::episode_digest;
 pub use executables::VendorSignature;
 #[cfg(test)]
 use executables::wait_refresh;
@@ -1273,9 +1277,10 @@ pub(crate) struct MessageCandidate {
 
 impl MessageCandidate {
     /// Checks a retired Codex session's same live process, private store and
-    /// MESSAGE-only qualification. This alone does not authorize a resume.
+    /// MESSAGE-only qualification. Present or unreadable higher-priority routes
+    /// hold; the caller must prove the selected route.
     #[cfg(target_os = "linux")]
-    fn live_resume_binding(&self) -> Result<(Attestation, RecipientBinding), String> {
+    fn live_server_binding(&self, route: &str) -> Result<(Attestation, RecipientBinding), String> {
         let binding = &self.binding;
         if binding.address.harness != Harness::CODEX
             || !binding.retired
@@ -1283,8 +1288,10 @@ impl MessageCandidate {
             || self.committed_gateway().is_some()
             || !binding.capabilities.message
             || !self.policy.message
-            || os::process_env(binding.harness.0, "CODEX_APP_TOOLS_PIPE_PATH").is_some()
-            || os::process_env(binding.harness.0, "BRIDGE_NATIVE_OWNER_SOCKET").is_some()
+            || os::process_env_checked(binding.harness.0, "CODEX_APP_TOOLS_PIPE_PATH")
+                .map_err(|_| "native harness environment is unreadable")?
+                .is_some()
+            || crate::owner::locator(binding.harness.0)?.is_some()
         {
             return Err("no qualified live-server idle proof".into());
         }
@@ -1299,7 +1306,7 @@ impl MessageCandidate {
                 message: true,
             },
             proof(format!(
-                "codex-live-resume:{}@{}:epoch{}",
+                "{route}:{}@{}:epoch{}",
                 binding.harness.0, binding.harness.1, binding.epoch
             )),
         )
@@ -1325,9 +1332,46 @@ impl MessageCandidate {
         if self.binding.wake.is_none() {
             return Err("live-server idle proof was already spent".into());
         }
-        let facts = self.live_resume_binding()?;
+        let facts = self.live_server_binding("codex-live-resume")?;
         self.proves_idle()?;
         Ok(facts)
+    }
+
+    /// Checks a possible settings-only extension of an unspent managed proof.
+    /// It is not authority until the exact native completed turn is rechecked.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn validate_live_settings(
+        &self,
+    ) -> Result<(Attestation, RecipientBinding, gateway::SettingsContinuity), String> {
+        let (attestation, binding) = self.live_server_binding("codex-live-resume")?;
+        let continuity = self.settings_continuity()?;
+        Ok((attestation, binding, continuity))
+    }
+
+    /// Validates a retired binding for a fresh, loaded-native-idle observation.
+    /// This never grants permission to resume or create a proof.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn validate_live_idle(&self) -> Result<(Attestation, RecipientBinding), String> {
+        let facts = self.live_server_binding("codex-live-idle")?;
+        gateway::read_stamp(&self.binding, self.owner_uid)
+            .ok_or("the retained transcript is unreadable or no longer the exact thread")?;
+        Ok(facts)
+    }
+
+    /// Validates the exact live server and retained thread without inventing an
+    /// idle proof. A native episode and durable claim are still required to wake.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn validate_live_cold(&self) -> Result<(Attestation, RecipientBinding), String> {
+        let facts = self.live_server_binding("codex-live-resume")?;
+        gateway::read_stamp(&self.binding, self.owner_uid)
+            .ok_or("the retained transcript is unreadable or no longer the exact thread")?;
+        Ok(facts)
+    }
+
+    /// Whether an existing proof must be spent before an alternative cold wake.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn has_live_wake(&self) -> bool {
+        self.binding.wake.is_some()
     }
 
     /// Derives the exact snapshot expected after journaled proof consumption.
@@ -1349,7 +1393,7 @@ impl MessageCandidate {
         if self.binding.wake.is_some() {
             return Err("live-server idle proof was not spent".into());
         }
-        self.live_resume_binding()
+        self.live_server_binding("codex-live-resume")
     }
 
     /// Revalidates exact PID/start, owner, recorded executable and the harness's
@@ -2453,6 +2497,26 @@ impl Registry {
             .filter(|path| path.is_absolute() && path.starts_with(&matched.store));
 
         let previous_binding = self.bindings.get(&key).cloned();
+        // A duplicate managed-server end cannot start a new session or recreate
+        // an idle proof. Keep the exact unspent proof only for the same process
+        // and transcript; delivery still revalidates both before native I/O.
+        let repeated_live_end = cfg!(target_os = "linux")
+            && harness == Harness::CODEX
+            && kind == HookKind::SessionEnd
+            && role == ActorRole::Root
+            && previous_binding.as_ref().is_some_and(|binding| {
+                binding.retired
+                    && !binding.pending
+                    && !binding.desktop_idle_message
+                    && binding.harness == matched.incarnation
+                    && binding.capabilities.message
+                    && matched.policy.message
+                    && binding.wake.is_some()
+                    && payload
+                        .transcript_path
+                        .as_deref()
+                        .is_none_or(|path| binding.transcript.as_deref() == Some(Path::new(path)))
+            });
         let (renewed, previous_epoch) = match self.bindings.get(&key) {
             Some(binding) if binding.harness != matched.incarnation => {
                 if !binding.retired && os::incarnation_alive(binding.harness.0, binding.harness.1) {
@@ -2467,7 +2531,7 @@ impl Registry {
             // address's own hook, so core records the actor's true capability.
             Some(binding) => (
                 starts_own_session(kind, role, &matched.policy, payload)
-                    || binding.retired
+                    || (binding.retired && !repeated_live_end)
                     || binding.pending
                     || (harness == Harness::OPENCODE && binding.role != Some(role)),
                 Some(binding.epoch),
@@ -2560,10 +2624,13 @@ impl Registry {
         if kind == HookKind::SessionEnd && role == ActorRole::Root && binding.desktop_idle_message {
             // The narrow retired-Desktop idle exception keeps the proof stamped at
             // the positive idle before the end; every other end clears it.
-            binding.wake = prior_wake;
+            binding.wake = prior_wake.clone();
         }
         #[cfg(target_os = "linux")]
-        if let Some(live_end_idle) = live_end_idle {
+        if repeated_live_end && retained_path {
+            // Preserve only the earlier stamp, never mint a proof for this end.
+            binding.wake = prior_wake;
+        } else if let Some(live_end_idle) = live_end_idle {
             // The existing gateway explicitly rejects this retired non-Desktop
             // shape. Preserve a separate exact idle stamp for the live server.
             binding.wake = Some(live_end_idle);
@@ -3140,6 +3207,26 @@ impl Registry {
         &self,
         address: &NativeAddress,
     ) -> Result<MessageCandidate, String> {
+        self.live_server_candidate(address, true)
+    }
+
+    /// Copies a retired Codex candidate without a proof for a fresh native-idle
+    /// observation; this snapshot must never authorize a thread resume.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn live_idle_candidate(
+        &self,
+        address: &NativeAddress,
+    ) -> Result<MessageCandidate, String> {
+        self.live_server_candidate(address, false)
+    }
+
+    /// Selects one retired live-server candidate with the requested proof state.
+    #[cfg(target_os = "linux")]
+    fn live_server_candidate(
+        &self,
+        address: &NativeAddress,
+        has_wake: bool,
+    ) -> Result<MessageCandidate, String> {
         let binding = self
             .bindings
             .get(&address.to_canonical_string())
@@ -3149,7 +3236,7 @@ impl Registry {
             || address.harness != Harness::CODEX
             || !binding.retired
             || binding.desktop_idle_message
-            || binding.wake.is_none()
+            || binding.wake.is_some() != has_wake
         {
             return Err("no retired live-server candidate".into());
         }

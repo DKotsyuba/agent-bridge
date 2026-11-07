@@ -318,6 +318,12 @@ fn strict_object(bytes: &[u8], limit: usize) -> Result<Value, ProtocolError> {
     }
     Ok(value.0)
 }
+/// Parses one bounded JSON object while rejecting duplicate keys recursively.
+/// The caller supplies the frame limit and validates the returned object's shape.
+#[doc(hidden)]
+pub fn decode_strict_object(bytes: &[u8], limit: usize) -> Result<Value, ProtocolError> {
+    strict_object(bytes, limit)
+}
 /// Parses a single additive request; caller frames/peer-authenticates separately.
 pub fn decode_request(bytes: &[u8]) -> Result<Request, ProtocolError> {
     let value = strict_object(bytes, MAX_REQUEST_BYTES)?;

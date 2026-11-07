@@ -286,16 +286,28 @@ protected path and exact kernel peer PID/UID/process incarnation, reads metadata
 for the exact recipient thread and delivers MESSAGE through one native
 `turn/start`. The socket must be owned mode `0600` inside a private owned
 canonical directory; the owned control-directory link is resolved and checked.
-An unloaded thread can be resumed only when its own prior idle and exact retained
-transcript were recorded at its `SessionEnd`, the same live server is verified,
-and the one-shot proof is durably spent before `thread/resume`. A confirmed
-resume may renew the binding; Bridge rechecks it before sending. An unconfirmed
-resume is retained as unknown. If the same retired thread is still loaded and
-the live server reports it idle, Bridge spends the same proof before one
-`turn/start` without a resume. For new Linux idle-end proofs, Bridge also hashes
+An unloaded retired thread can be resumed when the same live server confirms
+that its latest turn is completed (or that there are no turns) and the exact
+thread and retained transcript are verified. Before any resume, Bridge records
+one durable claim for that recipient and completed-turn episode in the private
+channel directory, shared across source accounts. The same episode is not
+automatically resumed again after an unknown result; a new completed turn is a
+new episode. Claims are never evicted automatically: the bounded claim store
+holds further wakes if full. This applies even when a prior idle proof is absent
+or invalid, so a previously uncertain native resume may cause session-start
+hooks to run again. An uncertain message handoff is never automatically resent.
+A confirmed resume may renew the binding; Bridge rechecks it before sending.
+When the same retired thread is already loaded and idle, Bridge can deliver
+MESSAGE without resuming. Active or input-waiting retired threads still hold.
+For new Linux idle-end proofs, Bridge also hashes
 the whole transcript up to 256 MiB, so metadata-only changes do not invalidate
-unchanged content. Older proofs and larger transcripts still require unchanged
-metadata; a changed transcript always holds. Waiting, unknown, or unproven states hold.
+unchanged content. A repeated end for the same process and transcript retains
+an unspent proof but never creates a missing one. An existing full proof can also
+survive a bounded suffix of native settings-only records, after the same live
+server confirms that the latest native turn is still the completed turn in the
+authenticated prefix. Older proofs and larger transcripts still require
+unchanged metadata to use the proof; otherwise the separately checked one-shot
+native episode path applies. Waiting or unobservable native states hold.
 An explicit native owner locator still takes precedence and
 cannot fall back if its proof fails. See the
 [adapter contract](../crates/bridge-adapters/README.md#delivery-paths) for fences,

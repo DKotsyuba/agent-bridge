@@ -1,7 +1,9 @@
 //! Linux App Server transport for an already attested Codex process.
 //!
-//! Only a route with a protected idle proof may resume an unloaded thread or
-//! hand off to a retired binding that the live server still reports idle.
+//! Only a route with a protected idle proof or a one-shot cold claim may resume
+//! an unloaded thread.
+//! A retired binding may also receive MESSAGE without resuming while the same
+//! live server freshly confirms its thread is loaded and idle.
 //! An unconfirmed resume or message write has an unknown outcome and is not retried.
 
 use std::fs;
@@ -120,6 +122,78 @@ impl Endpoint {
             .ok_or("invalid timeout")?;
         let mut ws = self.open(deadline)?;
         read_state(&mut ws, thread, 2).map_err(|_| "native thread state unavailable".into())
+    }
+
+    /// Reads the latest completed turn between identical idle/unloaded
+    /// observations from the verified peer. An empty ID denotes no turns.
+    pub(crate) fn latest_completed(
+        &self,
+        thread: &str,
+        timeout: Duration,
+    ) -> Result<(State, String), String> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or("invalid timeout")?;
+        let mut ws = self.open(deadline)?;
+        let before =
+            read_state(&mut ws, thread, 2).map_err(|_| "native thread state unavailable")?;
+        if !matches!(before, State::Idle | State::NotLoaded) {
+            return Err("native thread is not idle or unloaded".into());
+        }
+        request(
+            &mut ws,
+            json!({"id":3,"method":"thread/turns/list","params":{
+                "threadId":thread,"limit":1,"sortDirection":"desc","itemsView":"notLoaded"
+            }}),
+        )?;
+        let reply = response(&mut ws, 3)?;
+        if reply.get("error").is_some() {
+            return Err("native latest turn unavailable".into());
+        }
+        let turns = reply
+            .pointer("/result/data")
+            .and_then(Value::as_array)
+            .ok_or("native latest turn unavailable")?;
+        let turn_id = match turns.as_slice() {
+            [] => String::new(),
+            [turn] => {
+                let id = turn
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| valid_id(id))
+                    .ok_or("native latest turn has invalid id")?;
+                if turn.get("status").and_then(Value::as_str) != Some("completed")
+                    || !turn.get("error").is_none_or(Value::is_null)
+                {
+                    return Err("native latest turn changed or is unfinished".into());
+                }
+                id.to_owned()
+            }
+            _ => return Err("native latest turn unavailable".into()),
+        };
+        let after =
+            read_state(&mut ws, thread, 4).map_err(|_| "native thread state unavailable")?;
+        if before != after
+            || self.verify_peer(&ws.get_ref().stream).is_err()
+            || Instant::now() >= deadline
+        {
+            return Err("native thread or peer changed during observation".into());
+        }
+        Ok((after, turn_id))
+    }
+
+    /// Verifies the exact latest completed turn, or no turns if expected is empty.
+    pub(crate) fn completed_state(
+        &self,
+        thread: &str,
+        expected_turn: &str,
+        timeout: Duration,
+    ) -> Result<State, String> {
+        let (state, turn_id) = self.latest_completed(thread, timeout)?;
+        if turn_id != expected_turn {
+            return Err("native latest turn changed or is unfinished".into());
+        }
+        Ok(state)
     }
 
     /// Opens and initializes a deadline-bound WebSocket to the verified peer.
@@ -288,15 +362,19 @@ pub(crate) struct Handoff<'a> {
     pub text: &'a str,
     /// Requested dispatch mode.
     pub mode: Mode,
-    /// True only for the separately attested retired live-server idle route.
+    /// Permit the qualified retired route after its pre-resume claim succeeds.
     pub allow_resume: bool,
+    /// Require a fresh loaded idle state and never send to an active thread.
+    pub require_idle: bool,
+    /// Expected latest completed turn, or empty for no turns, before resuming.
+    pub cold_expected_turn: Option<&'a str>,
     /// Absolute core deadline in Unix milliseconds.
     pub deadline_ms: u64,
     /// Maximum duration of this exchange.
     pub timeout: Duration,
 }
 
-/// Performs one handoff; the final fence runs immediately before the first write.
+/// Performs one handoff, fencing native mutations and classifying uncertain receipts.
 pub(crate) fn deliver(
     endpoint: &Endpoint,
     handoff: &Handoff<'_>,
@@ -320,7 +398,23 @@ pub(crate) fn deliver(
     };
     let mut resumed = false;
     match read_state(&mut ws, handoff.thread, 2) {
-        Ok(State::Idle) if !handoff.allow_resume => {}
+        Ok(State::Idle | State::Active) if handoff.cold_expected_turn.is_some() => {
+            return Outcome::DeferredKnownUnsent {
+                evidence: "native recipient is no longer unloaded; nothing sent".into(),
+            };
+        }
+        Ok(State::Idle) if !handoff.allow_resume => {
+            if handoff.require_idle
+                && (endpoint.verify_peer(&ws.get_ref().stream).is_err()
+                    || final_check().is_err()
+                    || Instant::now() >= deadline
+                    || !matches!(read_state(&mut ws, handoff.thread, 5), Ok(State::Idle)))
+            {
+                return Outcome::DeferredKnownUnsent {
+                    evidence: "retired native recipient is no longer idle; nothing sent".into(),
+                };
+            }
+        }
         Ok(State::Idle) if handoff.allow_resume => {
             if endpoint.verify_peer(&ws.get_ref().stream).is_err()
                 || Instant::now() >= deadline
@@ -336,9 +430,11 @@ pub(crate) fn deliver(
                 };
             }
         }
-        Ok(State::Active) if !handoff.allow_resume && handoff.mode == Mode::Message => {}
+        Ok(State::Active)
+            if !handoff.allow_resume && !handoff.require_idle && handoff.mode == Mode::Message => {}
         Ok(State::NotLoaded) => {
             if !handoff.allow_resume
+                || handoff.cold_expected_turn.is_none()
                 || endpoint.verify_peer(&ws.get_ref().stream).is_err()
                 || Instant::now() >= deadline
                 || pre_resume().is_err()
@@ -347,9 +443,28 @@ pub(crate) fn deliver(
                     evidence: "native resume is not qualified; nothing sent".into(),
                 };
             }
+            if handoff.cold_expected_turn.is_some_and(|expected_turn| {
+                Instant::now() >= deadline
+                    || !matches!(
+                        endpoint.completed_state(
+                            handoff.thread,
+                            expected_turn,
+                            deadline.saturating_duration_since(Instant::now()),
+                        ),
+                        Ok(State::NotLoaded)
+                    )
+            }) {
+                return Outcome::DeferredKnownUnsent {
+                    evidence: "native episode changed before resume; nothing sent".into(),
+                };
+            }
             // Proof persistence may have taken time. Recheck the exact spent
             // snapshot and kernel peer immediately before the resume write.
             if endpoint.verify_peer(&ws.get_ref().stream).is_err()
+                || final_check().is_err()
+                || Instant::now() >= deadline
+                || !matches!(read_state(&mut ws, handoff.thread, 6), Ok(State::NotLoaded))
+                || endpoint.verify_peer(&ws.get_ref().stream).is_err()
                 || final_check().is_err()
                 || Instant::now() >= deadline
             {
@@ -389,6 +504,11 @@ pub(crate) fn deliver(
         Ok(State::Idle | State::Active) | Err(StateError::Lifecycle) => {
             return Outcome::DeferredKnownUnsent {
                 evidence: "native lifecycle unavailable or changed before handoff".into(),
+            };
+        }
+        Err(StateError::Other) if handoff.cold_expected_turn.is_some() => {
+            return Outcome::DeferredKnownUnsent {
+                evidence: "native recipient state unavailable; nothing sent".into(),
             };
         }
         Err(StateError::Other) => {
@@ -443,15 +563,18 @@ pub(crate) fn deliver(
     }
 }
 
+/// Checks that a native identifier is nonempty, bounded, and free of controls.
+fn valid_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control)
+}
+
 /// Checks the correlated receipt identity/status and bounded opaque item metadata.
 fn valid_turn(value: &Value) -> bool {
     if value.get("error").is_some() {
         return false;
     }
     let t = &value["result"]["turn"];
-    t.get("id")
-        .and_then(Value::as_str)
-        .is_some_and(|id| !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control))
+    t.get("id").and_then(Value::as_str).is_some_and(valid_id)
         && matches!(
             t.get("status").and_then(Value::as_str),
             Some("completed" | "interrupted" | "failed" | "inProgress")
@@ -476,11 +599,9 @@ fn valid_turn(value: &Value) -> bool {
 /// The exact RPC response's turn identity/status establish native acceptance;
 /// unrelated tool output, messages and other display fields grant no authority.
 fn valid_item(item: &Value) -> bool {
-    ["id", "type"].iter().all(|key| {
-        item.get(key).and_then(Value::as_str).is_some_and(|value| {
-            !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
-        })
-    })
+    ["id", "type"]
+        .iter()
+        .all(|key| item.get(key).and_then(Value::as_str).is_some_and(valid_id))
 }
 
 #[cfg(test)]
@@ -584,6 +705,8 @@ mod tests {
             text: "hello",
             mode,
             allow_resume,
+            require_idle: false,
+            cold_expected_turn: None,
             deadline_ms: current_unix_millis() + 3000,
             timeout: Duration::from_secs(3),
         };
@@ -727,6 +850,8 @@ mod tests {
             text: "hello",
             mode: Mode::Auto,
             allow_resume: false,
+            require_idle: false,
+            cold_expected_turn: None,
             deadline_ms: current_unix_millis() + 3000,
             timeout: Duration::from_secs(3),
         };
@@ -746,6 +871,249 @@ mod tests {
         assert_eq!(initial, State::Idle);
         assert!(matches!(outcome, Outcome::DeferredKnownUnsent { .. }));
         assert_eq!(mutations, 0);
+    }
+
+    /// The latest episode is either one valid completed turn or an empty list,
+    /// surrounded by identical idle/unloaded observations from the same peer.
+    #[test]
+    fn completed_state_rejects_changed_turn_and_pending_input() {
+        for case in [
+            "ready",
+            "idle",
+            "exact",
+            "empty",
+            "empty_exact",
+            "empty_wrong",
+            "nonempty_wrong",
+            "wrong_turn",
+            "running",
+            "changed",
+            "approval",
+            "active",
+            "initial_approval",
+            "idle_flags",
+            "unloaded_flags",
+            "multiple",
+            "invalid_empty",
+            "invalid_long",
+            "invalid_control",
+            "missing_id",
+            "turn_error",
+            "rpc_error",
+            "malformed",
+            "error_null",
+        ] {
+            let (dir, listener, binding) = fixture();
+            let worker = thread::spawn(move || {
+                drop(listener.accept().unwrap().0);
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut ws = tungstenite::accept(stream).unwrap();
+                let _ = ws.read().unwrap();
+                ws.send(Message::Text(
+                    json!({"id":1,"result":{}}).to_string().into(),
+                ))
+                .unwrap();
+                let _ = ws.read().unwrap();
+                let _ = ws.read().unwrap();
+                let first = match case {
+                    "active" => json!({"type":"active","activeFlags":[]}),
+                    "initial_approval" => {
+                        json!({"type":"active","activeFlags":["waitingOnApproval"]})
+                    }
+                    "idle_flags" => json!({"type":"idle","activeFlags":["waitingOnApproval"]}),
+                    "unloaded_flags" => {
+                        json!({"type":"notLoaded","activeFlags":["waitingOnApproval"]})
+                    }
+                    "idle" => json!({"type":"idle"}),
+                    _ => json!({"type":"notLoaded"}),
+                };
+                ws.send(Message::Text(
+                    json!({"id":2,"result":{"thread":{"id":"thread-1","status":first}}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+                let Ok(Message::Text(list)) = ws.read() else {
+                    return;
+                };
+                let list: Value = serde_json::from_str(&list).unwrap();
+                assert_eq!(list["method"], "thread/turns/list", "{case}");
+                assert_eq!(
+                    list["params"],
+                    json!({"threadId":"thread-1","limit":1,"sortDirection":"desc","itemsView":"notLoaded"}),
+                    "{case}"
+                );
+                let data = match case {
+                    "empty" | "empty_exact" | "empty_wrong" => json!([]),
+                    "multiple" => json!([
+                        {"id":"turn-1","status":"completed"},
+                        {"id":"turn-2","status":"completed"}
+                    ]),
+                    "invalid_empty" => json!([{"id":"","status":"completed"}]),
+                    "invalid_long" => json!([{"id":"x".repeat(257),"status":"completed"}]),
+                    "invalid_control" => json!([{"id":"turn\n1","status":"completed"}]),
+                    "missing_id" => json!([{"status":"completed"}]),
+                    "running" => json!([{"id":"turn-1","status":"inProgress"}]),
+                    "turn_error" => json!([{"id":"turn-1","status":"completed","error":{}}]),
+                    "error_null" => json!([{"id":"turn-1","status":"completed","error":null}]),
+                    "wrong_turn" => json!([{"id":"other","status":"completed"}]),
+                    _ => json!([{"id":"turn-1","status":"completed"}]),
+                };
+                let reply = if case == "malformed" {
+                    "{".into()
+                } else if case == "rpc_error" {
+                    json!({"id":3,"result":{"data":data},"error":{}}).to_string()
+                } else {
+                    json!({"id":3,"result":{"data":data}}).to_string()
+                };
+                ws.send(Message::Text(reply.into())).unwrap();
+                let Ok(Message::Text(read)) = ws.read() else {
+                    return;
+                };
+                let read: Value = serde_json::from_str(&read).unwrap();
+                assert_eq!(read["method"], "thread/read", "{case}");
+                let last = match case {
+                    "changed" => json!({"type":"idle"}),
+                    "approval" => json!({"type":"active","activeFlags":["waitingOnApproval"]}),
+                    "idle" => json!({"type":"idle"}),
+                    _ => json!({"type":"notLoaded"}),
+                };
+                ws.send(Message::Text(
+                    json!({"id":4,"result":{"thread":{"id":"thread-1","status":last}}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+                assert!(
+                    !matches!(ws.read(), Ok(Message::Text(_))),
+                    "{case}: unexpected native write"
+                );
+            });
+            let endpoint = locate(&binding).unwrap().unwrap();
+            let result = match case {
+                "exact" | "wrong_turn" | "empty_wrong" => endpoint
+                    .completed_state("thread-1", "turn-1", Duration::from_secs(3))
+                    .map(|state| (state, "turn-1".to_owned())),
+                "empty_exact" | "nonempty_wrong" => endpoint
+                    .completed_state("thread-1", "", Duration::from_secs(3))
+                    .map(|state| (state, String::new())),
+                _ => endpoint.latest_completed("thread-1", Duration::from_secs(3)),
+            };
+            worker.join().unwrap();
+            let target_dir = std::env::temp_dir()
+                .parent()
+                .unwrap()
+                .join(dir.file_name().unwrap());
+            fs::remove_dir_all(dir).unwrap();
+            fs::remove_dir_all(target_dir).unwrap();
+            match case {
+                "ready" | "exact" | "error_null" => {
+                    assert_eq!(
+                        result.unwrap(),
+                        (State::NotLoaded, "turn-1".into()),
+                        "{case}"
+                    );
+                }
+                "idle" => assert_eq!(result.unwrap(), (State::Idle, "turn-1".into())),
+                "empty" | "empty_exact" => {
+                    assert_eq!(result.unwrap(), (State::NotLoaded, String::new()), "{case}");
+                }
+                _ => assert!(result.is_err(), "{case}: {result:?}"),
+            }
+        }
+    }
+
+    /// A retired proofless binding may send only while the loaded native thread
+    /// remains idle; an unknown result is never reported as a safe refusal.
+    #[test]
+    fn retired_loaded_idle_without_proof_never_resumes_or_sends_when_busy() {
+        for case in ["idle", "changed", "active", "unloaded", "approval", "lost"] {
+            let (dir, listener, binding) = fixture();
+            let worker = thread::spawn(move || {
+                drop(listener.accept().unwrap().0);
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut ws = tungstenite::accept(stream).unwrap();
+                let _ = ws.read().unwrap();
+                ws.send(Message::Text(
+                    json!({"id":1,"result":{}}).to_string().into(),
+                ))
+                .unwrap();
+                let _ = ws.read().unwrap();
+                let _ = ws.read().unwrap();
+                let status = match case {
+                    "active" => json!({"type":"active","activeFlags":[]}),
+                    "unloaded" => json!({"type":"notLoaded"}),
+                    "approval" => json!({"type":"active","activeFlags":["waitingOnApproval"]}),
+                    _ => json!({"type":"idle"}),
+                };
+                ws.send(Message::Text(
+                    json!({"id":2,"result":{"thread":{"id":"thread-1","status":status}}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+                let Ok(Message::Text(read)) = ws.read() else {
+                    return false;
+                };
+                let read: Value = serde_json::from_str(&read).unwrap();
+                assert_eq!(read["method"], "thread/read", "{case}");
+                let status = if case == "changed" {
+                    json!({"type":"active","activeFlags":[]})
+                } else {
+                    json!({"type":"idle"})
+                };
+                ws.send(Message::Text(
+                    json!({"id":5,"result":{"thread":{"id":"thread-1","status":status}}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+                let Ok(Message::Text(next)) = ws.read() else {
+                    return false;
+                };
+                let next: Value = serde_json::from_str(&next).unwrap();
+                assert_eq!(next["method"], "turn/start", "{case}");
+                if case != "lost" {
+                    ws.send(Message::Text(json!({"id":3,"result":{"turn":{"id":"turn-1","items":[],"status":"inProgress"}}}).to_string().into())).unwrap();
+                }
+                true
+            });
+            let endpoint = locate(&binding).unwrap().unwrap();
+            let handoff = Handoff {
+                thread: "thread-1",
+                client_id: "client-1",
+                text: "hello",
+                mode: Mode::Message,
+                allow_resume: false,
+                require_idle: true,
+                cold_expected_turn: None,
+                deadline_ms: current_unix_millis() + 3000,
+                timeout: Duration::from_secs(3),
+            };
+            let outcome = deliver(&endpoint, &handoff, || panic!("must not resume"), || Ok(()));
+            let started = worker.join().unwrap();
+            let target_dir = std::env::temp_dir()
+                .parent()
+                .unwrap()
+                .join(dir.file_name().unwrap());
+            fs::remove_dir_all(dir).unwrap();
+            fs::remove_dir_all(target_dir).unwrap();
+            assert_eq!(started, matches!(case, "idle" | "lost"), "{case}");
+            assert!(
+                match case {
+                    "idle" => matches!(outcome, Outcome::NativeAccepted { .. }),
+                    "lost" => matches!(outcome, Outcome::OutcomeUnknown { .. }),
+                    _ => matches!(outcome, Outcome::DeferredKnownUnsent { .. }),
+                },
+                "{case}: {outcome:?}"
+            );
+        }
     }
 
     /// A retired binding may use its one-shot idle proof for an already loaded
@@ -810,6 +1178,8 @@ mod tests {
                 },
                 mode: Mode::Message,
                 allow_resume: true,
+                require_idle: false,
+                cold_expected_turn: None,
                 deadline_ms,
                 timeout: Duration::from_secs(3),
             };
@@ -851,14 +1221,40 @@ mod tests {
         }
     }
 
-    /// Resume requires the same binding and fresh idle; an unconfirmed resume stays unknown.
+    /// Resume requires the same episode and binding; uncertain writes stay unknown.
     #[test]
     fn unloaded_thread_resumes_without_crossing_a_changed_binding() {
-        for case in ["ready", "renewed", "waiting", "lost", "wrong", "denied"] {
+        for case in [
+            "ready",
+            "empty_ready",
+            "empty_changed",
+            "different",
+            "in_progress",
+            "pending_before",
+            "pending_after",
+            "probe_active",
+            "probe_idle",
+            "state_change",
+            "invalid_id",
+            "multiple",
+            "initial_idle",
+            "unqualified",
+            "deadline",
+            "fence_before",
+            "renewed",
+            "waiting",
+            "lost",
+            "message_lost",
+            "wrong",
+            "denied",
+            "pre_busy",
+        ] {
             let changed = case == "renewed";
             let (dir, listener, binding) = fixture();
             let fence = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let server_fence = std::sync::Arc::clone(&fence);
+            let claims = std::sync::Arc::new(AtomicU64::new(0));
+            let server_claims = std::sync::Arc::clone(&claims);
             let worker = thread::spawn(move || {
                 drop(listener.accept().unwrap().0);
                 let (stream, _) = listener.accept().unwrap();
@@ -873,7 +1269,106 @@ mod tests {
                 .unwrap();
                 let _ = ws.read().unwrap();
                 let _ = ws.read().unwrap();
-                ws.send(Message::Text(json!({"id":2,"result":{"thread":{"id":"thread-1","status":{"type":"notLoaded"}}}}).to_string().into())).unwrap();
+                let initial = if case == "initial_idle" {
+                    "idle"
+                } else {
+                    "notLoaded"
+                };
+                ws.send(Message::Text(
+                    json!({"id":2,"result":{"thread":{"id":"thread-1","status":{"type":initial}}}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+                if !matches!(case, "initial_idle" | "unqualified" | "deadline" | "denied") {
+                    listener.set_nonblocking(true).unwrap();
+                    let limit = Instant::now() + Duration::from_secs(4);
+                    let probe_stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                                assert!(Instant::now() < limit, "{case}: no episode recheck");
+                                thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(err) => panic!("{case}: probe accept failed: {err}"),
+                        }
+                    };
+                    assert_eq!(server_claims.load(Ordering::SeqCst), 1, "{case}");
+                    probe_stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    let mut probe = tungstenite::accept(probe_stream).unwrap();
+                    let _ = probe.read().unwrap();
+                    probe
+                        .send(Message::Text(
+                            json!({"id":1,"result":{}}).to_string().into(),
+                        ))
+                        .unwrap();
+                    let _ = probe.read().unwrap();
+                    let _ = probe.read().unwrap();
+                    let status = match case {
+                        "pending_before" => {
+                            json!({"type":"active","activeFlags":["waitingOnApproval"]})
+                        }
+                        "probe_active" => json!({"type":"active","activeFlags":[]}),
+                        "probe_idle" => json!({"type":"idle"}),
+                        _ => json!({"type":"notLoaded"}),
+                    };
+                    probe
+                        .send(Message::Text(
+                            json!({"id":2,"result":{"thread":{"id":"thread-1","status":status}}})
+                                .to_string()
+                                .into(),
+                        ))
+                        .unwrap();
+                    if let Ok(Message::Text(list)) = probe.read() {
+                        let list: Value = serde_json::from_str(&list).unwrap();
+                        assert_eq!(list["method"], "thread/turns/list", "{case}");
+                        let data = match case {
+                            "empty_ready" => json!([]),
+                            "different" => json!([{"id":"other","status":"completed"}]),
+                            "in_progress" => json!([{"id":"turn-1","status":"inProgress"}]),
+                            "invalid_id" => json!([{"id":"","status":"completed"}]),
+                            "multiple" => {
+                                json!([{"id":"turn-1","status":"completed"},{"id":"turn-2","status":"completed"}])
+                            }
+                            _ => json!([{"id":"turn-1","status":"completed"}]),
+                        };
+                        probe
+                            .send(Message::Text(
+                                json!({"id":3,"result":{"data":data}}).to_string().into(),
+                            ))
+                            .unwrap();
+                        if let Ok(Message::Text(read)) = probe.read() {
+                            let read: Value = serde_json::from_str(&read).unwrap();
+                            assert_eq!(read["method"], "thread/read", "{case}");
+                            let status = match case {
+                                "pending_after" => {
+                                    json!({"type":"active","activeFlags":["waitingOnApproval"]})
+                                }
+                                "probe_idle" | "state_change" => json!({"type":"idle"}),
+                                _ => json!({"type":"notLoaded"}),
+                            };
+                            probe.send(Message::Text(json!({"id":4,"result":{"thread":{"id":"thread-1","status":status}}}).to_string().into())).unwrap();
+                        }
+                    }
+                }
+                let Ok(Message::Text(recheck)) = ws.read() else {
+                    return (false, false);
+                };
+                let recheck: Value = serde_json::from_str(&recheck).unwrap();
+                assert_eq!(recheck["method"], "thread/read");
+                let status = if case == "pre_busy" {
+                    json!({"type":"active","activeFlags":["waitingOnApproval"]})
+                } else {
+                    json!({"type":"notLoaded"})
+                };
+                ws.send(Message::Text(
+                    json!({"id":6,"result":{"thread":{"id":"thread-1","status":status}}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
                 let Ok(Message::Text(resume)) = ws.read() else {
                     return (false, false);
                 };
@@ -918,25 +1413,37 @@ mod tests {
                 .unwrap();
                 let started =
                     matches!(ws.read(), Ok(Message::Text(text)) if text.contains("turn/start"));
-                if started {
+                if started && case != "message_lost" {
                     ws.send(Message::Text(json!({"id":3,"result":{"turn":{"id":"turn-1","items":[],"status":"inProgress"}}}).to_string().into())).unwrap();
                 }
                 (true, started)
             });
             let endpoint = locate(&binding).unwrap().unwrap();
+            let deadline_ms = current_unix_millis() + if case == "deadline" { 1000 } else { 3000 };
             let handoff = Handoff {
                 thread: "thread-1",
                 client_id: "client-1",
                 text: "hello",
                 mode: Mode::Message,
                 allow_resume: true,
-                deadline_ms: current_unix_millis() + 3000,
+                require_idle: false,
+                cold_expected_turn: match case {
+                    "unqualified" => None,
+                    "empty_ready" | "empty_changed" => Some(""),
+                    _ => Some("turn-1"),
+                },
+                deadline_ms,
                 timeout: Duration::from_secs(3),
             };
             let outcome = deliver(
                 &endpoint,
                 &handoff,
                 || {
+                    claims.fetch_add(1, Ordering::SeqCst);
+                    if case == "deadline" {
+                        let remaining = deadline_ms.saturating_sub(current_unix_millis());
+                        thread::sleep(Duration::from_millis(remaining + 25));
+                    }
                     if case == "denied" {
                         Err("no idle proof".into())
                     } else {
@@ -944,7 +1451,7 @@ mod tests {
                     }
                 },
                 || {
-                    if fence.load(Ordering::SeqCst) {
+                    if case == "fence_before" || fence.load(Ordering::SeqCst) {
                         Err("changed".into())
                     } else {
                         Ok(())
@@ -958,14 +1465,38 @@ mod tests {
                 .join(dir.file_name().unwrap());
             fs::remove_dir_all(dir).unwrap();
             fs::remove_dir_all(target_dir).unwrap();
-            assert_eq!(resumed, case != "denied", "{case}");
-            assert_eq!(started, case == "ready", "{case}");
+            assert_eq!(
+                claims.load(Ordering::SeqCst),
+                u64::from(!matches!(case, "initial_idle" | "unqualified")),
+                "{case}"
+            );
+            assert_eq!(
+                resumed,
+                matches!(
+                    case,
+                    "ready"
+                        | "empty_ready"
+                        | "renewed"
+                        | "waiting"
+                        | "lost"
+                        | "message_lost"
+                        | "wrong"
+                ),
+                "{case}"
+            );
+            assert_eq!(
+                started,
+                matches!(case, "ready" | "empty_ready" | "message_lost"),
+                "{case}"
+            );
             assert!(
                 match case {
-                    "ready" => matches!(outcome, Outcome::NativeAccepted { .. }),
-                    "lost" | "wrong" => matches!(outcome, Outcome::OutcomeUnknown { .. }),
-                    "denied" => matches!(outcome, Outcome::DeferredKnownUnsent { .. }),
-                    _ => matches!(outcome, Outcome::ResumeAcceptedNoMessage { .. }),
+                    "ready" | "empty_ready" => matches!(outcome, Outcome::NativeAccepted { .. }),
+                    "lost" | "wrong" | "message_lost" =>
+                        matches!(outcome, Outcome::OutcomeUnknown { .. }),
+                    "renewed" | "waiting" =>
+                        matches!(outcome, Outcome::ResumeAcceptedNoMessage { .. }),
+                    _ => matches!(outcome, Outcome::DeferredKnownUnsent { .. }),
                 },
                 "{case}: {outcome:?}"
             );

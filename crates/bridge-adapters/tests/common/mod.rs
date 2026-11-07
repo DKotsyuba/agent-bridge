@@ -11,7 +11,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use bridge_adapters::registry::{
     HarnessPolicy, Registry, RegistryConfig, RelayExecutable, file_sha256,
@@ -54,7 +54,8 @@ impl Drop for TempDir {
     }
 }
 
-/// Resolved path of the fixture executable.
+/// Resolved path of the fixture executable, optionally a byte-identical private
+/// test-owned copy when the build filesystem gives binaries shared write permissions.
 ///
 /// The registry refuses a build written or changed (mtime or ctime) in the
 /// same whole second a process started or later (the loaded bytes are then
@@ -63,15 +64,28 @@ impl Drop for TempDir {
 /// strictly after its mtime and ctime. An older fixture costs nothing.
 pub fn fixture_exe() -> PathBuf {
     use std::os::unix::fs::MetadataExt;
-    let path = PathBuf::from(env!("CARGO_BIN_EXE_bridge-fixture"))
-        .canonicalize()
-        .unwrap();
-    let metadata = std::fs::metadata(&path).unwrap();
+    static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+    let path = FIXTURE.get_or_init(|| {
+        let built = PathBuf::from(env!("CARGO_BIN_EXE_bridge-fixture"))
+            .canonicalize()
+            .unwrap();
+        let Some(copy) = std::env::var_os("BRIDGE_TEST_FIXTURE") else {
+            return built;
+        };
+        let copy = PathBuf::from(copy).canonicalize().unwrap();
+        assert_eq!(
+            file_sha256(&copy).unwrap(),
+            file_sha256(&built).unwrap(),
+            "private fixture differs from the built executable"
+        );
+        copy
+    });
+    let metadata = std::fs::metadata(path).unwrap();
     let written = metadata.mtime().max(metadata.ctime());
     while i64::try_from(now() / 1000).unwrap() <= written {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    path
+    path.clone()
 }
 
 /// Path of the product hook executable.

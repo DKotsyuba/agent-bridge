@@ -4,6 +4,24 @@ All notable changes to Agent Bridge are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions describe the
 source, and the crates are not published to crates.io.
 
+## [0.6.6] - 2026-11-07
+
+### Fixed
+
+- Wake a retired Linux Codex thread once per verified native episode when its
+  prior idle proof is missing or stale. The recipient-side claim survives a
+  restart, is shared across source accounts and is recorded before native I/O.
+- Preserve an unspent idle proof across repeated session-end hooks, and accept
+  a bounded settings-only transcript suffix after verifying the same completed
+  native turn. Uncertain native message handoffs are never automatically resent.
+- Hold the live-server route when higher-priority native-owner or Desktop
+  environment information cannot be read.
+
+### Changed
+
+- A single cold wake may repeat session-start hooks if an earlier wake outcome
+  is unknown; waiting for input or an unobservable native state still holds.
+
 ## [0.6.5] - 2026-11-06
 
 ### Fixed

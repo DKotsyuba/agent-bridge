@@ -32,8 +32,10 @@
 //!   only if the same stamp is read again after the old incarnation is gone; any
 //!   growth, rewrite, replacement, touch or unreadable header holds. Managed Linux
 //!   session ends additionally retain a bounded full-content digest, permitting
-//!   metadata-only changes only when every byte remains unchanged. No time window
-//!   substitutes for this proof.
+//!   metadata-only changes only when every byte remains unchanged. A narrow Linux
+//!   managed-server exception can advance an unspent full proof across a bounded
+//!   settings-only suffix after separate exact-peer native checks verify the same
+//!   latest completed turn and idle state. No time window substitutes for proof.
 //! - **Unique live gateway.** Exactly one distinct live harness incarnation that
 //!   started after the recorded one, running the recorded executable unchanged
 //!   since it started, with the same store and the application's native pipe, owning a probe-verified
@@ -62,6 +64,13 @@ const TAIL_BYTES: u64 = 65_536;
 #[cfg(target_os = "linux")]
 const MAX_LIVE_HASH_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Maximum total bytes in a settings-only transcript suffix.
+#[cfg(target_os = "linux")]
+const MAX_SETTINGS_BYTES: u64 = 65_536;
+/// Maximum complete settings records accepted after an idle proof.
+#[cfg(target_os = "linux")]
+const MAX_SETTINGS_RECORDS: usize = 16;
+
 /// Private evidence that an address was positively idle, bound to the exact
 /// stable transcript, plus the physical gateway committed for it (if any).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +91,123 @@ pub(crate) struct WakeProof {
     /// with the current endpoint epoch; absent until a gateway was committed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     gateway: Option<(u32, u64)>,
+}
+
+/// Evidence that an existing full idle proof has only settings records appended.
+/// It does not prove native idleness and can only replace the exact unspent proof.
+#[cfg(target_os = "linux")]
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct SettingsContinuity {
+    /// The original unspent proof whose full digest authenticates the prefix.
+    original: WakeProof,
+    /// A fresh full proof of the same inode after the validated suffix.
+    updated: WakeProof,
+    /// Latest completed turn in the authenticated old transcript tail.
+    last_completed_turn: String,
+}
+
+#[cfg(target_os = "linux")]
+impl SettingsContinuity {
+    /// Identifies the old completed turn for independent native-state checks.
+    pub(crate) fn turn_id(&self) -> &str {
+        &self.last_completed_turn
+    }
+}
+
+/// Checks the lowercase encoding used for a SHA-256 digest in a wake proof.
+#[cfg(target_os = "linux")]
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Splits a full proof only when both stored digests have canonical encoding.
+#[cfg(target_os = "linux")]
+fn live_digests(proof: &WakeProof) -> Option<(&str, &str)> {
+    let (tail, full) = proof.tail.split_once(':')?;
+    (valid_digest(tail) && valid_digest(full)).then_some((tail, full))
+}
+
+/// Accepts only a duplicate-free native settings event for this exact thread.
+#[cfg(target_os = "linux")]
+fn settings_record(line: &[u8], thread: &str) -> bool {
+    let Ok(value) = bridge_protocol::decode_strict_object(line, MAX_SETTINGS_BYTES as usize) else {
+        return false;
+    };
+    let Some(record) = value.as_object() else {
+        return false;
+    };
+    if record.len() != 3 + usize::from(record.contains_key("ordinal"))
+        || record.get("type").and_then(|v| v.as_str()) != Some("event_msg")
+        || !record
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .is_some_and(|value| bridge_protocol::validate_id("timestamp", value, 64).is_ok())
+        || record
+            .get("ordinal")
+            .is_some_and(|ordinal| ordinal.as_u64().is_none())
+    {
+        return false;
+    }
+    let Some(payload) = record.get("payload").and_then(|v| v.as_object()) else {
+        return false;
+    };
+    payload.len() == 3
+        && payload.get("type").and_then(|v| v.as_str()) == Some("thread_settings_applied")
+        && payload.get("thread_id").and_then(|v| v.as_str()) == Some(thread)
+        && payload
+            .get("thread_settings")
+            .is_some_and(|v| v.is_object())
+}
+
+/// Extracts the last completed turn from complete, authenticated old tail lines.
+/// A truncated first line is skipped; malformed later lines or an invalid latest
+/// completion refuse, and no transcript content is included in errors.
+#[cfg(target_os = "linux")]
+fn last_completed_turn(tail: &[u8], starts_at_line: bool) -> Result<String, String> {
+    let lines = if starts_at_line {
+        tail
+    } else {
+        let end = tail
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .ok_or("completed turn not found in transcript tail")?;
+        &tail[end + 1..]
+    };
+    for line in lines.split(|byte| *byte == b'\n').rev().skip(1) {
+        let record = bridge_protocol::decode_strict_object(line, TAIL_BYTES as usize)
+            .map_err(|_| "invalid transcript tail record")?;
+        let payload = record.get("payload");
+        if record.get("type").and_then(|v| v.as_str()) == Some("event_msg")
+            && payload.and_then(|v| v.get("type")).and_then(|v| v.as_str()) == Some("task_complete")
+        {
+            let turn = payload
+                .and_then(|v| v.get("turn_id"))
+                .and_then(|v| v.as_str())
+                .ok_or("completed turn identifier missing")?;
+            bridge_protocol::validate_id("turn_id", turn, MAX_NATIVE_ID_BYTES)
+                .map_err(|_| "invalid completed turn identifier")?;
+            return Ok(turn.to_owned());
+        }
+    }
+    Err("completed turn not found in transcript tail".into())
+}
+
+/// Checks the metadata that must remain unchanged across a transcript read.
+#[cfg(target_os = "linux")]
+fn same_transcript_metadata(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.len() == right.len()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+        && left.ctime() == right.ctime()
+        && left.ctime_nsec() == right.ctime_nsec()
+        && left.uid() == right.uid()
+        && left.nlink() == right.nlink()
+        && left.mode() == right.mode()
 }
 
 /// Reads the exact stable identity of the binding's retained transcript: the
@@ -181,6 +307,129 @@ impl MessageCandidate {
             && tail == old.tail
             && full.gateway == old.gateway)
             .then_some(full)
+    }
+
+    /// Verifies that only bounded settings records follow an existing full idle
+    /// proof on the same stable owned transcript. The result carries no native
+    /// idle assertion; callers must independently check the exact completed turn
+    /// and native idle state before committing it, and recheck before use.
+    ///
+    /// # Errors
+    ///
+    /// The proof, file identity, stable full prefix, completed turn or suffix is
+    /// missing, changing, malformed or outside its bounds.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn settings_continuity(&self) -> Result<SettingsContinuity, String> {
+        let binding = &self.binding;
+        let old = binding.wake.as_ref().ok_or("idle proof missing")?;
+        let (old_tail, old_full) = live_digests(old).ok_or("full idle proof missing")?;
+        if binding.address.harness != Harness::CODEX
+            || !binding.retired
+            || binding.desktop_idle_message
+            || old.gateway.is_some()
+            || old.len == 0
+            || old.len > MAX_LIVE_HASH_BYTES
+        {
+            return Err("not an eligible managed idle proof".into());
+        }
+        let identity = retained_transcript(binding, self.owner_uid)
+            .filter(|identity| *identity == old.transcript)
+            .ok_or("the retained transcript identity changed")?;
+        let mut file = std::fs::File::open(
+            binding
+                .transcript
+                .as_ref()
+                .ok_or("the retained transcript is missing")?,
+        )
+        .map_err(|_| "the retained transcript is unreadable")?;
+        let before = file
+            .metadata()
+            .map_err(|_| "the retained transcript metadata is unreadable")?;
+        let suffix_len = before
+            .len()
+            .checked_sub(old.len)
+            .filter(|len| *len > 0 && *len <= MAX_SETTINGS_BYTES)
+            .ok_or("the settings suffix is outside its bounds")?;
+        if !before.is_file()
+            || (before.dev(), before.ino()) != identity
+            || before.uid() != self.owner_uid
+            || before.nlink() != 1
+            || before.len() > MAX_LIVE_HASH_BYTES
+        {
+            return Err("the retained transcript identity changed".into());
+        }
+        let mut prefix = (&mut file).take(old.len);
+        let digest =
+            sha256_reader(&mut prefix).map_err(|_| "the transcript prefix is unreadable")?;
+        if prefix.limit() != 0 || digest != old_full {
+            return Err("the transcript prefix changed since its idle proof".into());
+        }
+
+        let tail_start = old.len.saturating_sub(TAIL_BYTES);
+        let starts_at_line = if tail_start == 0 {
+            true
+        } else {
+            file.seek(SeekFrom::Start(tail_start - 1))
+                .map_err(|_| "the transcript tail is unreadable")?;
+            let mut previous = [0_u8; 1];
+            file.read_exact(&mut previous)
+                .map_err(|_| "the transcript tail is unreadable")?;
+            previous[0] == b'\n'
+        };
+        file.seek(SeekFrom::Start(tail_start))
+            .map_err(|_| "the transcript tail is unreadable")?;
+        let mut tail = vec![0_u8; (old.len - tail_start) as usize];
+        file.read_exact(&mut tail)
+            .map_err(|_| "the transcript tail is unreadable")?;
+        if tail.last() != Some(&b'\n')
+            || sha256_reader(&mut tail.as_slice())
+                .map_err(|_| "the transcript tail is unreadable")?
+                != old_tail
+        {
+            return Err("the transcript idle tail is incomplete or changed".into());
+        }
+        let turn = last_completed_turn(&tail, starts_at_line)?;
+
+        let mut suffix = vec![0_u8; suffix_len as usize];
+        file.read_exact(&mut suffix)
+            .map_err(|_| "the settings suffix is unreadable")?;
+        if suffix.last() != Some(&b'\n') {
+            return Err("the settings suffix is incomplete".into());
+        }
+        for (index, line) in suffix[..suffix.len() - 1]
+            .split(|byte| *byte == b'\n')
+            .enumerate()
+        {
+            if index >= MAX_SETTINGS_RECORDS
+                || !settings_record(line, &binding.address.native_session_id)
+            {
+                return Err("the transcript suffix is not settings-only".into());
+            }
+        }
+        let after = file
+            .metadata()
+            .map_err(|_| "the retained transcript metadata is unreadable")?;
+        if !same_transcript_metadata(&before, &after)
+            || retained_transcript(binding, self.owner_uid) != Some(identity)
+        {
+            return Err("the retained transcript changed while reading".into());
+        }
+        let updated = read_live_stamp(binding, self.owner_uid)
+            .ok_or("the retained transcript could not be rechecked")?;
+        if updated.transcript != identity
+            || updated.len != before.len()
+            || updated.mtime != (before.mtime(), before.mtime_nsec())
+            || updated.ctime != (before.ctime(), before.ctime_nsec())
+            || updated.gateway.is_some()
+            || live_digests(&updated).is_none()
+        {
+            return Err("the retained transcript changed while rechecking".into());
+        }
+        Ok(SettingsContinuity {
+            original: old.clone(),
+            updated,
+            last_completed_turn: turn,
+        })
     }
 
     /// Whether this binding can only be reached through a physical gateway: a
@@ -419,6 +668,52 @@ impl MessageCandidate {
 }
 
 impl Registry {
+    /// Atomically replaces the exact unspent old proof after independent native
+    /// checks confirm the recorded completed turn and idle state. The value alone
+    /// asserts no native state. A stale binding or failed journal write cannot
+    /// create, restore or advance a proof.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn commit_settings_continuity(
+        &mut self,
+        snapshot: &MessageCandidate,
+        continuity: &SettingsContinuity,
+    ) -> Result<(), String> {
+        self.message_current(snapshot)?;
+        let old = snapshot.binding.wake.as_ref().ok_or("idle proof missing")?;
+        let updated = &continuity.updated;
+        if snapshot.owner_uid != self.owner_uid
+            || snapshot.binding.address.harness != Harness::CODEX
+            || !snapshot.binding.retired
+            || snapshot.binding.desktop_idle_message
+            || old != &continuity.original
+            || old.gateway.is_some()
+            || updated.gateway.is_some()
+            || live_digests(old).is_none()
+            || live_digests(updated).is_none()
+            || old.transcript != updated.transcript
+            || old.len == 0
+            || old.len > MAX_LIVE_HASH_BYTES
+            || updated.len > MAX_LIVE_HASH_BYTES
+            || !updated
+                .len
+                .checked_sub(old.len)
+                .is_some_and(|len| len > 0 && len <= MAX_SETTINGS_BYTES)
+            || bridge_protocol::validate_id("turn_id", continuity.turn_id(), MAX_NATIVE_ID_BYTES)
+                .is_err()
+        {
+            return Err("settings continuity does not match the idle snapshot".into());
+        }
+        let key = snapshot.binding.address.to_canonical_string();
+        let binding = self.bindings.get_mut(&key).ok_or("idle binding missing")?;
+        let previous = binding.clone();
+        binding.wake = Some(updated.clone());
+        if let Err(error) = self.persist_routes() {
+            self.bindings.insert(key, previous);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Persists a full digest only if the exact idle binding still matches the
     /// unlocked snapshot. A failed journal write restores the previous proof.
     #[cfg(target_os = "linux")]
@@ -641,6 +936,396 @@ mod tests {
         os::process_facts(std::process::id()).unwrap().uid.unwrap()
     }
 
+    /// Builds a synthetic retired managed candidate with a full proof of `prefix`.
+    #[cfg(target_os = "linux")]
+    fn continuity_candidate(tag: &str, prefix: &str) -> (PathBuf, PathBuf, MessageCandidate) {
+        let store = store(tag);
+        let path = store.join("sessions").join("t.jsonl");
+        std::fs::write(&path, prefix).unwrap();
+        let mut binding = binding_for(&store, "t1", &path);
+        binding.retired = true;
+        binding.wake = Some(read_live_stamp(&binding, uid()).unwrap());
+        let policy = HarnessPolicy {
+            harness: Harness::CODEX,
+            namespace: "ns".into(),
+            inject: true,
+            message: true,
+            executable_markers: Vec::new(),
+            store_env: None,
+            store_home: None,
+            child_address: None,
+            caller_proof: Vec::new(),
+        };
+        (
+            store,
+            path,
+            MessageCandidate {
+                binding,
+                policy,
+                owner_uid: uid(),
+            },
+        )
+    }
+
+    /// A complete synthetic transcript with two completed turns.
+    #[cfg(target_os = "linux")]
+    fn continuity_prefix() -> String {
+        format!(
+            "{}\n{}\n{}\n",
+            json!({"type":"session_meta","payload":{"id":"t1"}}),
+            json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"older"}}),
+            json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"latest"}}),
+        )
+    }
+
+    /// One complete, observed-shape settings record for the fixture thread.
+    #[cfg(target_os = "linux")]
+    fn settings_line() -> String {
+        format!(
+            "{}\n",
+            json!({"timestamp":"2026-11-07T06:22:43.786Z", "ordinal":7,
+                "type":"event_msg", "payload":{"type":"thread_settings_applied",
+                "thread_id":"t1", "thread_settings":{"model":"fixture", "policy":{"mode":"safe"}}}})
+        )
+    }
+
+    /// Settings-only growth retains the old proof and extracts the latest turn.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn settings_continuity_accepts_bounded_settings_records() {
+        let prefix = continuity_prefix();
+        let (store, path, candidate) = continuity_candidate("settings-ok", &prefix);
+        assert!(candidate.settings_continuity().is_err(), "no suffix");
+        let first = settings_line();
+        std::fs::write(&path, format!("{prefix}{first}")).unwrap();
+        assert!(candidate.proves_idle().is_err());
+        let one = candidate.settings_continuity().unwrap();
+        assert_eq!(one.turn_id(), "latest");
+        assert_eq!(one.original, *candidate.binding.wake.as_ref().unwrap());
+
+        let second = format!(
+            "{}\n",
+            json!({"timestamp":"2026-11-07T06:22:43Z",
+            "type":"event_msg", "payload":{"type":"thread_settings_applied",
+            "thread_id":"t1", "thread_settings":{}}})
+        );
+        std::fs::write(&path, format!("{prefix}{first}{second}")).unwrap();
+        let two = candidate.settings_continuity().unwrap();
+        assert_eq!(two.turn_id(), "latest");
+        assert!(one != two);
+        assert_eq!(
+            two.updated,
+            read_live_stamp(&candidate.binding, uid()).unwrap()
+        );
+
+        std::fs::write(
+            &path,
+            format!("{prefix}{}", first.repeat(MAX_SETTINGS_RECORDS)),
+        )
+        .unwrap();
+        assert!(candidate.settings_continuity().is_ok());
+        std::fs::write(
+            &path,
+            format!("{prefix}{}", first.repeat(MAX_SETTINGS_RECORDS + 1)),
+        )
+        .unwrap();
+        assert!(candidate.settings_continuity().is_err());
+        let empty = format!(
+            "{}\n",
+            json!({"timestamp":"t", "type":"event_msg",
+            "payload":{"type":"thread_settings_applied", "thread_id":"t1", "thread_settings":{"pad":""}}})
+        );
+        let padding = "x".repeat(MAX_SETTINGS_BYTES as usize - empty.len());
+        let maximum = empty.replace("\"pad\":\"\"", &format!("\"pad\":\"{padding}\""));
+        assert_eq!(maximum.len(), MAX_SETTINGS_BYTES as usize);
+        std::fs::write(&path, format!("{prefix}{maximum}")).unwrap();
+        assert!(
+            candidate.settings_continuity().is_ok(),
+            "the byte limit is inclusive"
+        );
+        std::fs::remove_dir_all(store).unwrap();
+    }
+
+    /// Unknown, duplicated, incomplete, oversized and non-settings suffixes hold.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn settings_continuity_rejects_untrusted_suffixes() {
+        let prefix = continuity_prefix();
+        let (store, path, candidate) = continuity_candidate("settings-invalid", &prefix);
+        let good = settings_line();
+        let cases = [
+            ("wrong thread", good.replace("\"t1\"", "\"t2\"")),
+            (
+                "wrong event",
+                good.replace("thread_settings_applied", "task_complete"),
+            ),
+            (
+                "wrong outer type",
+                good.replace("event_msg", "response_item"),
+            ),
+            (
+                "unknown outer key",
+                good.replace("\"ordinal\":7", "\"extra\":0,\"ordinal\":7"),
+            ),
+            (
+                "unknown payload key",
+                good.replace("\"thread_id\":\"t1\"", "\"extra\":0,\"thread_id\":\"t1\""),
+            ),
+            (
+                "non-object settings",
+                good.replace(
+                    "\"thread_settings\":{\"model\":\"fixture\",\"policy\":{\"mode\":\"safe\"}}",
+                    "\"thread_settings\":null",
+                ),
+            ),
+            (
+                "empty timestamp",
+                good.replace("2026-11-07T06:22:43.786Z", ""),
+            ),
+            (
+                "long timestamp",
+                good.replace("2026-11-07T06:22:43.786Z", &"x".repeat(65)),
+            ),
+            (
+                "control in timestamp",
+                good.replace("2026-11-07T06:22:43.786Z", "\\u0000"),
+            ),
+            (
+                "negative ordinal",
+                good.replace("\"ordinal\":7", "\"ordinal\":-1"),
+            ),
+            (
+                "duplicate nested key",
+                good.replace("\"mode\":\"safe\"", "\"mode\":\"safe\",\"mode\":\"unsafe\""),
+            ),
+            (
+                "duplicate outer key",
+                good.replace("\"ordinal\":7", "\"ordinal\":7,\"ordinal\":8"),
+            ),
+            ("trailing garbage", good.replace("}\n", "} true\n")),
+            ("missing newline", good.trim_end_matches('\n').to_owned()),
+            ("extra blank line", format!("{good}\n")),
+            ("carriage return", good.replace('\n', "\r\n")),
+            (
+                "mixed with message",
+                format!(
+                    "{good}{}\n",
+                    json!({"type":"event_msg","payload":{"type":"user_message"}})
+                ),
+            ),
+            (
+                "oversized",
+                format!(
+                    "{}\n",
+                    json!({"timestamp":"2026-11-07T06:22:43Z",
+                "type":"event_msg", "payload":{"type":"thread_settings_applied", "thread_id":"t1",
+                "thread_settings":{"text":"x".repeat(MAX_SETTINGS_BYTES as usize)}}})
+                ),
+            ),
+        ];
+        for (name, suffix) in cases {
+            assert_ne!(suffix, good, "fixture must alter {name}");
+            std::fs::write(&path, format!("{prefix}{suffix}")).unwrap();
+            assert!(candidate.settings_continuity().is_err(), "{name}");
+        }
+        std::fs::remove_dir_all(store).unwrap();
+    }
+
+    /// Missing, invalid or out-of-tail completed turns cannot support continuity.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn settings_continuity_requires_authenticated_completed_turn() {
+        let header = format!("{}\n", json!({"type":"session_meta","payload":{"id":"t1"}}));
+        let cases = [
+            format!(
+                "{header}{}\n",
+                json!({"type":"event_msg","payload":{"type":"task_complete"}})
+            ),
+            format!(
+                "{header}{}\n",
+                json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":""}})
+            ),
+            format!(
+                "{}{}\n",
+                continuity_prefix(),
+                json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":null}})
+            ),
+            format!(
+                "{}{}\n",
+                continuity_prefix(),
+                json!({"type":"event_msg","payload":{"data":"x".repeat(TAIL_BYTES as usize)}})
+            ),
+            format!(
+                "{}{{\"type\":\"event_msg\",\"type\":\"event_msg\"}}\n",
+                continuity_prefix()
+            ),
+        ];
+        for (index, prefix) in cases.iter().enumerate() {
+            let (store, path, candidate) =
+                continuity_candidate(&format!("settings-turn-{index}"), prefix);
+            std::fs::write(&path, format!("{prefix}{}", settings_line())).unwrap();
+            assert!(candidate.settings_continuity().is_err(), "case {index}");
+            std::fs::remove_dir_all(store).unwrap();
+        }
+        let unfinished = continuity_prefix().trim_end_matches('\n').to_owned();
+        let (store, path, candidate) = continuity_candidate("settings-old-eof", &unfinished);
+        std::fs::write(&path, format!("{unfinished}\n{}", settings_line())).unwrap();
+        assert!(candidate.settings_continuity().is_err());
+        std::fs::remove_dir_all(store).unwrap();
+
+        let large = format!(
+            "{header}{}\n{}\n",
+            json!({"type":"event_msg","payload":{"data":"x".repeat(TAIL_BYTES as usize)}}),
+            json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"latest"}})
+        );
+        let (store, path, candidate) = continuity_candidate("settings-tail", &large);
+        std::fs::write(&path, format!("{large}{}", settings_line())).unwrap();
+        assert_eq!(candidate.settings_continuity().unwrap().turn_id(), "latest");
+        std::fs::remove_dir_all(store).unwrap();
+    }
+
+    /// The old proof, owned single-link inode and exact prefix must remain intact.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn settings_continuity_rejects_lost_proof_and_changed_identity() {
+        let prefix = continuity_prefix();
+        let (store, path, candidate) = continuity_candidate("settings-identity", &prefix);
+        let contents = format!("{prefix}{}", settings_line());
+        std::fs::write(&path, &contents).unwrap();
+        assert!(candidate.settings_continuity().is_ok());
+
+        let mut changed = candidate.clone();
+        changed.binding.wake = None;
+        assert!(changed.settings_continuity().is_err());
+        changed = candidate.clone();
+        let proof = changed.binding.wake.as_mut().unwrap();
+        proof.tail = proof.tail.split(':').next().unwrap().to_owned();
+        assert!(changed.settings_continuity().is_err());
+        changed = candidate.clone();
+        changed.binding.desktop_idle_message = true;
+        assert!(changed.settings_continuity().is_err());
+        changed = candidate.clone();
+        changed.binding.retired = false;
+        assert!(changed.settings_continuity().is_err());
+        changed = candidate.clone();
+        changed.binding.address =
+            NativeAddress::new("h", Harness::CLAUDE_CODE, "ns", "t1").unwrap();
+        assert!(changed.settings_continuity().is_err());
+        changed = candidate.clone();
+        changed.binding.wake.as_mut().unwrap().gateway = Some((1, 2));
+        assert!(changed.settings_continuity().is_err());
+        changed = candidate.clone();
+        changed.owner_uid = uid().wrapping_add(1);
+        assert!(changed.settings_continuity().is_err());
+        changed = candidate.clone();
+        changed.binding.wake.as_mut().unwrap().len = MAX_LIVE_HASH_BYTES + 1;
+        assert!(changed.settings_continuity().is_err());
+
+        std::fs::write(&path, contents.replacen("older", "other", 1)).unwrap();
+        assert!(candidate.settings_continuity().is_err(), "tampered prefix");
+        std::fs::write(&path, &contents).unwrap();
+        let hardlink = store.join("sessions").join("other.jsonl");
+        std::fs::hard_link(&path, &hardlink).unwrap();
+        assert!(candidate.settings_continuity().is_err(), "multiple links");
+        std::fs::remove_file(hardlink).unwrap();
+        let original = store.join("sessions").join("original.jsonl");
+        std::fs::rename(&path, &original).unwrap();
+        std::fs::write(&path, &contents).unwrap();
+        assert!(
+            candidate.settings_continuity().is_err(),
+            "replacement inode"
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&original, &path).unwrap();
+        assert!(candidate.settings_continuity().is_err(), "symlink path");
+        std::fs::remove_dir_all(store).unwrap();
+    }
+
+    /// Journal replacement is fenced by the exact old proof and rolls back on I/O failure.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn settings_continuity_commit_fences_stale_spent_and_failed_writes() {
+        let prefix = continuity_prefix();
+        let (store, path, candidate) = continuity_candidate("settings-commit", &prefix);
+        std::fs::write(&path, format!("{prefix}{}", settings_line())).unwrap();
+        let continuity = candidate.settings_continuity().unwrap();
+        let config = RegistryConfig {
+            host_id: "h".into(),
+            harnesses: Vec::new(),
+            profiles: Vec::new(),
+            intermediates: Vec::new(),
+            max_call_age_ms: 600_000,
+            relays: Vec::new(),
+            audiences: Vec::new(),
+            legacy_owner_relays: 0,
+        };
+        let mut registry = Registry::new(config, uid()).unwrap();
+        let routes = store.join("routes");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&routes)
+            .unwrap();
+        let journal = routes.join("c.bindings.json");
+        registry.attach_journal(&journal, 1).unwrap();
+        registry.policies.push(candidate.policy.clone());
+        let key = candidate.binding.address.to_canonical_string();
+        registry
+            .bindings
+            .insert(key.clone(), candidate.binding.clone());
+        registry.persist_routes().unwrap();
+        let snapshot = registry
+            .live_resume_candidate(&candidate.binding.address)
+            .unwrap();
+        let spent = registry
+            .spend_wake(&snapshot.binding.address, snapshot.binding.epoch)
+            .unwrap();
+        assert!(
+            registry
+                .commit_settings_continuity(&snapshot, &continuity)
+                .is_err()
+        );
+        registry.restore_wake(&snapshot.binding.address, spent);
+
+        registry.bindings.get_mut(&key).unwrap().lifecycle = Lifecycle::Unknown;
+        assert!(
+            registry
+                .commit_settings_continuity(&snapshot, &continuity)
+                .is_err()
+        );
+        registry
+            .bindings
+            .insert(key.clone(), snapshot.binding.clone());
+        registry.journal = Some(store.join("missing-directory").join("bindings.json"));
+        assert!(
+            registry
+                .commit_settings_continuity(&snapshot, &continuity)
+                .is_err()
+        );
+        assert_eq!(registry.bindings[&key], snapshot.binding);
+        registry.journal = Some(journal.clone());
+
+        registry
+            .commit_settings_continuity(&snapshot, &continuity)
+            .unwrap();
+        assert_eq!(
+            registry.bindings[&key].wake.as_ref(),
+            Some(&continuity.updated)
+        );
+        let saved: RouteSnapshot =
+            serde_json::from_slice(&std::fs::read(journal).unwrap()).unwrap();
+        assert_eq!(saved.bindings[0].wake.as_ref(), Some(&continuity.updated));
+        assert!(
+            registry
+                .commit_settings_continuity(&snapshot, &continuity)
+                .is_err()
+        );
+        let refreshed = registry
+            .live_resume_candidate(&snapshot.binding.address)
+            .unwrap();
+        assert!(refreshed.proves_idle().is_ok());
+        std::fs::remove_dir_all(store).unwrap();
+    }
+
     /// A managed-end stamp needs a real prior idle and never enables the Desktop gateway.
     #[cfg(target_os = "linux")]
     #[test]
@@ -809,6 +1494,13 @@ mod tests {
         assert!(
             registry.live_resume_candidate(&binding.address).is_err(),
             "a missing stamp is not authority"
+        );
+        let idle = registry
+            .live_idle_candidate(&binding.address)
+            .expect("proofless retired binding can be observed");
+        assert!(
+            idle.validate_live_idle().is_err(),
+            "an unverified process cannot authorize even a loaded idle route"
         );
         let mut restored = Registry::new(config, uid()).unwrap();
         restored.attach_journal(&journal, 10).unwrap();

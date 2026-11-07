@@ -139,7 +139,7 @@ impl CodexQueueCarrier {
         let defer_changes = match &route {
             Route::Owner(_) => true,
             #[cfg(target_os = "linux")]
-            Route::LiveAppServer(_) | Route::LiveResume(_, _) => true,
+            Route::LiveAppServer(_) | Route::LiveResume(_, _, _, _) | Route::LiveIdle(_, _) => true,
             _ => false,
         };
         let changed = |reason: &str| {
@@ -185,8 +185,10 @@ impl CodexQueueCarrier {
     /// fresh journaled epoch committed
     /// before the snapshot is re-read), and a live `Unknown` route carrying an
     /// unspent idle proof is attested `Inactive` only while that exact transcript
-    /// proof reads back unchanged. Failure holds before reservation or sending;
-    /// no native/history/status request or caller evidence is manufactured.
+    /// proof reads back unchanged. A retired Linux binding without a usable proof
+    /// may use a fresh native idle observation, or one durable wake claim for an
+    /// unloaded completed-turn episode. Failure holds before reservation or sending;
+    /// these native observations grant no caller evidence.
     /// A final locked equality check rejects even same-epoch lifecycle changes
     /// during validation/probing before returning to either attest or send.
     /// Returns the selected route with the snapshot, so send performs no
@@ -196,7 +198,7 @@ impl CodexQueueCarrier {
     /// while its confinement launcher exists; missing confinement never disables an owner.
     /// Linux live App Server discovery follows explicit owner/application routes
     /// and precedes the helper. Its metadata preflight holds on unavailable,
-    /// unloaded, awaiting-input or malformed native thread state.
+    /// awaiting-input or malformed native thread state.
     fn message_recipient(
         &self,
         address: &NativeAddress,
@@ -209,25 +211,58 @@ impl CodexQueueCarrier {
                     .live_resume_candidate(address)
                     .ok()
             };
-            if let Some(candidate) = candidate {
-                let (attestation, binding) = candidate.validate_live_resume()?;
-                let endpoint = crate::codex_live::locate(&binding)?
-                    .ok_or("qualified native control socket unavailable")?;
-                if !matches!(
-                    endpoint.state(
-                        &address.native_session_id,
-                        self.timeout.min(Duration::from_secs(3)),
-                    )?,
-                    crate::codex_live::State::NotLoaded | crate::codex_live::State::Idle
-                ) {
-                    return Err("retired live-server thread is not idle or unloaded".into());
+            if let Some(mut candidate) = candidate {
+                let mut proven = candidate.validate_live_resume().is_ok();
+                if !proven && let Ok((_, binding, first)) = candidate.validate_live_settings() {
+                    // A settings-only append is not idle authority by itself.
+                    // Confirm the same completed native turn before advancing
+                    // the still-unspent, transcript-bound proof. A failed
+                    // advance still permits a fresh, separately fenced cold route.
+                    let upgraded = (|| -> Result<_, String> {
+                        let endpoint = crate::codex_live::locate(&binding)?
+                            .ok_or("qualified native control socket unavailable")?;
+                        let timeout = self.timeout.min(Duration::from_secs(3));
+                        endpoint.completed_state(
+                            &address.native_session_id,
+                            first.turn_id(),
+                            timeout,
+                        )?;
+                        let (_, _, second) = candidate.validate_live_settings()?;
+                        if first != second {
+                            return Err("idle transcript changed during continuity check".into());
+                        }
+                        endpoint.completed_state(
+                            &address.native_session_id,
+                            second.turn_id(),
+                            timeout,
+                        )?;
+                        let mut registry = lock_registry(&self.registry);
+                        registry.commit_settings_continuity(&candidate, &second)?;
+                        let updated = registry.live_resume_candidate(address)?;
+                        drop(registry);
+                        updated.validate_live_resume()?;
+                        Ok(updated)
+                    })();
+                    candidate = match upgraded {
+                        Ok(updated) => updated,
+                        Err(_) => {
+                            let registry = lock_registry(&self.registry);
+                            registry
+                                .live_resume_candidate(address)
+                                .or_else(|_| registry.live_idle_candidate(address))?
+                        }
+                    };
+                    proven = candidate.validate_live_resume().is_ok();
                 }
-                lock_registry(&self.registry).message_current(&candidate)?;
-                return Ok((
-                    attestation,
-                    binding,
-                    Route::LiveResume(endpoint, Box::new(candidate)),
-                ));
+                return self.retired_live_route(address, candidate, proven);
+            }
+            let candidate = {
+                lock_registry(&self.registry)
+                    .live_idle_candidate(address)
+                    .ok()
+            };
+            if let Some(candidate) = candidate {
+                return self.retired_live_route(address, candidate, false);
             }
         }
         let mut candidate = { lock_registry(&self.registry).message_candidate(address)? };
@@ -282,6 +317,84 @@ impl CodexQueueCarrier {
         )?;
         Ok((result.0, result.1, route))
     }
+
+    /// Selects a loaded idle handoff or a single recorded unloaded wake, after
+    /// checking the exact live server, native episode and current binding.
+    #[cfg(target_os = "linux")]
+    fn retired_live_route(
+        &self,
+        address: &NativeAddress,
+        candidate: crate::registry::MessageCandidate,
+        proven: bool,
+    ) -> Result<(Attestation, RecipientBinding, Route), String> {
+        let (attestation, binding) = if proven {
+            candidate.validate_live_resume()?
+        } else {
+            candidate.validate_live_cold()?
+        };
+        let endpoint = crate::codex_live::locate(&binding)?
+            .ok_or("qualified native control socket unavailable")?;
+        let timeout = self.timeout.min(Duration::from_secs(3));
+        match endpoint.state(&address.native_session_id, timeout)? {
+            crate::codex_live::State::Idle if !proven => {
+                let (attestation, binding) = candidate.validate_live_idle()?;
+                lock_registry(&self.registry).message_current(&candidate)?;
+                Ok((
+                    attestation,
+                    binding,
+                    Route::LiveIdle(endpoint, Box::new(candidate)),
+                ))
+            }
+            crate::codex_live::State::Idle => {
+                lock_registry(&self.registry).message_current(&candidate)?;
+                Ok((
+                    attestation,
+                    binding,
+                    Route::LiveResume(endpoint, Box::new(candidate), None, true),
+                ))
+            }
+            crate::codex_live::State::NotLoaded => {
+                let (state, turn) =
+                    endpoint.latest_completed(&address.native_session_id, timeout)?;
+                if state != crate::codex_live::State::NotLoaded {
+                    return Err("native thread changed during wake observation".into());
+                }
+                lock_registry(&self.registry).cold_wake_available(&candidate, &turn)?;
+                let attestation = attested_episode(attestation, address, &turn)?;
+                Ok((
+                    attestation,
+                    binding,
+                    Route::LiveResume(endpoint, Box::new(candidate), Some(turn), proven),
+                ))
+            }
+            crate::codex_live::State::Active => {
+                Err("retired live-server thread is not idle or unloaded".into())
+            }
+        }
+    }
+}
+
+/// Binds a native resume route to the exact latest completed turn or no-turn episode.
+#[cfg(target_os = "linux")]
+fn attested_episode(
+    attestation: Attestation,
+    address: &NativeAddress,
+    turn: &str,
+) -> Result<Attestation, String> {
+    let reference = format!(
+        "{}:episode{}",
+        attestation.proof_ref(),
+        crate::registry::episode_digest(address, turn)?
+    );
+    Attestation::verified(
+        attestation.address().clone(),
+        attestation.actor_id(),
+        attestation.endpoint_epoch(),
+        attestation.lifecycle(),
+        attestation.capabilities(),
+        reference,
+    )
+    .map_err(|error| error.to_string())
 }
 
 impl CodexQueueCarrier {
@@ -460,6 +573,8 @@ impl DispatchCarrier for CodexQueueCarrier {
                         text: &attempt.manifest,
                         mode: attempt.requested_mode,
                         allow_resume: false,
+                        require_idle: false,
+                        cold_expected_turn: None,
                         deadline_ms: attempt.deadline_ms,
                         timeout: self.timeout,
                     },
@@ -484,11 +599,51 @@ impl DispatchCarrier for CodexQueueCarrier {
                 );
             }
             #[cfg(target_os = "linux")]
-            Route::LiveResume(endpoint, candidate) => {
+            Route::LiveIdle(endpoint, candidate) => {
+                return crate::codex_live::deliver(
+                    &endpoint,
+                    &crate::codex_live::Handoff {
+                        thread: &address.native_session_id,
+                        client_id: &client_id,
+                        text: &attempt.manifest,
+                        mode: attempt.requested_mode,
+                        allow_resume: false,
+                        require_idle: true,
+                        cold_expected_turn: None,
+                        deadline_ms: attempt.deadline_ms,
+                        timeout: self.timeout,
+                    },
+                    || Err("not a resume route".into()),
+                    || {
+                        let (attestation, current) = candidate.validate_live_idle()?;
+                        if current.epoch != binding.epoch
+                            || current.harness != binding.harness
+                            || current.store != binding.store
+                            || current.executable != binding.executable
+                            || attestation.lifecycle() != _lifecycle
+                            || attestation.proof_ref() != attempt.proof_ref
+                        {
+                            return Err("live idle binding changed".into());
+                        }
+                        lock_registry(&self.registry).message_current(&candidate)
+                    },
+                );
+            }
+            #[cfg(target_os = "linux")]
+            Route::LiveResume(endpoint, candidate, episode, proven) => {
                 let spent_candidate = candidate.after_live_resume_spend();
                 let spent_wake = std::cell::RefCell::new(None);
+                let cold_claim = std::cell::RefCell::new(None);
                 let fence = || -> Result<(), String> {
-                    let (attestation, current) = spent_candidate.validate_live_resume_after()?;
+                    let (attestation, current) = if proven {
+                        spent_candidate.validate_live_resume_after()?
+                    } else {
+                        spent_candidate.validate_live_cold()?
+                    };
+                    let attestation = match episode.as_deref() {
+                        Some(turn) => attested_episode(attestation, &address, turn)?,
+                        None => attestation,
+                    };
                     if current.epoch != binding.epoch
                         || current.harness != binding.harness
                         || current.store != binding.store
@@ -498,7 +653,18 @@ impl DispatchCarrier for CodexQueueCarrier {
                     {
                         return Err("live resume binding changed".into());
                     }
-                    lock_registry(&self.registry).message_current(&spent_candidate)
+                    let registry = lock_registry(&self.registry);
+                    match episode.as_deref() {
+                        Some(turn) => registry.cold_wake_current(
+                            &spent_candidate,
+                            turn,
+                            cold_claim
+                                .borrow()
+                                .as_ref()
+                                .ok_or("cold wake claim missing")?,
+                        ),
+                        None => registry.message_current(&spent_candidate),
+                    }
                 };
                 let outcome = crate::codex_live::deliver(
                     &endpoint,
@@ -508,38 +674,63 @@ impl DispatchCarrier for CodexQueueCarrier {
                         text: &attempt.manifest,
                         mode: attempt.requested_mode,
                         allow_resume: true,
+                        require_idle: false,
+                        cold_expected_turn: episode.as_deref(),
                         deadline_ms: attempt.deadline_ms,
                         timeout: self.timeout,
                     },
                     || {
-                        candidate.validate_live_resume()?;
+                        if proven {
+                            candidate.validate_live_resume()?;
+                        } else {
+                            candidate.validate_live_cold()?;
+                        }
                         {
                             let mut registry = lock_registry(&self.registry);
                             registry.message_current(&candidate)?;
-                            // Spend the exact idle proof durably before resume: even
-                            // another pending message cannot repeat an unknown wake.
-                            let spent = registry.spend_wake(&address, binding.epoch)?;
-                            if let Err(error) = registry.message_current(&spent_candidate) {
-                                registry.restore_wake(&address, spent);
-                                return Err(error);
+                            // All unloaded wakes claim the same target-owned episode,
+                            // even when an older positive idle proof was present.
+                            if let Some(turn) = episode.as_deref() {
+                                *cold_claim.borrow_mut() =
+                                    Some(registry.claim_cold_wake(&candidate, turn)?);
                             }
-                            *spent_wake.borrow_mut() = Some(spent);
+                            if candidate.has_live_wake() {
+                                let spent = registry.spend_wake(&address, binding.epoch)?;
+                                *spent_wake.borrow_mut() = Some(spent);
+                            }
+                            registry.message_current(&spent_candidate)?;
                         }
                         // Journal I/O may overlap a transcript update. Re-read
                         // the spent stamp outside the lock, then fence the exact
                         // post-spend snapshot again before the resume write.
-                        candidate.proves_idle()?;
+                        if proven {
+                            candidate.proves_idle()?;
+                        } else {
+                            candidate.validate_live_cold()?;
+                        }
                         lock_registry(&self.registry).message_current(&spent_candidate)
                     },
                     fence,
                 );
                 // A deferred result proves no native resume was written. Give
                 // back the exact still-valid proof; unknown outcomes never do so.
-                if matches!(&outcome, Outcome::DeferredKnownUnsent { .. })
-                    && let Some(spent) = spent_wake.into_inner()
-                    && candidate.proves_idle().is_ok()
-                {
-                    lock_registry(&self.registry).restore_wake(&address, spent);
+                if matches!(&outcome, Outcome::DeferredKnownUnsent { .. }) {
+                    let spent = spent_wake
+                        .into_inner()
+                        .filter(|_| candidate.proves_idle().is_ok());
+                    let claim = cold_claim.into_inner();
+                    let mut registry = lock_registry(&self.registry);
+                    if let Some(spent) = spent {
+                        registry.restore_wake(&address, spent);
+                    }
+                    if let (Some(turn), Some(claim)) = (episode.as_deref(), claim) {
+                        let current = if registry.message_current(&candidate).is_ok() {
+                            &candidate
+                        } else {
+                            &spent_candidate
+                        };
+                        registry.restore_cold_wake(current, turn, claim);
+                    }
                 }
                 return outcome;
             }
@@ -568,11 +759,19 @@ pub(crate) enum Route {
     /// The exact live Linux harness's protected native App Server transport.
     #[cfg(target_os = "linux")]
     LiveAppServer(crate::codex_live::Endpoint),
-    /// A retired, previously idle session with an exact live-server proof.
+    /// A retired session freshly observed idle without a wake proof; never resumes.
+    #[cfg(target_os = "linux")]
+    LiveIdle(
+        crate::codex_live::Endpoint,
+        Box<crate::registry::MessageCandidate>,
+    ),
+    /// A retired live-server session with a proof or a one-shot cold episode.
     #[cfg(target_os = "linux")]
     LiveResume(
         crate::codex_live::Endpoint,
         Box<crate::registry::MessageCandidate>,
+        Option<String>,
+        bool,
     ),
 }
 

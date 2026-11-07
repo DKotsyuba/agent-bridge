@@ -6,6 +6,7 @@ mod common;
 use bridge_core::Harness;
 use common::*;
 use serde_json::{Value, json};
+use std::sync::{Arc, Mutex};
 
 /// A `PreToolUse` payload of `tool` with its own input.
 fn pre_tool_use(session: &str, call: &str, tool: &str) -> Value {
@@ -89,5 +90,52 @@ fn built_in_harness_gets_no_token_by_default() {
         pre_tool_use("cs-1", "call-1", "mcp__agent-bridge-root__bridge_me"),
     );
     assert_eq!(reply["stdout"], "", "{reply}");
+    harness.stop();
+}
+
+/// Default intermediate paths accept the real shell alias and preserve the
+/// qualified harness's single-use caller token.
+#[test]
+fn default_shell_alias_preserves_hook_caller_attestation() {
+    use bridge_adapters::registry::Registry;
+    use bridge_adapters::server::{ChannelServer, Custody, private_directory};
+    use bridge_core::dispatch::DispatchTiming;
+
+    let mut lab = Lab::new("default-shell");
+    lab.channel.take().unwrap().stop();
+    let mut config = serde_json::to_value(&lab.config).unwrap();
+    config.as_object_mut().unwrap().remove("intermediates");
+    lab.config = serde_json::from_value(config).unwrap();
+    let uid = private_directory(lab.socket.parent().unwrap()).unwrap();
+    lab.registry = Arc::new(Mutex::new(Registry::new(lab.config.clone(), uid).unwrap()));
+    lab.channel = Some(
+        ChannelServer::start(
+            &lab.socket,
+            Arc::clone(&lab.registry),
+            Arc::clone(&lab.storage) as Arc<dyn Custody>,
+            DispatchTiming::default(),
+        )
+        .unwrap(),
+    );
+
+    let mut harness = Harnessed::start(GENERIC, &lab.generic_store);
+    let started = harness.hook(&lab.socket, GENERIC, hook("SessionStart", "shell-default"));
+    assert_eq!(started["status"], 0, "{started}");
+    let reply = harness.hook(
+        &lab.socket,
+        GENERIC,
+        pre_tool_use(
+            "shell-default",
+            "shell-call",
+            "mcp__agent-bridge-root__bridge_me",
+        ),
+    );
+    let (token, _) = issued(&reply).expect("qualified shell hook issues a token");
+    let attested = harness.mcp(&lab.socket, json!({"bridge_call_token": token}));
+    assert_eq!(attested["ok"]["native_id"], "shell-default");
+    assert_eq!(
+        harness.mcp(&lab.socket, json!({"bridge_call_token": token}))["err"],
+        "duplicate"
+    );
     harness.stop();
 }
