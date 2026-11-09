@@ -332,6 +332,7 @@ fn refusal(error: &AttemptErrorV1) -> bool {
                 | "capability_missing"
                 | "transport_unsupported"
                 | "role_unqualified"
+                | "relaunch_required"
                 | "peer_not_authorized"
                 | "audience_mismatch"
                 | "binding_unavailable"
@@ -1000,6 +1001,34 @@ mod tests {
             .unwrap();
         assert_eq!(result.store_id, STORE);
         assert_eq!(result.capabilities, ["attempt_launch_v1"]);
+        cleanup(server);
+    }
+
+    /// A managed-role bootstrap refusal reaches callers as a typed refusal,
+    /// not as an uncertain transport outcome.
+    #[test]
+    fn relaunch_required_is_a_typed_refusal() {
+        let answer = format!(
+            r#"{{"api_version":1,"request_id":"req","success":true,"result":{{"op":"observation_lookup_v1","value":{{"status":"error","error":{{"version":1,"store_id":"{STORE}","code":"relaunch_required","recovery":"none"}}}}}}}}"#
+        );
+        let (client, server) = mock(Some(answer));
+        let error = client
+            .observation_lookup_v1(
+                "req",
+                &server.pin,
+                ObservationLookupParamsV1 {
+                    version: 1,
+                    expected_store_id: STORE.into(),
+                    producer: "pool".into(),
+                    consume_request_id: "consume".into(),
+                    invocation_key: "invocation".into(),
+                    security_digest: "a".repeat(64),
+                },
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, AttemptClientError::Refused(AttemptErrorV1 { code, .. }) if code == "relaunch_required")
+        );
         cleanup(server);
     }
 

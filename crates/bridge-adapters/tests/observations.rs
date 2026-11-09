@@ -86,7 +86,10 @@ fn observation_grant_precedes_registry_lookup() {
         );
         // A forbidden observation must complete while another owner holds the
         // registry lock: even a missing recipient must not reach that lookup.
+        // Hold across a maintenance tick too, so its scheduler cannot stall
+        // accept before the request reaches its grant check.
         let locked = lab.registry.lock().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
         let result = read(
             &lab,
             Operation::ObserveRecipient(ObserveRecipientParams {

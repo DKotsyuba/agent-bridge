@@ -521,6 +521,33 @@ impl Harnessed {
         Self::start_with_app(&fixture_exe(), harness, store, None, None, Some(launch))
     }
 
+    /// Starts one owned harness with two valid synthetic product stores so
+    /// overlapping executable markers do not invent frontend role ambiguity.
+    pub fn start_with_dual_stores(claude: &Path, codex: &Path, launch: &str) -> Harnessed {
+        let mut child = Command::new(fixture_exe())
+            .arg("harness")
+            .env("HOME", "/nonexistent-bridge-test-home")
+            .env("CLAUDE_CONFIG_DIR", claude)
+            .env("CODEX_HOME", codex)
+            .env_remove("OPENCODE_DB")
+            .env_remove("CODEX_APP_TOOLS_PIPE_PATH")
+            .env_remove("CODEX_MCP_NODE_PATH")
+            .env_remove("BRIDGE_NATIVE_OWNER_SOCKET")
+            .env_remove("BRIDGE_NATIVE_OWNER_SOCKET_V2")
+            .env("AGENT_RUN_LAUNCH_ID", launch)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        Harnessed {
+            child,
+            stdin,
+            stdout,
+        }
+    }
+
     /// Starts the fixture with the specified store, optional owned Desktop pipe
     /// and optional raw owner-locator environment value; inherited application
     /// capabilities, other products' stores and native-owner locators are

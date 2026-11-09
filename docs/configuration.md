@@ -239,11 +239,22 @@ executable = { path = "/ABS/run-reader", sha256 = "<distinct 64 hex>" }
 producer = "sample-producer"
 server = "pool"
 commands = ["vote"]
-frontend = { path = "/ABS/stdio-frontend", sha256 = "<distinct 64 hex>" }
+frontend = { path = "/ABS/stdio-frontend", sha256 = "<64 hex>" }
 ```
 
-Managed frontend, backend audience and Run reader must have distinct paths and
-build digests. A managed producer requires all three configured roles; only
+The managed frontend and backend audience may use the same path and build. The
+Run reader and managed owner builds must remain distinct from both. The
+frontend must be a verified stdio descendant of the managed harness; the
+consumer must have a complete detached ancestry with no managed harness or
+recorded frontend process. A managed producer requires all three roles. On
+first managed enable, Bridge initializes a private frontend-role journal;
+start or restart a shared-build Pool resident after that initialization.
+Earlier or equal-tick residents receive `relaunch_required`. Normal Bridge
+restarts retain the bootstrap point and do not require a resident restart; a
+new boot/namespace or a missing role journal requires a new bootstrap. The
+role journal lives beside the route journal and must be preserved with it;
+corrupt or uncertain role state refuses managed frontend/consumer authority
+without stopping legacy routes. Only
 the configured reader may attest retirement of a fully settled old issuer
 namespace. See the [attempt-binding wire](../crates/bridge-adapters/docs/attempt-binding-v1.md)
 for its recovery, retention and transport boundaries.

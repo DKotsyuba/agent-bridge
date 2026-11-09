@@ -663,7 +663,18 @@ fn accept_loop(listener: UnixListener, state: Arc<ChannelState>) {
     let mut next_attempt_maintenance = Instant::now();
     while state.running.load(Ordering::SeqCst) {
         if Instant::now() >= next_attempt_maintenance {
-            lock_registry(&state.registry).maintain_attempts(current_unix_millis());
+            // Maintenance must not block accepting requests while another
+            // owner holds the registry. Retry on a later tick; admission also
+            // sweeps expired reservations under the registry writer.
+            match state.registry.try_lock() {
+                Ok(mut registry) => registry.maintain_attempts(current_unix_millis()),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    poisoned
+                        .into_inner()
+                        .maintain_attempts(current_unix_millis());
+                }
+                Err(std::sync::TryLockError::WouldBlock) => (),
+            }
             next_attempt_maintenance = Instant::now() + Duration::from_secs(1);
         }
         match listener.accept() {

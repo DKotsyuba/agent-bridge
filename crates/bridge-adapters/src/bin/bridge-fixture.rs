@@ -40,6 +40,8 @@
 //!     runs `bridge-fixture mcp-server` as its child, sends the JSON-RPC
 //!     requests and answers the responses of those with an id.
 //!   - `{"cmd":"exit"}` closes/reaps an owned Desktop child, then exits.
+//!   - `{"cmd":"b1_session_start","socket":..}` starts one persistent
+//!     same-process stdio frontend; `b1_session_request` sends it a request.
 //! - `bridge-fixture owner <directory>`: a scripted stand-in native owner. It
 //!   binds `<directory>/o.sock` (private directory, mode 0600), starts
 //!   `bridge-fixture harness` (or the executable named by
@@ -104,6 +106,54 @@ struct Inbox {
     behavior: String,
     /// Whether the listener already runs.
     started: bool,
+}
+
+/// Owned persistent stdio frontend for same-process role-separation tests.
+struct ManagedFixtureFrontend {
+    /// Direct harness child; it is reaped on normal fixture shutdown.
+    child: std::process::Child,
+    /// Request pipe to the frontend.
+    input: Option<std::process::ChildStdin>,
+    /// Correlated response lines from the same frontend process.
+    output: BufReader<std::process::ChildStdout>,
+}
+
+impl ManagedFixtureFrontend {
+    /// Starts a separate frontend with genuinely piped stdin/stdout.
+    fn start(socket: &str) -> Self {
+        let mut child = Command::new(std::env::current_exe().expect("own executable"))
+            .arg("b1-session")
+            .arg(socket)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("owned B1 session");
+        let input = child.stdin.take();
+        let output = BufReader::new(child.stdout.take().expect("frontend stdout"));
+        Self {
+            child,
+            input,
+            output,
+        }
+    }
+
+    /// Exchanges one request on the same frontend process.
+    fn request(&mut self, request: &Value) -> Value {
+        let input = self.input.as_mut().expect("frontend stdin");
+        writeln!(input, "{request}").unwrap();
+        input.flush().unwrap();
+        let mut answer = String::new();
+        self.output.read_line(&mut answer).unwrap();
+        serde_json::from_str(&answer).unwrap_or(Value::Null)
+    }
+}
+
+impl Drop for ManagedFixtureFrontend {
+    /// Closing the input ends the owned child; wait so no fixture remains.
+    fn drop(&mut self) {
+        drop(self.input.take());
+        let _ = self.child.wait();
+    }
 }
 
 /// Sends one receipt frame to a `uds:` callback.
@@ -212,6 +262,7 @@ fn harness() {
     let inbox = Arc::new(Mutex::new(Inbox::default()));
     // Owned independent Desktop frontend lives under this exact harness.
     let mut frontend = None;
+    let mut managed_frontend: Option<ManagedFixtureFrontend> = None;
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -229,6 +280,21 @@ fn harness() {
             "mcp" => run_mcp(&command),
             "v1" => run_v1_frontend(&command),
             "b1" => run_b1_frontend(&command),
+            "b1_session_start" => {
+                assert!(managed_frontend.is_none());
+                let frontend = ManagedFixtureFrontend::start(command["socket"].as_str().unwrap());
+                let pid = frontend.child.id();
+                managed_frontend = Some(frontend);
+                json!({"pid":pid})
+            }
+            "b1_session_request" => managed_frontend
+                .as_mut()
+                .expect("B1 session started")
+                .request(&command["request"]),
+            "b1_session_stop" => {
+                drop(managed_frontend.take());
+                json!({"ok":true})
+            }
             "v1_and_legacy" => run_v1_and_legacy(&command),
             "v1_direct" => core_call(
                 command["socket"].as_str().unwrap_or_default(),
@@ -926,10 +992,19 @@ fn run_v1_frontend(command: &Value) -> Value {
 /// Runs a raw B1 frame as an owned stdio frontend with genuine ancestry.
 fn run_b1_frontend(command: &Value) -> Value {
     let mut process = Command::new(std::env::current_exe().expect("own executable"));
-    process
-        .arg("b1-frontend")
-        .arg(command["socket"].as_str().unwrap_or_default())
-        .stdout(Stdio::piped());
+    let depth = command["nested_depth"].as_u64().unwrap_or(0).min(16);
+    if depth == 0 {
+        process.arg("b1-frontend");
+    } else {
+        process.arg("b1-nested");
+        // Only the original harness retains its launch marker in this fixture.
+        process.env_remove("AGENT_RUN_LAUNCH_ID");
+    }
+    process.arg(command["socket"].as_str().unwrap_or_default());
+    if depth != 0 {
+        process.arg(depth.to_string());
+    }
+    process.stdout(Stdio::piped());
     let redirected = command["non_stdio"].as_bool() == Some(true);
     if redirected {
         use std::os::unix::fs::OpenOptionsExt;
@@ -974,6 +1049,46 @@ fn b1_frontend(socket: &str) {
     if let Ok(request) = serde_json::from_slice::<Value>(&bytes) {
         println!("{}", core_call(socket, &request));
     }
+}
+
+/// One live stdio frontend repeatedly sends managed frames under the same PID.
+fn b1_session(socket: &str) {
+    for line in std::io::stdin().lock().lines() {
+        let Ok(line) = line else { break };
+        let Ok(request) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        println!("{}", core_call(socket, &request));
+        let _ = std::io::stdout().flush();
+    }
+}
+
+/// Spawns a bounded chain of launch-marker-free children under one real test
+/// harness, then forwards one B1 request from the deepest process.
+fn b1_nested(socket: &str, depth: u8) {
+    let mut input = Vec::new();
+    let _ = std::io::stdin()
+        .take(bridge_protocol::MAX_REGISTRATION_BYTES as u64 + 1)
+        .read_to_end(&mut input);
+    let mut command = Command::new(std::env::current_exe().expect("own executable"));
+    if depth == 0 {
+        command.arg("b1-frontend");
+    } else {
+        command.arg("b1-nested");
+    }
+    command.arg(socket);
+    if depth != 0 {
+        command.arg((depth - 1).to_string());
+    }
+    let mut child = command
+        .env_remove("AGENT_RUN_LAUNCH_ID")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("owned nested frontend");
+    child.stdin.take().unwrap().write_all(&input).unwrap();
+    let output = child.wait_with_output().expect("nested frontend output");
+    let _ = std::io::stdout().write_all(&output.stdout);
 }
 
 /// Runs genuine sibling frontends for a controlled reservation/legacy race.
@@ -1734,6 +1849,14 @@ fn main() {
         Some("mcp-seal") => mcp(args.get(2).map(String::as_str).unwrap_or_default(), true),
         Some("relay") => relay(args.get(2).map(String::as_str).unwrap_or_default()),
         Some("b1-frontend") => b1_frontend(args.get(2).map(String::as_str).unwrap_or_default()),
+        Some("b1-session") => b1_session(args.get(2).map(String::as_str).unwrap_or_default()),
+        Some("b1-nested") => b1_nested(
+            args.get(2).map(String::as_str).unwrap_or_default(),
+            args.get(3)
+                .and_then(|value| value.parse::<u8>().ok())
+                .filter(|depth| *depth <= 16)
+                .unwrap_or(0),
+        ),
         Some("v1-frontend") => {
             v1_frontend(args.get(2).map(String::as_str).unwrap_or_default(), false)
         }

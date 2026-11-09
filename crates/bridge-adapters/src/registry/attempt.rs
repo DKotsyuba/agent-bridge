@@ -1437,6 +1437,8 @@ impl Registry {
         {
             return Err(AttemptError::new("capability_missing", "none"));
         }
+        #[cfg(target_os = "linux")]
+        self.ensure_frontend_roles()?;
         let mut capabilities = vec![
             "attempt_launch_v1",
             "launch_assertion_v1",
@@ -1586,7 +1588,7 @@ impl Registry {
         &mut self,
         peer: PeerIdentity,
         frontend: &RelayExecutable,
-    ) -> ResultV1<()> {
+    ) -> ResultV1<os::attempt::KernelIncarnation> {
         let frontend_before = os::attempt::kernel_incarnation(peer.pid, self.owner_uid)
             .map_err(|_| AttemptError::new("peer_not_authorized", "none"))?;
         let facts = os::process_facts(peer.pid)
@@ -1610,10 +1612,12 @@ impl Registry {
         {
             return Err(AttemptError::new("transport_unsupported", "none"));
         }
-        Ok(())
+        Ok(frontend_before)
     }
 
-    /// Authenticates a configured producer frontend before any managed action.
+    /// Authenticates a configured stdio frontend and its verified managed
+    /// harness ancestry, then durably fences that exact frontend incarnation.
+    #[cfg(target_os = "linux")]
     fn verify_producer_frontend(&mut self, peer: PeerIdentity, producer: &str) -> ResultV1<()> {
         let facts = os::process_facts(peer.pid)
             .ok_or_else(|| AttemptError::new("peer_not_authorized", "none"))?;
@@ -1626,12 +1630,62 @@ impl Registry {
             })
             .map(|tool| tool.frontend.clone())
             .ok_or_else(|| AttemptError::new("peer_not_authorized", "none"))?;
-        self.verify_managed_frontend(peer, &frontend)
+        let before = self.verify_managed_frontend(peer, &frontend)?;
+        let executable = os::attempt::live_executable(&before)
+            .map_err(|_| AttemptError::new("peer_not_authorized", "none"))?;
+        let qualifying = self.managed_frontend_harnesses(peer);
+        if qualifying.is_empty()
+            || os::attempt::kernel_incarnation(peer.pid, peer.uid)
+                .ok()
+                .as_ref()
+                != Some(&before)
+        {
+            return Err(AttemptError::new("peer_not_authorized", "none"));
+        }
+        self.remember_frontend(&before)?;
+        if self.managed_frontend_harnesses(peer) != qualifying
+            || os::attempt::kernel_incarnation(peer.pid, peer.uid)
+                .ok()
+                .as_ref()
+                != Some(&before)
+            || os::attempt::live_executable(&before).ok().as_ref() != Some(&executable)
+        {
+            return Err(AttemptError::new("peer_not_authorized", "none"));
+        }
+        Ok(())
+    }
+
+    /// Samples all configured managed harness matches in stable policy order;
+    /// each match already proves the full same-UID ancestry to that harness.
+    #[cfg(target_os = "linux")]
+    fn managed_frontend_harnesses(
+        &mut self,
+        peer: PeerIdentity,
+    ) -> Vec<os::attempt::KernelIncarnation> {
+        [Harness::CODEX, Harness::CLAUDE_CODE]
+            .into_iter()
+            .filter_map(|harness| {
+                self.harness_of(peer, harness, true)
+                    .ok()
+                    .filter(|matched| matched.managed_ancestry)
+                    .and_then(|matched| matched.kernel_incarnation)
+            })
+            .collect()
+    }
+
+    /// Unsupported platforms cannot qualify a managed producer frontend.
+    #[cfg(not(target_os = "linux"))]
+    fn verify_producer_frontend(&mut self, _: PeerIdentity, _: &str) -> ResultV1<()> {
+        Err(AttemptError::new("transport_unsupported", "none"))
     }
 
     /// Unsupported platforms cannot qualify a managed stdio frontend.
     #[cfg(not(target_os = "linux"))]
-    fn verify_managed_frontend(&mut self, _: PeerIdentity, _: &RelayExecutable) -> ResultV1<()> {
+    fn verify_managed_frontend(
+        &mut self,
+        _: PeerIdentity,
+        _: &RelayExecutable,
+    ) -> ResultV1<os::attempt::KernelIncarnation> {
         Err(AttemptError::new("transport_unsupported", "none"))
     }
 
@@ -1995,7 +2049,9 @@ impl Registry {
         Ok(())
     }
 
-    /// Checks a consumer audience with full same-incarnation bracketing.
+    /// Checks a consumer audience, detached role and exact live executable,
+    /// bracketed by the full same-incarnation kernel identity.
+    #[cfg(target_os = "linux")]
     fn verify_attempt_consumer(
         &mut self,
         peer: PeerIdentity,
@@ -2008,16 +2064,44 @@ impl Registry {
         }
         let before = os::attempt::kernel_incarnation(peer.pid, peer.uid)
             .map_err(|_| AttemptError::new("peer_not_authorized", "none"))?;
+        let executable = os::attempt::live_executable(&before)
+            .map_err(|_| AttemptError::new("peer_not_authorized", "none"))?;
         self.verify_audience(peer, producer, audience)
             .map_err(source_error)?;
+        self.verify_detached_consumer(&before, producer, audience)?;
         if os::attempt::kernel_incarnation(peer.pid, peer.uid)
             .ok()
             .as_ref()
             != Some(&before)
+            || os::attempt::live_executable(&before).ok().as_ref() != Some(&executable)
+        {
+            return Err(AttemptError::new("peer_not_authorized", "none"));
+        }
+        self.remember_consumer(&before)?;
+        if self
+            .verify_detached_consumer(&before, producer, audience)
+            .is_err()
+            || os::attempt::kernel_incarnation(peer.pid, peer.uid)
+                .ok()
+                .as_ref()
+                != Some(&before)
+            || os::attempt::live_executable(&before).ok().as_ref() != Some(&executable)
         {
             return Err(AttemptError::new("peer_not_authorized", "none"));
         }
         Ok(())
+    }
+
+    /// Unsupported platforms cannot establish a detached managed consumer.
+    #[cfg(not(target_os = "linux"))]
+    fn verify_attempt_consumer(
+        &mut self,
+        _: PeerIdentity,
+        _: &str,
+        _: &str,
+        _: &[String],
+    ) -> ResultV1<()> {
+        Err(AttemptError::new("transport_unsupported", "none"))
     }
 
     /// Authenticates a configured consumer when an expired fence has no audience.
@@ -2034,14 +2118,22 @@ impl Registry {
             .filter(|entry| entry.producer == producer && allowed.contains(&entry.name))
             .map(|entry| entry.name.clone())
             .collect();
-        if candidates.iter().any(|audience| {
-            self.verify_attempt_consumer(peer, producer, audience, allowed)
-                .is_ok()
-        }) {
-            Ok(())
-        } else {
-            Err(AttemptError::new("peer_not_authorized", "none"))
+        let mut recovery = None;
+        for audience in candidates {
+            match self.verify_attempt_consumer(peer, producer, &audience, allowed) {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if matches!(
+                        error.code,
+                        "relaunch_required" | "recovery_required" | "capacity_exhausted"
+                    ) =>
+                {
+                    recovery = Some(error)
+                }
+                Err(_) => (),
+            }
         }
+        Err(recovery.unwrap_or_else(|| AttemptError::new("peer_not_authorized", "none")))
     }
 
     /// Gives a configured Run reader the unchanged bootstrap observation.

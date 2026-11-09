@@ -78,6 +78,8 @@ mod cold;
 mod executables;
 mod gateway;
 mod observations;
+#[cfg(target_os = "linux")]
+mod roles;
 pub(crate) use claims::EvidenceClaim;
 #[cfg(target_os = "linux")]
 pub(crate) use cold::episode_digest;
@@ -1919,6 +1921,9 @@ pub struct Registry {
     /// until a fresh daemon issuer, without affecting legacy or B1 paths.
     #[cfg(target_os = "linux")]
     root_capture_poisoned: bool,
+    /// Independent durable managed frontend-role fences and bootstrap point.
+    #[cfg(target_os = "linux")]
+    frontend_roles: roles::RoleState,
     /// This daemon's full kernel identity; a process older than this issuer
     /// cannot prove that a prior missing launch observation was not repaired.
     #[cfg(target_os = "linux")]
@@ -2302,19 +2307,9 @@ impl Registry {
                 }
             }
         }
-        // Distinct trusted builds prevent a frontend holding producer credentials
-        // from also satisfying the backend or Run-reader executable fence.
+        // Run readers remain a separate build; frontend and audience may share
+        // a build only because managed operations prove distinct process roles.
         for mapping in &config.managed_tools {
-            for audience in &config.audiences {
-                if mapping.frontend.path == audience.executable.path
-                    || mapping
-                        .frontend
-                        .sha256
-                        .eq_ignore_ascii_case(&audience.executable.sha256)
-                {
-                    return Err("managed frontend and audience executable overlap".into());
-                }
-            }
             for reader in &config.run_readers {
                 if mapping.frontend.path == reader.executable.path
                     || mapping
@@ -2355,6 +2350,8 @@ impl Registry {
             root_launches: HashMap::new(),
             #[cfg(target_os = "linux")]
             root_capture_poisoned: false,
+            #[cfg(target_os = "linux")]
+            frontend_roles: roles::RoleState::default(),
             #[cfg(target_os = "linux")]
             issuer_process_incarnation: os::attempt::kernel_incarnation(
                 std::process::id(),
@@ -2699,6 +2696,8 @@ impl Registry {
         }
         self.journal = Some(path.to_path_buf());
         self.persist_routes()?;
+        #[cfg(target_os = "linux")]
+        self.attach_frontend_roles(path);
         if !self.attempt_journal_poisoned {
             self.attempt_ledger.seal_after_restart(&self.issuer_boot);
             if self.persist_attempt().is_err() {
@@ -4803,8 +4802,8 @@ mod tests {
         Registry::new(config, 0).unwrap()
     }
 
-    /// Managed frontend, consumer and reader builds must be distinct, and a
-    /// native server/command pair cannot name two producers.
+    /// Frontend and audience may share a build; reader builds remain distinct,
+    /// and a native server/command pair cannot name two producers.
     #[test]
     fn managed_configuration_rejects_role_and_tool_overlap() {
         let mut config = registry_with(&[]).config;
@@ -4831,15 +4830,114 @@ mod tests {
         assert!(Registry::new(config.clone(), 0).is_ok());
         let mut same_build = config.clone();
         same_build.audiences[0].executable.sha256 = "a".repeat(64);
-        assert!(Registry::new(same_build, 0).is_err());
+        assert!(Registry::new(same_build, 0).is_ok());
+        let mut same_path_and_build = config.clone();
+        same_path_and_build.audiences[0].executable =
+            same_path_and_build.managed_tools[0].frontend.clone();
+        assert!(Registry::new(same_path_and_build, 0).is_ok());
         let mut same_path = config.clone();
         same_path.run_readers[0].executable.path = "/frontend".into();
         assert!(Registry::new(same_path, 0).is_err());
+        let mut reader_same_audience_hash = config.clone();
+        reader_same_audience_hash.run_readers[0].executable.sha256 = "b".repeat(64);
+        assert!(Registry::new(reader_same_audience_hash, 0).is_err());
+        let mut reader_same_frontend_hash = config.clone();
+        reader_same_frontend_hash.run_readers[0].executable.sha256 = "a".repeat(64);
+        assert!(Registry::new(reader_same_frontend_hash, 0).is_err());
+        let mut reader_same_audience_path = config.clone();
+        reader_same_audience_path.run_readers[0].executable.path = "/backend".into();
+        assert!(Registry::new(reader_same_audience_path, 0).is_err());
+        let mut owner_overlap = config.clone();
+        let route = |store: &str| bridge_protocol::managed_owner::RouteV1 {
+            component_store_id: store.into(),
+            route_id: "route".into(),
+            worker_uid: 0,
+        };
+        owner_overlap.owner_v2_routes.push(ManagedOwnerRoute {
+            producer: "p".into(),
+            audience: "aud".into(),
+            producer_scopes: vec!["scope".into()],
+            run_home: "/run".into(),
+            run_route: route("run-store"),
+            pool_route: route("pool-store"),
+            bridge_route: route("01234567-89ab-4cde-8fab-0123456789ab"),
+            run_executable: owner_overlap.managed_tools[0].frontend.clone(),
+        });
+        assert!(Registry::new(owner_overlap, 0).is_err());
         let mut cross_producer = config.clone();
         let mut second = cross_producer.managed_tools[0].clone();
         second.producer = "other".into();
         cross_producer.managed_tools.push(second);
         assert!(Registry::new(cross_producer, 0).is_err());
+    }
+
+    /// A saved frontend incarnation remains excluded even when considered as a
+    /// detached consumer and after the registry is reconstructed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn frontend_role_fence_survives_restart_for_the_same_process() {
+        let mut config = registry_with(&[]).config;
+        let shared = RelayExecutable {
+            path: "/shared-build".into(),
+            sha256: "a".repeat(64),
+        };
+        config.managed_tools.push(ManagedTools {
+            producer: "p".into(),
+            server: "pool".into(),
+            commands: vec!["vote".into()],
+            frontend: shared.clone(),
+        });
+        config.audiences.push(BackendAudience {
+            producer: "p".into(),
+            name: "aud".into(),
+            executable: shared,
+        });
+        config.run_readers.push(RunReader {
+            producer: "p".into(),
+            reader: "run".into(),
+            executable: RelayExecutable {
+                path: "/reader".into(),
+                sha256: "b".repeat(64),
+            },
+        });
+        let uid = os::process_facts(std::process::id()).unwrap().uid.unwrap();
+        let identity = os::attempt::kernel_incarnation(std::process::id(), uid).unwrap();
+        let dir = scratch("frontend-fence");
+        let path = dir.join("routes.json");
+        let mut first = Registry::new(config.clone(), uid).unwrap();
+        first.attach_journal(&path, 10).unwrap();
+        first
+            .remember_frontend(&identity)
+            .ok()
+            .expect("persist frontend");
+        assert!(
+            matches!(first.verify_detached_consumer(&identity, "p", "aud"), Err(error) if error.code == "peer_not_authorized")
+        );
+        drop(first);
+        let mut restored = Registry::new(config.clone(), uid).unwrap();
+        restored.attach_journal(&path, 11).unwrap();
+        assert!(
+            matches!(restored.verify_detached_consumer(&identity, "p", "aud"), Err(error) if error.code == "peer_not_authorized")
+        );
+        let consumer_path = dir.join("consumer.json");
+        let mut consumer = Registry::new(config.clone(), uid).unwrap();
+        consumer.attach_journal(&consumer_path, 12).unwrap();
+        consumer
+            .remember_consumer(&identity)
+            .ok()
+            .expect("persist consumer");
+        assert!(
+            matches!(consumer.remember_frontend(&identity), Err(error) if error.code == "peer_not_authorized")
+        );
+        drop(consumer);
+        let mut restored_consumer = Registry::new(config, uid).unwrap();
+        restored_consumer
+            .attach_journal(&consumer_path, 13)
+            .unwrap();
+        assert!(
+            matches!(restored_consumer.remember_frontend(&identity), Err(error) if error.code == "peer_not_authorized")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A private temporary directory for one test, including under inherited

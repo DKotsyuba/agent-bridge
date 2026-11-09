@@ -10,7 +10,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 /// A same-namespace process identity as observed from Linux procfs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KernelIncarnation {
     /// Linux boot UUID.
@@ -71,6 +71,210 @@ const LAUNCH_NAME: &[u8] = b"AGENT_RUN_LAUNCH_ID=";
 /// Only the independent v2 owner locator is inspected for managed egress.
 #[cfg(target_os = "linux")]
 const OWNER_V2_NAME: &[u8] = b"BRIDGE_NATIVE_OWNER_SOCKET_V2=";
+
+/// Maximum complete process ancestry accepted for a detached managed consumer.
+/// Reaching the bound before namespace init is uncertainty, not absence.
+#[cfg(target_os = "linux")]
+const MAX_ROLE_ANCESTRY: usize = 128;
+
+/// Kernel-reported parent edge and birth information, including foreign-UID
+/// ancestors whose executable and PID namespace may not be readable.
+#[cfg(target_os = "linux")]
+#[derive(Clone, PartialEq, Eq)]
+struct RoleLink {
+    /// PID in Bridge's visible PID namespace.
+    pid: u32,
+    /// Kernel-reported parent PID, zero only at namespace init.
+    parent: u32,
+    /// Effective UID from the kernel status record.
+    uid: u32,
+    /// Birth tick from the kernel stat record.
+    start_ticks: u64,
+}
+
+/// Reads one role ancestry edge without requiring access to a foreign UID's exe.
+#[cfg(target_os = "linux")]
+fn role_link_at(proc_root: &Path, pid: u32) -> io::Result<RoleLink> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "process ancestry unavailable");
+    if pid == 0 {
+        return Err(invalid());
+    }
+    let process = proc_root.join(pid.to_string());
+    let status = bounded(&process.join("status"), 64 * 1024)?;
+    let status = std::str::from_utf8(&status).map_err(|_| invalid())?;
+    let mut uid_lines = status.lines().filter_map(|line| line.strip_prefix("Uid:"));
+    let values = uid_lines
+        .next()
+        .ok_or_else(invalid)?
+        .split_ascii_whitespace()
+        .map(str::parse::<u32>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| invalid())?;
+    if values.len() != 4 || uid_lines.next().is_some() {
+        return Err(invalid());
+    }
+    let stat = bounded(&process.join("stat"), 64 * 1024)?;
+    let end = stat
+        .iter()
+        .rposition(|byte| *byte == b')')
+        .ok_or_else(invalid)?;
+    let open = stat[..end]
+        .iter()
+        .position(|byte| *byte == b'(')
+        .ok_or_else(invalid)?;
+    if std::str::from_utf8(&stat[..open])
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok())
+        != Some(pid)
+    {
+        return Err(invalid());
+    }
+    let fields: Vec<_> = stat[end + 1..]
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .collect();
+    let number = |index: usize| {
+        fields
+            .get(index)
+            .and_then(|field| std::str::from_utf8(field).ok())
+            .and_then(|field| field.parse::<u64>().ok())
+            .ok_or_else(invalid)
+    };
+    let parent = u32::try_from(number(1)?).map_err(|_| invalid())?;
+    let start_ticks = number(19)?;
+    if parent == pid {
+        return Err(invalid());
+    }
+    Ok(RoleLink {
+        pid,
+        parent,
+        uid: values[1],
+        start_ticks,
+    })
+}
+
+/// Reads only whether the managed launch entry was present in the original
+/// exec environment. An unreadable, truncated or empty environment is unknown.
+#[cfg(target_os = "linux")]
+fn launch_marker_at(proc_root: &Path, identity: &KernelIncarnation) -> io::Result<bool> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "process role unavailable");
+    if incarnation_at(proc_root, identity.pid, identity.uid)? != *identity {
+        return Err(invalid());
+    }
+    let bytes = bounded(
+        &proc_root.join(identity.pid.to_string()).join("environ"),
+        MAX_ENV_BYTES,
+    )?;
+    if bytes.is_empty() || bytes.last() != Some(&0) {
+        return Err(invalid());
+    }
+    let present = bytes
+        .split(|byte| *byte == 0)
+        .any(|entry| entry.starts_with(LAUNCH_NAME));
+    if incarnation_at(proc_root, identity.pid, identity.uid)? != *identity {
+        return Err(invalid());
+    }
+    Ok(present)
+}
+
+/// Proves a same-UID consumer is outside every known managed harness/frontend
+/// and has no managed-launch marker in any same-UID ancestor. Every parent edge
+/// is re-read through namespace init; unreadable, changed, cyclic or overlong
+/// chains refuse instead of being treated as detached.
+#[cfg(target_os = "linux")]
+pub(crate) fn detached_consumer(
+    peer: &KernelIncarnation,
+    excluded: &[KernelIncarnation],
+) -> io::Result<bool> {
+    detached_consumer_at(Path::new("/proc"), peer, excluded, || {})
+}
+
+/// Shared implementation with a synthetic reparent/identity-race seam.
+#[cfg(target_os = "linux")]
+fn detached_consumer_at(
+    proc_root: &Path,
+    peer: &KernelIncarnation,
+    excluded: &[KernelIncarnation],
+    between: impl FnOnce(),
+) -> io::Result<bool> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "process ancestry unavailable");
+    let mut chain = Vec::new();
+    let mut next = peer.pid;
+    while next != 0 {
+        if chain.len() >= MAX_ROLE_ANCESTRY
+            || chain
+                .iter()
+                .any(|(link, _): &(RoleLink, Option<KernelIncarnation>)| link.pid == next)
+        {
+            return Err(invalid());
+        }
+        let link = role_link_at(proc_root, next)?;
+        let identity = if link.uid == peer.uid {
+            let identity = incarnation_at(proc_root, link.pid, peer.uid)?;
+            if identity.start_ticks != link.start_ticks
+                || identity.boot_id != peer.boot_id
+                || identity.pid_namespace_inode != peer.pid_namespace_inode
+            {
+                return Err(invalid());
+            }
+            if excluded.contains(&identity) || launch_marker_at(proc_root, &identity)? {
+                return Ok(false);
+            }
+            Some(identity)
+        } else {
+            None
+        };
+        if let Some((child, _)) = chain.last()
+            && link.start_ticks > child.start_ticks
+        {
+            return Err(invalid());
+        }
+        next = link.parent;
+        chain.push((link, identity));
+    }
+    if chain.first().and_then(|(_, identity)| identity.as_ref()) != Some(peer)
+        || chain.last().is_none_or(|(link, _)| link.pid != 1)
+    {
+        return Err(invalid());
+    }
+    between();
+    for (link, identity) in &chain {
+        if role_link_at(proc_root, link.pid)? != *link {
+            return Err(invalid());
+        }
+        if let Some(identity) = identity
+            && (incarnation_at(proc_root, identity.pid, identity.uid)? != *identity
+                || launch_marker_at(proc_root, identity)?)
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(true)
+}
+
+/// Reads the exact live executable path and inode between equal process
+/// incarnations, without trusting arguments or a configured label.
+#[cfg(target_os = "linux")]
+pub(crate) fn live_executable(
+    identity: &KernelIncarnation,
+) -> io::Result<(std::path::PathBuf, u64, u64)> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "process executable unavailable");
+    if kernel_incarnation(identity.pid, identity.uid)? != *identity {
+        return Err(invalid());
+    }
+    let path = Path::new("/proc")
+        .join(identity.pid.to_string())
+        .join("exe");
+    let executable = std::fs::read_link(&path)?;
+    let metadata = std::fs::metadata(&path)?;
+    if !metadata.is_file()
+        || std::fs::read_link(&path)? != executable
+        || kernel_incarnation(identity.pid, identity.uid)? != *identity
+    {
+        return Err(invalid());
+    }
+    Ok((executable, metadata.dev(), metadata.ino()))
+}
 
 /// Kernel start tick of a thread created before connecting to a managed peer.
 /// Equal-tick PID reuse still requires the documented pidfd hardening.
@@ -536,6 +740,32 @@ mod tests {
         assert!(p.capture().is_err());
         std::fs::remove_file(p.0.join("42/environ")).unwrap();
         assert!(p.capture().is_err());
+    }
+
+    /// Detached role proof requires the complete stable chain and refuses a
+    /// known frontend or a managed-launch marker, even with no live binding.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detached_role_requires_complete_stable_ancestry() {
+        let p = ProcFixture::new();
+        std::fs::create_dir_all(p.0.join("1")).unwrap();
+        std::fs::write(p.0.join("1/status"), "Name:\tinit\nUid:\t0\t0\t0\t0\n").unwrap();
+        std::fs::write(
+            p.0.join("1/stat"),
+            format!("1 (init) S 0 {} 10 0\n", vec!["0"; 17].join(" ")),
+        )
+        .unwrap();
+        p.environment(b"OTHER=value\0");
+        let peer = incarnation_at(&p.0, 42, 1000).unwrap();
+        assert!(detached_consumer_at(&p.0, &peer, &[], || {}).unwrap());
+        assert!(!detached_consumer_at(&p.0, &peer, std::slice::from_ref(&peer), || {}).unwrap());
+        p.environment(b"AGENT_RUN_LAUNCH_ID=invalid-still-refuses\0");
+        assert!(!detached_consumer_at(&p.0, &peer, &[], || {}).unwrap());
+        p.environment(b"OTHER=value\0");
+        assert!(detached_consumer_at(&p.0, &peer, &[], || ProcFixture::stat(&p.0, 124)).is_err());
+        ProcFixture::stat(&p.0, 123);
+        std::fs::remove_file(p.0.join("1/status")).unwrap();
+        assert!(detached_consumer_at(&p.0, &peer, &[], || {}).is_err());
     }
 
     /// Namespace, UID and start-tick changes cannot preserve process identity.

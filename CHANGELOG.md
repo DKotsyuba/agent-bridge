@@ -14,6 +14,9 @@ source, and the crates are not published to crates.io.
 
 ### Changed
 
+- Managed frontends and detached consumer audiences may share a build. A
+  separate private role journal fences process incarnations across restarts;
+  a shared-build resident started before first enable must be restarted.
 - Managed attempt binding upgrades the private route journal to schema 4 and
   moves managed records out of the schema-2 snapshot. Older Bridge binaries,
   including schema-2 readers, refuse the new route journal; downgrade requires

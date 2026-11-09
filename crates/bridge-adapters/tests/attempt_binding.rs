@@ -161,9 +161,393 @@ fn call(harness: &mut Harnessed, lab: &Lab, request: Value, direct: bool) -> Val
     )
 }
 
+/// Exchanges a managed request from one persistent stdio frontend PID.
+fn session_call(harness: &mut Harnessed, request: Value) -> Value {
+    harness.cmd(json!({"cmd":"b1_session_request","request":request}))
+}
+
 /// Extracts the managed result without printing credentials or returned keys.
 fn value(response: &Value) -> &Value {
     &response["result"]["value"]
+}
+
+/// A shared executable is usable by a newly started detached resident, while
+/// the actual frontend and any consumer beneath a managed harness are refused.
+/// The bootstrap point and frontend incarnation survive a Bridge restart.
+#[test]
+fn same_build_frontend_and_consumer_require_distinct_process_roles() {
+    let mut lab = Lab::new("shared-roles");
+    let executable = RelayExecutable {
+        path: fixture_exe(),
+        sha256: file_sha256(&fixture_exe()).unwrap(),
+    };
+    // This process predates first managed enable and must be relaunched.
+    let mut early =
+        Harnessed::start_from(&executable.path, Harness::CLAUDE_CODE, &lab.claude_store);
+    let reader_executable = distinct_fixture(&lab, "shared-reader");
+    let separate_executable = distinct_fixture(&lab, "preexisting-separate-consumer");
+    let mut early_separate = Harnessed::start_from(
+        &separate_executable.path,
+        Harness::CLAUDE_CODE,
+        &lab.claude_store,
+    );
+    let grant = |token: &str, name: &str, policy: Value| -> GrantConfig {
+        serde_json::from_value(json!({"token":token,"publisher":name,"recipients":["*"],"kinds":["*"],"modes":["message","inject"],"policies":["keep_all"],"producer_v1":policy})).unwrap()
+    };
+    let grants = [
+        grant(
+            PRODUCER_TOKEN,
+            PRODUCER,
+            json!({"registration":true,"native_scopes":["*"],"assertion_audiences":["backend","isolated"],"delivery_scopes":true}),
+        ),
+        grant(READER_TOKEN, READER, json!({})),
+    ];
+    lab.storage
+        .lock()
+        .unwrap()
+        .install_producer_authorizer(Arc::new(ProducerAuthorizer::new(&grants).unwrap()))
+        .unwrap();
+    lab.config.audiences.push(BackendAudience {
+        name: "backend".into(),
+        producer: PRODUCER.into(),
+        executable: executable.clone(),
+    });
+    lab.config.audiences.push(BackendAudience {
+        name: "isolated".into(),
+        producer: PRODUCER.into(),
+        executable: separate_executable,
+    });
+    lab.config.managed_tools.push(ManagedTools {
+        producer: PRODUCER.into(),
+        server: "pool".into(),
+        commands: vec!["vote".into()],
+        frontend: executable.clone(),
+    });
+    lab.config.run_readers.push(RunReader {
+        producer: PRODUCER.into(),
+        reader: READER.into(),
+        executable: reader_executable,
+    });
+    restart(&mut lab);
+
+    let mut source = Harnessed::start_with_launch(Harness::CLAUDE_CODE, &lab.claude_store, LAUNCH);
+    let (store, issuer) = discover(&mut source, &lab);
+    let separate_abort = request(
+        PRODUCER_TOKEN,
+        "separate-abort",
+        "consume_launch_assertion_abort_v1",
+        json!({"version":1,"expected_store_id":store,"producer":PRODUCER,"consume_request_id":"separate-consume","invocation_key":"separate-inv","security_digest":DIGEST,"audience":"isolated"}),
+    );
+    assert_eq!(
+        value(&call(&mut early_separate, &lab, separate_abort, true))["value"]["aborted"],
+        true
+    );
+    pre(&mut source, &lab, "expired-role-call", "mcp__pool__vote");
+    let expire_prepare = request(
+        PRODUCER_TOKEN,
+        "expired-role-prepare",
+        "prepare_native_context_v1",
+        json!({"version":1,"expected_store_id":store,"expected_issuer_epoch":issuer,"invocation_key":"expired-role-inv","command_name":"vote","native_proof":proof("expired-role-call")}),
+    );
+    assert_eq!(
+        value(&call(&mut source, &lab, expire_prepare, false))["status"],
+        "ok"
+    );
+    lab.registry
+        .lock()
+        .unwrap()
+        .fixture_expire_managed(
+            now()
+                .saturating_add(lab.config.max_call_age_ms)
+                .saturating_add(1),
+        )
+        .unwrap();
+    let expired_consume = request(
+        PRODUCER_TOKEN,
+        "expired-role-consume",
+        "consume_launch_assertion_v1",
+        json!({"version":1,"expected_store_id":store,"assertion_key":"expired-key","invocation_key":"expired-role-inv","security_digest":DIGEST}),
+    );
+    assert_eq!(
+        value(&call(&mut early, &lab, expired_consume, true))["error"]["code"],
+        "relaunch_required"
+    );
+    pre(&mut source, &lab, "shared-call", "mcp__pool__vote");
+    let session = source.cmd(json!({"cmd":"b1_session_start","socket":lab.socket}));
+    let frontend_pid = session["pid"].as_u64().unwrap();
+    let prepare = request(
+        PRODUCER_TOKEN,
+        "shared-prepare",
+        "prepare_native_context_v1",
+        json!({"version":1,"expected_store_id":store,"expected_issuer_epoch":issuer,"invocation_key":"shared-inv","command_name":"vote","native_proof":proof("shared-call")}),
+    );
+    let prepared = session_call(&mut source, prepare);
+    assert_eq!(value(&prepared)["status"], "ok");
+    let reference = value(&prepared)["value"]["bridge_context_ref"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let register = request(
+        PRODUCER_TOKEN,
+        "shared-register",
+        "register_launch_assertion_v1",
+        json!({"version":1,"expected_store_id":store,"bridge_context_ref":reference,"invocation_key":"shared-inv","command_name":"vote","security_digest":DIGEST,"audience":"backend","nonce":"shared-nonce","native_proof":proof("shared-call")}),
+    );
+    let registered = session_call(&mut source, register);
+    assert_eq!(value(&registered)["status"], "ok");
+    let key = value(&registered)["value"]["assertion_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let consume = request(
+        PRODUCER_TOKEN,
+        "shared-consume",
+        "consume_launch_assertion_v1",
+        json!({"version":1,"expected_store_id":store,"assertion_key":key,"invocation_key":"shared-inv","security_digest":DIGEST}),
+    );
+    assert_eq!(
+        value(&session_call(&mut source, consume.clone()))["error"]["code"],
+        "peer_not_authorized"
+    );
+    assert_eq!(
+        value(&call(&mut source, &lab, consume.clone(), false))["error"]["code"],
+        "peer_not_authorized"
+    );
+    assert_eq!(
+        value(&call(&mut source, &lab, consume.clone(), true))["error"]["code"],
+        "peer_not_authorized"
+    );
+    let nested = source
+        .cmd(json!({"cmd":"b1","socket":lab.socket,"request":consume.clone(),"nested_depth":12}));
+    assert_eq!(value(&nested)["error"]["code"], "peer_not_authorized");
+    let mut unobserved =
+        Harnessed::start_with_launch(Harness::CLAUDE_CODE, &lab.claude_store, LAUNCH);
+    assert_eq!(
+        value(&call(&mut unobserved, &lab, consume.clone(), false))["error"]["code"],
+        "peer_not_authorized"
+    );
+    let early_result = call(&mut early, &lab, consume.clone(), true);
+    assert_eq!(value(&early_result)["error"]["code"], "relaunch_required");
+    assert_eq!(value(&early_result)["error"]["recovery"], "none");
+
+    // Only the resident process is restarted; it uses the very same build.
+    early.stop();
+    let mut resident =
+        Harnessed::start_from(&executable.path, Harness::CLAUDE_CODE, &lab.claude_store);
+    let consumed = call(&mut resident, &lab, consume.clone(), true);
+    assert_eq!(value(&consumed)["value"]["validity"], "current");
+    let role_path = lab
+        .socket
+        .with_extension("bindings.json")
+        .with_extension("frontend-roles.json");
+    let before: Value = serde_json::from_slice(&std::fs::read(&role_path).unwrap()).unwrap();
+    assert!(
+        before["frontends"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["pid"] == frontend_pid)
+    );
+    restart(&mut lab);
+    let after: Value = serde_json::from_slice(&std::fs::read(&role_path).unwrap()).unwrap();
+    assert_eq!(before["initialized_ticks"], after["initialized_ticks"]);
+    assert!(
+        after["frontends"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["pid"] == frontend_pid)
+    );
+    let lookup = request(
+        PRODUCER_TOKEN,
+        "shared-lookup",
+        "observation_lookup_v1",
+        json!({"version":1,"expected_store_id":store,"producer":PRODUCER,"consume_request_id":"shared-consume","invocation_key":"shared-inv","security_digest":DIGEST}),
+    );
+    assert_eq!(
+        value(&call(&mut resident, &lab, lookup.clone(), true))["value"]["validity"],
+        "historical"
+    );
+    assert_eq!(
+        value(&session_call(&mut source, lookup))["error"]["code"],
+        "peer_not_authorized"
+    );
+    assert_eq!(source.cmd(json!({"cmd":"b1_session_stop"}))["ok"], true);
+
+    // Losing the independent role table establishes a new bootstrap point,
+    // so the formerly valid same-build resident must be started again.
+    lab.channel.take().unwrap().stop();
+    std::fs::remove_file(&role_path).unwrap();
+    restart(&mut lab);
+    let again = request(
+        PRODUCER_TOKEN,
+        "shared-lookup-after-loss",
+        "observation_lookup_v1",
+        json!({"version":1,"expected_store_id":store,"producer":PRODUCER,"consume_request_id":"shared-consume","invocation_key":"shared-inv","security_digest":DIGEST}),
+    );
+    assert_eq!(
+        value(&call(&mut resident, &lab, again.clone(), true))["error"]["code"],
+        "relaunch_required"
+    );
+    resident.stop();
+    std::thread::sleep(std::time::Duration::from_millis(25));
+    let mut replacement =
+        Harnessed::start_from(&executable.path, Harness::CLAUDE_CODE, &lab.claude_store);
+    assert_eq!(
+        value(&call(&mut replacement, &lab, again, true))["value"]["validity"],
+        "historical"
+    );
+}
+
+/// Discovery does not refuse a genuine stdio harness merely because two
+/// configured marker/store combinations identify the same ancestor; the
+/// protected hook and exact native proof still select the actual actor.
+#[test]
+fn frontend_with_overlapping_harness_markers_remains_qualified() {
+    let lab = lab();
+    let mut source = Harnessed::start_with_dual_stores(&lab.claude_store, &lab.codex_store, LAUNCH);
+    let (store, issuer) = discover(&mut source, &lab);
+    pre(&mut source, &lab, "dual-marker-call", "mcp__pool__vote");
+    let prepare = request(
+        PRODUCER_TOKEN,
+        "dual-marker-prepare",
+        "prepare_native_context_v1",
+        json!({"version":1,"expected_store_id":store,"expected_issuer_epoch":issuer,"invocation_key":"dual-marker-inv","command_name":"vote","native_proof":proof("dual-marker-call")}),
+    );
+    assert_eq!(
+        value(&call(&mut source, &lab, prepare, false))["status"],
+        "ok"
+    );
+}
+
+/// A future or corrupt role journal cannot authorize managed operations and
+/// never prevents independent legacy hook routing.
+#[test]
+fn invalid_frontend_role_journal_fences_managed_only() {
+    let mut lab = lab();
+    let mut source = Harnessed::start_with_launch(Harness::CLAUDE_CODE, &lab.claude_store, LAUNCH);
+    let mut consumer = start_consumer(&lab);
+    let mut reader = start_reader(&lab);
+    let (store, _) = discover(&mut source, &lab);
+    assert_eq!(
+        source.hook(
+            &lab.socket,
+            Harness::CLAUDE_CODE,
+            json!({"hook_event_name":"SessionStart","session_id":"legacy-role"})
+        )["status"],
+        0
+    );
+    lab.channel.take().unwrap().stop();
+    let path = lab
+        .socket
+        .with_extension("bindings.json")
+        .with_extension("frontend-roles.json");
+    let mut journal: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    journal["schema"] = json!(2);
+    let future = serde_json::to_vec(&journal).unwrap();
+    std::fs::write(&path, &future).unwrap();
+    restart(&mut lab);
+    let discovery = request(
+        READER_TOKEN,
+        "corrupt-role-discovery",
+        "attempt_binding_capabilities_v1",
+        json!({"version":1}),
+    );
+    assert_eq!(
+        value(&call(&mut reader, &lab, discovery, true))["error"]["code"],
+        "recovery_required"
+    );
+    let abort = request(
+        PRODUCER_TOKEN,
+        "corrupt-role-abort",
+        "consume_launch_assertion_abort_v1",
+        json!({"version":1,"expected_store_id":store,"producer":PRODUCER,"consume_request_id":"corrupt-role","invocation_key":"corrupt-role","security_digest":DIGEST,"audience":"backend"}),
+    );
+    let refused = call(&mut consumer, &lab, abort, true);
+    assert_eq!(value(&refused)["error"]["code"], "recovery_required");
+    assert_eq!(value(&refused)["error"]["recovery"], "operator");
+    assert_eq!(std::fs::read(&path).unwrap(), future);
+    assert_eq!(
+        source.hook(
+            &lab.socket,
+            Harness::CLAUDE_CODE,
+            json!({"hook_event_name":"Stop","session_id":"legacy-role"})
+        )["status"],
+        0
+    );
+    assert_eq!(
+        lab.registry
+            .lock()
+            .unwrap()
+            .attest_recipient(&lab.claude_address("legacy-role"))
+            .unwrap()
+            .0
+            .lifecycle(),
+        bridge_core::dispatch::Lifecycle::Inactive
+    );
+}
+
+/// A failed role commit fences managed authority but leaves legacy hooks live;
+/// restarting reloads the last committed role table without inventing proof.
+#[test]
+fn failed_frontend_role_commit_fences_managed_only() {
+    let mut lab = lab();
+    let mut source = Harnessed::start_with_launch(Harness::CLAUDE_CODE, &lab.claude_store, LAUNCH);
+    let mut consumer = start_consumer(&lab);
+    let (store, _) = discover(&mut source, &lab);
+    assert_eq!(
+        source.hook(
+            &lab.socket,
+            Harness::CLAUDE_CODE,
+            json!({"hook_event_name":"SessionStart","session_id":"role-fault"})
+        )["status"],
+        0
+    );
+    let original = lab
+        .registry
+        .lock()
+        .unwrap()
+        .fixture_fail_frontend_role_commit();
+    let abort = request(
+        PRODUCER_TOKEN,
+        "role-fault-abort",
+        "consume_launch_assertion_abort_v1",
+        json!({"version":1,"expected_store_id":store,"producer":PRODUCER,"consume_request_id":"role-fault","invocation_key":"role-fault","security_digest":DIGEST,"audience":"backend"}),
+    );
+    let failed = call(&mut consumer, &lab, abort.clone(), true);
+    assert_eq!(value(&failed)["error"]["code"], "recovery_required");
+    assert_eq!(value(&failed)["error"]["recovery"], "same_key_lookup");
+    lab.registry
+        .lock()
+        .unwrap()
+        .fixture_restore_frontend_role_commit(original);
+    assert_eq!(
+        value(&call(&mut consumer, &lab, abort.clone(), true))["error"]["recovery"],
+        "same_key_lookup"
+    );
+    assert_eq!(
+        source.hook(
+            &lab.socket,
+            Harness::CLAUDE_CODE,
+            json!({"hook_event_name":"Stop","session_id":"role-fault"})
+        )["status"],
+        0
+    );
+    assert_eq!(
+        lab.registry
+            .lock()
+            .unwrap()
+            .attest_recipient(&lab.claude_address("role-fault"))
+            .unwrap()
+            .0
+            .lifecycle(),
+        bridge_core::dispatch::Lifecycle::Inactive
+    );
+    restart(&mut lab);
+    assert_eq!(
+        value(&call(&mut consumer, &lab, abort, true))["value"]["aborted"],
+        true
+    );
 }
 
 /// Builds protected metadata for one synthetic Claude MCP call.

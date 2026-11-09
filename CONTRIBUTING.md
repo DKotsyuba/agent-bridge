@@ -54,6 +54,11 @@ writes can continue, but a nearly full retained ledger can still exhaust the
 shared snapshot limit in that recovery state. Released schema-1 stores do not
 contain that embedded ledger.
 
+Managed hook ingress currently relies on the verified harness ancestry and the
+restricted managed role; it does not pin the hook executable. A future hardening
+change should verify the actual `bridge-hook` peer against an explicitly pinned
+build without weakening the same-incarnation and role fences.
+
 Managed journal key fences are permanent and currently consume per-store
 space even after an issuer namespace is retired. The 16 MiB byte limit can be
 reached before the 65,536-slot fence limit; the actual number depends on the
