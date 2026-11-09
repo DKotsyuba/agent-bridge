@@ -656,6 +656,7 @@ impl MessageCandidate {
             attestation,
             RecipientBinding {
                 harness: gateway,
+                managed_incarnation: None,
                 epoch: binding.epoch,
                 store: binding.store.clone(),
                 executable: binding.executable.clone(),
@@ -894,6 +895,7 @@ mod tests {
     /// A Codex binding over a canonical scratch store with `transcript` retained.
     fn binding_for(store: &Path, thread: &str, transcript: &Path) -> Binding {
         Binding {
+            managed_incarnation: None,
             address: NativeAddress::new("h", Harness::CODEX, "ns", thread).unwrap(),
             harness: (1, 2),
             epoch: 3,
@@ -1257,6 +1259,9 @@ mod tests {
             max_call_age_ms: 600_000,
             relays: Vec::new(),
             audiences: Vec::new(),
+            run_readers: Vec::new(),
+            managed_tools: Vec::new(),
+            owner_v2_routes: Vec::new(),
             legacy_owner_relays: 0,
         };
         let mut registry = Registry::new(config, uid()).unwrap();
@@ -1435,6 +1440,9 @@ mod tests {
             max_call_age_ms: 600_000,
             relays: Vec::new(),
             audiences: Vec::new(),
+            run_readers: Vec::new(),
+            managed_tools: Vec::new(),
+            owner_v2_routes: Vec::new(),
             legacy_owner_relays: 0,
         };
         let mut registry = Registry::new(config.clone(), uid()).unwrap();
@@ -1708,6 +1716,9 @@ mod tests {
                 max_call_age_ms: 600_000,
                 relays: Vec::new(),
                 audiences: Vec::new(),
+                run_readers: Vec::new(),
+                managed_tools: Vec::new(),
+                owner_v2_routes: Vec::new(),
                 legacy_owner_relays: 0,
             },
             uid(),
@@ -1819,6 +1830,9 @@ mod tests {
             max_call_age_ms: 600_000,
             relays: Vec::new(),
             audiences: Vec::new(),
+            run_readers: Vec::new(),
+            managed_tools: Vec::new(),
+            owner_v2_routes: Vec::new(),
             legacy_owner_relays: 0,
         };
         let journal = store.join("routes");
@@ -1938,6 +1952,9 @@ mod tests {
             max_call_age_ms: 600_000,
             relays: Vec::new(),
             audiences: Vec::new(),
+            run_readers: Vec::new(),
+            managed_tools: Vec::new(),
+            owner_v2_routes: Vec::new(),
             legacy_owner_relays: 0,
         };
         let mut cold = Registry::new(config, uid()).unwrap();
@@ -2037,6 +2054,9 @@ mod tests {
             max_call_age_ms: 600_000,
             relays: Vec::new(),
             audiences: Vec::new(),
+            run_readers: Vec::new(),
+            managed_tools: Vec::new(),
+            owner_v2_routes: Vec::new(),
             legacy_owner_relays: 0,
         };
         let mut registry = Registry::new(config, uid()).unwrap();

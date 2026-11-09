@@ -4,6 +4,34 @@ All notable changes to Agent Bridge are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions describe the
 source, and the crates are not published to crates.io.
 
+## Unreleased
+
+### Added
+
+- Add versioned managed-attempt SDK methods with mandatory pinned server
+  executable verification, and separate managed-owner v2 effect custody,
+  lookup and abort with authenticated Run recovery.
+
+### Changed
+
+- Managed attempt binding upgrades the private route journal to schema 4 and
+  moves managed records out of the schema-2 snapshot. Older Bridge binaries,
+  including schema-2 readers, refuse the new route journal; downgrade requires
+  a compatible earlier journal or a fresh store, not a silent conversion.
+- Core storage schema 9 adds separate managed-owner effect custody and removes
+  the redundant message bytes retained by the unreleased schema 8. Older
+  builds refuse the upgraded store; downgrade requires an earlier compatible
+  store or a fresh store, never a silent state conversion.
+- The unreleased schema-8 owner route hash included the Run build pin. A
+  retained effect with that old hash may require operator recovery after
+  migration; the new hash excludes the build pin and still pins the route.
+
+### Fixed
+
+- Create the lifecycle state directory with mode `0700` atomically, including
+  under inherited default ACLs, so concurrent starts cannot observe an
+  intermediate writable directory.
+
 ## [0.6.6] - 2026-11-07
 
 ### Fixed

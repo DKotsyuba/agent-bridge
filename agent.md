@@ -11,7 +11,7 @@ Agent Bridge is a local durable message service for Codex, Claude Code and manag
 sessions: producers publish events to an exact native address, Bridge keeps them
 in SQLite custody and delivers them through native hooks or queues, and every
 uncertain outcome is retained for a manual decision. Source version 0.6.6,
-producer API v1, storage schema 7. macOS Apple silicon is the supported release
+producer API v1, storage schema 9. macOS Apple silicon is the supported release
 platform; Linux x86_64/ARM64 are source and local-install candidates with separate
 native qualification requirements.
 
@@ -41,6 +41,9 @@ cargo +1.98.1 xtask check-public
 
 Run the narrowest test for what you changed first (`cargo test -p bridge-core
 --test dispatch`, for example), then the affected crate, then the gates above.
+For the full suite, `BRIDGE_TEST_NODE` must resolve to a trusted, non-group-writable
+executable whose basename is `node`: the previous-build Desktop frontend test
+checks the actual kernel-reported executable name.
 
 ## Invariants not to break
 

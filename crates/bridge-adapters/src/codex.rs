@@ -273,7 +273,11 @@ impl CodexQueueCarrier {
         };
         let route = checked_frontend(
             || {
-                if let Some(socket) = crate::owner::locate(&self.registry, result.1.harness)? {
+                if let Some(socket) = crate::owner::locate(
+                    &self.registry,
+                    result.1.harness,
+                    result.1.managed_incarnation.as_ref(),
+                )? {
                     return if result.1.desktop_message_only {
                         Err("a retired recipient cannot use a native owner route".into())
                     } else {
@@ -506,6 +510,7 @@ impl DispatchCarrier for CodexQueueCarrier {
                     &self.registry,
                     &socket,
                     binding.harness,
+                    binding.managed_incarnation.as_ref(),
                     Harness::CODEX,
                     &crate::owner::Handoff {
                         thread_id: &address.native_session_id,

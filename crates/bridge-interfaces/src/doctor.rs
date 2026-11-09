@@ -292,12 +292,13 @@ fn interfaces(config: &InterfacesConfig, push: &mut dyn FnMut(&str, &'static str
 /// Checks of the native daemon's `[adapters]` declarations.
 fn adapters(path: &Path, release: Option<&Path>, push: &mut dyn FnMut(&str, &'static str, Value)) {
     // Parse errors are withheld: the daemon configuration holds tokens.
-    let parsed = std::fs::read_to_string(path)
+    let document = std::fs::read_to_string(path)
         .ok()
-        .and_then(|text| toml::from_str::<toml::Value>(&text).ok())
-        .and_then(|value| value.get("adapters").cloned())
-        .and_then(|adapters| adapters.try_into::<bridge_adapters::RegistryConfig>().ok());
-    let Some(registry) = parsed else {
+        .and_then(|text| toml::from_str::<toml::Value>(&text).ok());
+    let parsed = document
+        .as_ref()
+        .and_then(|value| value.get("adapters").cloned());
+    let Some(adapters) = parsed else {
         push(
             "adapters",
             "fail",
@@ -305,6 +306,100 @@ fn adapters(path: &Path, release: Option<&Path>, push: &mut dyn FnMut(&str, &'st
         );
         return;
     };
+    let Ok(registry) = adapters
+        .clone()
+        .try_into::<bridge_adapters::RegistryConfig>()
+    else {
+        push(
+            "adapters",
+            "fail",
+            json!("daemon configuration or [adapters] unreadable"),
+        );
+        return;
+    };
+    if let Some(channel) = adapters.get("channel").and_then(toml::Value::as_str) {
+        let capacity = crate::config::own_uid().and_then(|uid| {
+            bridge_adapters::registry::inspect_attempt_capacity(Path::new(channel), uid)
+        });
+        match capacity {
+            Ok(Some(capacity)) => push(
+                "adapters.attempt_capacity",
+                "ok",
+                json!({"capacity": capacity, "note": "point-in-time only; journal bytes can exhaust before the fence count limit"}),
+            ),
+            Ok(None) => push(
+                "adapters.attempt_capacity",
+                "not_configured",
+                json!("no managed journal"),
+            ),
+            Err(_) => push(
+                "adapters.attempt_capacity",
+                "warn",
+                json!("managed journal capacity unavailable"),
+            ),
+        }
+    }
+    if !registry.owner_v2_routes.is_empty() {
+        let database = document
+            .as_ref()
+            .and_then(|doc| doc.get("database"))
+            .and_then(toml::Value::as_str);
+        let retained_limit = document
+            .as_ref()
+            .and_then(|doc| doc.get("limits"))
+            .and_then(toml::Value::as_table)
+            .and_then(|limits| match limits.get("max_retained_events") {
+                Some(value) => value
+                    .as_integer()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .filter(|n| *n > 0),
+                None => Some(bridge_core::Limits::new(1).max_retained_events),
+            });
+        let capacity = database
+            .zip(retained_limit)
+            .and_then(|(path, retained_limit)| {
+                crate::config::own_uid().ok().and_then(|uid| {
+                    bridge_core::owner_v2::inspect_owner_capacity(
+                        Path::new(path),
+                        uid,
+                        retained_limit,
+                    )
+                    .ok()
+                })
+            });
+        match capacity {
+            Some(mut capacity) => {
+                for route in &registry.owner_v2_routes {
+                    if !capacity
+                        .producers
+                        .iter()
+                        .any(|entry| entry.producer == route.producer)
+                    {
+                        capacity
+                            .producers
+                            .push(bridge_core::owner_v2::OwnerProducerCapacity {
+                                producer: route.producer.clone(),
+                                used: 0,
+                                remaining: capacity.producer_limit.min(capacity.store_remaining),
+                            });
+                    }
+                }
+                capacity
+                    .producers
+                    .sort_by(|a, b| a.producer.cmp(&b.producer));
+                push(
+                    "adapters.owner_capacity",
+                    "ok",
+                    json!({"capacity":capacity,"note":"point-in-time only"}),
+                );
+            }
+            None => push(
+                "adapters.owner_capacity",
+                "warn",
+                json!("managed owner capacity unavailable"),
+            ),
+        }
+    }
     // Native recipients are governed by the harness-level policy only: no store
     // path and no executable is predeclared. Legacy `profiles` still parse as
     // migration input and are reported as such; they authorize nothing.

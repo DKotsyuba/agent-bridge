@@ -1183,8 +1183,12 @@ impl ClaudeLaterCarrier {
         crate::registry::refresh_stale(&self.registry);
         let candidate = { lock_registry(&self.registry).message_candidate(recipient)? };
         let (attestation, binding) = candidate.validate()?;
-        let socket = crate::owner::locate(&self.registry, binding.harness)?
-            .ok_or("native owner locator is no longer present")?;
+        let socket = crate::owner::locate(
+            &self.registry,
+            binding.harness,
+            binding.managed_incarnation.as_ref(),
+        )?
+        .ok_or("native owner locator is no longer present")?;
         lock_registry(&self.registry).message_current(&candidate)?;
         Ok((attestation, binding, socket))
     }
@@ -1220,6 +1224,7 @@ impl ClaudeLaterCarrier {
             &self.registry,
             &socket,
             binding.harness,
+            binding.managed_incarnation.as_ref(),
             Harness::CLAUDE_CODE,
             &crate::owner::Handoff {
                 thread_id: &address.native_session_id,
@@ -1317,7 +1322,7 @@ impl ClaudeLaterCarrier {
             Ok((_, binding)) => binding,
             Err(reason) => return unsent(format!("recipient not attested: {reason}")),
         };
-        match crate::owner::locator(binding.harness.0) {
+        match crate::owner::checked_locator(binding.harness, binding.managed_incarnation.as_ref()) {
             Ok(None) => {}
             Ok(Some(_)) => return self.send_owner(attempt, &address, delivery.source_uid),
             Err(reason) => return unsent(reason),
@@ -1622,7 +1627,9 @@ impl DispatchCarrier for ClaudeLaterCarrier {
             registry.message_candidate(recipient)?
         };
         let (_, binding) = candidate.validate()?;
-        if crate::owner::locator(binding.harness.0)?.is_some() {
+        if crate::owner::checked_locator(binding.harness, binding.managed_incarnation.as_ref())?
+            .is_some()
+        {
             let attestation = self.owner_route(recipient)?.0;
             if attestation.lifecycle() != bridge_core::dispatch::Lifecycle::Inactive {
                 return Err("native owner recipient is not positively idle".into());

@@ -324,11 +324,15 @@ mod tests {
             max_call_age_ms: 600_000,
             relays: Vec::new(),
             audiences: Vec::new(),
+            run_readers: Vec::new(),
+            managed_tools: Vec::new(),
+            owner_v2_routes: Vec::new(),
             legacy_owner_relays: 0,
         };
         let mut registry = Registry::new(config.clone(), uid).unwrap();
         registry.attach_journal(&journal, 1).unwrap();
         let mut binding = Binding {
+            managed_incarnation: None,
             address: address.clone(),
             harness: (1, 2),
             epoch: 3,

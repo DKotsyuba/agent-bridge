@@ -30,6 +30,8 @@ pub mod framing;
 pub mod managed;
 /// Fixed content-free diagnostics types and transactional store projections.
 pub mod observation;
+/// Independent durable managed-owner v2 effect custody.
+pub mod owner_v2;
 pub mod producer;
 pub mod recovery;
 pub mod schema;

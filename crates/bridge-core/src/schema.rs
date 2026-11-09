@@ -26,7 +26,9 @@ use crate::types::{CoreError, Envelope};
 /// evidence-use claims, lifetime fences and scoped snapshot watermarks;
 /// accepted legacy envelope bytes/hashes and possible effects stay unchanged.
 /// Version 7 adds opt-in bounded delivery/report associations without enrolling old events.
-pub const SCHEMA_VERSION: u32 = 7;
+/// Version 8 adds the separate, per-effect managed owner v2 custody ledger.
+/// Version 9 removes message bytes from managed-owner custody rows.
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// Backfills each migrated `latest` event's lineage key.
 ///
@@ -121,6 +123,24 @@ CREATE TABLE IF NOT EXISTS counters (
     name TEXT PRIMARY KEY,
     value INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS managed_owner_effects (
+    producer_scope TEXT NOT NULL,
+    effect_id TEXT NOT NULL,
+    producer TEXT NOT NULL,
+    audience TEXT NOT NULL,
+    effect_digest TEXT NOT NULL,
+    run_receipt_id TEXT NOT NULL,
+    route_fingerprint TEXT NOT NULL,
+    intent_json BLOB NOT NULL,
+    payload BLOB NOT NULL DEFAULT X'',
+    state TEXT NOT NULL CHECK(state IN ('invoking','abort_pending','accepted','known_unsent','unknown','aborted')),
+    call_id TEXT NOT NULL,
+    protocol TEXT,
+    native_id TEXT,
+    reason TEXT,
+    PRIMARY KEY (producer_scope, effect_id)
+);
+CREATE INDEX IF NOT EXISTS managed_owner_effects_producer_idx ON managed_owner_effects(producer);
 INSERT OR IGNORE INTO counters (name, value) VALUES
     ('acceptance_seq', 0), ('attempt_seq', 0), ('incident_seq', 0),
     ('evidence_seq', 0), ('audit_seq', 0), ('retained_events', 0), ('managed_completion_seq', 0);
@@ -376,7 +396,18 @@ pub fn ensure(tx: &Transaction<'_>) -> Result<(), CoreError> {
             tx.execute_batch(CURRENT_DDL)?;
             Ok(())
         }
-        Some(Ok(6)) => {
+        Some(Ok(8)) => {
+            // The unreleased v8 owner ledger retained text redundantly. The
+            // frozen intent already commits its SHA-256 and exact byte length.
+            tx.execute("UPDATE managed_owner_effects SET payload=X''", [])?;
+            tx.execute_batch(CURRENT_DDL)?;
+            tx.execute(
+                "UPDATE schema_meta SET value=?1 WHERE key='schema_version'",
+                params![SCHEMA_VERSION.to_string()],
+            )?;
+            Ok(())
+        }
+        Some(Ok(6 | 7)) => {
             tx.execute_batch(CURRENT_DDL)?;
             tx.execute(
                 "UPDATE schema_meta SET value=?1 WHERE key='schema_version'",

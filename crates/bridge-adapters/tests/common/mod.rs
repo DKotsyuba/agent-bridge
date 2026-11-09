@@ -194,6 +194,9 @@ impl Lab {
                 sha256: sha.clone(),
             }],
             audiences: Vec::new(),
+            run_readers: Vec::new(),
+            managed_tools: Vec::new(),
+            owner_v2_routes: Vec::new(),
             legacy_owner_relays: 0,
         };
         let registry = Arc::new(Mutex::new(
@@ -317,16 +320,39 @@ pub struct Harnessed {
 }
 
 impl Harnessed {
+    /// Starts a distinct owned synthetic Run recovery endpoint in an existing
+    /// private directory after the previous socket path has been removed.
+    pub fn start_receipt_only(executable: &Path, directory: &Path) -> Harnessed {
+        let mut child = Command::new(executable)
+            .arg("receipt-only")
+            .arg(directory)
+            .env_remove("AGENT_RUN_LAUNCH_ID")
+            .env_remove("BRIDGE_NATIVE_OWNER_SOCKET")
+            .env_remove("BRIDGE_NATIVE_OWNER_SOCKET_V2")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut fixture = Harnessed {
+            child,
+            stdin,
+            stdout,
+        };
+        assert!(fixture.cmd(json!({"cmd":"owner_log"}))["run_queries"].is_u64());
+        fixture
+    }
     /// Starts a CLI fixture harness whose store variable names `store`, stripping
     /// real Desktop capabilities so owned stand-ins cannot select the GUI route.
     pub fn start(harness: Harness, store: &Path) -> Harnessed {
-        Self::start_with_app(&fixture_exe(), harness, store, None, None)
+        Self::start_with_app(&fixture_exe(), harness, store, None, None, None)
     }
 
     /// Starts a CLI fixture harness from the executable copy `exe` instead of the
     /// shared fixture.
     pub fn start_from(exe: &Path, harness: Harness, store: &Path) -> Harnessed {
-        Self::start_with_app(exe, harness, store, None, None)
+        Self::start_with_app(exe, harness, store, None, None, None)
     }
 
     /// Starts a fixture process with NO product marker: a copy of the fixture at
@@ -345,6 +371,8 @@ impl Harnessed {
             .env_remove("CODEX_APP_TOOLS_PIPE_PATH")
             .env_remove("CODEX_MCP_NODE_PATH")
             .env_remove("BRIDGE_NATIVE_OWNER_SOCKET")
+            .env_remove("BRIDGE_NATIVE_OWNER_SOCKET_V2")
+            .env_remove("AGENT_RUN_LAUNCH_ID")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -360,13 +388,20 @@ impl Harnessed {
 
     /// Starts an owned Codex Desktop stand-in from the executable copy `exe`.
     pub fn start_desktop_from(exe: &Path, store: &Path, pipe: &Path) -> Harnessed {
-        Self::start_with_app(exe, Harness::CODEX, store, Some(pipe), None)
+        Self::start_with_app(exe, Harness::CODEX, store, Some(pipe), None, None)
     }
 
     /// Starts an owned Codex Desktop stand-in with its own native pipe capability;
     /// no installed application, frontend, or caller evidence is fabricated.
     pub fn start_desktop(store: &Path, pipe: &Path) -> Harnessed {
-        Self::start_with_app(&fixture_exe(), Harness::CODEX, store, Some(pipe), None)
+        Self::start_with_app(
+            &fixture_exe(),
+            Harness::CODEX,
+            store,
+            Some(pipe),
+            None,
+            None,
+        )
     }
 
     /// Starts a scripted stand-in native owner (a fixture process) whose direct
@@ -388,6 +423,31 @@ impl Harnessed {
         store: &Path,
         directory: &Path,
     ) -> Harnessed {
+        Self::start_owned_from_inner(owner_exe, harness, store, directory, None, false)
+    }
+
+    /// Starts a synthetic managed owner with an explicit launch and optional
+    /// separate v2/receipt sockets; no inherited locator is ever retained.
+    pub fn start_owned_v2(
+        owner_exe: &Path,
+        harness: Harness,
+        store: &Path,
+        directory: &Path,
+        launch: &str,
+        enabled: bool,
+    ) -> Harnessed {
+        Self::start_owned_from_inner(owner_exe, harness, store, directory, Some(launch), enabled)
+    }
+
+    /// Implements the explicitly configured owned synthetic owner process.
+    fn start_owned_from_inner(
+        owner_exe: &Path,
+        harness: Harness,
+        store: &Path,
+        directory: &Path,
+        launch: Option<&str>,
+        v2_enabled: bool,
+    ) -> Harnessed {
         use std::os::unix::fs::DirBuilderExt;
         std::fs::DirBuilder::new()
             .mode(0o700)
@@ -404,7 +464,8 @@ impl Harnessed {
         } else {
             store.to_path_buf()
         };
-        let mut child = Command::new(owner_exe)
+        let mut command = Command::new(owner_exe);
+        command
             .arg("owner")
             .arg(directory)
             .env("BRIDGE_FIXTURE_HARNESS_EXE", fixture_exe())
@@ -412,13 +473,21 @@ impl Harnessed {
             .env_remove("CLAUDE_CONFIG_DIR")
             .env_remove("OPENCODE_DB")
             .env_remove("BRIDGE_NATIVE_OWNER_SOCKET")
+            .env_remove("BRIDGE_NATIVE_OWNER_SOCKET_V2")
+            .env_remove("BRIDGE_FIXTURE_OWNER_V2")
+            .env_remove("AGENT_RUN_LAUNCH_ID")
             .env(variable, value)
             .env_remove("CODEX_APP_TOOLS_PIPE_PATH")
             .env_remove("CODEX_MCP_NODE_PATH")
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stdout(Stdio::piped());
+        if let Some(launch) = launch {
+            command.env("AGENT_RUN_LAUNCH_ID", launch);
+        }
+        if v2_enabled {
+            command.env("BRIDGE_FIXTURE_OWNER_V2", "1");
+        }
+        let mut child = command.spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         let mut owned = Harnessed {
@@ -443,7 +512,13 @@ impl Harnessed {
             store,
             None,
             Some(std::ffi::OsStr::from_bytes(locator)),
+            None,
         )
+    }
+
+    /// Starts an owned fixture with an explicit synthetic launch UUID.
+    pub fn start_with_launch(harness: Harness, store: &Path, launch: &str) -> Harnessed {
+        Self::start_with_app(&fixture_exe(), harness, store, None, None, Some(launch))
     }
 
     /// Starts the fixture with the specified store, optional owned Desktop pipe
@@ -457,6 +532,7 @@ impl Harnessed {
         store: &Path,
         pipe: Option<&Path>,
         locator: Option<&std::ffi::OsStr>,
+        launch: Option<&str>,
     ) -> Harnessed {
         let variable = match harness {
             Harness::CODEX => "CODEX_HOME",
@@ -482,8 +558,13 @@ impl Harnessed {
             .env_remove("CODEX_APP_TOOLS_PIPE_PATH")
             .env_remove("CODEX_MCP_NODE_PATH")
             .env_remove("BRIDGE_NATIVE_OWNER_SOCKET")
+            .env_remove("BRIDGE_NATIVE_OWNER_SOCKET_V2")
+            .env_remove("AGENT_RUN_LAUNCH_ID")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped());
+        if let Some(launch) = launch {
+            command.env("AGENT_RUN_LAUNCH_ID", launch);
+        }
         if let Some(pipe) = pipe {
             command.env("CODEX_APP_TOOLS_PIPE_PATH", pipe);
         }

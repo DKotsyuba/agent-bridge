@@ -1033,6 +1033,15 @@ impl Storage {
                     &format!("SELECT COALESCE(SUM(CASE WHEN possible THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN NOT possible AND (state!='pending' OR delivery IN('accepted','hook_submitted','refused','disposed')) THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN NOT possible AND state='pending' AND delivery NOT IN('accepted','hook_submitted','refused','disposed') THEN 1 ELSE 0 END),0) FROM (SELECT e.state,e.delivery,{POSSIBLE_EFFECT} AS possible FROM events e WHERE e.publisher_id=?1 AND e.delivery_scope_key=?2)") ,
                     params![grant.producer(),params.scope_key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))
                 ).map_err(storage_error)?;
+                // Managed-owner effects have their own durable ledger. Invoking,
+                // unknown and accepted effects remain possible/real native handoffs
+                // after scope retirement and must appear in the same receipt.
+                let (owner_possible, owner_unsent): (u64, u64) = tx.query_row(
+                    "SELECT COALESCE(SUM(CASE WHEN state IN ('invoking','abort_pending','unknown','accepted') THEN 1 ELSE 0 END),0), COALESCE(SUM(CASE WHEN state IN ('known_unsent','aborted') THEN 1 ELSE 0 END),0) FROM managed_owner_effects WHERE producer=?1 AND producer_scope=?2",
+                    params![grant.producer(), params.scope_key], |row| Ok((row.get(0)?,row.get(1)?)),
+                ).map_err(storage_error)?;
+                let possible = possible.saturating_add(owner_possible);
+                let terminal = terminal.saturating_add(owner_unsent);
                 let retire = params.action == RetirementAction::RetireUnhanded;
                 let receipt = RetireReceipt {
                     producer: grant.producer().into(),

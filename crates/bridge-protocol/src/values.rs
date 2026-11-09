@@ -3,6 +3,26 @@
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt};
 
+/// Computes the lowercase SHA-256 of a reader without retaining its contents.
+///
+/// # Errors
+///
+/// The reader reports an I/O error; no input bytes are included in that error.
+pub fn sha256_reader(reader: &mut impl std::io::Read) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    let mut bytes = [0_u8; 64 * 1024];
+    loop {
+        match reader.read(&mut bytes) {
+            Ok(0) => break,
+            Ok(count) => hash.update(&bytes[..count]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => (),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
 /// Public additive API version; independent of legacy envelope/storage schema.
 pub const API_VERSION: u16 = 1;
 /// Maximum opaque identifier bytes; identifiers are never normalized.

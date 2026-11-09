@@ -13,6 +13,9 @@
 //! tokio's stable `peer_cred` (LOCAL_PEEREPID + getpeereid on macOS,
 //! SO_PEERCRED on Linux) and process facts from `sysinfo`.
 
+/// Linux-only attempt identity and direct launch-environment capture.
+pub mod attempt;
+
 use std::ffi::{OsStr, OsString};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -106,6 +109,9 @@ pub struct ProcessFacts {
     /// Start time in seconds since the Unix epoch; with `pid` it names one
     /// process incarnation (a reused PID has a later start time).
     pub start_time: u64,
+    /// Full Linux identity sampled around the process-table read, if available.
+    #[cfg(target_os = "linux")]
+    pub kernel_incarnation: Option<attempt::KernelIncarnation>,
     /// Resolved executable path, when readable.
     pub exe: Option<PathBuf>,
     /// Real user id, when readable.
@@ -127,11 +133,50 @@ pub fn process_facts(pid: u32) -> Option<ProcessFacts> {
     let process = system.process(target)?;
     Some(ProcessFacts {
         pid,
+        #[cfg(target_os = "linux")]
+        kernel_incarnation: None,
         parent: process.parent().map(Pid::as_u32),
         start_time: process.start_time(),
         exe: process.exe().map(PathBuf::from),
         uid: process.user_id().map(|uid| **uid),
     })
+}
+
+/// Samples a Linux process-table record between equal full identity reads.
+/// Missing kernel evidence leaves the record unqualified for managed use.
+#[cfg(target_os = "linux")]
+pub(crate) fn process_facts_managed(pid: u32) -> Option<ProcessFacts> {
+    use std::os::unix::fs::MetadataExt;
+    let before = std::fs::metadata(format!("/proc/{pid}"))
+        .ok()
+        .and_then(|metadata| attempt::kernel_incarnation(pid, metadata.uid()).ok());
+    let mut facts = process_facts(pid)?;
+    facts.kernel_incarnation = before.and_then(|before| {
+        (facts.uid == Some(before.uid)
+            && attempt::kernel_incarnation(pid, before.uid).ok().as_ref() == Some(&before))
+        .then_some(before)
+    });
+    Some(facts)
+}
+
+/// Reads the bounded ancestry with complete identity around each process read.
+#[cfg(target_os = "linux")]
+pub(crate) fn ancestry_managed(pid: u32) -> Vec<ProcessFacts> {
+    let mut chain = Vec::new();
+    let mut next = Some(pid);
+    while let Some(current) = next {
+        if chain.len() > MAX_ANCESTRY {
+            break;
+        }
+        let Some(facts) = process_facts_managed(current) else {
+            break;
+        };
+        next = facts
+            .parent
+            .filter(|parent| *parent != current && *parent > 0);
+        chain.push(facts);
+    }
+    chain
 }
 
 /// Reads the parent chain of `pid`, starting with `pid` itself, at most

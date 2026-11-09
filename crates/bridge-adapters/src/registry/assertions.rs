@@ -218,7 +218,7 @@ impl Registry {
 
     /// Verifies the current own-UID backend executable and exact loaded build.
     /// Configuration names do not grant authority without core authentication.
-    fn verify_audience(
+    pub(super) fn verify_audience(
         &mut self,
         peer: PeerIdentity,
         producer: &str,

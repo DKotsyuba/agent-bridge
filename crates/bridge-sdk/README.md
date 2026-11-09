@@ -63,6 +63,18 @@ See [exact native reads](../bridge-protocol/docs/wire-v1.md#exact-native-reads)
 for limits and consumer responsibilities. Read failures have no mutation
 reconciliation key.
 
+Managed-attempt methods additionally require an explicit `AttemptServerPin`
+with the configured Bridge server's absolute canonical executable path and
+lowercase SHA-256. Pass it to every managed call, for example
+`client.attempt_binding_capabilities_v1(id, &pin, params)`. The SDK hashes that
+file and verifies the UID, PID, full kernel incarnation and live executable
+inode of the same connected server before writing any credential or request.
+Failure returns `AttemptClientError::PeerNotAuthorized`. Managed operations
+are Linux-only, use one exchange without automatic reconnect, and report an
+uncertain mutation for same-key recovery. Their versioned DTOs live in
+`bridge_sdk::bridge_protocol::attempt` and `managed_owner`; legacy client
+methods and DTOs do not change.
+
 ## Integration sequence
 
 1. At the actual MCP frontend, preserve the protected `_meta` separately from the
@@ -93,7 +105,7 @@ reconciliation key.
 ## Transport and errors
 
 The configuration is immutable and shareable; each exchange owns one bounded Unix stream.
-Before any credential or request byte is sent, the SDK compares the connected
+For the legacy producer methods, before any credential or request byte is sent, the SDK compares the connected
 server's kernel UID with its own effective UID obtained from a fresh socket pair.
 Unreadable or mismatching credentials refuse as `NotSent`. This checks OS user
 identity, not the identity of an arbitrary process running under that same user;

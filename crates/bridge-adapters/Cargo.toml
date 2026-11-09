@@ -24,6 +24,8 @@ listenfd.workspace = true
 tungstenite.workspace = true
 
 [dev-dependencies]
+# Synthetic protected-channel integration exercises the workspace SDK itself.
+bridge-sdk.workspace = true
 # The crate's own fixture feature for its tests only: integration tests build
 # fixture callers, which production builds (no dev-dependencies, feature off) do
 # not contain.

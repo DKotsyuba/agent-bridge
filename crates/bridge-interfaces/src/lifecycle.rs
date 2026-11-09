@@ -439,13 +439,16 @@ pub fn start(
 /// inside it); with `create`, an absent directory is created (`0700`). Never
 /// changes permissions of, clears or replaces anything that already exists.
 pub(crate) fn private_dir(path: &Path, create: bool) -> Result<(), String> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    if create
+        && std::fs::symlink_metadata(path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(path).map_err(|error| error.to_string())?;
+    }
     match std::fs::symlink_metadata(path) {
-        Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(path).map_err(|error| error.to_string())?;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-                .map_err(|error| error.to_string())
-        }
         Err(error) => Err(format!("{}: {error}", path.display())),
         Ok(metadata)
             if metadata.is_dir()
@@ -547,6 +550,27 @@ mod tests {
     use super::*;
     use crate::testdir::TestDir;
     use std::os::unix::net::UnixListener;
+
+    /// Concurrent first users observe a private directory immediately and
+    /// existing insecure directories are never silently changed.
+    #[test]
+    fn concurrent_private_directory_creation_is_atomic() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = TestDir::new("private-state");
+        let path = dir.path().join("nested/state");
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| scope.spawn(|| private_dir(&path, true)))
+                .collect();
+            for handle in handles {
+                handle.join().unwrap().unwrap();
+            }
+        });
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o077, 0);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(private_dir(&path, true).is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o777);
+    }
 
     /// Distinct listeners of this process are ready; a second name of the same
     /// socket (hard link, same device and inode) is not, in either order, and

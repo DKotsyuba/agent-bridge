@@ -228,6 +228,7 @@ fn harness() {
             "delayed_hook" => run_delayed_hook(&command),
             "mcp" => run_mcp(&command),
             "v1" => run_v1_frontend(&command),
+            "b1" => run_b1_frontend(&command),
             "v1_and_legacy" => run_v1_and_legacy(&command),
             "v1_direct" => core_call(
                 command["socket"].as_str().unwrap_or_default(),
@@ -289,6 +290,188 @@ struct OwnerState {
     probes: u64,
     /// Strict request frames received, in order.
     frames: Vec<Value>,
+    /// Separate v2 frames, never mixed with v1 owner traffic.
+    v2_frames: Vec<Value>,
+    /// Synthetic durable Run current receipt selected by the test.
+    run_receipt: Value,
+    /// Number of authenticated receipt-query connections received.
+    run_queries: u64,
+    /// Synthetic Run effect states, keyed by producer scope and effect ID.
+    run_effects: std::collections::HashMap<(String, String), Value>,
+}
+
+/// Serves scripted owner-v2 frames only on the separately bound test socket.
+fn owner_v2_serve(listener: UnixListener, state: Arc<Mutex<OwnerState>>) {
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else { break };
+        let state = Arc::clone(&state);
+        std::thread::spawn(move || {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut head = [0; 4];
+            if stream.read_exact(&mut head).is_err() {
+                return;
+            }
+            let length = u32::from_le_bytes(head) as usize;
+            if length == 0 || length > 1_048_576 {
+                return;
+            }
+            let mut body = vec![0; length];
+            if stream.read_exact(&mut body).is_err() {
+                return;
+            }
+            let Ok(request) = serde_json::from_slice::<Value>(&body) else {
+                return;
+            };
+            let mode = {
+                let mut state = state.lock().unwrap();
+                state.v2_frames.push(request.clone());
+                state.mode.clone()
+            };
+            let (state_name, protocol, native_id, reason) =
+                match mode.split_once(':').unwrap_or((&mode, "")) {
+                    ("codex_accept", _) => (
+                        "accepted",
+                        json!("codex_turn"),
+                        json!("fresh-native-id"),
+                        Value::Null,
+                    ),
+                    ("claude_accept", _) => (
+                        "accepted",
+                        json!("claude_input"),
+                        json!("fresh-native-id"),
+                        Value::Null,
+                    ),
+                    ("wrong_effect", _) => (
+                        "accepted",
+                        json!("claude_input"),
+                        json!("fresh-native-id"),
+                        Value::Null,
+                    ),
+                    ("known_unsent", reason) => {
+                        ("known_unsent", Value::Null, Value::Null, json!(reason))
+                    }
+                    ("unknown", reason) => ("unknown", Value::Null, Value::Null, json!(reason)),
+                    _ => return,
+                };
+            let mut response = json!({"version":2,"call_id":request["call_id"],"effect_id":request["outbox_intent"]["effect_id"],"effect_digest":request["effect_digest"],"state":state_name,"protocol":protocol,"native_id":native_id,"reason":reason});
+            if mode == "wrong_effect" {
+                response["effect_id"] = json!("different-effect");
+            }
+            let bytes = response.to_string().into_bytes();
+            let _ = stream.write_all(&(bytes.len() as u32).to_le_bytes());
+            let _ = stream.write_all(&bytes);
+        });
+    }
+}
+
+/// Serves only a synthetic pinned Run receipt lookup on a separate endpoint.
+fn receipt_serve(
+    listener: UnixListener,
+    state: Arc<Mutex<OwnerState>>,
+    gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+) {
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else { break };
+        let state = Arc::clone(&state);
+        let gate = Arc::clone(&gate);
+        std::thread::spawn(move || {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut line = String::new();
+            if BufReader::new(&stream).read_line(&mut line).is_err() {
+                return;
+            }
+            let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                return;
+            };
+            let mut state = state.lock().unwrap();
+            state.run_queries += 1;
+            let response = match request["method"].as_str().unwrap_or_default() {
+                "_attempt_current_receipt_v1" if !state.run_receipt.is_null() => {
+                    let receipt = state.run_receipt.clone();
+                    json!({"id":request["id"],"result":{"version":1,"store_id":receipt["attempt"]["run_store_id"],"receipt":receipt}})
+                }
+                method @ ("_owner_effect_lookup_v2" | "_owner_effect_abort_v2") => {
+                    let params = &request["params"];
+                    let key = (
+                        params["producer_scope"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                        params["effect_id"].as_str().unwrap_or_default().to_string(),
+                    );
+                    let mut effect = state.run_effects.get(&key).cloned().unwrap_or_else(|| json!({"state":"absent","protocol":null,"native_id":null,"reason":null,"effect_digest":params["effect_digest"]}));
+                    if effect["effect_digest"] != params["effect_digest"] {
+                        return;
+                    }
+                    if method == "_owner_effect_abort_v2"
+                        && (effect["state"] == "absent" || effect["state"] == "known_unsent")
+                    {
+                        effect = json!({"state":"aborted","protocol":null,"native_id":null,"reason":null,"effect_digest":params["effect_digest"]});
+                        state.run_effects.insert(key, effect.clone());
+                    }
+                    let reply_id = effect
+                        .get("reply_effect_id")
+                        .unwrap_or(&params["effect_id"]);
+                    let reply_store = effect
+                        .get("reply_store_id")
+                        .unwrap_or(&params["expected_store_id"]);
+                    json!({"id":request["id"],"result":{"version":2,"store_id":reply_store,"producer_scope":params["producer_scope"],"effect_id":reply_id,"effect_digest":params["effect_digest"],"state":effect["state"],"protocol":effect["protocol"],"native_id":effect["native_id"],"reason":effect["reason"]}})
+                }
+                _ => return,
+            };
+            drop(state);
+            if request["method"] == "_attempt_current_receipt_v1" {
+                let (held, wake) = &*gate;
+                let held = held.lock().unwrap();
+                drop(wake.wait_timeout_while(held, Duration::from_secs(10), |held| *held));
+            }
+            let _ = writeln!(stream, "{response}");
+        });
+    }
+}
+
+/// A distinct synthetic Run build serving only the receipt/recovery socket.
+fn receipt_only(directory: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let socket = Path::new(directory).join("attempt-receipts.sock");
+    let listener = UnixListener::bind(&socket).expect("receipt socket");
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).expect("mode");
+    let state = Arc::new(Mutex::new(OwnerState::default()));
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    std::thread::spawn({
+        let state = Arc::clone(&state);
+        move || receipt_serve(listener, state, gate)
+    });
+    let mut output = std::io::stdout();
+    for line in std::io::stdin().lock().lines() {
+        let Ok(line) = line else { break };
+        let command: Value = serde_json::from_str(&line).unwrap_or_default();
+        let reply = match command["cmd"].as_str().unwrap_or_default() {
+            "owner_set_effect" => {
+                let key = (
+                    command["producer_scope"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    command["effect_id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+                state
+                    .lock()
+                    .unwrap()
+                    .run_effects
+                    .insert(key, command["effect"].clone());
+                json!({"ok":true})
+            }
+            "owner_log" => json!({"run_queries":state.lock().unwrap().run_queries}),
+            "exit" => break,
+            _ => json!({"error":"unknown command"}),
+        };
+        let _ = writeln!(output, "{reply}");
+        let _ = output.flush();
+    }
 }
 
 /// Renders the scripted receipt bytes for `mode` answering `request`, or
@@ -377,14 +560,40 @@ fn owner(directory: &str) {
     let listener = UnixListener::bind(&socket).expect("owner socket");
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).expect("mode");
     let state = Arc::new(Mutex::new(OwnerState::default()));
+    let receipt_gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
     let served = Arc::clone(&state);
     std::thread::spawn(move || owner_serve(listener, served));
+    let v2_enabled = std::env::var_os("BRIDGE_FIXTURE_OWNER_V2").is_some();
+    let v2_socket = Path::new(directory).join("v2.sock");
+    if v2_enabled {
+        let v2_listener = UnixListener::bind(&v2_socket).expect("v2 owner socket");
+        std::fs::set_permissions(&v2_socket, std::fs::Permissions::from_mode(0o600)).expect("mode");
+        let receipt_socket = Path::new(directory).join("attempt-receipts.sock");
+        let receipt_listener = UnixListener::bind(&receipt_socket).expect("receipt socket");
+        std::fs::set_permissions(&receipt_socket, std::fs::Permissions::from_mode(0o600))
+            .expect("mode");
+        std::thread::spawn({
+            let state = Arc::clone(&state);
+            move || owner_v2_serve(v2_listener, state)
+        });
+        std::thread::spawn({
+            let state = Arc::clone(&state);
+            let gate = Arc::clone(&receipt_gate);
+            move || receipt_serve(receipt_listener, state, gate)
+        });
+    }
     let harness_exe = std::env::var_os("BRIDGE_FIXTURE_HARNESS_EXE")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::current_exe().expect("self"));
-    let mut child = Command::new(harness_exe)
+    let mut command = Command::new(harness_exe);
+    command
         .arg("harness")
         .env("BRIDGE_NATIVE_OWNER_SOCKET", &socket)
+        .env_remove("BRIDGE_NATIVE_OWNER_SOCKET_V2");
+    if v2_enabled {
+        command.env("BRIDGE_NATIVE_OWNER_SOCKET_V2", &v2_socket);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -402,7 +611,35 @@ fn owner(directory: &str) {
             }
             "owner_log" => {
                 let state = state.lock().unwrap();
-                json!({"probes": state.probes, "frames": state.frames, "harness_pid": child.id()})
+                json!({"probes": state.probes, "frames": state.frames, "v2_frames":state.v2_frames,"run_queries":state.run_queries,"harness_pid": child.id()})
+            }
+            "owner_set_receipt" => {
+                state.lock().unwrap().run_receipt = command["receipt"].clone();
+                json!({"ok":true})
+            }
+            "owner_hold_receipt" => {
+                let (held, wake) = &*receipt_gate;
+                *held.lock().unwrap() = command["held"].as_bool().unwrap_or(false);
+                wake.notify_all();
+                json!({"ok":true})
+            }
+            "owner_set_effect" => {
+                let key = (
+                    command["producer_scope"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    command["effect_id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+                state
+                    .lock()
+                    .unwrap()
+                    .run_effects
+                    .insert(key, command["effect"].clone());
+                json!({"ok":true})
             }
             "owner_stop_harness" => {
                 drop(to_child.take());
@@ -684,6 +921,59 @@ fn run_v1_frontend(command: &Value) -> Value {
         .write_all(command["request"].to_string().as_bytes());
     let output = child.wait_with_output().expect("owned frontend output");
     serde_json::from_slice(&output.stdout).unwrap_or(json!({"error": "frontend response missing"}))
+}
+
+/// Runs a raw B1 frame as an owned stdio frontend with genuine ancestry.
+fn run_b1_frontend(command: &Value) -> Value {
+    let mut process = Command::new(std::env::current_exe().expect("own executable"));
+    process
+        .arg("b1-frontend")
+        .arg(command["socket"].as_str().unwrap_or_default())
+        .stdout(Stdio::piped());
+    let redirected = command["non_stdio"].as_bool() == Some(true);
+    if redirected {
+        use std::os::unix::fs::OpenOptionsExt;
+        let nonce: String = bridge_adapters::os::random_bytes().unwrap()[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let path = std::env::temp_dir().join(format!("b1-input-{nonce}"));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        file.write_all(command["request"].to_string().as_bytes())
+            .unwrap();
+        drop(file);
+        let input = std::fs::File::open(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        process.stdin(Stdio::from(input));
+    } else {
+        process.stdin(Stdio::piped());
+    }
+    let mut child = process.spawn().expect("owned B1 frontend");
+    if !redirected {
+        let _ = child
+            .stdin
+            .take()
+            .expect("frontend input")
+            .write_all(command["request"].to_string().as_bytes());
+    }
+    let output = child.wait_with_output().expect("owned frontend output");
+    serde_json::from_slice(&output.stdout).unwrap_or(json!({"error":"frontend response missing"}))
+}
+
+/// Sends one bounded raw B1 request over the owned channel.
+fn b1_frontend(socket: &str) {
+    let mut bytes = Vec::new();
+    let _ = std::io::stdin()
+        .take(bridge_protocol::MAX_REGISTRATION_BYTES as u64 + 1)
+        .read_to_end(&mut bytes);
+    if let Ok(request) = serde_json::from_slice::<Value>(&bytes) {
+        println!("{}", core_call(socket, &request));
+    }
 }
 
 /// Runs genuine sibling frontends for a controlled reservation/legacy race.
@@ -1437,11 +1727,13 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("harness") => harness(),
         Some("owner") => owner(args.get(2).map(String::as_str).unwrap_or_default()),
+        Some("receipt-only") => receipt_only(args.get(2).map(String::as_str).unwrap_or_default()),
         Some("delayed-hook") => delayed_hook(args.get(2).map(String::as_str).unwrap_or_default()),
         Some("desktop-child") => desktop_child(args.get(2).unwrap()),
         Some("mcp") => mcp(args.get(2).map(String::as_str).unwrap_or_default(), false),
         Some("mcp-seal") => mcp(args.get(2).map(String::as_str).unwrap_or_default(), true),
         Some("relay") => relay(args.get(2).map(String::as_str).unwrap_or_default()),
+        Some("b1-frontend") => b1_frontend(args.get(2).map(String::as_str).unwrap_or_default()),
         Some("v1-frontend") => {
             v1_frontend(args.get(2).map(String::as_str).unwrap_or_default(), false)
         }

@@ -641,6 +641,7 @@ mod tests {
         let facts = os::process_facts(std::process::id()).unwrap();
         let binding = RecipientBinding {
             harness: (facts.pid, facts.start_time),
+            managed_incarnation: None,
             epoch: 1,
             store: dir.clone(),
             executable: facts.exe.unwrap(),

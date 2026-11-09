@@ -1,5 +1,8 @@
 //! Thin synchronous universal producer client for protected local Bridge sockets.
 //! No domain outbox, native attestation, core/storage dependency or background work.
+pub mod attempt;
+#[cfg(target_os = "linux")]
+mod attempt_peer;
 pub mod client;
 pub mod config;
 pub mod native_meta;
@@ -7,6 +10,7 @@ pub mod publication;
 pub mod registration;
 pub mod status;
 mod transport;
+pub use attempt::{AttemptClientError, AttemptServerPin};
 pub use bridge_protocol;
 use bridge_protocol::{ApiError, ProtocolError, ReconciliationKey};
 pub use client::Client;

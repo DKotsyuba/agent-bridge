@@ -31,6 +31,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+mod attempt;
+#[cfg(target_os = "linux")]
+mod owner_v2;
 mod producer;
 
 use bridge_core::dispatch::{
@@ -395,6 +398,9 @@ struct ChannelState {
     running: AtomicBool,
     /// Connections being served.
     active: AtomicUsize,
+    /// Round-robin cursor for bounded managed-owner compaction passes.
+    #[cfg(target_os = "linux")]
+    owner_compaction_cursor: AtomicUsize,
 }
 
 /// A running channel listener.
@@ -602,6 +608,8 @@ impl ChannelServer {
             timing,
             running: AtomicBool::new(true),
             active: AtomicUsize::new(0),
+            #[cfg(target_os = "linux")]
+            owner_compaction_cursor: AtomicUsize::new(0),
         });
         let accept_state = Arc::clone(&state);
         let accept = std::thread::Builder::new()
@@ -652,7 +660,12 @@ impl Drop for ChannelServer {
 
 /// Accepts connections until stopped, one bounded thread each.
 fn accept_loop(listener: UnixListener, state: Arc<ChannelState>) {
+    let mut next_attempt_maintenance = Instant::now();
     while state.running.load(Ordering::SeqCst) {
+        if Instant::now() >= next_attempt_maintenance {
+            lock_registry(&state.registry).maintain_attempts(current_unix_millis());
+            next_attempt_maintenance = Instant::now() + Duration::from_secs(1);
+        }
         match listener.accept() {
             Ok((stream, _)) => {
                 if state.active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
@@ -731,10 +744,27 @@ fn serve(stream: UnixStream, state: &ChannelState) {
     let Some(line) = read_line(&mut reader, IO_TIMEOUT) else {
         return;
     };
-    if serde_json::from_str::<serde_json::Value>(&line)
+    if let Some(value) = serde_json::from_str::<serde_json::Value>(&line)
         .ok()
-        .is_some_and(|value| value.get("api_version").is_some())
+        .filter(|value| value.get("api_version").is_some())
     {
+        #[cfg(target_os = "linux")]
+        if value
+            .get("op")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(owner_v2::is_owner_operation)
+        {
+            owner_v2::serve(&line, peer, state, &mut writer);
+            return;
+        }
+        if value
+            .get("op")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(attempt::is_attempt_operation)
+        {
+            attempt::serve(&line, peer, state, &mut writer);
+            return;
+        }
         producer::serve_v1(&line, peer, state, &mut writer);
         return;
     }

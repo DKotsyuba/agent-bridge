@@ -2,8 +2,9 @@
 
 Native Codex, Claude Code and managed OpenCode adapters for Agent Bridge: the protected caller
 registry, quiet root hooks, lifecycle plugin and message carriers. They consume core's
-single custody and attempt state (`DispatchCarrier`, `observe_binding`,
-`drain_inject`, `record_outcome`); there is no second attempt or hook store.
+single delivery custody and attempt state (`DispatchCarrier`, `observe_binding`,
+`drain_inject`, `record_outcome`). The separate [private attempt-binding journal](docs/attempt-binding-v1.md)
+retains original managed observations, consumes and abort fences; Run owns admission.
 
 Status: implemented and covered by tests that run real channel, hook, relay and core
 processes against labeled stand-in harnesses (`bridge-fixture`) and scripted carriers.
@@ -603,8 +604,9 @@ one (connection refused) is replaced.
 The adapter socket additionally serves authenticated v1 `capabilities`,
 `register_call` and `consume_assertion`; core publication/status/lifetime
 operations retain the separately configured core endpoint. The authority is
-shared with core, while native observation claims and audience assertions remain
-ephemeral. Historical route recovery is not invocation permission.
+shared with core. Legacy native observation claims and audience assertions remain
+ephemeral; managed consume receipts and abort fences use a separate private journal.
+Historical route recovery is not invocation permission.
 
 See [the native provider contract](docs/producer-native-v1.md) for opaque
 producer onboarding, declaration of generic backend audiences, exact

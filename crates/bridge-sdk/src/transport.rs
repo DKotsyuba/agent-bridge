@@ -187,6 +187,86 @@ fn read_frame(stream: &mut UnixStream, deadline: Instant) -> Result<Vec<u8>, &'s
     }
 }
 
+/// Secret-safe managed exchange failure, distinguishing refused peer proof.
+pub(crate) enum AttemptFailure {
+    /// The same connected peer failed its explicit executable/build pin.
+    PeerNotAuthorized,
+    /// Transport failure and whether any request write may have occurred.
+    Transport(bool, &'static str),
+}
+impl From<(bool, &'static str)> for AttemptFailure {
+    /// Preserves the write stage and static transport diagnostic.
+    fn from((wrote, reason): (bool, &'static str)) -> Self {
+        Self::Transport(wrote, reason)
+    }
+}
+
+/// Makes exactly one authenticated B1 exchange. No credential byte is
+/// written until the connected server's UID, kernel identity and pinned
+/// executable/build have all been proven. Uncertain writes are not retried.
+#[cfg(target_os = "linux")]
+pub(crate) fn exchange_attempt(
+    path: &Path,
+    bytes: &[u8],
+    timeout: Duration,
+    pin: &crate::AttemptServerPin,
+) -> Result<Vec<u8>, AttemptFailure> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or((false, "deadline overflow"))?;
+    let expected_uid = current_uid().map_err(|_| (false, "current user identity unavailable"))?;
+    let executable = crate::attempt_peer::prepare(expected_uid, pin, deadline)
+        .map_err(|_| AttemptFailure::PeerNotAuthorized)?;
+    let socket = Socket::new(Domain::UNIX, Type::STREAM, None)
+        .map_err(|_| (false, "socket creation failed"))?;
+    let address = SockAddr::unix(path).map_err(|_| (false, "invalid socket address"))?;
+    let before_connect_ticks =
+        crate::attempt_peer::sample_start_ticks().map_err(|_| AttemptFailure::PeerNotAuthorized)?;
+    socket
+        .connect_timeout(
+            &address,
+            remaining(deadline).map_err(|_| (false, "connect deadline"))?,
+        )
+        .map_err(|_| (false, "connect failed"))?;
+    let owned: OwnedFd = socket.into();
+    let mut stream = UnixStream::from(owned);
+    let (uid, pid) = peer_credentials(&stream).map_err(|_| AttemptFailure::PeerNotAuthorized)?;
+    if uid != expected_uid {
+        return Err(AttemptFailure::PeerNotAuthorized);
+    }
+    let pid = pid.ok_or(AttemptFailure::PeerNotAuthorized)?;
+    crate::attempt_peer::verify(pid, uid, pin, executable, before_connect_ticks, deadline)
+        .map_err(|_| AttemptFailure::PeerNotAuthorized)?;
+    if peer_credentials(&stream).ok() != Some((uid, Some(pid))) {
+        return Err(AttemptFailure::PeerNotAuthorized);
+    }
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let budget = remaining(deadline).map_err(|_| (offset != 0, "write deadline"))?;
+        stream
+            .set_write_timeout(Some(budget))
+            .map_err(|_| (offset != 0, "write timeout unavailable"))?;
+        match stream.write(&bytes[offset..]) {
+            Ok(0) => return Err((true, "write closed").into()),
+            Ok(n) => offset += n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => (),
+            Err(_) => return Err((true, "write failed").into()),
+        }
+    }
+    read_frame(&mut stream, deadline).map_err(|reason| (true, reason).into())
+}
+
+/// Managed B1 is not qualified on this platform and never connects.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn exchange_attempt(
+    _: &Path,
+    _: &[u8],
+    _: Duration,
+    _: &crate::AttemptServerPin,
+) -> Result<Vec<u8>, AttemptFailure> {
+    Err(AttemptFailure::PeerNotAuthorized)
+}
+
 /// Reads this process's effective UID from credentials on a fresh private socket
 /// pair. Both handles close before return; no environment, path owner or label is
 /// identity evidence. Missing kernel credential support fails closed.
@@ -202,6 +282,11 @@ fn current_uid() -> std::io::Result<u32> {
 /// nonblocking flags, restored to blocking on every result. All duplicate handles
 /// and the task-free driver are released before return; errors expose no peer data.
 fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
+    peer_credentials(stream).map(|(uid, _)| uid)
+}
+
+/// Reads UID and optional PID from the same connected socket's kernel peer.
+fn peer_credentials(stream: &UnixStream) -> std::io::Result<(u32, Option<u32>)> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .build()?;
@@ -210,9 +295,14 @@ fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
         let clone = stream.try_clone()?;
         clone.set_nonblocking(true)?;
         let registered = tokio::net::UnixStream::from_std(clone)?;
-        let uid = registered.peer_cred().map(|credentials| credentials.uid());
+        let credentials = registered.peer_cred().map(|credentials| {
+            (
+                credentials.uid(),
+                credentials.pid().and_then(|pid| u32::try_from(pid).ok()),
+            )
+        });
         drop(registered.into_std()?);
-        uid
+        credentials
     })();
     // No tasks were spawned. Nonblocking shutdown is valid even when the SDK
     // was called synchronously from a surrounding runtime's worker thread.

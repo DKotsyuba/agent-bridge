@@ -162,7 +162,10 @@ fn version_two_databases_migrate_without_touching_accepted_bytes_or_identity() {
         .collect();
 
     let mut storage = Storage::open(&path, Limits::new(100)).unwrap();
-    assert_eq!(version(&path), "7");
+    assert_eq!(
+        version(&path),
+        bridge_core::schema::SCHEMA_VERSION.to_string()
+    );
     let after: Vec<(String, Vec<u8>, String)> = Connection::open(&path)
         .unwrap()
         .prepare("SELECT event_id, envelope_json, envelope_hash FROM events ORDER BY event_id")
@@ -572,7 +575,10 @@ fn version_four_databases_gain_lineages_additively() {
             .unwrap();
     }
     let mut storage = Storage::open(&path, Limits::new(10)).unwrap();
-    assert_eq!(version(&path), "7");
+    assert_eq!(
+        version(&path),
+        bridge_core::schema::SCHEMA_VERSION.to_string()
+    );
     // Lineage fencing is live on the migrated database.
     let event = Envelope::new(
         PublisherId::new("agent-run").unwrap(),
@@ -1166,7 +1172,10 @@ fn version_six_adds_bounded_policy_without_enrolling_existing_messages() {
         connection.execute_batch("DROP TABLE managed_deliveries; UPDATE schema_meta SET value='6' WHERE key='schema_version';").unwrap();
     }
     let mut storage = Storage::open(&path, Limits::new(100)).unwrap();
-    assert_eq!(version(&path), "7");
+    assert_eq!(
+        version(&path),
+        bridge_core::schema::SCHEMA_VERSION.to_string()
+    );
     storage.run_maintenance(900_000).unwrap();
     assert!(
         storage

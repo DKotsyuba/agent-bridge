@@ -6,7 +6,7 @@ use bridge_protocol::*;
 #[derive(Debug, Clone)]
 pub struct Client {
     /// Explicit trusted deployment configuration, never auto-discovered.
-    config: Config,
+    pub(crate) config: Config,
 }
 impl Client {
     /// Validates configuration without connecting or consuming evidence.

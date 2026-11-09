@@ -1,7 +1,9 @@
 //! Universal producer wire v1, independent of core, native carriers and products.
 //! Decoding/validation never creates native authority. See the canonical wire doc.
+pub mod attempt;
 mod dto;
 mod fingerprint;
+pub mod managed_owner;
 mod validate;
 mod values;
 mod wire;

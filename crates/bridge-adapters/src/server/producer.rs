@@ -465,7 +465,7 @@ fn register(
 
 /// Converts original framework evidence using existing native parsing; explicit
 /// host tag must agree. Sealed values carry no caller-authored origin facts.
-fn evidence(candidate: &CallEvidence) -> Result<PresentedMeta, CorrelationError> {
+pub(super) fn evidence(candidate: &CallEvidence) -> Result<PresentedMeta, CorrelationError> {
     match candidate {
         CallEvidence::Native { host, metadata } => {
             let meta = PresentedMeta::from_mcp_meta(metadata)?;

@@ -229,7 +229,24 @@ sha256 = "<64 hex>"
 name = "backend-a"                      # opaque name, also granted in assertion_audiences
 producer = "sample-producer"            # authenticated producer identity
 executable = { path = "/ABS/backend", sha256 = "<64 hex>" }
+
+[[adapters.run_readers]]                # optional: attempt-binding Run reader
+producer = "sample-producer"
+reader = "sample-run-reader"            # distinct authenticated producer identity
+executable = { path = "/ABS/run-reader", sha256 = "<distinct 64 hex>" }
+
+[[adapters.managed_tools]]              # optional: qualified stdio frontend
+producer = "sample-producer"
+server = "pool"
+commands = ["vote"]
+frontend = { path = "/ABS/stdio-frontend", sha256 = "<distinct 64 hex>" }
 ```
+
+Managed frontend, backend audience and Run reader must have distinct paths and
+build digests. A managed producer requires all three configured roles; only
+the configured reader may attest retirement of a fully settled old issuer
+namespace. See the [attempt-binding wire](../crates/bridge-adapters/docs/attempt-binding-v1.md)
+for its recovery, retention and transport boundaries.
 
 No store path and no harness executable is declared. A hook counts as a hook of a harness
 only when its parent chain reaches a process of that harness product (through the
@@ -348,6 +365,56 @@ process started. No owner path or digest is configured, and no enrollment exists
 
 Do not share a backend credential or executable qualification with an untrusted
 frontend: an audience entry is a deployment trust declaration, not a permission.
+
+### Managed owner v2
+
+Managed attempt-bound messages use a separate Linux-only owner route. Configure
+each `[[adapters.owner_v2_routes]]` with `producer`, `audience`, a nonempty
+`producer_scopes` array owned only by that producer, an absolute
+`run_home`, `run_route`, `pool_route`, `bridge_route` and
+`run_executable = { path = "/ABS/run", sha256 = "<sha256>" }`. Each route is
+an inline table with `component_store_id`, `route_id` and `worker_uid`. The
+Bridge route names this store; the Run route names the pinned Run store; the
+Pool route must match the Run receipt-reader grant configured for Bridge. All
+worker UIDs must be the daemon's UID, and the producer must have a distinct
+configured backend audience and a grant allowing delivery scopes, the target
+recipient, message mode and keep-all policy. Ambiguous route configuration is
+refused. The Run executable must be a different build from the producer's
+frontend and audience.
+
+Run separately configures the Bridge daemon executable as both a receipt
+reader and a scoped owner-custody reader on its private `attempt-receipts.sock`
+endpoint. Bridge checks that endpoint's
+same-UID peer and pinned Run executable, reads the Run-owned receipt, and
+compares the whole attempt, process incarnation, actor and lineage to the
+frozen effect. The receipt read has a 15-second absolute budget and the owner
+handoff a separate 35-second budget; clients must account for both and for
+local peer verification. The harness must name a separately qualified
+`BRIDGE_NATIVE_OWNER_SOCKET_V2` in its original environment. An absent or
+unverifiable v2 locator is known unsent; no legacy owner or other carrier is
+probed. An effect is persisted as invoking before possible native I/O, is never
+coalesced with another, and an unknown or accepted result is never resent.
+Scope retirement fences new dispatch while preserving historical outcomes.
+An explicit abort durably fences local dispatch before asking Run to install a
+permanent writer tombstone. A matching authenticated Run lookup can resolve an
+unknown effect as accepted or aborted; unavailable Run recovery leaves it
+unknown and never resent. After the producer has settled its effects and
+retired its scope, it may request explicit compaction: known-unsent rows and
+Run-confirmed accepted or aborted rows can be removed while the permanent
+scope fence remains. Unknown and pending-abort rows stay. Doctor reports the
+per-store and per-producer custody headroom. The owner ledger retains at most
+65,536 rows per store, also bounded by `max_retained_events`, and 4,096 rows
+per producer; neither limit causes an uncertain effect to be evicted.
+
+The first root hook journals its original launch observation with the full
+process identity and actor epoch. After a Bridge restart that observation
+stays inert until a fresh root hook proves the same process, session and
+epoch. A missing original observation requires a new launch; no later hook
+can repair it. The authenticated Run reader can query whether a fresh hook or
+relaunch is required. Every handoff still requires a current Run receipt.
+Peer checks retain a narrow equal-tick PID reuse window until pidfd pinning is
+available; Run's writer fence protects aborts racing the final Bridge check.
+Native host qualification remains a separate manual process.
 
 ## Interfaces configuration
 

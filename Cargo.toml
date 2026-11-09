@@ -24,7 +24,7 @@ bridge-protocol = { path = "crates/bridge-protocol" }
 bridge-sdk = { path = "crates/bridge-sdk" }
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = { version = "=1.0.154", features = ["float_roundtrip"] }
 signal-hook = "0.3.18"
 socket2 = "0.6.5"
 listenfd = "=1.0.2"

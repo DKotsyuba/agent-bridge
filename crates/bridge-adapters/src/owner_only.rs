@@ -53,8 +53,12 @@ impl OwnerOnlyCarrier {
         crate::registry::refresh_stale(&self.registry);
         let candidate = lock_registry(&self.registry).message_candidate(recipient)?;
         let (attestation, binding) = candidate.validate()?;
-        let socket = crate::owner::locate(&self.registry, binding.harness)?
-            .ok_or("the recipient has no supported native owner")?;
+        let socket = crate::owner::locate(
+            &self.registry,
+            binding.harness,
+            binding.managed_incarnation.as_ref(),
+        )?
+        .ok_or("the recipient has no supported native owner")?;
         lock_registry(&self.registry).message_current(&candidate)?;
         Ok((attestation, binding, socket))
     }
@@ -108,6 +112,7 @@ impl DispatchCarrier for OwnerOnlyCarrier {
             &self.registry,
             &socket,
             binding.harness,
+            binding.managed_incarnation.as_ref(),
             address.harness,
             &crate::owner::Handoff {
                 thread_id: &address.native_session_id,

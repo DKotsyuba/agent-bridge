@@ -30,6 +30,14 @@ pub(super) enum ClaimSource {
         /// Actual owning harness process incarnation.
         harness: (u32, u64),
     },
+    /// A managed call reserved by the complete original kernel identity.
+    #[cfg(target_os = "linux")]
+    ManagedNative {
+        /// Protected per-invocation call identifier.
+        call: String,
+        /// Full original kernel incarnation.
+        incarnation: os::attempt::KernelIncarnation,
+    },
     /// A legacy frontend proof retaining the original observation-use identity.
     Sealed {
         /// SHA-256 lookup of the proof, never the raw secret.
@@ -76,10 +84,13 @@ impl Registry {
         request_id: &str,
         fingerprint: &str,
     ) -> Result<Option<String>, CorrelationError> {
-        let claim = self
-            .claims
-            .iter()
-            .find(|(_, claim)| claim.producer == producer && claim.request_id == request_id);
+        let claim = self.claims.iter().find(|(_, claim)| {
+            #[cfg(target_os = "linux")]
+            let legacy = !matches!(claim.source, ClaimSource::ManagedNative { .. });
+            #[cfg(not(target_os = "linux"))]
+            let legacy = true;
+            legacy && claim.producer == producer && claim.request_id == request_id
+        });
         match claim {
             Some((key, claim)) if claim.fingerprint == fingerprint => Ok(Some(key.clone())),
             Some(_) => Err(CorrelationError::Conflicting(
@@ -209,6 +220,20 @@ impl Registry {
                         record.consumed = true;
                     }
                 }
+                #[cfg(target_os = "linux")]
+                ClaimSource::ManagedNative { call, incarnation } => {
+                    if let Some(record) = self.calls.get_mut(&call).and_then(|records| {
+                        records.iter_mut().find(|record| {
+                            record
+                                .launch_observation
+                                .as_ref()
+                                .is_some_and(|launch| launch.incarnation == incarnation)
+                        })
+                    }) {
+                        record.claimed = false;
+                        record.consumed = true;
+                    }
+                }
                 ClaimSource::Sealed { digest } => {
                     self.sealed.remove(&digest);
                 }
@@ -219,14 +244,30 @@ impl Registry {
     /// Releases only a proven uncommitted claim. Callers must never invoke this
     /// merely because a response was lost or a reconciliation row was absent.
     pub(crate) fn release_claim(&mut self, use_key: &str) {
-        if let Some(claim) = self.claims.remove(use_key)
-            && let ClaimSource::Native { call, harness } = claim.source
-            && let Some(record) = self
-                .calls
-                .get_mut(&call)
-                .and_then(|records| records.iter_mut().find(|record| record.harness == harness))
-        {
-            record.claimed = false;
+        if let Some(claim) = self.claims.remove(use_key) {
+            match claim.source {
+                ClaimSource::Native { call, harness } => {
+                    if let Some(record) = self.calls.get_mut(&call).and_then(|records| {
+                        records.iter_mut().find(|record| record.harness == harness)
+                    }) {
+                        record.claimed = false;
+                    }
+                }
+                #[cfg(target_os = "linux")]
+                ClaimSource::ManagedNative { call, incarnation } => {
+                    if let Some(record) = self.calls.get_mut(&call).and_then(|records| {
+                        records.iter_mut().find(|record| {
+                            record
+                                .launch_observation
+                                .as_ref()
+                                .is_some_and(|launch| launch.incarnation == incarnation)
+                        })
+                    }) {
+                        record.claimed = false;
+                    }
+                }
+                ClaimSource::Sealed { .. } => (),
+            }
         }
     }
 
@@ -339,6 +380,9 @@ mod tests {
                 max_call_age_ms: 10_000,
                 relays: Vec::new(),
                 audiences: Vec::new(),
+                run_readers: Vec::new(),
+                managed_tools: Vec::new(),
+                owner_v2_routes: Vec::new(),
                 legacy_owner_relays: 0,
             },
             0,
@@ -350,6 +394,8 @@ mod tests {
     fn record(claimed: bool) -> CallRecord {
         CallRecord {
             harness: (42, 7),
+            #[cfg(target_os = "linux")]
+            launch_observation: None,
             address: "lab/claude-code/store/session".into(),
             role: ActorRole::Root,
             native_id: "session".into(),

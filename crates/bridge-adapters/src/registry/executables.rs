@@ -68,6 +68,24 @@ impl Registry {
                     .iter()
                     .map(|audience| audience.executable.path.as_path()),
             )
+            .chain(
+                self.config
+                    .run_readers
+                    .iter()
+                    .map(|reader| reader.executable.path.as_path()),
+            )
+            .chain(
+                self.config
+                    .managed_tools
+                    .iter()
+                    .map(|tool| tool.frontend.path.as_path()),
+            )
+            .chain(
+                self.config
+                    .owner_v2_routes
+                    .iter()
+                    .map(|route| route.run_executable.path.as_path()),
+            )
             .collect();
         paths.sort();
         paths.dedup();

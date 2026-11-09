@@ -4,8 +4,9 @@
 //! This crate owns the `bridge-native-host` and `bridge-root-caller`
 //! boundaries. It consumes core's one authoritative custody and attempt
 //! state — [`bridge_core::dispatch::DispatchCarrier`], `observe_binding`,
-//! `drain_inject` and `record_outcome` — and keeps no second attempt or
-//! hook database.
+//! `drain_inject` and `record_outcome`. A separate private journal retains
+//! managed invocation observations, consumption receipts and abort fences;
+//! Run owns admission and native delivery ownership.
 //!
 //! Module layout:
 //! - [`os`]: kernel-observed peer credentials and process facts.

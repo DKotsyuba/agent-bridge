@@ -8,7 +8,7 @@ source branch in Bridge: native adapters understand host evidence, while
 operation and event meaning stay with the producer.
 
 References: the [wire contract](../crates/bridge-protocol/docs/wire-v1.md), the
-[core contract](../crates/bridge-core/docs/producer-core-v1.md), the [native
+[core contract](../crates/bridge-core/docs/producer-core-v1.md), the [attempt-binding private wire](../crates/bridge-adapters/docs/attempt-binding-v1.md), the [native
 ingress contract](../crates/bridge-adapters/docs/producer-native-v1.md) and the
 [SDK guide](../crates/bridge-sdk/README.md).
 

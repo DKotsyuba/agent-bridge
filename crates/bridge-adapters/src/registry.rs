@@ -69,6 +69,9 @@ use crate::os::{self, PeerIdentity, ProcessFacts};
 use crate::server::lock_registry;
 
 mod assertions;
+mod attempt;
+pub(crate) use attempt::AttemptError;
+pub use attempt::{AttemptCapacity, inspect_attempt_capacity};
 mod claims;
 #[cfg(target_os = "linux")]
 mod cold;
@@ -349,6 +352,15 @@ pub struct RegistryConfig {
     /// Optional generic backend audiences; absent preserves legacy deployments.
     #[serde(default)]
     pub audiences: Vec<BackendAudience>,
+    /// Same-UID Run reader identities and exact executable builds for B1 lookups.
+    #[serde(default)]
+    pub run_readers: Vec<RunReader>,
+    /// Explicit producer/server/tool mapping for managed native calls.
+    #[serde(default)]
+    pub managed_tools: Vec<ManagedTools>,
+    /// Explicit authenticated Run receipt and owner v2 routes; empty disables B2.
+    #[serde(default)]
+    pub owner_v2_routes: Vec<ManagedOwnerRoute>,
     /// Parse-only legacy input: how many `[[adapters.owner_relays]]` entries a
     /// configuration written for the removed owner path and SHA-256 allowlist
     /// carries. The entries themselves are discarded unread: they authorize
@@ -416,6 +428,57 @@ pub struct BackendAudience {
     pub producer: String,
     /// Exact backend executable path and qualified loaded-build digest.
     pub executable: RelayExecutable,
+}
+
+/// A configured Run reader, scoped to one original producer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunReader {
+    /// Producer whose observations this reader may inspect.
+    pub producer: String,
+    /// Reader identity authenticated by a distinct producer credential.
+    pub reader: String,
+    /// Exact trusted reader executable and build.
+    pub executable: RelayExecutable,
+}
+
+/// An out-of-band pinned Run and Pool route for managed owner v2 custody.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedOwnerRoute {
+    /// Authenticated producer allowed to publish under this route.
+    pub producer: String,
+    /// Existing distinct configured consumer audience for this producer.
+    pub audience: String,
+    /// Exact producer scopes authorized to occupy effect keys on this route.
+    pub producer_scopes: Vec<String>,
+    /// Canonical Run home containing the separately protected receipt socket.
+    pub run_home: PathBuf,
+    /// Exact Run store, route and worker UID.
+    pub run_route: bridge_protocol::managed_owner::RouteV1,
+    /// Exact Pool receipt-reader grant route and worker UID.
+    pub pool_route: bridge_protocol::managed_owner::RouteV1,
+    /// Exact local Bridge store, route and worker UID.
+    pub bridge_route: bridge_protocol::managed_owner::RouteV1,
+    /// Exact configured Run server and owner executable build.
+    pub run_executable: RelayExecutable,
+}
+
+/// All route components are strings or integers with reflexive equality.
+impl Eq for ManagedOwnerRoute {}
+
+/// Exact native MCP server and command names for one producer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedTools {
+    /// Producer allowed to associate this native call.
+    pub producer: String,
+    /// Exact native MCP server segment.
+    pub server: String,
+    /// Exact command names accepted for this server.
+    pub commands: Vec<String>,
+    /// Exact trusted stdio frontend executable and loaded build.
+    pub frontend: RelayExecutable,
 }
 
 /// Lifetime of a sealed caller proof, in milliseconds.
@@ -1083,6 +1146,9 @@ struct Binding {
     address: NativeAddress,
     /// Harness incarnation `(pid, start_time)`.
     harness: (u32, u64),
+    /// Full Linux identity captured by a new hook; old journal rows have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_incarnation: Option<os::attempt::KernelIncarnation>,
     /// Monotonic endpoint epoch.
     epoch: u64,
     /// Current capabilities of this binding (a carrier may withdraw message
@@ -1145,6 +1211,47 @@ struct Binding {
     role: Option<ActorRole>,
 }
 
+/// Decides managed-hook renewal using the complete kernel identity. Historic
+/// rows are unqualified and can only be renewed by a fresh observed hook.
+fn managed_binding_decision(
+    binding: Option<&Binding>,
+    identity: &os::attempt::KernelIncarnation,
+) -> Result<(bool, Option<u64>), CorrelationError> {
+    let Some(binding) = binding else {
+        return Ok((true, None));
+    };
+    if binding.managed_incarnation.as_ref() == Some(identity) {
+        return Ok((binding.retired || binding.pending, Some(binding.epoch)));
+    }
+    if !binding.retired {
+        if let Some(old) = &binding.managed_incarnation {
+            match os::attempt::kernel_incarnation(old.pid, old.uid) {
+                Ok(current) if current == *old => {
+                    return Err(CorrelationError::Conflicting(
+                        "address has another live kernel incarnation".into(),
+                    ));
+                }
+                Ok(_) => (),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && os::attempt::definitely_gone(old.pid) => {}
+                Err(_) => {
+                    return Err(CorrelationError::Unavailable(
+                        "prior kernel incarnation unavailable".into(),
+                    ));
+                }
+            }
+        } else if binding.harness.0 != identity.pid
+            && !os::attempt::definitely_gone(binding.harness.0)
+        {
+            return Err(CorrelationError::Unavailable(
+                "historic route incarnation unavailable".into(),
+            ));
+        }
+    }
+    Ok((true, Some(binding.epoch)))
+}
+
 /// Serde omission predicate for the private idle fact: false carries no new
 /// authority and need not change legacy journal rows; true must persist.
 fn is_false(value: &bool) -> bool {
@@ -1160,6 +1267,9 @@ type NativeInspection = (VerifiedCaller, (u32, u64), String, Option<String>);
 struct CallRecord {
     /// Harness incarnation that fired the hook.
     harness: (u32, u64),
+    /// The original checked launch capture, never reconstructed later.
+    #[cfg(target_os = "linux")]
+    launch_observation: Option<os::attempt::LaunchObservation>,
     /// Canonical address of the actor's binding.
     address: String,
     /// Actor role.
@@ -1180,11 +1290,64 @@ struct CallRecord {
     token_digest: Option<String>,
 }
 
+/// First checked root launch observation, including a failed capture. Later
+/// hooks never repair a missing observation for this incarnation.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RootLaunch {
+    /// Original full kernel incarnation, independent of PID reuse.
+    incarnation: os::attempt::KernelIncarnation,
+    /// Original direct environment capture, or permanent refusal for this issuer.
+    observation: Option<os::attempt::LaunchObservation>,
+    /// Binding epoch that the original root observation currently identifies.
+    epoch: u64,
+    /// A fresh root hook in this daemon proved the saved actor again.
+    #[serde(skip)]
+    armed: bool,
+}
+
+/// Proves the observed process was born strictly after this daemon issuer,
+/// in the same boot, PID namespace and UID. Ambiguous equal ticks refuse.
+#[cfg(target_os = "linux")]
+fn root_started_after_issuer(
+    issuer: Option<&os::attempt::KernelIncarnation>,
+    process: &os::attempt::KernelIncarnation,
+) -> bool {
+    issuer.is_some_and(|issuer| {
+        issuer.boot_id == process.boot_id
+            && issuer.pid_namespace_inode == process.pid_namespace_inode
+            && issuer.uid == process.uid
+            && issuer.start_ticks < process.start_ticks
+    })
+}
+
+/// Retains an original root fence while its exact process may still exist.
+#[cfg(target_os = "linux")]
+fn root_capture_may_be_live(root: &RootLaunch) -> bool {
+    match os::attempt::kernel_incarnation(root.incarnation.pid, root.incarnation.uid) {
+        Ok(actual) => actual == root.incarnation,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && os::attempt::definitely_gone(root.incarnation.pid) =>
+        {
+            false
+        }
+        Err(_) => true,
+    }
+}
+
 /// The harness a peer belongs to.
 #[derive(Debug, Clone)]
 struct HarnessMatch {
     /// Harness incarnation.
     incarnation: (u32, u64),
+    /// Full identity sampled with the selected ancestor's process facts.
+    #[cfg(target_os = "linux")]
+    kernel_incarnation: Option<os::attempt::KernelIncarnation>,
+    /// Every managed ancestry edge has complete ordered kernel identity.
+    #[cfg(target_os = "linux")]
+    managed_ancestry: bool,
     /// The harness's own store, derived from its process environment and proven
     /// canonical, owned by this user and not writable by group or other.
     store: PathBuf,
@@ -1242,6 +1405,8 @@ fn key_of(path: &Path, metadata: &std::fs::Metadata) -> FileKey {
 pub struct RecipientBinding {
     /// Harness incarnation `(pid, start_time)` owning the session.
     pub harness: (u32, u64),
+    /// Full managed incarnation, absent for legacy routes.
+    pub(crate) managed_incarnation: Option<os::attempt::KernelIncarnation>,
     /// Endpoint epoch.
     pub epoch: u64,
     /// Harness store directory, the harness process's own (a process fact).
@@ -1291,7 +1456,8 @@ impl MessageCandidate {
             || os::process_env_checked(binding.harness.0, "CODEX_APP_TOOLS_PIPE_PATH")
                 .map_err(|_| "native harness environment is unreadable")?
                 .is_some()
-            || crate::owner::locator(binding.harness.0)?.is_some()
+            || crate::owner::checked_locator(binding.harness, binding.managed_incarnation.as_ref())?
+                .is_some()
         {
             return Err("no qualified live-server idle proof".into());
         }
@@ -1315,6 +1481,7 @@ impl MessageCandidate {
             attestation,
             RecipientBinding {
                 harness: binding.harness,
+                managed_incarnation: binding.managed_incarnation.clone(),
                 epoch: binding.epoch,
                 store: binding.store.clone(),
                 executable: binding.executable.clone(),
@@ -1460,6 +1627,7 @@ impl MessageCandidate {
             attestation,
             RecipientBinding {
                 harness: binding.harness,
+                managed_incarnation: binding.managed_incarnation.clone(),
                 epoch: binding.epoch,
                 store: binding.store.clone(),
                 executable: binding.executable.clone(),
@@ -1494,14 +1662,31 @@ fn live_binding(
     owner_uid: u32,
 ) -> Result<ProcessFacts, String> {
     let facts = os::process_facts(binding.harness.0).ok_or("harness is gone")?;
+    let identity_current = if let Some(identity) = &binding.managed_incarnation {
+        binding.harness.0 == identity.pid
+            && os::attempt::kernel_incarnation(identity.pid, identity.uid)
+                .ok()
+                .as_ref()
+                == Some(identity)
+    } else {
+        facts.start_time == binding.harness.1
+    };
     if facts.uid != Some(owner_uid)
-        || facts.start_time != binding.harness.1
+        || !identity_current
         || facts.exe.as_ref() != Some(&binding.executable)
         || harness_store(&facts, policy).is_none_or(|store| store != binding.store)
         || private_store(&binding.store, owner_uid).is_err()
         || executable_current(&binding.executable, &facts, owner_uid).is_err()
     {
         return Err("message harness/store changed".into());
+    }
+    if let Some(identity) = &binding.managed_incarnation
+        && os::attempt::kernel_incarnation(identity.pid, identity.uid)
+            .ok()
+            .as_ref()
+            != Some(identity)
+    {
+        return Err("message harness identity changed".into());
     }
     Ok(facts)
 }
@@ -1547,25 +1732,160 @@ fn live_end_idle_proof(
     gateway::read_stamp(binding, owner_uid)
 }
 
-/// Versioned bounded route snapshot. It contains no publisher tokens, native
-/// inbox keys, message bodies, caller records or single-use proofs.
+/// Versioned private route snapshot. Schema 2 embedded the managed journal;
+/// schema 3 separates it; schema 4 atomically records first-root captures.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RouteSnapshot {
-    /// Snapshot format version; only version 1 is accepted.
+    /// Numbered snapshot format: 1/2/3 historical, 4 current.
     schema: u32,
+    /// Durable store identity, absent only in schema 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    store_id: Option<String>,
     /// Last verified bindings, including retired tombstones and input-wait states.
     bindings: Vec<Binding>,
+    /// Numbered durable managed assertion/consume journal, absent in old snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attempts: Option<attempt::Ledger>,
+    /// Original root captures, including unsuccessful reads, tied to addresses.
+    #[cfg(target_os = "linux")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    root_launches: Vec<(String, RootLaunch)>,
+}
+
+/// Generates a random version-4 UUID for a new private journal.
+fn new_store_id() -> Result<String, String> {
+    let mut bytes = os::random_bytes().map_err(|_| "route journal entropy unavailable")?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    ))
 }
 
 /// Largest private route snapshot accepted before allocation/JSON parsing.
 const MAX_ROUTE_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Reads a bounded, owner-only single-link journal without following replacement.
+fn read_private_journal(path: &Path, owner: u32) -> Result<Option<Vec<u8>>, String> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("private journal unreadable".into()),
+        Ok(meta) => meta,
+    };
+    if !meta.is_file()
+        || meta.uid() != owner
+        || meta.mode() & 0o077 != 0
+        || meta.nlink() != 1
+        || meta.len() > MAX_ROUTE_SNAPSHOT_BYTES
+    {
+        return Err("private journal is not a bounded private regular file".into());
+    }
+    let file = std::fs::File::open(path).map_err(|_| "private journal unreadable")?;
+    let opened = file
+        .metadata()
+        .map_err(|_| "private journal metadata unreadable")?;
+    if (opened.dev(), opened.ino()) != (meta.dev(), meta.ino()) {
+        return Err("private journal changed while opening".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_ROUTE_SNAPSHOT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "private journal unreadable")?;
+    if bytes.len() as u64 > MAX_ROUTE_SNAPSHOT_BYTES {
+        return Err("private journal oversized".into());
+    }
+    Ok(Some(bytes))
+}
+
+/// Atomically commits private bytes; a post-rename error remains uncertain.
+fn write_private_journal(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let random = os::random_bytes().map_err(|_| "journal entropy unavailable")?;
+    let temp = path.with_extension(format!(
+        "new-{:x}",
+        u64::from_le_bytes(random[..8].try_into().expect("eight entropy bytes"))
+    ));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, path)?;
+        std::fs::File::open(path.parent().expect("validated journal parent"))?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+        return Err("private journal commit uncertain".into());
+    }
+    Ok(())
+}
+
+/// Removes only owned regular stale journal temp files from the private directory.
+fn remove_stale_journal_temps(path: &Path, owner: u32) -> Result<(), String> {
+    let prefix = path.with_extension("new-");
+    let prefix = prefix
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or("invalid journal name")?;
+    let parent = path.parent().ok_or("invalid journal parent")?;
+    let mut removed = false;
+    for entry in std::fs::read_dir(parent).map_err(|_| "journal directory unreadable")? {
+        let entry = entry.map_err(|_| "journal directory unreadable")?;
+        let name = entry.file_name();
+        if !name
+            .to_str()
+            .and_then(|name| name.strip_prefix(prefix))
+            .is_some_and(|suffix| {
+                !suffix.is_empty()
+                    && suffix.len() <= 16
+                    && suffix
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+        {
+            continue;
+        }
+        let meta =
+            std::fs::symlink_metadata(entry.path()).map_err(|_| "journal temp unreadable")?;
+        if !meta.is_file() || meta.uid() != owner || meta.mode() & 0o077 != 0 || meta.nlink() != 1 {
+            return Err("unsafe stale journal temp".into());
+        }
+        std::fs::remove_file(entry.path()).map_err(|_| "journal temp cleanup failed")?;
+        removed = true;
+    }
+    if removed {
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| "journal temp cleanup sync failed")?;
+    }
+    Ok(())
+}
+
 /// Protected native registry. Verified recipient routes can be journaled in the
 /// private channel directory and recovered only for the same live harness
 /// incarnation in its own store (or as a gateway candidate of a gone Codex
-/// incarnation). Call records, exclusive claims, sealed proofs and detached
-/// assertions remain strictly memory-only; route history is never fresh authority.
+/// incarnation). Legacy calls, claims, sealed proofs and assertions remain
+/// memory-only. Managed consume records are durable but never regain freshness
+/// after the issuer changes; route history alone is never fresh authority.
 #[derive(Debug)]
 pub struct Registry {
     /// Configuration.
@@ -1576,10 +1896,33 @@ pub struct Registry {
     epoch_floor: u64,
     /// Bindings by canonical address.
     bindings: HashMap<String, Binding>,
-    /// Optional private atomic snapshot of verified recipient routes, never calls or secrets.
+    /// Optional private atomic route snapshot.
     journal: Option<PathBuf>,
+    /// Separate private managed assertion/consume snapshot.
+    attempt_journal: Option<PathBuf>,
+    /// Frozen schema-2 ledger retained only when migration cannot commit.
+    legacy_embedded_attempts: Option<attempt::Ledger>,
+    /// Random journal identity, durable once the journal attaches.
+    store_id: String,
+    /// Durable versioned managed invocation state.
+    attempt_ledger: attempt::Ledger,
+    /// A possibly failed journal commit requires restart before further writes.
+    attempt_journal_poisoned: bool,
+    /// A managed commit may have crossed its durable rename without an ACK.
+    attempt_journal_uncertain: bool,
     /// Call records by call id.
     calls: HashMap<String, Vec<CallRecord>>,
+    /// Original root-launch captures for this issuer, keyed by native address.
+    #[cfg(target_os = "linux")]
+    root_launches: HashMap<String, RootLaunch>,
+    /// A failed route commit after missing root capture fences new B2 captures
+    /// until a fresh daemon issuer, without affecting legacy or B1 paths.
+    #[cfg(target_os = "linux")]
+    root_capture_poisoned: bool,
+    /// This daemon's full kernel identity; a process older than this issuer
+    /// cannot prove that a prior missing launch observation was not repaired.
+    #[cfg(target_os = "linux")]
+    issuer_process_incarnation: Option<os::attempt::KernelIncarnation>,
     /// Call ids in insertion order, for bounded eviction.
     call_order: VecDeque<String>,
     /// Digests of the configured relay and audience executables
@@ -1819,13 +2162,205 @@ impl Registry {
             }
             audience_names.push((&audience.producer, &audience.name));
         }
+        if config.run_readers.len() > 64
+            || config.managed_tools.len() > 64
+            || config.owner_v2_routes.len() > 64
+        {
+            return Err("managed configuration capacity exceeded".into());
+        }
+        let mut owner_routes = std::collections::HashSet::new();
+        let mut scope_owners = std::collections::HashMap::new();
+        for route in &config.owner_v2_routes {
+            for value in [
+                &route.producer,
+                &route.audience,
+                &route.run_route.component_store_id,
+                &route.run_route.route_id,
+                &route.pool_route.component_store_id,
+                &route.pool_route.route_id,
+                &route.bridge_route.component_store_id,
+                &route.bridge_route.route_id,
+            ] {
+                checked_id(value, "owner route identity")?;
+            }
+            let mut route_scopes = std::collections::HashSet::new();
+            if route.producer_scopes.is_empty() || route.producer_scopes.len() > 1024 {
+                return Err("invalid managed owner scopes".into());
+            }
+            for scope in &route.producer_scopes {
+                checked_id(scope, "owner producer scope")?;
+                if !route_scopes.insert(scope)
+                    || scope_owners
+                        .insert(scope, &route.producer)
+                        .is_some_and(|owner| owner != &route.producer)
+                {
+                    return Err("conflicting managed owner scope".into());
+                }
+            }
+            if !route.run_home.is_absolute()
+                || !route.run_executable.path.is_absolute()
+                || route.run_executable.sha256.len() != 64
+                || !route
+                    .run_executable
+                    .sha256
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                || route.run_route.worker_uid != owner_uid
+                || route.pool_route.worker_uid != owner_uid
+                || route.bridge_route.worker_uid != owner_uid
+                || !config
+                    .audiences
+                    .iter()
+                    .any(|entry| entry.producer == route.producer && entry.name == route.audience)
+                || !owner_routes.insert((
+                    &route.producer,
+                    &route.audience,
+                    &route.run_route.route_id,
+                    &route.run_route.component_store_id,
+                    &route.pool_route.component_store_id,
+                    &route.bridge_route.component_store_id,
+                    &route.bridge_route.route_id,
+                ))
+            {
+                return Err("invalid or ambiguous managed owner route".into());
+            }
+            if config.audiences.iter().any(|entry| {
+                entry.executable.path == route.run_executable.path
+                    || entry
+                        .executable
+                        .sha256
+                        .eq_ignore_ascii_case(&route.run_executable.sha256)
+            }) || config.managed_tools.iter().any(|entry| {
+                entry.frontend.path == route.run_executable.path
+                    || entry
+                        .frontend
+                        .sha256
+                        .eq_ignore_ascii_case(&route.run_executable.sha256)
+            }) {
+                return Err("managed owner and producer executable overlap".into());
+            }
+        }
+        let mut reader_pairs = std::collections::HashSet::new();
+        for reader in &config.run_readers {
+            checked_id(&reader.producer, "producer")?;
+            checked_id(&reader.reader, "reader")?;
+            if !reader_pairs.insert((&reader.producer, &reader.reader))
+                || reader.producer == reader.reader
+                || !reader.executable.path.is_absolute()
+                || reader.executable.sha256.len() != 64
+                || !reader
+                    .executable
+                    .sha256
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+            {
+                return Err("invalid or duplicate Run reader".into());
+            }
+        }
+        let mut tools = std::collections::HashSet::new();
+        let mut tool_owners = std::collections::HashMap::new();
+        for mapping in &config.managed_tools {
+            checked_id(&mapping.producer, "producer")?;
+            if !mapping.frontend.path.is_absolute()
+                || mapping.frontend.sha256.len() != 64
+                || !mapping
+                    .frontend
+                    .sha256
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                || mapping.commands.is_empty()
+                || mapping.commands.len() > 64
+                || mapping.server.is_empty()
+                || mapping.server.len() > MAX_NATIVE_ID_BYTES
+                || !mapping
+                    .server
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+                || mapping.server.contains("__")
+            {
+                return Err("invalid managed tool mapping".into());
+            }
+            for command in &mapping.commands {
+                if command.is_empty()
+                    || command
+                        .len()
+                        .saturating_add(mapping.server.len())
+                        .saturating_add(7)
+                        > MAX_NATIVE_ID_BYTES
+                    || !command
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+                    || !tools.insert((&mapping.producer, &mapping.server, command))
+                {
+                    return Err("invalid or duplicate managed command".into());
+                }
+                if tool_owners
+                    .insert((&mapping.server, command), &mapping.producer)
+                    .is_some_and(|owner| owner != &mapping.producer)
+                {
+                    return Err("managed command is mapped to multiple producers".into());
+                }
+            }
+        }
+        // Distinct trusted builds prevent a frontend holding producer credentials
+        // from also satisfying the backend or Run-reader executable fence.
+        for mapping in &config.managed_tools {
+            for audience in &config.audiences {
+                if mapping.frontend.path == audience.executable.path
+                    || mapping
+                        .frontend
+                        .sha256
+                        .eq_ignore_ascii_case(&audience.executable.sha256)
+                {
+                    return Err("managed frontend and audience executable overlap".into());
+                }
+            }
+            for reader in &config.run_readers {
+                if mapping.frontend.path == reader.executable.path
+                    || mapping
+                        .frontend
+                        .sha256
+                        .eq_ignore_ascii_case(&reader.executable.sha256)
+                {
+                    return Err("managed frontend and reader executable overlap".into());
+                }
+            }
+        }
+        for reader in &config.run_readers {
+            for audience in &config.audiences {
+                if reader.executable.path == audience.executable.path
+                    || reader
+                        .executable
+                        .sha256
+                        .eq_ignore_ascii_case(&audience.executable.sha256)
+                {
+                    return Err("managed reader and audience executable overlap".into());
+                }
+            }
+        }
         let mut registry = Registry {
             config,
             owner_uid,
             epoch_floor: 0,
             bindings: HashMap::new(),
             journal: None,
+            attempt_journal: None,
+            legacy_embedded_attempts: None,
+            store_id: new_store_id()?,
+            attempt_ledger: attempt::Ledger::default(),
+            attempt_journal_poisoned: false,
+            attempt_journal_uncertain: false,
             calls: HashMap::new(),
+            #[cfg(target_os = "linux")]
+            root_launches: HashMap::new(),
+            #[cfg(target_os = "linux")]
+            root_capture_poisoned: false,
+            #[cfg(target_os = "linux")]
+            issuer_process_incarnation: os::attempt::kernel_incarnation(
+                std::process::id(),
+                owner_uid,
+            )
+            .ok(),
             call_order: VecDeque::new(),
             digests: HashMap::new(),
             refreshing: Arc::new(AtomicBool::new(false)),
@@ -1892,6 +2427,9 @@ impl Registry {
         }
         crate::server::private_directory(path.parent().ok_or("route journal lacks parent")?)
             .map_err(|_| "route journal directory refused".to_string())?;
+        remove_stale_journal_temps(path, self.owner_uid)?;
+        let attempt_path = path.with_extension("attempts.json");
+        let attempt_temps_safe = remove_stale_journal_temps(&attempt_path, self.owner_uid).is_ok();
         let snapshot = match std::fs::symlink_metadata(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(_) => return Err("route journal unreadable".into()),
@@ -1920,13 +2458,135 @@ impl Registry {
                 }
                 let snapshot: RouteSnapshot =
                     serde_json::from_slice(&bytes).map_err(|_| "route journal malformed")?;
-                if snapshot.schema != 1 || snapshot.bindings.len() > DEFAULT_MAX_BINDINGS {
+                #[cfg(target_os = "linux")]
+                {
+                    let mut seen = std::collections::HashSet::new();
+                    if snapshot.root_launches.len() > DEFAULT_MAX_BINDINGS
+                        || (snapshot.schema < 4 && !snapshot.root_launches.is_empty())
+                        || snapshot.root_launches.iter().any(|(address, root)| {
+                            !seen.insert(address)
+                                || NativeAddress::parse(address).is_err()
+                                || root.epoch == 0
+                                || root.incarnation.uid != self.owner_uid
+                                || root.incarnation.pid <= 1
+                                || root.incarnation.pid_namespace_inode == 0
+                                || root.incarnation.start_ticks == 0
+                                || !os::attempt::canonical_uuid(&root.incarnation.boot_id)
+                                || root.observation.as_ref().is_some_and(|observation| {
+                                    observation.incarnation != root.incarnation
+                                        || !os::attempt::canonical_uuid(&observation.launch_id)
+                                })
+                        })
+                    {
+                        return Err("route root capture refused".into());
+                    }
+                }
+                if snapshot.bindings.len() > DEFAULT_MAX_BINDINGS
+                    || snapshot.bindings.iter().any(|binding| {
+                        binding
+                            .managed_incarnation
+                            .as_ref()
+                            .is_some_and(|identity| {
+                                identity.pid != binding.harness.0
+                                    || identity.uid != self.owner_uid
+                                    || identity.pid_namespace_inode == 0
+                                    || identity.start_ticks == 0
+                                    || !os::attempt::canonical_uuid(&identity.boot_id)
+                            })
+                    })
+                    || match snapshot.schema {
+                        1 => {
+                            snapshot.store_id.is_some()
+                                || snapshot.attempts.is_some()
+                                || snapshot
+                                    .bindings
+                                    .iter()
+                                    .any(|b| b.managed_incarnation.is_some())
+                        }
+                        2 => !snapshot
+                            .store_id
+                            .as_deref()
+                            .is_some_and(os::attempt::canonical_uuid),
+                        3 | 4 => {
+                            snapshot.attempts.is_some()
+                                || !snapshot
+                                    .store_id
+                                    .as_deref()
+                                    .is_some_and(os::attempt::canonical_uuid)
+                        }
+                        _ => true,
+                    }
+                {
                     return Err("route journal version or count refused".into());
+                }
+                if let Some(ledger) = &snapshot.attempts {
+                    ledger.validate()?;
                 }
                 Some(snapshot)
             }
         };
+        let prior_schema = snapshot.as_ref().map_or(0, |snapshot| snapshot.schema);
+        let embedded = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.attempts.clone())
+            .unwrap_or_default();
+        if let Some(store_id) = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.store_id.as_ref())
+        {
+            self.store_id = store_id.clone();
+        }
+        self.attempt_journal = Some(attempt_path.clone());
+        let separate = read_private_journal(&attempt_path, self.owner_uid).and_then(|bytes| {
+            bytes
+                .map(|bytes| attempt::LedgerFile::decode(&bytes))
+                .transpose()
+        });
+        if matches!(prior_schema, 3 | 4) && !attempt_temps_safe {
+            self.attempt_journal_poisoned = true;
+        } else if matches!(prior_schema, 3 | 4) {
+            match separate {
+                Ok(Some(file)) if file.store_id == self.store_id => {
+                    self.attempt_ledger = file.ledger
+                }
+                _ => self.attempt_journal_poisoned = true,
+            }
+        } else {
+            let migrated = if !attempt_temps_safe {
+                false
+            } else {
+                match separate {
+                    Ok(Some(file))
+                        if prior_schema != 0
+                            && (prior_schema == 1 || file.store_id == self.store_id)
+                            && serde_json::to_value(&file.ledger).ok()
+                                == serde_json::to_value(&embedded).ok() =>
+                    {
+                        self.store_id = file.store_id;
+                        self.attempt_ledger = file.ledger;
+                        true
+                    }
+                    Ok(None) => {
+                        self.attempt_ledger = embedded.clone();
+                        self.persist_attempt().is_ok()
+                    }
+                    _ => false,
+                }
+            };
+            if !migrated {
+                // Preserve historical receipts and permanent fences until an
+                // operator repairs migration, while scrubbing stale keys.
+                self.attempt_journal_poisoned = true;
+                let mut retained = embedded;
+                retained.seal_after_restart(&self.issuer_boot);
+                self.legacy_embedded_attempts = Some(retained);
+            }
+        }
         if let Some(snapshot) = snapshot {
+            #[cfg(target_os = "linux")]
+            {
+                self.root_launches = snapshot.root_launches.into_iter().collect();
+            }
             for mut binding in snapshot.bindings {
                 if binding.address.host_id != self.config.host_id
                     || binding.epoch == 0
@@ -1949,8 +2609,21 @@ impl Registry {
                 // The recorded incarnation is alive only if its PID is held by a
                 // process with exactly the recorded start time: a reused PID is a
                 // different process, gone for every purpose and never authority.
-                let live = os::process_facts(binding.harness.0)
-                    .filter(|facts| facts.start_time == binding.harness.1);
+                let live = if let Some(identity) = &binding.managed_incarnation {
+                    #[cfg(target_os = "linux")]
+                    {
+                        os::process_facts_managed(identity.pid)
+                            .filter(|facts| facts.kernel_incarnation.as_ref() == Some(identity))
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        let _ = identity;
+                        None
+                    }
+                } else {
+                    os::process_facts(binding.harness.0)
+                        .filter(|facts| facts.start_time == binding.harness.1)
+                };
                 let Some(facts) = live else {
                     // A gone incarnation survives only as an *unspent* gateway
                     // candidate (the spend is journaled before any native write, so
@@ -1984,7 +2657,33 @@ impl Registry {
                 {
                     continue;
                 }
-                binding.epoch = next_epoch(self.epoch_floor, Some(binding.epoch), now_ms)?;
+                // Historic seconds-only routes stay legacy-only; a persisted full
+                // managed identity survives only a positive exact kernel recheck.
+                #[cfg(target_os = "linux")]
+                if binding.managed_incarnation != facts.kernel_incarnation {
+                    binding.managed_incarnation = None;
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    binding.managed_incarnation = None;
+                }
+                // A saved exact managed root is the same actor only after a
+                // fresh hook. Keep that actor epoch; normal legacy routes still
+                // advance their endpoint epoch on daemon restart.
+                #[cfg(target_os = "linux")]
+                let preserve_root_epoch = self
+                    .root_launches
+                    .get(&binding.address.to_canonical_string())
+                    .is_some_and(|root| {
+                        root.observation.is_some()
+                            && root.epoch == binding.epoch
+                            && binding.managed_incarnation.as_ref() == Some(&root.incarnation)
+                    });
+                #[cfg(not(target_os = "linux"))]
+                let preserve_root_epoch = false;
+                if !preserve_root_epoch {
+                    binding.epoch = next_epoch(self.epoch_floor, Some(binding.epoch), now_ms)?;
+                }
                 self.apply_policy(&mut binding, &policy);
                 if binding
                     .transcript
@@ -2000,6 +2699,12 @@ impl Registry {
         }
         self.journal = Some(path.to_path_buf());
         self.persist_routes()?;
+        if !self.attempt_journal_poisoned {
+            self.attempt_ledger.seal_after_restart(&self.issuer_boot);
+            if self.persist_attempt().is_err() {
+                self.attempt_journal_poisoned = true;
+            }
+        }
         Ok(self
             .bindings
             .values()
@@ -2057,35 +2762,29 @@ impl Registry {
             return Ok(());
         };
         let bytes = serde_json::to_vec(&RouteSnapshot {
-            schema: 1,
+            schema: if self.legacy_embedded_attempts.is_some() {
+                2
+            } else {
+                4
+            },
+            store_id: Some(self.store_id.clone()),
             bindings: self.bindings.values().cloned().collect(),
+            attempts: self.legacy_embedded_attempts.clone(),
+            #[cfg(target_os = "linux")]
+            root_launches: if self.legacy_embedded_attempts.is_some() {
+                Vec::new()
+            } else {
+                self.root_launches
+                    .iter()
+                    .map(|(key, root)| (key.clone(), root.clone()))
+                    .collect()
+            },
         })
         .map_err(|_| "route snapshot encoding failed")?;
         if bytes.len() as u64 > MAX_ROUTE_SNAPSHOT_BYTES {
             return Err("route snapshot oversized".into());
         }
-        let random = os::random_bytes().map_err(|_| "route snapshot entropy unavailable")?;
-        let temp = path.with_extension(format!(
-            "new-{:x}",
-            u64::from_le_bytes(random[..8].try_into().expect("eight entropy bytes"))
-        ));
-        // ponytail: one bounded snapshot per hook; use journaled rows if hook throughput warrants it.
-        let result = (|| -> std::io::Result<()> {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&temp)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            std::fs::rename(&temp, path)?;
-            std::fs::File::open(path.parent().expect("validated journal parent"))?.sync_all()
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&temp);
-            return Err("route snapshot could not be committed".into());
-        }
-        Ok(())
+        write_private_journal(path, &bytes)
     }
 
     /// Re-observes the lifecycle of a known live interactive Claude route stuck at
@@ -2130,14 +2829,31 @@ impl Registry {
         let Some(facts) = os::process_facts(hint.pid) else {
             return Ok(());
         };
+        let same_incarnation = if let Some(identity) = &known.managed_incarnation {
+            hint.pid == identity.pid
+                && os::attempt::kernel_incarnation(identity.pid, identity.uid)
+                    .ok()
+                    .as_ref()
+                    == Some(identity)
+        } else {
+            (facts.pid, facts.start_time) == known.harness
+        };
         if facts.uid != Some(self.owner_uid)
-            || (facts.pid, facts.start_time) != known.harness
+            || !same_incarnation
             || i128::from(hint.written_at) < i128::from(facts.start_time)
             || facts.exe.as_ref() != Some(&known.executable)
             || harness_store(&facts, &policy).as_ref() != Some(&known.store)
             || private_store(&known.store, self.owner_uid).is_err()
             || !product_marked(&facts, &policy)
             || executable_current(&known.executable, &facts, self.owner_uid).is_err()
+        {
+            return Ok(());
+        }
+        if let Some(identity) = &known.managed_incarnation
+            && os::attempt::kernel_incarnation(identity.pid, identity.uid)
+                .ok()
+                .as_ref()
+                != Some(identity)
         {
             return Ok(());
         }
@@ -2177,6 +2893,90 @@ impl Registry {
         &self.config.host_id
     }
 
+    /// Skews only legacy second-resolution fixture fields without changing the
+    /// genuine managed kernel identities, to test that they are not consulted.
+    #[cfg(all(target_os = "linux", any(test, feature = "test-fixtures")))]
+    #[doc(hidden)]
+    pub fn fixture_skew_legacy_seconds(&mut self, address: &NativeAddress, call: &str) {
+        self.fixture_skew_binding_seconds(address);
+        let records = self.calls.get_mut(call).expect("fixture call");
+        let record = records
+            .iter_mut()
+            .find(|record| record.launch_observation.is_some())
+            .expect("fixture managed observation");
+        record.harness.1 = record.harness.1.saturating_add(47);
+    }
+
+    /// Skews only a managed binding's legacy seconds for a synthetic route test.
+    #[cfg(all(target_os = "linux", any(test, feature = "test-fixtures")))]
+    #[doc(hidden)]
+    pub fn fixture_skew_binding_seconds(&mut self, address: &NativeAddress) {
+        let binding = self
+            .bindings
+            .get_mut(&address.to_canonical_string())
+            .expect("fixture binding");
+        assert!(binding.managed_incarnation.is_some());
+        binding.harness.1 = binding.harness.1.saturating_add(23);
+    }
+
+    /// Advances only the synthetic managed-expiry sweep in fixture tests.
+    #[cfg(all(target_os = "linux", any(test, feature = "test-fixtures")))]
+    #[doc(hidden)]
+    pub fn fixture_expire_managed(&mut self, now_ms: u64) -> Result<(), CorrelationError> {
+        self.expire_attempt_contexts(now_ms)
+    }
+
+    /// Evicts a spent, unclaimed synthetic call to exercise durable source fences.
+    #[cfg(all(target_os = "linux", any(test, feature = "test-fixtures")))]
+    #[doc(hidden)]
+    pub fn fixture_evict_spent_call(&mut self, call: &str) -> bool {
+        if !self.calls.get(call).is_some_and(|records| {
+            !records.is_empty()
+                && records
+                    .iter()
+                    .all(|record| record.consumed && !record.claimed)
+        }) {
+            return false;
+        }
+        self.calls.remove(call);
+        self.call_order.retain(|entry| entry != call);
+        true
+    }
+
+    /// Redirects only the synthetic managed journal to an unavailable parent.
+    #[cfg(all(target_os = "linux", any(test, feature = "test-fixtures")))]
+    #[doc(hidden)]
+    pub fn fixture_fail_managed_commit(&mut self) {
+        let parent = self
+            .journal
+            .as_ref()
+            .and_then(|path| path.parent())
+            .expect("fixture journal");
+        self.attempt_journal = Some(parent.join("missing-fixture-parent/attempts.json"));
+    }
+
+    /// Redirects only a synthetic route journal to an unavailable parent and
+    /// returns its original path so the fixture may restore legacy operation.
+    #[cfg(all(target_os = "linux", any(test, feature = "test-fixtures")))]
+    #[doc(hidden)]
+    pub fn fixture_fail_route_commit(&mut self) -> PathBuf {
+        let original = self.journal.clone().expect("fixture route journal");
+        self.journal = Some(
+            original
+                .parent()
+                .expect("fixture parent")
+                .join("missing-fixture-parent/bindings.json"),
+        );
+        original
+    }
+
+    /// Restores the exact route-journal path returned by the synthetic fixture.
+    #[cfg(all(target_os = "linux", any(test, feature = "test-fixtures")))]
+    #[doc(hidden)]
+    pub fn fixture_restore_route_commit(&mut self, original: PathBuf) {
+        self.journal = Some(original);
+    }
+
     /// Resolves the harness a channel peer belongs to.
     ///
     /// The peer must run as the owner, and `harness` must be enabled by the
@@ -2205,6 +3005,13 @@ impl Registry {
                 "peer runs as another user".into(),
             ));
         }
+        #[cfg(target_os = "linux")]
+        let chain = if self.config.managed_tools.is_empty() {
+            os::ancestry(peer.pid)
+        } else {
+            os::ancestry_managed(peer.pid)
+        };
+        #[cfg(not(target_os = "linux"))]
         let chain = os::ancestry(peer.pid);
         let Some((_, ancestors)) = chain.split_first() else {
             return Err(CorrelationError::NotEvidence("peer process is gone".into()));
@@ -2249,8 +3056,19 @@ impl Registry {
             ))
         })?;
         private_store(&store, self.owner_uid).map_err(CorrelationError::NotEvidence)?;
+        #[cfg(target_os = "linux")]
+        let managed_ancestry = chain
+            .iter()
+            .position(|entry| entry.pid == facts.pid)
+            .is_some_and(|index| {
+                os::attempt::ordered_managed_ancestry(&chain[..=index], self.owner_uid)
+            });
         Ok(HarnessMatch {
             incarnation: (facts.pid, facts.start_time),
+            #[cfg(target_os = "linux")]
+            kernel_incarnation: facts.kernel_incarnation.clone(),
+            #[cfg(target_os = "linux")]
+            managed_ancestry,
             store,
             executable: exe,
             policy,
@@ -2458,9 +3276,24 @@ impl Registry {
             .transpose()
             .map_err(CorrelationError::NotEvidence)?;
         if kind == HookKind::PreToolUse && payload.tool_use_id.is_some() {
+            self.expire_attempt_contexts(now_ms)?;
             self.ensure_call_capacity()?;
         }
         let matched = self.harness_of(peer, harness, false)?;
+        // Capture only at this original hook. Missing or changed evidence stays
+        // absent; legacy observations remain independent of managed authority.
+        #[cfg(target_os = "linux")]
+        let launch_observation = if !self.config.managed_tools.is_empty()
+            && kind == HookKind::PreToolUse
+            && (harness == Harness::CODEX || harness == Harness::CLAUDE_CODE)
+            && matched.managed_ancestry
+        {
+            os::attempt::capture_launch(matched.incarnation.0, self.owner_uid)
+                .ok()
+                .filter(|capture| Some(&capture.incarnation) == matched.kernel_incarnation.as_ref())
+        } else {
+            None
+        };
         // Claude children share the root session's address; Codex children
         // are their own threads with their own addresses; any other harness
         // follows its profile.
@@ -2497,6 +3330,71 @@ impl Registry {
             .filter(|path| path.is_absolute() && path.starts_with(&matched.store));
 
         let previous_binding = self.bindings.get(&key).cloned();
+        // Capture the first observed root launch directly, independently of a
+        // Pool call. A restored row is not an original hook. Once a process
+        // has been observed without an original root capture, no later hook
+        // from that incarnation may manufacture one, including after restart.
+        #[cfg(target_os = "linux")]
+        if self.root_launches.len() >= DEFAULT_MAX_BINDINGS {
+            self.root_launches
+                .retain(|_, root| root_capture_may_be_live(root));
+        }
+        #[cfg(target_os = "linux")]
+        let first_root_launch = matched.kernel_incarnation.as_ref().and_then(|identity| {
+            if self.config.managed_tools.is_empty()
+                || self.root_capture_poisoned
+                || self.legacy_embedded_attempts.is_some()
+                || (!self.root_launches.contains_key(&key)
+                    && self.root_launches.len() >= DEFAULT_MAX_BINDINGS)
+                || role != ActorRole::Root
+                || !matched.managed_ancestry
+                || (harness != Harness::CODEX && harness != Harness::CLAUDE_CODE)
+                || !root_started_after_issuer(self.issuer_process_incarnation.as_ref(), identity)
+                || self
+                    .root_launches
+                    .get(&key)
+                    .is_some_and(|old| old.incarnation == *identity)
+            {
+                return None;
+            }
+            let captures: Vec<_> = self
+                .root_launches
+                .values()
+                .filter(|old| old.incarnation == *identity)
+                .collect();
+            let seen_process = self.bindings.values().any(|old| {
+                old.managed_incarnation.as_ref() == Some(identity)
+                    || (old.managed_incarnation.is_none() && old.harness.0 == identity.pid)
+            });
+            let fresh = if captures.is_empty() {
+                !seen_process
+            } else {
+                captures
+                    .iter()
+                    .all(|old| old.armed && old.observation.is_some())
+            };
+            fresh.then(|| {
+                let observation = if kind == HookKind::PreToolUse {
+                    launch_observation.clone()
+                } else {
+                    os::attempt::capture_launch(identity.pid, self.owner_uid)
+                        .ok()
+                        .filter(|capture| capture.incarnation == *identity)
+                };
+                (identity.clone(), observation)
+            })
+        });
+        #[cfg(target_os = "linux")]
+        if previous_binding
+            .as_ref()
+            .is_some_and(|binding| binding.managed_incarnation.is_some())
+            && matched.kernel_incarnation.is_some()
+            && !matched.managed_ancestry
+        {
+            return Err(CorrelationError::NotEvidence(
+                "managed ancestry is unavailable".into(),
+            ));
+        }
         // A duplicate managed-server end cannot start a new session or recreate
         // an idle proof. Keep the exact unspent proof only for the same process
         // and transcript; delivery still revalidates both before native I/O.
@@ -2508,7 +3406,19 @@ impl Registry {
                 binding.retired
                     && !binding.pending
                     && !binding.desktop_idle_message
-                    && binding.harness == matched.incarnation
+                    && {
+                        #[cfg(target_os = "linux")]
+                        {
+                            match (&binding.managed_incarnation, &matched.kernel_incarnation) {
+                                (Some(old), Some(new)) => old == new,
+                                _ => binding.harness == matched.incarnation,
+                            }
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        {
+                            binding.harness == matched.incarnation
+                        }
+                    }
                     && binding.capabilities.message
                     && matched.policy.message
                     && binding.wake.is_some()
@@ -2517,26 +3427,62 @@ impl Registry {
                         .as_deref()
                         .is_none_or(|path| binding.transcript.as_deref() == Some(Path::new(path)))
             });
-        let (renewed, previous_epoch) = match self.bindings.get(&key) {
-            Some(binding) if binding.harness != matched.incarnation => {
-                if !binding.retired && os::incarnation_alive(binding.harness.0, binding.harness.1) {
-                    return Err(CorrelationError::Conflicting(
-                        "address is bound to another live harness incarnation".into(),
-                    ));
+        // Once a binding and hook both carry full identity, all hooks use it;
+        // seconds-only legacy bindings retain their existing behavior.
+        #[cfg(target_os = "linux")]
+        let managed_identity = matched
+            .kernel_incarnation
+            .as_ref()
+            .filter(|_| {
+                previous_binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.managed_incarnation.is_some())
+            })
+            .or_else(|| {
+                launch_observation
+                    .as_ref()
+                    .filter(|_| role == ActorRole::Root)
+                    .filter(|_| {
+                        payload.tool_name.as_deref().is_some_and(|tool| {
+                            self.config.managed_tools.iter().any(|mapping| {
+                                mapping.commands.iter().any(|command| {
+                                    tool == format!("mcp__{}__{command}", mapping.server)
+                                })
+                            })
+                        })
+                    })
+                    .map(|launch| &launch.incarnation)
+            });
+        #[cfg(not(target_os = "linux"))]
+        let managed_identity: Option<&os::attempt::KernelIncarnation> = None;
+        let (renewed, previous_epoch) = if let Some(identity) = managed_identity {
+            let (changed, epoch) = managed_binding_decision(self.bindings.get(&key), identity)?;
+            let start = starts_own_session(kind, role, &matched.policy, payload);
+            ((changed && !repeated_live_end) || start, epoch)
+        } else {
+            match self.bindings.get(&key) {
+                Some(binding) if binding.harness != matched.incarnation => {
+                    if !binding.retired
+                        && os::incarnation_alive(binding.harness.0, binding.harness.1)
+                    {
+                        return Err(CorrelationError::Conflicting(
+                            "address is bound to another live harness incarnation".into(),
+                        ));
+                    }
+                    (true, Some(binding.epoch))
                 }
-                (true, Some(binding.epoch))
+                // An OpenCode binding without this actor recorded (an earlier
+                // build's row, restored with MESSAGE withheld) is renewed from the
+                // address's own hook, so core records the actor's true capability.
+                Some(binding) => (
+                    starts_own_session(kind, role, &matched.policy, payload)
+                        || (binding.retired && !repeated_live_end)
+                        || binding.pending
+                        || (harness == Harness::OPENCODE && binding.role != Some(role)),
+                    Some(binding.epoch),
+                ),
+                None => (true, None),
             }
-            // An OpenCode binding without this actor recorded (an earlier
-            // build's row, restored with MESSAGE withheld) is renewed from the
-            // address's own hook, so core records the actor's true capability.
-            Some(binding) => (
-                starts_own_session(kind, role, &matched.policy, payload)
-                    || (binding.retired && !repeated_live_end)
-                    || binding.pending
-                    || (harness == Harness::OPENCODE && binding.role != Some(role)),
-                Some(binding.epoch),
-            ),
-            None => (true, None),
         };
         if renewed {
             let epoch = next_epoch(self.epoch_floor, previous_epoch, now_ms)
@@ -2552,6 +3498,13 @@ impl Registry {
                 Binding {
                     address: address.clone(),
                     harness: matched.incarnation,
+                    #[cfg(target_os = "linux")]
+                    managed_incarnation: (!self.config.managed_tools.is_empty()
+                        && (harness == Harness::CODEX || harness == Harness::CLAUDE_CODE))
+                        .then(|| matched.kernel_incarnation.clone())
+                        .flatten(),
+                    #[cfg(not(target_os = "linux"))]
+                    managed_incarnation: None,
                     epoch,
                     capabilities,
                     qualified: capabilities,
@@ -2636,7 +3589,44 @@ impl Registry {
             binding.wake = Some(live_end_idle);
         }
         let binding = binding.clone();
+        // A root capture and its verified binding are committed in the same
+        // snapshot. Restored captures are inert until this fresh root hook has
+        // matched the exact saved incarnation, session and actor epoch.
+        #[cfg(target_os = "linux")]
+        if role == ActorRole::Root {
+            if let Some((incarnation, observation)) = first_root_launch {
+                self.root_launches.insert(
+                    key.clone(),
+                    RootLaunch {
+                        incarnation,
+                        observation,
+                        epoch: binding.epoch,
+                        armed: true,
+                    },
+                );
+            } else if let (Some(existing), Some(identity)) = (
+                self.root_launches.get_mut(&key),
+                binding.managed_incarnation.as_ref(),
+            ) && existing.incarnation == *identity
+            {
+                if existing.armed {
+                    existing.epoch = binding.epoch;
+                } else if !renewed
+                    && matched.managed_ancestry
+                    && existing.observation.is_some()
+                    && existing.epoch == binding.epoch
+                {
+                    existing.armed = true;
+                }
+            }
+        }
         if let Err(error) = self.persist_routes() {
+            #[cfg(target_os = "linux")]
+            if role == ActorRole::Root && matched.kernel_incarnation.is_some() {
+                // The rename may already have committed. Keep the original
+                // capture as an inert fence and require a restart before B2.
+                self.root_capture_poisoned = true;
+            }
             match previous_binding {
                 Some(old) => {
                     self.bindings.insert(key.clone(), old);
@@ -2669,6 +3659,8 @@ impl Registry {
                 call,
                 CallRecord {
                     harness: matched.incarnation,
+                    #[cfg(target_os = "linux")]
+                    launch_observation,
                     address: key.clone(),
                     role,
                     native_id: native_id.clone(),
@@ -2786,8 +3778,19 @@ impl Registry {
         if self.bindings.len() < DEFAULT_MAX_BINDINGS {
             return;
         }
-        self.bindings
-            .retain(|_, binding| os::incarnation_alive(binding.harness.0, binding.harness.1));
+        self.bindings.retain(|_, binding| {
+            if let Some(identity) = &binding.managed_incarnation {
+                match os::attempt::kernel_incarnation(identity.pid, identity.uid) {
+                    Ok(current) => current == *identity,
+                    Err(_) => true,
+                }
+            } else {
+                os::incarnation_alive(binding.harness.0, binding.harness.1)
+            }
+        });
+        #[cfg(target_os = "linux")]
+        self.root_launches
+            .retain(|_, root| root_capture_may_be_live(root));
     }
 
     /// Attests the actual caller of one MCP request.
@@ -3289,7 +4292,16 @@ impl Registry {
         if binding.retired {
             return Err("the recipient session ended (unknown, not inactive)".into());
         }
-        if !os::incarnation_alive(binding.harness.0, binding.harness.1) {
+        let current = if let Some(identity) = &binding.managed_incarnation {
+            binding.harness.0 == identity.pid
+                && os::attempt::kernel_incarnation(identity.pid, identity.uid)
+                    .ok()
+                    .as_ref()
+                    == Some(identity)
+        } else {
+            os::incarnation_alive(binding.harness.0, binding.harness.1)
+        };
+        if !current {
             return Err(
                 "the recipient's harness process is gone (disconnected, not inactive)".into(),
             );
@@ -3310,6 +4322,7 @@ impl Registry {
             attestation,
             RecipientBinding {
                 harness: binding.harness,
+                managed_incarnation: binding.managed_incarnation.clone(),
                 epoch: binding.epoch,
                 store: binding.store.clone(),
                 executable: binding.executable.clone(),
@@ -3641,6 +4654,7 @@ mod tests {
         let mut registry = registry_with(&[]);
         let address = NativeAddress::new("h", Harness::CODEX, "ns", "idle").unwrap();
         let binding = Binding {
+            managed_incarnation: None,
             address: address.clone(),
             harness: (1, 2),
             epoch: 3,
@@ -3781,9 +4795,51 @@ mod tests {
                 })
                 .collect(),
             audiences: Vec::new(),
+            run_readers: Vec::new(),
+            managed_tools: Vec::new(),
+            owner_v2_routes: Vec::new(),
             legacy_owner_relays: 0,
         };
         Registry::new(config, 0).unwrap()
+    }
+
+    /// Managed frontend, consumer and reader builds must be distinct, and a
+    /// native server/command pair cannot name two producers.
+    #[test]
+    fn managed_configuration_rejects_role_and_tool_overlap() {
+        let mut config = registry_with(&[]).config;
+        let executable = |path: &str, digit: char| RelayExecutable {
+            path: path.into(),
+            sha256: digit.to_string().repeat(64),
+        };
+        config.managed_tools.push(ManagedTools {
+            producer: "p".into(),
+            server: "pool".into(),
+            commands: vec!["vote".into()],
+            frontend: executable("/frontend", 'a'),
+        });
+        config.audiences.push(BackendAudience {
+            producer: "p".into(),
+            name: "aud".into(),
+            executable: executable("/backend", 'b'),
+        });
+        config.run_readers.push(RunReader {
+            producer: "p".into(),
+            reader: "run".into(),
+            executable: executable("/reader", 'c'),
+        });
+        assert!(Registry::new(config.clone(), 0).is_ok());
+        let mut same_build = config.clone();
+        same_build.audiences[0].executable.sha256 = "a".repeat(64);
+        assert!(Registry::new(same_build, 0).is_err());
+        let mut same_path = config.clone();
+        same_path.run_readers[0].executable.path = "/frontend".into();
+        assert!(Registry::new(same_path, 0).is_err());
+        let mut cross_producer = config.clone();
+        let mut second = cross_producer.managed_tools[0].clone();
+        second.producer = "other".into();
+        cross_producer.managed_tools.push(second);
+        assert!(Registry::new(cross_producer, 0).is_err());
     }
 
     /// A private temporary directory for one test, including under inherited
@@ -3796,6 +4852,125 @@ mod tests {
             .create(&dir)
             .unwrap();
         dir.canonicalize().unwrap()
+    }
+
+    /// Schema-1 rows keep no managed identity; conversion and store ID survive
+    /// restart, and an unknown future schema refuses without rewriting bytes.
+    #[test]
+    fn historical_migrations_restart() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("bindingmigration");
+        let path = dir.join("routes.json");
+        let address = NativeAddress::new("h", Harness::CLAUDE_CODE, "ns", "old").unwrap();
+        let old = Binding {
+            address: address.clone(),
+            harness: (42, 7),
+            managed_incarnation: None,
+            epoch: 2,
+            capabilities: Capabilities {
+                inject: false,
+                message: false,
+            },
+            qualified: Capabilities {
+                inject: false,
+                message: false,
+            },
+            version: "old".into(),
+            lifecycle: Lifecycle::Unknown,
+            transcript: None,
+            store: dir.clone(),
+            executable: dir.clone(),
+            retired: true,
+            desktop_idle_message: false,
+            desktop_idle_transcript: None,
+            wake: None,
+            pending: false,
+            role: None,
+        };
+        let old_bytes = serde_json::to_vec(&RouteSnapshot {
+            schema: 1,
+            store_id: None,
+            bindings: vec![old],
+            attempts: None,
+            #[cfg(target_os = "linux")]
+            root_launches: Vec::new(),
+        })
+        .unwrap();
+        std::fs::write(&path, old_bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let owner = os::process_facts(std::process::id()).unwrap().uid.unwrap();
+        let mut first = registry_with(&[]);
+        first.owner_uid = owner;
+        assert!(first.attach_journal(&path, 100).unwrap().is_empty());
+        assert!(
+            first.bindings[&address.to_canonical_string()]
+                .managed_incarnation
+                .is_none()
+        );
+        let converted = std::fs::read(&path).unwrap();
+        let snapshot: RouteSnapshot = serde_json::from_slice(&converted).unwrap();
+        assert_eq!(snapshot.schema, 4);
+        let id = snapshot.store_id.unwrap();
+        assert!(os::attempt::canonical_uuid(&id));
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct OldSnapshot {
+            #[allow(dead_code)]
+            schema: u32,
+            #[allow(dead_code)]
+            bindings: Vec<Binding>,
+        }
+        assert!(serde_json::from_slice::<OldSnapshot>(&converted).is_err());
+        let mut second = registry_with(&[]);
+        second.owner_uid = owner;
+        second.attach_journal(&path, 101).unwrap();
+        assert_eq!(second.store_id, id);
+        let attempt_path = path.with_extension("attempts.json");
+        let original_ledger = std::fs::read(&attempt_path).unwrap();
+        let mut unknown_ledger: serde_json::Value =
+            serde_json::from_slice(&original_ledger).unwrap();
+        unknown_ledger["schema"] = serde_json::json!(99);
+        let unknown_ledger = serde_json::to_vec(&unknown_ledger).unwrap();
+        std::fs::write(&attempt_path, &unknown_ledger).unwrap();
+        let mut refused_ledger = registry_with(&[]);
+        refused_ledger.owner_uid = owner;
+        assert!(refused_ledger.attach_journal(&path, 102).is_ok());
+        assert!(refused_ledger.attempt_journal_poisoned);
+        assert_eq!(std::fs::read(&attempt_path).unwrap(), unknown_ledger);
+        std::fs::write(&attempt_path, original_ledger).unwrap();
+        let mut future: serde_json::Value = serde_json::from_slice(&converted).unwrap();
+        future["schema"] = serde_json::json!(5);
+        let future = serde_json::to_vec(&future).unwrap();
+        std::fs::write(&path, &future).unwrap();
+        let mut refused = registry_with(&[]);
+        refused.owner_uid = owner;
+        assert!(refused.attach_journal(&path, 102).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), future);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Root capture capacity drops only kernel-proven dead incarnations.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn root_capture_capacity_retains_live_and_drops_definitely_gone() {
+        let pid = std::process::id();
+        let uid = os::process_facts(pid).unwrap().uid.unwrap();
+        let identity = os::attempt::kernel_incarnation(pid, uid).unwrap();
+        let mut root = RootLaunch {
+            incarnation: identity,
+            observation: None,
+            epoch: 1,
+            armed: false,
+        };
+        assert!(root_capture_may_be_live(&root));
+        root.incarnation.start_ticks += 1;
+        assert!(!root_capture_may_be_live(&root));
+        root.incarnation.pid = u32::MAX;
+        if os::attempt::definitely_gone(u32::MAX) {
+            assert!(!root_capture_may_be_live(&root));
+        } else {
+            assert!(root_capture_may_be_live(&root));
+        }
     }
 
     /// Construction alone (no manual warm) caches the real digest of every
@@ -4413,6 +5588,9 @@ mod tests {
                 max_call_age_ms: 600_000,
                 relays: Vec::new(),
                 audiences: Vec::new(),
+                run_readers: Vec::new(),
+                managed_tools: Vec::new(),
+                owner_v2_routes: Vec::new(),
                 legacy_owner_relays: 0,
             },
             os::process_facts(std::process::id()).unwrap().uid.unwrap(),
@@ -4429,6 +5607,7 @@ mod tests {
     ) -> Binding {
         let facts = os::process_facts(child.id()).unwrap();
         Binding {
+            managed_incarnation: None,
             address: address.clone(),
             harness: (facts.pid, facts.start_time),
             epoch: 5,
@@ -4757,6 +5936,7 @@ mod tests {
         let address = NativeAddress::new("h", Harness::CLAUDE_CODE, "ns", "session").unwrap();
         let candidate = MessageCandidate {
             binding: Binding {
+                managed_incarnation: None,
                 address,
                 harness: (facts.pid, facts.start_time),
                 epoch: 1,
@@ -4941,6 +6121,9 @@ mod tests {
             max_call_age_ms: 1,
             relays: Vec::new(),
             audiences: Vec::new(),
+            run_readers: Vec::new(),
+            managed_tools: Vec::new(),
+            owner_v2_routes: Vec::new(),
             legacy_owner_relays: 0,
         };
         let none = base().harness_policies().unwrap();

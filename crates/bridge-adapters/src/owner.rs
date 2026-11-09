@@ -95,6 +95,33 @@ pub(crate) fn locator(pid: u32) -> Result<Option<String>, String> {
     }
 }
 
+/// Reads a locator while bracketing managed process identity; legacy callers
+/// retain the original checked-environment behavior.
+pub(crate) fn checked_locator(
+    harness: (u32, u64),
+    managed: Option<&os::attempt::KernelIncarnation>,
+) -> Result<Option<String>, String> {
+    if let Some(identity) = managed
+        && (identity.pid != harness.0
+            || os::attempt::kernel_incarnation(identity.pid, identity.uid)
+                .ok()
+                .as_ref()
+                != Some(identity))
+    {
+        return Err("managed owner harness identity unavailable".into());
+    }
+    let raw = locator(harness.0)?;
+    if let Some(identity) = managed
+        && os::attempt::kernel_incarnation(identity.pid, identity.uid)
+            .ok()
+            .as_ref()
+            != Some(identity)
+    {
+        return Err("managed owner harness identity changed".into());
+    }
+    Ok(raw)
+}
+
 /// Validates a present owner locator for the exact harness incarnation and
 /// proves the live owner with a read-only connection that writes nothing.
 ///
@@ -106,8 +133,10 @@ pub(crate) fn locator(pid: u32) -> Result<Option<String>, String> {
 pub(crate) fn locate(
     registry: &Mutex<Registry>,
     harness: (u32, u64),
+    managed: Option<&os::attempt::KernelIncarnation>,
 ) -> Result<Option<PathBuf>, String> {
-    let Some(raw) = locator(harness.0)? else {
+    let raw = checked_locator(harness, managed)?;
+    let Some(raw) = raw else {
         return Ok(None);
     };
     let socket = PathBuf::from(raw);
@@ -115,14 +144,14 @@ pub(crate) fn locate(
     check_socket(&socket, uid)?;
     let stream = connect(&socket, Instant::now() + PROBE_BUDGET)
         .map_err(|_| "native owner socket is not connectable".to_string())?;
-    verify_peer(&stream, harness, uid)?;
+    verify_peer(&stream, harness, managed, uid)?;
     Ok(Some(socket))
 }
 
 /// Requires `path` to be a canonical absolute socket, mode 0600 and owned by
 /// `uid`, inside a directory that is mode 0700, owned by `uid` and not a
 /// symlink. Canonical equality rejects every symlink component.
-fn check_socket(path: &Path, uid: u32) -> Result<(), String> {
+pub(crate) fn check_socket(path: &Path, uid: u32) -> Result<(), String> {
     let refuse = |what: &str| Err(format!("native owner socket {what}"));
     if !path.is_absolute()
         || path.as_os_str().as_bytes().contains(&0)
@@ -153,8 +182,41 @@ fn check_socket(path: &Path, uid: u32) -> Result<(), String> {
 /// unchanged since the owner started ([`owner_executable_current`]). Process
 /// facts are re-read here, so a reused or replaced process never inherits an
 /// earlier proof.
-fn verify_peer(stream: &UnixStream, harness: (u32, u64), uid: u32) -> Result<(), String> {
+fn verify_peer(
+    stream: &UnixStream,
+    harness: (u32, u64),
+    managed: Option<&os::attempt::KernelIncarnation>,
+    uid: u32,
+) -> Result<(), String> {
     let peer = os::peer_identity(stream).map_err(|_| "native owner peer is unidentified")?;
+    if let Some(expected) = managed {
+        let owner_before = os::attempt::kernel_incarnation(peer.pid, uid)
+            .map_err(|_| "native owner identity unavailable")?;
+        let native_before = os::attempt::kernel_incarnation(expected.pid, uid)
+            .map_err(|_| "native harness identity unavailable")?;
+        let owner = os::process_facts(peer.pid).ok_or("native owner process is gone")?;
+        let native = os::process_facts(expected.pid).ok_or("native harness process is gone")?;
+        if peer.uid != uid
+            || owner.uid != Some(uid)
+            || native.uid != Some(uid)
+            || native_before != *expected
+            || harness.0 != expected.pid
+            || native.parent != Some(peer.pid)
+            || owner_before.boot_id != expected.boot_id
+            || owner_before.pid_namespace_inode != expected.pid_namespace_inode
+            || owner_before.start_ticks > expected.start_ticks
+            || os::attempt::kernel_incarnation(peer.pid, uid).ok().as_ref() != Some(&owner_before)
+            || os::attempt::kernel_incarnation(expected.pid, uid)
+                .ok()
+                .as_ref()
+                != Some(expected)
+        {
+            return Err(
+                "native owner is not the exact direct parent of the managed harness".into(),
+            );
+        }
+        return owner_executable_current(&owner, uid);
+    }
     let owner = os::process_facts(peer.pid).ok_or("native owner process is gone")?;
     let native = os::process_facts(harness.0).ok_or("native harness process is gone")?;
     if peer.uid != uid
@@ -323,6 +385,7 @@ pub(crate) fn deliver(
     registry: &Mutex<Registry>,
     socket: &Path,
     harness: (u32, u64),
+    managed: Option<&os::attempt::KernelIncarnation>,
     kind: Harness,
     handoff: &Handoff<'_>,
 ) -> Outcome {
@@ -352,7 +415,9 @@ pub(crate) fn deliver(
         Ok(stream) => stream,
         Err(_) => return unsent("owner socket unavailable"),
     };
-    if let Err(why) = check_socket(socket, uid).and_then(|()| verify_peer(&stream, harness, uid)) {
+    if let Err(why) =
+        check_socket(socket, uid).and_then(|()| verify_peer(&stream, harness, managed, uid))
+    {
         return unsent(&why);
     }
     let body = match serde_json::to_vec(&Request {
@@ -428,6 +493,135 @@ fn exchange(
         return possible("receipt incomplete");
     }
     classify(&receipt, call_id, kind)
+}
+
+/// Resolves only the separately named managed v2 locator, without connecting.
+/// Absent, malformed, unreadable, unsafe or changed values all refuse.
+#[cfg(target_os = "linux")]
+pub(crate) fn preflight_v2(identity: &os::attempt::KernelIncarnation) -> Option<PathBuf> {
+    let raw = os::attempt::owner_v2_locator(identity).ok().flatten()?;
+    let path = PathBuf::from(raw);
+    check_socket(&path, identity.uid).ok()?;
+    Some(path)
+}
+
+/// Sends one already-reserved frozen effect to its exact pinned v2 owner.
+/// Every failure before the first write is known-unsent; every later failure is
+/// unknown unless a strict, correlated owner reply proves another outcome.
+#[cfg(target_os = "linux")]
+pub(crate) fn deliver_v2(
+    registry: &Mutex<Registry>,
+    route: &crate::registry::ManagedOwnerRoute,
+    identity: &os::attempt::KernelIncarnation,
+    socket: &Path,
+    request: &bridge_protocol::managed_owner::OwnerRequestV2,
+    still_invoking: &mut dyn FnMut() -> bool,
+) -> bridge_core::owner_v2::OwnerEffectResult {
+    use bridge_core::owner_v2::OwnerEffectResult;
+    use bridge_protocol::managed_owner::{
+        ManagedOwnerStateV1, OwnerReplyV2, OwnerStateV2, validate_raw_integer_tokens,
+    };
+    let unsent = |reason: &str| OwnerEffectResult {
+        state: ManagedOwnerStateV1::KnownUnsent,
+        protocol: None,
+        native_id: None,
+        reason: Some(reason.into()),
+    };
+    let unknown = || OwnerEffectResult {
+        state: ManagedOwnerStateV1::Unknown,
+        protocol: None,
+        native_id: None,
+        reason: Some("native_uncertain".into()),
+    };
+    if request.validate().is_err() {
+        return unsent("invalid_request");
+    }
+    if preflight_v2(identity).as_deref() != Some(socket) {
+        return unsent("capability_missing");
+    }
+    let body = match serde_json::to_vec(request) {
+        Ok(body) if !body.is_empty() && body.len() <= MAX_FRAME_BYTES => body,
+        _ => return unsent("invalid_request"),
+    };
+    let deadline = Instant::now() + Duration::from_secs(CLIENT_SECONDS);
+    let before_connect_ticks = match os::attempt::sample_start_ticks() {
+        Ok(value) => value,
+        Err(_) => return unsent("capability_missing"),
+    };
+    let mut stream = match connect(socket, deadline) {
+        Ok(stream) => stream,
+        Err(_) => return unsent("unavailable"),
+    };
+    let peer = match os::peer_identity(&stream) {
+        Ok(peer) => peer,
+        Err(_) => return unsent("capability_missing"),
+    };
+    if !os::attempt::kernel_incarnation(peer.pid, peer.uid)
+        .is_ok_and(|actual| actual.start_ticks <= before_connect_ticks)
+        || check_socket(socket, identity.uid).is_err()
+        || verify_peer(&stream, (identity.pid, 0), Some(identity), identity.uid).is_err()
+        || lock_registry(registry)
+            .verify_owner_v2_run_peer(peer, route)
+            .is_err()
+        || !lock_registry(registry).owner_v2_target_current(&request.outbox_intent)
+        || preflight_v2(identity).as_deref() != Some(socket)
+    {
+        return unsent("actor_mismatch");
+    }
+    let mut bytes = (body.len() as u32).to_le_bytes().to_vec();
+    bytes.extend_from_slice(&body);
+    if !still_invoking() {
+        return unsent("cancelled");
+    }
+    if write_all(&mut stream, &bytes, deadline).is_err() {
+        return unknown();
+    }
+    let mut header = [0; 4];
+    if read_exact(&mut stream, &mut header, deadline).is_err() {
+        return unknown();
+    }
+    let length = u32::from_le_bytes(header) as usize;
+    if length == 0 || length > MAX_FRAME_BYTES {
+        return unknown();
+    }
+    let mut frame = vec![0; length];
+    if read_exact(&mut stream, &mut frame, deadline).is_err()
+        || validate_raw_integer_tokens(&frame).is_err()
+    {
+        return unknown();
+    }
+    let reply: OwnerReplyV2 = match bridge_protocol::decode_strict_object(&frame, MAX_FRAME_BYTES)
+        .ok()
+        .and_then(|value| serde_json::from_value(value).ok())
+    {
+        Some(reply) => reply,
+        None => return unknown(),
+    };
+    let protocol = match request
+        .outbox_intent
+        .target_binding
+        .actor
+        .address
+        .split('/')
+        .nth(1)
+    {
+        Some("codex") => "codex_turn",
+        Some("claude-code") => "claude_input",
+        _ => return unknown(),
+    };
+    if reply.validate_for(request, protocol).is_err() {
+        return unknown();
+    }
+    OwnerEffectResult {
+        state: match reply.state {
+            OwnerStateV2::Accepted => ManagedOwnerStateV1::Accepted,
+            OwnerStateV2::KnownUnsent => ManagedOwnerStateV1::KnownUnsent,
+            OwnerStateV2::Unknown => ManagedOwnerStateV1::Unknown,
+        },
+        protocol: reply.protocol,
+        native_id: reply.native_id,
+        reason: reply.reason,
+    }
 }
 
 #[cfg(test)]

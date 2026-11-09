@@ -32,13 +32,35 @@ cargo +1.98.1 xtask check-public
 ```
 
 These are the checks CI runs. Set `TMPDIR` to a short directory you own; tests
-create Unix sockets beneath it. Set `BRIDGE_TEST_NODE` to an absolute Node.js
+create Unix sockets beneath it. Leave room for a seven-digit PID and a socket
+name plus its terminator: on Linux, a temporary root longer than 62 bytes can
+exceed the 108-byte Unix socket path limit. Use a private root without a
+group-writable default ACL and run the suite with `umask 077`.
+Lifecycle startup creates new state directories with private permissions atomically.
+Set `BRIDGE_TEST_NODE` to an absolute Node.js
 executable (`command -v node`): the full workspace tests, including the deterministic
 Desktop regressions, require it and fail without it. Node is not needed to build or use
-Bridge or the SDK. Tests must use only isolated synthetic state:
+Bridge or the SDK. Its resolved executable must be trusted and non-group-writable,
+with basename `node`; the previous-build Desktop frontend check verifies that exact
+kernel-reported basename. Tests must use only isolated synthetic state:
 fresh temporary databases, private sockets, scripted carriers and fixture
 processes. A test must never touch your real Codex, Claude Code or OpenCode stores,
 sessions or hooks, call a model, or use the network.
+
+The unreleased schema-2 route journal embedded managed receipts. If migration
+to the separate managed journal cannot commit, Bridge preserves the scrubbed
+embedded ledger and refuses managed operations until repair. Legacy route
+writes can continue, but a nearly full retained ledger can still exhaust the
+shared snapshot limit in that recovery state. Released schema-1 stores do not
+contain that embedded ledger.
+
+Managed journal key fences are permanent and currently consume per-store
+space even after an issuer namespace is retired. The 16 MiB byte limit can be
+reached before the 65,536-slot fence limit; the actual number depends on the
+records retained. With the daemon configuration supplied, `bridge doctor`
+reports the fence count, remaining reserved slots and journal byte headroom as
+a point-in-time observation. Neither remaining figure guarantees that a new
+invocation will fit. Namespace-level compact fences are future work.
 
 The native probes in `crates/bridge-adapters/qualification/` need real harness
 builds, may spend model budget and read host state. They are run deliberately by
