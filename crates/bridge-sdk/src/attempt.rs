@@ -673,6 +673,55 @@ impl Client {
         )
     }
 
+    /// Retires one producer delivery scope using the existing core operation,
+    /// after proving the same connected server's pinned executable and kernel
+    /// incarnation. The exact request identity must be retained for recovery;
+    /// this method never automatically retries an uncertain mutation.
+    pub fn retire_delivery_scope_pinned(
+        &self,
+        request_id: impl Into<String>,
+        server: &AttemptServerPin,
+        params: bridge_protocol::RetireDeliveryScopeParams,
+    ) -> Result<bridge_protocol::RetireResult, AttemptClientError> {
+        server
+            .validate()
+            .map_err(AttemptClientError::InvalidRequest)?;
+        let request = bridge_protocol::Request::new(
+            request_id,
+            self.config.credential.clone(),
+            bridge_protocol::Operation::RetireDeliveryScope(params),
+        )
+        .map_err(AttemptClientError::InvalidRequest)?;
+        let mut bytes = bridge_protocol::encode_request(&request)
+            .map_err(AttemptClientError::InvalidRequest)?;
+        bytes.push(b'\n');
+        let frame = transport::exchange_attempt(
+            &self.config.core_socket,
+            &bytes,
+            self.config.timeout,
+            server,
+        )
+        .map_err(|error| match error {
+            transport::AttemptFailure::PeerNotAuthorized => AttemptClientError::PeerNotAuthorized,
+            transport::AttemptFailure::Transport(wrote, reason) => failed(wrote, true, reason),
+        })?;
+        let invalid = || failed(true, true, "invalid correlated response");
+        bridge_protocol::managed_owner::validate_raw_integer_tokens(&frame)
+            .map_err(|_| invalid())?;
+        let response = bridge_protocol::decode_response(&frame, &request).map_err(|_| invalid())?;
+        if let Some(error) = response.error {
+            return Err(AttemptClientError::Service(error));
+        }
+        match response.result {
+            Some(bridge_protocol::OperationResult::RetireDeliveryScope(result))
+                if result.receipt.request_id == request.request_id =>
+            {
+                Ok(result)
+            }
+            _ => Err(invalid()),
+        }
+    }
+
     /// Queries the authenticated Run-reader view of an exact root launch.
     /// A current observation is a snapshot, not an atomic Run admission.
     pub fn run_actor_lookup_v1(
@@ -1029,6 +1078,106 @@ mod tests {
         assert!(
             matches!(error, AttemptClientError::Refused(AttemptErrorV1 { code, .. }) if code == "relaunch_required")
         );
+        cleanup(server);
+    }
+
+    /// Pinned scope retirement uses the core endpoint and correlates the exact
+    /// immutable scope, action and request ID in the returned receipt.
+    #[test]
+    fn pinned_scope_retirement_checks_core_peer_and_receipt() {
+        use bridge_protocol::{
+            OperationResult, Response, RetireDeliveryScopeParams, RetireReceipt, RetireResult,
+            RetirementAction,
+        };
+        let params = RetireDeliveryScopeParams {
+            scope_key: "pool/store/member".into(),
+            action: RetirementAction::RetireUnhanded,
+        };
+        let receipt = RetireReceipt {
+            producer: "pool".into(),
+            request_id: "retire".into(),
+            scope_key: params.scope_key.clone(),
+            action: params.action,
+            retired_at_ms: 1,
+            disposed: 0,
+            already_terminal: 0,
+            preserved_possible_effect: 1,
+            preserved_unhanded: 0,
+        };
+        let answer = Response::ok(
+            "retire",
+            OperationResult::RetireDeliveryScope(RetireResult {
+                receipt: receipt.clone(),
+                replayed: false,
+            }),
+        );
+        let encoded =
+            String::from_utf8(bridge_protocol::encode_response(&answer).unwrap()).unwrap();
+        let (mut client, server) = mock(Some(encoded));
+        client.config.registration_socket = server.directory.join("unused-registration.sock");
+        let result = client
+            .retire_delivery_scope_pinned("retire", &server.pin, params.clone())
+            .unwrap();
+        assert_eq!(result.receipt, receipt);
+        assert!(!result.replayed);
+        cleanup(server);
+
+        let mut wrong = receipt;
+        wrong.scope_key = "pool/other".into();
+        let answer = Response::ok(
+            "retire",
+            OperationResult::RetireDeliveryScope(RetireResult {
+                receipt: wrong,
+                replayed: false,
+            }),
+        );
+        let encoded =
+            String::from_utf8(bridge_protocol::encode_response(&answer).unwrap()).unwrap();
+        let (client, server) = mock(Some(encoded));
+        assert!(matches!(
+            client.retire_delivery_scope_pinned("retire", &server.pin, params),
+            Err(AttemptClientError::Transport {
+                outcome: TransportOutcome::OutcomeUnknown,
+                ..
+            })
+        ));
+        cleanup(server);
+    }
+
+    /// A mismatched executable receives no producer credential or request.
+    #[test]
+    fn pinned_scope_retirement_refuses_untrusted_peer_before_write() {
+        let (client, server) = mock_case(None, true);
+        let path = std::fs::canonicalize("/usr/bin/true").unwrap();
+        let digest =
+            bridge_protocol::sha256_reader(&mut std::fs::File::open(&path).unwrap()).unwrap();
+        let pin = AttemptServerPin::new(path, digest).unwrap();
+        let params = bridge_protocol::RetireDeliveryScopeParams {
+            scope_key: "pool/store/member".into(),
+            action: bridge_protocol::RetirementAction::Preserve,
+        };
+        assert!(matches!(
+            client.retire_delivery_scope_pinned("retire", &pin, params),
+            Err(AttemptClientError::PeerNotAuthorized)
+        ));
+        cleanup(server);
+    }
+
+    /// A lost retirement acknowledgement is uncertain and never reconnected.
+    #[test]
+    fn pinned_scope_retirement_lost_ack_is_not_retried() {
+        let (client, server) = mock(None);
+        let params = bridge_protocol::RetireDeliveryScopeParams {
+            scope_key: "pool/store/member".into(),
+            action: bridge_protocol::RetirementAction::Preserve,
+        };
+        assert!(matches!(
+            client.retire_delivery_scope_pinned("retire", &server.pin, params),
+            Err(AttemptClientError::Transport {
+                outcome: TransportOutcome::OutcomeUnknown,
+                ..
+            })
+        ));
         cleanup(server);
     }
 

@@ -380,8 +380,9 @@ frontend: an audience entry is a deployment trust declaration, not a permission.
 ### Managed owner v2
 
 Managed attempt-bound messages use a separate Linux-only owner route. Configure
-each `[[adapters.owner_v2_routes]]` with `producer`, `audience`, a nonempty
-`producer_scopes` array owned only by that producer, an absolute
+each `[[adapters.owner_v2_routes]]` with `producer`, `audience`, and at least
+one exact `producer_scopes` entry or slash-terminated
+`producer_scope_prefixes` namespace owned only by that producer, an absolute
 `run_home`, `run_route`, `pool_route`, `bridge_route` and
 `run_executable = { path = "/ABS/run", sha256 = "<sha256>" }`. Each route is
 an inline table with `component_store_id`, `route_id` and `worker_uid`. The
@@ -391,7 +392,11 @@ worker UIDs must be the daemon's UID, and the producer must have a distinct
 configured backend audience and a grant allowing delivery scopes, the target
 recipient, message mode and keep-all policy. Ambiguous route configuration is
 refused. The Run executable must be a different build from the producer's
-frontend and audience.
+frontend and audience. A prefix such as `pool/store/pool/` authorizes only
+nonempty descendant segments, for example `pool/store/pool/member` and its
+`/final-notice` descendant; empty path segments and cross-producer overlaps are
+refused. Scope retirement closes the exact scope, not the prefix or its other
+descendants.
 
 Run separately configures the Bridge daemon executable as both a receipt
 reader and a scoped owner-custody reader on its private `attempt-receipts.sock`

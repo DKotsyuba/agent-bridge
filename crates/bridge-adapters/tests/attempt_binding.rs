@@ -1833,6 +1833,100 @@ fn sdk_b1_client_against_protected_server() {
     );
 }
 
+/// The pinned SDK retirement method reaches a real owned core server, keeps
+/// exact replay semantics and leaves sibling scopes independently retireable.
+#[test]
+fn sdk_pinned_scope_retirement_against_owned_core() {
+    use bridge_sdk::{
+        AttemptClientError, AttemptServerPin, Client, Config,
+        bridge_protocol::{RetireDeliveryScopeParams, RetirementAction, Secret},
+    };
+    if std::env::var_os("BRIDGE_PINNED_RETIRE_CHILD").is_none() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("pinned-retire-parent");
+        let executable = dir.0.join("owned-core-test");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = std::process::Command::new(&executable)
+            .args([
+                "--exact",
+                "sdk_pinned_scope_retirement_against_owned_core",
+                "--nocapture",
+            ])
+            .env("BRIDGE_PINNED_RETIRE_CHILD", "1")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "owned pinned-core test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let dir = TempDir::new("pinned-retire-core");
+    let socket = dir.0.join("core.sock");
+    let grant: GrantConfig =
+        serde_json::from_value(json!({"token":PRODUCER_TOKEN,"publisher":PRODUCER,
+        "recipients":["*"],"kinds":["*"],"modes":["message"],"policies":["keep_all"],
+        "producer_v1":{"delivery_scopes":true}}))
+        .unwrap();
+    let running = bridge_core::service::start(bridge_core::service::Config {
+        database: dir.0.join("core.db"),
+        socket: socket.clone(),
+        limits: bridge_core::Limits::new(10),
+        grants: vec![grant],
+        universal_limits: bridge_core::UniversalLimits::default(),
+    })
+    .unwrap();
+    let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+    let pin = AttemptServerPin::new(&executable, file_sha256(&executable).unwrap()).unwrap();
+    let client = Client::new(
+        Config::new(
+            dir.0.join("unused-registration.sock"),
+            &socket,
+            Secret::new(PRODUCER_TOKEN),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let params = RetireDeliveryScopeParams {
+        scope_key: "pool/store/pool/member".into(),
+        action: RetirementAction::RetireUnhanded,
+    };
+    let first = client
+        .retire_delivery_scope_pinned("pinned-retire", &pin, params.clone())
+        .unwrap();
+    assert_eq!(first.receipt.scope_key, params.scope_key);
+    assert!(!first.replayed);
+    let replay = client
+        .retire_delivery_scope_pinned("pinned-retire", &pin, params.clone())
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(first.receipt, replay.receipt);
+    let sibling = RetireDeliveryScopeParams {
+        scope_key: "pool/store/pool/member/final-notice".into(),
+        action: RetirementAction::RetireUnhanded,
+    };
+    assert!(
+        !client
+            .retire_delivery_scope_pinned("pinned-sibling", &pin, sibling)
+            .unwrap()
+            .replayed
+    );
+    let changed = RetireDeliveryScopeParams {
+        scope_key: params.scope_key,
+        action: RetirementAction::Preserve,
+    };
+    assert!(matches!(
+        client.retire_delivery_scope_pinned("pinned-retire", &pin, changed),
+        Err(AttemptClientError::Service(_))
+    ));
+    running.shutdown();
+    running.join();
+}
+
 /// A Run reader observes the original root launch from SessionStart even when
 /// the resumed process has not called Pool; foreign peers and reused identity
 /// cannot obtain a current actor.
@@ -2056,6 +2150,7 @@ fn managed_owner_v2_exact_effect_and_no_legacy_fallback() {
         producer: PRODUCER.into(),
         audience: "backend".into(),
         producer_scopes: vec!["scope".into(), "compact-scope".into()],
+        producer_scope_prefixes: vec!["pool/store/pool/".into()],
         run_home: run_home.clone(),
         run_route: run_route.clone(),
         pool_route,
@@ -2084,6 +2179,7 @@ fn managed_owner_v2_exact_effect_and_no_legacy_fallback() {
     let mut other_route = lab.config.owner_v2_routes[0].clone();
     other_route.producer = "other-pool".into();
     other_route.producer_scopes = vec!["other-scope".into()];
+    other_route.producer_scope_prefixes = vec!["other/".into()];
     lab.config.owner_v2_routes.push(other_route);
     let mut overlapping = lab.config.clone();
     overlapping.owner_v2_routes[1].producer_scopes = vec!["scope".into()];
@@ -2181,6 +2277,38 @@ fn managed_owner_v2_exact_effect_and_no_legacy_fallback() {
     );
     assert_eq!(
         value(&call(&mut other, &lab, squat_lookup, true))["error"]["code"],
+        "peer_not_authorized"
+    );
+    for operation in ["lookup_managed_owner_v1", "compact_managed_owner_scope_v1"] {
+        let mut params = json!({"version":1,"expected_store_id":store,"audience":"backend","producer_scope":"pool/store/pool/member"});
+        if operation == "lookup_managed_owner_v1" {
+            params["effect_id"] = json!("prefix-squat");
+            params["effect_digest"] = json!("a".repeat(64));
+        }
+        let request = request(
+            "synthetic-other-producer-token",
+            "prefix-squat-read",
+            operation,
+            params,
+        );
+        assert_eq!(
+            value(&call(&mut other, &lab, request, true))["error"]["code"],
+            "peer_not_authorized"
+        );
+    }
+    let mut prefix_squat = build("prefix-squat", "prefix-squat-publish");
+    prefix_squat["credential"] = json!("synthetic-other-producer-token");
+    prefix_squat["params"]["outbox_intent"]["producer_scope"] = json!("pool/store/pool/member");
+    let squat_intent: OutboxIntentV1 =
+        serde_json::from_value(prefix_squat["params"]["outbox_intent"].clone()).unwrap();
+    prefix_squat["params"]["effect_digest"] = json!(egress_intent_digest(&squat_intent).unwrap());
+    assert_eq!(
+        value(&call(&mut other, &lab, prefix_squat.clone(), true))["error"]["code"],
+        "peer_not_authorized"
+    );
+    prefix_squat["op"] = json!("abort_managed_owner_v1");
+    assert_eq!(
+        value(&call(&mut other, &lab, prefix_squat, true))["error"]["code"],
         "peer_not_authorized"
     );
     let mut unprivileged = build("unprivileged-abort", "unprivileged-abort");
@@ -2503,6 +2631,89 @@ fn managed_owner_v2_exact_effect_and_no_legacy_fallback() {
     assert_eq!(route_check["v2_frames"].as_array().unwrap().len(), 8);
     assert_eq!(route_check["run_queries"], before["run_queries"]);
 
+    // Dynamic prefixes cover every managed custody operation, while retiring
+    // one exact scope cannot close its separate final-notice descendant.
+    for scope in [
+        "pool/store/pool/",
+        "pool/store/pool//member",
+        "pool/store/pools/member",
+    ] {
+        let lookup = request(
+            PRODUCER_TOKEN,
+            "prefix-boundary",
+            "lookup_managed_owner_v1",
+            json!({"version":1,"expected_store_id":store,"audience":"backend","producer_scope":scope,"effect_id":"missing","effect_digest":"a".repeat(64)}),
+        );
+        assert_eq!(
+            value(&call(&mut consumer, &lab, lookup, true))["error"]["code"],
+            "peer_not_authorized"
+        );
+    }
+    let member_scope = "pool/store/pool/member";
+    let mut prefix_publish = build("prefix-effect", "prefix-dispatch");
+    prefix_publish["params"]["outbox_intent"]["producer_scope"] = json!(member_scope);
+    let prefix_intent: OutboxIntentV1 =
+        serde_json::from_value(prefix_publish["params"]["outbox_intent"].clone()).unwrap();
+    let prefix_digest = egress_intent_digest(&prefix_intent).unwrap();
+    prefix_publish["params"]["effect_digest"] = json!(prefix_digest);
+    native.cmd(json!({"cmd":"owner_script","mode":"claude_accept"}));
+    assert_eq!(
+        value(&call(&mut consumer, &lab, prefix_publish.clone(), true))["value"]["state"],
+        "accepted"
+    );
+    let prefix_lookup = request(
+        PRODUCER_TOKEN,
+        "prefix-lookup",
+        "lookup_managed_owner_v1",
+        json!({"version":1,"expected_store_id":store,"audience":"backend","producer_scope":member_scope,"effect_id":"prefix-effect","effect_digest":prefix_digest}),
+    );
+    assert_eq!(
+        value(&call(&mut consumer, &lab, prefix_lookup, true))["value"]["state"],
+        "accepted"
+    );
+    let mut prefix_abort = prefix_publish;
+    prefix_abort["op"] = json!("abort_managed_owner_v1");
+    prefix_abort["request_id"] = json!("prefix-abort");
+    assert_eq!(
+        value(&call(&mut consumer, &lab, prefix_abort, true))["value"]["state"],
+        "accepted"
+    );
+    native.cmd(json!({"cmd":"owner_set_effect","producer_scope":member_scope,"effect_id":"prefix-effect",
+        "effect":{"state":"accepted","protocol":"claude_input","native_id":"fresh-native-id","reason":null,"effect_digest":prefix_digest}}));
+    lab.storage
+        .lock()
+        .unwrap()
+        .retire_delivery_scope(
+            PRODUCER_TOKEN,
+            "prefix-retire",
+            &bridge_protocol::RetireDeliveryScopeParams {
+                scope_key: member_scope.into(),
+                action: bridge_protocol::RetirementAction::RetireUnhanded,
+            },
+            &|| now(),
+        )
+        .unwrap();
+    let prefix_compact = request(
+        PRODUCER_TOKEN,
+        "prefix-compact",
+        "compact_managed_owner_scope_v1",
+        json!({"version":1,"expected_store_id":store,"audience":"backend","producer_scope":member_scope}),
+    );
+    assert_eq!(
+        value(&call(&mut consumer, &lab, prefix_compact, true))["value"]["compacted"],
+        1
+    );
+    let mut notice = build("prefix-notice", "notice-dispatch");
+    notice["params"]["outbox_intent"]["producer_scope"] =
+        json!("pool/store/pool/member/final-notice");
+    let notice_intent: OutboxIntentV1 =
+        serde_json::from_value(notice["params"]["outbox_intent"].clone()).unwrap();
+    notice["params"]["effect_digest"] = json!(egress_intent_digest(&notice_intent).unwrap());
+    assert_eq!(
+        value(&call(&mut consumer, &lab, notice, true))["value"]["state"],
+        "accepted"
+    );
+
     // Scoped compaction uses the authenticated Run endpoint for each terminal
     // receipt and leaves uncertain rows and the durable closed-scope fence.
     use bridge_core::owner_v2::{OwnerEffect, OwnerEffectResult};
@@ -2613,12 +2824,26 @@ fn managed_owner_v2_exact_effect_and_no_legacy_fallback() {
     assert_eq!(value(&first)["value"]["remaining"], 3);
     native.cmd(json!({"cmd":"owner_set_effect","producer_scope":"compact-scope","effect_id":"compact-accepted",
         "effect":{"state":"accepted","protocol":"claude_input","native_id":"compact-receipt","reason":null,"effect_digest":digests[1].1}}));
-    let second = call(&mut consumer, &lab, compact.clone(), true);
+    // Each pass checks at most one terminal Run receipt. Other scopes may have
+    // advanced the shared cursor, so allow a complete rotation to reach this
+    // accepted effect without weakening the exact receipt requirement.
+    let mut second = call(&mut consumer, &lab, compact.clone(), true);
+    for _ in 0..2 {
+        if value(&second)["value"]["compacted"] != 0 {
+            break;
+        }
+        assert_eq!(value(&second)["value"]["remaining"], 3);
+        second = call(&mut consumer, &lab, compact.clone(), true);
+    }
     assert_eq!(value(&second)["value"]["compacted"], 1);
     assert_eq!(value(&second)["value"]["remaining"], 2);
     native.cmd(json!({"cmd":"owner_set_effect","producer_scope":"compact-scope","effect_id":"compact-aborted",
         "effect":{"state":"aborted","protocol":null,"native_id":null,"reason":null,"effect_digest":digests[2].1}}));
-    let third = call(&mut consumer, &lab, compact, true);
+    let mut third = call(&mut consumer, &lab, compact.clone(), true);
+    if value(&third)["value"]["compacted"] == 0 {
+        assert_eq!(value(&third)["value"]["remaining"], 2);
+        third = call(&mut consumer, &lab, compact.clone(), true);
+    }
     assert_eq!(value(&third)["value"]["compacted"], 1);
     assert_eq!(value(&third)["value"]["remaining"], 1);
     let gone = request(
@@ -2723,7 +2948,7 @@ fn managed_owner_v2_exact_effect_and_no_legacy_fallback() {
             .as_array()
             .unwrap()
             .len(),
-        8
+        10
     );
 }
 

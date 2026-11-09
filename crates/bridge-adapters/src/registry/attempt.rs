@@ -1007,7 +1007,7 @@ impl Registry {
         let mut routes = self.config.owner_v2_routes.iter().filter(|route| {
             route.producer == producer
                 && route.audience == audience
-                && route.producer_scopes.contains(&intent.producer_scope)
+                && route.permits_scope(&intent.producer_scope)
                 && route.run_route == intent.target_binding.run_route
                 && route.pool_route.component_store_id == intent.target_binding.pool_store_id
                 && route.bridge_route == intent.bridge_route
@@ -1039,9 +1039,7 @@ impl Registry {
         self.managed_configured(producer)?;
         self.verify_attempt_consumer(peer, producer, audience, allowed)?;
         if !self.config.owner_v2_routes.iter().any(|route| {
-            route.producer == producer
-                && route.audience == audience
-                && route.producer_scopes.iter().any(|entry| entry == scope)
+            route.producer == producer && route.audience == audience && route.permits_scope(scope)
         }) {
             return Err(AttemptError::new("peer_not_authorized", "none"));
         }

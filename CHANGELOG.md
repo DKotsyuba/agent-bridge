@@ -11,6 +11,8 @@ source, and the crates are not published to crates.io.
 - Add versioned managed-attempt SDK methods with mandatory pinned server
   executable verification, and separate managed-owner v2 effect custody,
   lookup and abort with authenticated Run recovery.
+- Add producer-owned scope prefixes for managed-owner routes and a pinned SDK
+  method for retiring an exact delivery scope.
 
 ### Changed
 

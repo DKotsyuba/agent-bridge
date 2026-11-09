@@ -450,10 +450,14 @@ pub struct RunReader {
 pub struct ManagedOwnerRoute {
     /// Authenticated producer allowed to publish under this route.
     pub producer: String,
-    /// Existing distinct configured consumer audience for this producer.
+    /// Existing configured consumer audience for this producer.
     pub audience: String,
     /// Exact producer scopes authorized to occupy effect keys on this route.
+    #[serde(default)]
     pub producer_scopes: Vec<String>,
+    /// Owned slash-terminated namespaces for dynamic descendant scopes.
+    #[serde(default)]
+    pub producer_scope_prefixes: Vec<String>,
     /// Canonical Run home containing the separately protected receipt socket.
     pub run_home: PathBuf,
     /// Exact Run store, route and worker UID.
@@ -468,6 +472,34 @@ pub struct ManagedOwnerRoute {
 
 /// All route components are strings or integers with reflexive equality.
 impl Eq for ManagedOwnerRoute {}
+
+/// A prefix has complete nonempty slash-separated segments, ends in `/` and
+/// leaves space for at least one byte of an authorized descendant scope.
+fn valid_owner_scope_prefix(prefix: &str) -> bool {
+    prefix.len() < MAX_NATIVE_ID_BYTES
+        && checked_id(prefix, "owner scope prefix").is_ok()
+        && prefix.strip_suffix('/').is_some_and(|body| {
+            !body.is_empty() && body.split('/').all(|segment| !segment.is_empty())
+        })
+}
+
+/// A prefix authorizes only a nonempty descendant with no empty path segment.
+fn owner_scope_prefix_matches(prefix: &str, scope: &str) -> bool {
+    scope.strip_prefix(prefix).is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.split('/').all(|segment| !segment.is_empty())
+    })
+}
+
+impl ManagedOwnerRoute {
+    /// Checks the exact scope against this route's owned literals and prefixes.
+    pub(crate) fn permits_scope(&self, scope: &str) -> bool {
+        self.producer_scopes.iter().any(|entry| entry == scope)
+            || self
+                .producer_scope_prefixes
+                .iter()
+                .any(|prefix| owner_scope_prefix_matches(prefix, scope))
+    }
+}
 
 /// Exact native MCP server and command names for one producer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2175,6 +2207,7 @@ impl Registry {
         }
         let mut owner_routes = std::collections::HashSet::new();
         let mut scope_owners = std::collections::HashMap::new();
+        let mut prefix_owners = std::collections::HashMap::new();
         for route in &config.owner_v2_routes {
             for value in [
                 &route.producer,
@@ -2189,17 +2222,34 @@ impl Registry {
                 checked_id(value, "owner route identity")?;
             }
             let mut route_scopes = std::collections::HashSet::new();
-            if route.producer_scopes.is_empty() || route.producer_scopes.len() > 1024 {
+            if route.producer_scopes.is_empty() && route.producer_scope_prefixes.is_empty()
+                || route
+                    .producer_scopes
+                    .len()
+                    .saturating_add(route.producer_scope_prefixes.len())
+                    > 1024
+            {
                 return Err("invalid managed owner scopes".into());
             }
             for scope in &route.producer_scopes {
                 checked_id(scope, "owner producer scope")?;
                 if !route_scopes.insert(scope)
                     || scope_owners
-                        .insert(scope, &route.producer)
-                        .is_some_and(|owner| owner != &route.producer)
+                        .insert(scope.as_str(), route.producer.as_str())
+                        .is_some_and(|owner| owner != route.producer.as_str())
                 {
                     return Err("conflicting managed owner scope".into());
+                }
+            }
+            let mut route_prefixes = std::collections::HashSet::new();
+            for prefix in &route.producer_scope_prefixes {
+                if !valid_owner_scope_prefix(prefix)
+                    || !route_prefixes.insert(prefix)
+                    || prefix_owners
+                        .insert(prefix.as_str(), route.producer.as_str())
+                        .is_some_and(|owner| owner != route.producer.as_str())
+                {
+                    return Err("invalid or conflicting managed owner prefix".into());
                 }
             }
             if !route.run_home.is_absolute()
@@ -2243,6 +2293,32 @@ impl Registry {
                         .eq_ignore_ascii_case(&route.run_executable.sha256)
             }) {
                 return Err("managed owner and producer executable overlap".into());
+            }
+        }
+        // Compare every rule against all configured owners after collection,
+        // so nested-prefix and literal conflicts cannot depend on entry order.
+        for (prefix, owner) in &prefix_owners {
+            for (index, _) in prefix.match_indices('/') {
+                let ancestor = &prefix[..=index];
+                if ancestor != *prefix
+                    && prefix_owners
+                        .get(ancestor)
+                        .is_some_and(|other| *other != *owner)
+                {
+                    return Err("conflicting managed owner prefix".into());
+                }
+            }
+        }
+        for (scope, owner) in &scope_owners {
+            for (index, _) in scope.match_indices('/') {
+                let prefix = &scope[..=index];
+                if owner_scope_prefix_matches(prefix, scope)
+                    && prefix_owners
+                        .get(prefix)
+                        .is_some_and(|other| *other != *owner)
+                {
+                    return Err("conflicting managed owner scope".into());
+                }
             }
         }
         let mut reader_pairs = std::collections::HashSet::new();
@@ -4857,6 +4933,7 @@ mod tests {
             producer: "p".into(),
             audience: "aud".into(),
             producer_scopes: vec!["scope".into()],
+            producer_scope_prefixes: Vec::new(),
             run_home: "/run".into(),
             run_route: route("run-store"),
             pool_route: route("pool-store"),
@@ -4869,6 +4946,103 @@ mod tests {
         second.producer = "other".into();
         cross_producer.managed_tools.push(second);
         assert!(Registry::new(cross_producer, 0).is_err());
+    }
+
+    /// Slash prefixes authorize only nonempty descendant segments and cannot
+    /// overlap another producer's prefix or literal regardless of entry order.
+    #[test]
+    fn managed_owner_scope_prefixes_are_segmented_and_globally_owned() {
+        for prefix in ["", "/", "pool", "/pool/", "pool//", "pool//member/"] {
+            assert!(!valid_owner_scope_prefix(prefix), "{prefix:?}");
+        }
+        assert!(valid_owner_scope_prefix("pool/store/pool/"));
+        assert!(owner_scope_prefix_matches("pool/", "pool/store/member"));
+        assert!(owner_scope_prefix_matches(
+            "pool/",
+            "pool/member/final-notice"
+        ));
+        for scope in [
+            "pool",
+            "pool/",
+            "pool//member",
+            "pool/member/",
+            "pools/member",
+        ] {
+            assert!(!owner_scope_prefix_matches("pool/", scope), "{scope:?}");
+        }
+        let mut config = registry_with(&[]).config;
+        for (producer, digit) in [("p", 'a'), ("q", 'b')] {
+            config.audiences.push(BackendAudience {
+                producer: producer.into(),
+                name: "aud".into(),
+                executable: RelayExecutable {
+                    path: format!("/audience-{producer}").into(),
+                    sha256: digit.to_string().repeat(64),
+                },
+            });
+        }
+        let route_id = |store: &str| bridge_protocol::managed_owner::RouteV1 {
+            component_store_id: store.into(),
+            route_id: "route".into(),
+            worker_uid: 0,
+        };
+        let make = |producer: &str| ManagedOwnerRoute {
+            producer: producer.into(),
+            audience: "aud".into(),
+            producer_scopes: Vec::new(),
+            producer_scope_prefixes: Vec::new(),
+            run_home: "/run".into(),
+            run_route: route_id("run"),
+            pool_route: route_id("pool"),
+            bridge_route: route_id("01234567-89ab-4cde-8fab-0123456789ab"),
+            run_executable: RelayExecutable {
+                path: "/run-server".into(),
+                sha256: "c".repeat(64),
+            },
+        };
+        let mut p = make("p");
+        p.producer_scope_prefixes.push("pool/".into());
+        let mut q = make("q");
+        q.producer_scope_prefixes.push("pool/member/".into());
+        for reverse in [false, true] {
+            let mut candidate = config.clone();
+            candidate.owner_v2_routes = if reverse {
+                vec![q.clone(), p.clone()]
+            } else {
+                vec![p.clone(), q.clone()]
+            };
+            assert!(Registry::new(candidate, 0).is_err());
+        }
+        q.producer_scope_prefixes.clear();
+        q.producer_scopes.push("pool/member".into());
+        for reverse in [false, true] {
+            let mut candidate = config.clone();
+            candidate.owner_v2_routes = if reverse {
+                vec![q.clone(), p.clone()]
+            } else {
+                vec![p.clone(), q.clone()]
+            };
+            assert!(Registry::new(candidate, 0).is_err());
+        }
+        q.producer_scopes = vec!["pool//member".into()];
+        config.owner_v2_routes = vec![p.clone(), q];
+        assert!(Registry::new(config.clone(), 0).is_ok());
+        assert!(p.permits_scope("pool/store/member"));
+        assert!(!p.permits_scope("pool/"));
+        assert!(!p.permits_scope("pool//member"));
+        let mut raw = serde_json::to_value(&p).unwrap();
+        raw.as_object_mut().unwrap().remove("producer_scopes");
+        let prefix_only: ManagedOwnerRoute = serde_json::from_value(raw).unwrap();
+        assert!(prefix_only.producer_scopes.is_empty());
+        let mut legacy = serde_json::to_value(&p).unwrap();
+        legacy["producer_scopes"] = serde_json::json!(["legacy"]);
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("producer_scope_prefixes");
+        let legacy: ManagedOwnerRoute = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.producer_scope_prefixes.is_empty());
+        assert!(legacy.permits_scope("legacy"));
     }
 
     /// A saved frontend incarnation remains excluded even when considered as a
