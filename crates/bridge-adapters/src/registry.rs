@@ -3114,7 +3114,7 @@ impl Registry {
     /// Only a fresh owned descriptor in the route's own store that positively
     /// reports `idle` or `busy` for exactly the recorded session, PID and start
     /// time, executable and store, written at or after the process start (proven
-    /// without a clock discontinuity, see [`os::clock`]), sets the
+    /// without a clock discontinuity, see `os::clock`), sets the
     /// lifecycle (same epoch, no capability or caller change, journaled with
     /// rollback on failure). The store must still be a canonical owner-only
     /// directory, the process a marked harness running a trusted executable that
@@ -4890,7 +4890,7 @@ fn executable_current_for(
 
 /// Whether the descriptor written at `written_at` is positively no older than the
 /// process `facts`: on Linux the clock-discontinuity check of
-/// [`os::clock::written_after_start`] (refused for a process that started before
+/// `os::clock::written_after_start` (refused for a process that started before
 /// Bridge or whenever a wall-clock step cannot be excluded); elsewhere the
 /// earlier whole-second start time, a documented non-Linux residual (a wall-clock
 /// step can move it) kept for the ordinary Claude recipient route.
