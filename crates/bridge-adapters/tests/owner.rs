@@ -989,11 +989,17 @@ fn unsafe_or_changed_owner_executable_is_refused_with_no_effect() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     for harness in [Harness::CODEX, Harness::CLAUDE_CODE] {
         for (label, mode) in [("group-writable", 0o775), ("status change only", 0o755)] {
-            let refused = mode == 0o775;
+            // Off Linux a status change alone also refuses: the owner build is
+            // judged by whole-second file times, not by the loaded inode.
+            let refused = mode == 0o775 || cfg!(not(target_os = "linux"));
             let dir = TempDir::new("ow9");
             let owner_exe = dir.0.join("bridge-fixture-owner");
             std::fs::copy(fixture_exe(), &owner_exe).unwrap();
             std::fs::set_permissions(&owner_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // Off Linux the owner must start in a later second than its file's
+            // last change.
+            #[cfg(not(target_os = "linux"))]
+            std::thread::sleep(Duration::from_millis(1100));
             let mut rig = Rig::with_owner_exe("ow9", harness, Some(&owner_exe));
             rig.script(rig.accept());
             let control = rig.send("evt-ok", Mode::Message, "control");

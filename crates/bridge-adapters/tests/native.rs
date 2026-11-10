@@ -689,6 +689,10 @@ fn claude_changed_executable_holds_before_write_and_rejects_late_receipt() {
         let executable = lab.dir.0.join("bridge-fixture-claude");
         std::fs::copy(fixture_exe(), &executable).unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Off Linux the build is judged by whole-second file times, so the
+        // process must start in a later second than the copy's last change.
+        #[cfg(not(target_os = "linux"))]
+        std::thread::sleep(Duration::from_millis(2_100));
         let mut harness =
             Harnessed::start_from(&executable, Harness::CLAUDE_CODE, &lab.claude_store);
         harness.cmd(json!({"cmd": "inbox", "session_id": "sess-changed", "behavior": "none"}));
