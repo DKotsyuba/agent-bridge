@@ -19,14 +19,21 @@
 //! - `{"op":"attest","meta":{..}}` attests the presenting process as the
 //!   caller of one MCP request (see [`crate::registry::Registry::attest_caller`]).
 //!
+//! Capacity: an accepted connection is never dropped silently. Beyond the
+//! serving limit connections wait (bounded, then in the kernel listen queue)
+//! and, after a grace period, are refused with the typed `capacity_exhausted`
+//! reply of their own protocol before anything is decoded, so the identical
+//! request may be repeated (see [`BUSY_CODE`]).
+//!
 //! Lock order: the registry lock and the storage lock are never held at the
 //! same time, and neither is held across socket I/O.
 
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -54,7 +61,66 @@ use crate::registry::{
 pub const MAX_REQUEST_BYTES: usize = 128 * 1024;
 
 /// Largest number of connections served at once.
-const MAX_CONNECTIONS: usize = 64;
+///
+/// Each connection runs on its own thread, but the registry serializes the
+/// work, so extra threads buy no throughput: they only park. A thread costs a
+/// reserved (untouched) stack and one descriptor, so the bound exists to stop
+/// runaway growth, not to ration work. It must clear the legitimate burst: 20
+/// members each presenting a hook, a frontend attestation and the resident and
+/// Run operations of one call is roughly 100 simultaneous connections, which
+/// the former 64 could not hold. 256 leaves more than double that headroom
+/// while the descriptors (this plus [`MAX_PENDING`]) stay far below a default
+/// 1024-descriptor soft limit.
+const MAX_CONNECTIONS: usize = 256;
+
+/// Largest number of accepted connections that may wait for a serving slot.
+///
+/// Beyond it the accept loop stops accepting and the kernel listen queue
+/// (the system maximum, 4096 on Linux) holds later arrivals; clients wait in
+/// `connect` within their own timeout.
+const MAX_PENDING: usize = 128;
+
+/// How long an accepted connection may wait for a serving slot before it is
+/// refused with the typed busy reply. Shorter than every client's timeout
+/// (five seconds) so a client always receives a typed answer instead of timing
+/// out on an uncertain exchange.
+const BUSY_GRACE: Duration = Duration::from_secs(2);
+
+/// Time spent reading the request line of a connection being refused, so the
+/// reply uses the protocol the client speaks and nothing is left unread (an
+/// unread request makes the kernel reset the connection, losing the reply).
+const REFUSAL_READ_BUDGET: Duration = Duration::from_millis(25);
+
+/// Write timeout of a refusal, so a stalled peer cannot hold the accept loop.
+const REFUSAL_WRITE_BUDGET: Duration = Duration::from_millis(100);
+
+/// Total time allowed to refuse the connections still waiting at shutdown.
+const SHUTDOWN_REFUSAL_BUDGET: Duration = Duration::from_millis(250);
+
+/// Stable code of the typed busy refusal (a B1 refusal code, see
+/// `bridge-b1-wire.md`). It is sent before the request is decoded, so nothing
+/// was executed and the identical request may be repeated.
+pub const BUSY_CODE: &str = "capacity_exhausted";
+
+/// Class of the busy refusal on the legacy channel; [`BUSY_CODE`] is its detail.
+pub const BUSY_CLASS: &str = "unavailable";
+
+/// Connection limits of one channel.
+#[derive(Clone, Copy)]
+struct Limits {
+    /// Connections served at once.
+    max_connections: usize,
+    /// Longest wait for a serving slot before a busy refusal.
+    busy_grace: Duration,
+}
+
+impl Limits {
+    /// The production limits.
+    const DEFAULT: Limits = Limits {
+        max_connections: MAX_CONNECTIONS,
+        busy_grace: BUSY_GRACE,
+    };
+}
 
 /// Per-read/write timeout on a channel connection.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -398,6 +464,16 @@ struct ChannelState {
     running: AtomicBool,
     /// Connections being served.
     active: AtomicUsize,
+    /// Connections accepted and waiting for a serving slot.
+    pending: AtomicUsize,
+    /// Connections refused with the typed busy reply since start.
+    busy_refusals: AtomicU64,
+    /// Connection limits.
+    limits: Limits,
+    /// Durable store identity for typed busy refusals of B1 requests, read once
+    /// after the route journal attached so a refusal never waits for the
+    /// registry lock.
+    store_id: String,
     /// Round-robin cursor for bounded managed-owner compaction passes.
     #[cfg(target_os = "linux")]
     owner_compaction_cursor: AtomicUsize,
@@ -575,6 +651,47 @@ impl ChannelServer {
         timing: DispatchTiming,
         delivery: Arc<dyn DeliverySink>,
     ) -> std::io::Result<ChannelServer> {
+        Self::start_limited(socket, registry, custody, timing, delivery, Limits::DEFAULT)
+    }
+
+    /// Starts the channel with explicit connection limits, so a test can
+    /// saturate it with few connections.
+    ///
+    /// # Errors
+    ///
+    /// As [`ChannelServer::start`].
+    #[cfg(feature = "test-fixtures")]
+    pub fn start_with_limits(
+        socket: &Path,
+        registry: Arc<Mutex<Registry>>,
+        custody: Arc<dyn Custody>,
+        timing: DispatchTiming,
+        max_connections: usize,
+        busy_grace: Duration,
+    ) -> std::io::Result<ChannelServer> {
+        let delivery = Arc::new(LocalDelivery::new(Arc::clone(&custody)));
+        Self::start_limited(
+            socket,
+            registry,
+            custody,
+            timing,
+            delivery,
+            Limits {
+                max_connections,
+                busy_grace,
+            },
+        )
+    }
+
+    /// Shared start logic with the given connection limits.
+    fn start_limited(
+        socket: &Path,
+        registry: Arc<Mutex<Registry>>,
+        custody: Arc<dyn Custody>,
+        timing: DispatchTiming,
+        delivery: Arc<dyn DeliverySink>,
+        limits: Limits,
+    ) -> std::io::Result<ChannelServer> {
         let directory = socket
             .parent()
             .ok_or_else(|| std::io::Error::other("channel socket has no directory"))?;
@@ -601,6 +718,7 @@ impl ChannelServer {
         let metadata = std::fs::symlink_metadata(socket)?;
         std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
+        let store_id = lock_registry(&registry).attempt_store_id();
         let state = Arc::new(ChannelState {
             registry,
             custody,
@@ -608,6 +726,10 @@ impl ChannelServer {
             timing,
             running: AtomicBool::new(true),
             active: AtomicUsize::new(0),
+            pending: AtomicUsize::new(0),
+            busy_refusals: AtomicU64::new(0),
+            limits,
+            store_id,
             #[cfg(target_os = "linux")]
             owner_compaction_cursor: AtomicUsize::new(0),
         });
@@ -627,6 +749,21 @@ impl ChannelServer {
     /// The bound socket path.
     pub fn socket(&self) -> &Path {
         &self.socket
+    }
+
+    /// Connections refused with the typed busy reply since start. A refusal
+    /// is a typed answer, never a drop: the client may repeat its request.
+    pub fn busy_refusals(&self) -> u64 {
+        self.state.busy_refusals.load(Ordering::SeqCst)
+    }
+
+    /// Connections currently being served and connections accepted but still
+    /// waiting for a serving slot, in that order.
+    pub fn load(&self) -> (usize, usize) {
+        (
+            self.state.active.load(Ordering::SeqCst),
+            self.state.pending.load(Ordering::SeqCst),
+        )
     }
 
     /// Stops accepting, waits for the accept loop and removes the socket
@@ -659,8 +796,18 @@ impl Drop for ChannelServer {
 }
 
 /// Accepts connections until stopped, one bounded thread each.
+///
+/// No accepted connection is ever dropped silently. At the serving limit the
+/// loop applies backpressure: it keeps accepted connections in a bounded
+/// queue (and, when that is full, stops accepting so the kernel listen queue
+/// holds them) until a serving slot frees. A connection that waits longer than
+/// the grace period is refused with the typed busy reply and counted, so its
+/// client learns that nothing ran and may repeat the request. Shutdown refuses
+/// the still-waiting connections the same way.
 fn accept_loop(listener: UnixListener, state: Arc<ChannelState>) {
     let mut next_attempt_maintenance = Instant::now();
+    let mut waiting: VecDeque<(Instant, UnixStream)> = VecDeque::new();
+    let mut refusals = RefusalLog::default();
     while state.running.load(Ordering::SeqCst) {
         if Instant::now() >= next_attempt_maintenance {
             // Maintenance must not block accepting requests while another
@@ -677,29 +824,165 @@ fn accept_loop(listener: UnixListener, state: Arc<ChannelState>) {
             }
             next_attempt_maintenance = Instant::now() + Duration::from_secs(1);
         }
-        match listener.accept() {
-            Ok((stream, _)) => {
-                if state.active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
-                    state.active.fetch_sub(1, Ordering::SeqCst);
+        let mut progressed = false;
+        // Only this thread raises `active`, so a free slot seen here stays free.
+        while state.active.load(Ordering::SeqCst) < state.limits.max_connections
+            && let Some((_, stream)) = waiting.pop_front()
+        {
+            state.pending.fetch_sub(1, Ordering::SeqCst);
+            spawn_connection(stream, &state);
+            progressed = true;
+        }
+        while waiting
+            .front()
+            .is_some_and(|(since, _)| since.elapsed() >= state.limits.busy_grace)
+        {
+            let (_, stream) = waiting.pop_front().expect("front was just seen");
+            state.pending.fetch_sub(1, Ordering::SeqCst);
+            refuse_busy(stream, &state);
+            refusals.note();
+            progressed = true;
+        }
+        if waiting.len() < MAX_PENDING {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    waiting.push_back((Instant::now(), stream));
+                    state.pending.fetch_add(1, Ordering::SeqCst);
+                    progressed = true;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    std::thread::sleep(Duration::from_millis(20));
                     continue;
                 }
-                let connection_state = Arc::clone(&state);
-                let spawned = std::thread::Builder::new()
-                    .name("bridge-adapter-conn".into())
-                    .spawn(move || {
-                        serve(stream, &connection_state);
-                        connection_state.active.fetch_sub(1, Ordering::SeqCst);
-                    });
-                if spawned.is_err() {
-                    state.active.fetch_sub(1, Ordering::SeqCst);
-                }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(_) => std::thread::sleep(Duration::from_millis(20)),
+        }
+        refusals.flush(&state);
+        if !progressed {
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
+    let deadline = Instant::now() + SHUTDOWN_REFUSAL_BUDGET;
+    for (_, stream) in waiting {
+        state.pending.fetch_sub(1, Ordering::SeqCst);
+        if Instant::now() < deadline {
+            refuse_busy(stream, &state);
+            refusals.note();
+        }
+    }
+    refusals.flush(&state);
+}
+
+/// Serves `stream` on a bounded thread; when no thread can be created the
+/// connection is refused with the typed busy reply instead of being dropped.
+fn spawn_connection(stream: UnixStream, state: &Arc<ChannelState>) {
+    let Ok(spare) = stream.try_clone() else {
+        refuse_busy(stream, state);
+        return;
+    };
+    state.active.fetch_add(1, Ordering::SeqCst);
+    let connection_state = Arc::clone(state);
+    let spawned = std::thread::Builder::new()
+        .name("bridge-adapter-conn".into())
+        .spawn(move || {
+            serve(stream, &connection_state);
+            connection_state.active.fetch_sub(1, Ordering::SeqCst);
+        });
+    if spawned.is_err() {
+        state.active.fetch_sub(1, Ordering::SeqCst);
+        refuse_busy(spare, state);
+    }
+}
+
+/// Throttled log of busy refusals, so a flood costs one line per second.
+#[derive(Default)]
+struct RefusalLog {
+    /// Refusals since the last line.
+    unlogged: u64,
+    /// When the last line was written.
+    last: Option<Instant>,
+}
+
+impl RefusalLog {
+    /// Notes one refusal.
+    fn note(&mut self) {
+        self.unlogged += 1;
+    }
+
+    /// Writes the counter line when refusals are unlogged and at most once a second.
+    fn flush(&mut self, state: &ChannelState) {
+        if self.unlogged == 0
+            || self
+                .last
+                .is_some_and(|last| last.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
+        log_event(
+            "warn",
+            "connections_refused_busy",
+            &[
+                ("code", BUSY_CODE),
+                ("refused", &self.unlogged.to_string()),
+                (
+                    "refused_total",
+                    &state.busy_refusals.load(Ordering::SeqCst).to_string(),
+                ),
+                ("active", &state.active.load(Ordering::SeqCst).to_string()),
+                ("waiting", &state.pending.load(Ordering::SeqCst).to_string()),
+            ],
+        );
+        self.unlogged = 0;
+        self.last = Some(Instant::now());
+    }
+}
+
+/// Refuses one accepted connection with the typed busy reply and counts it.
+///
+/// The request line is read first (bounded by [`REFUSAL_READ_BUDGET`]): the
+/// reply must use the protocol the client speaks (B1 envelopes are correlated
+/// by request id), and a connection closed with unread request bytes is reset
+/// by the kernel, which would destroy the reply. Nothing is decoded, executed
+/// or logged beyond the counter, so the identical request may be repeated.
+fn refuse_busy(mut writer: UnixStream, state: &ChannelState) {
+    state.busy_refusals.fetch_add(1, Ordering::SeqCst);
+    let _ = writer.set_write_timeout(Some(REFUSAL_WRITE_BUDGET));
+    let busy = ChannelResponse::Refused {
+        class: BUSY_CLASS.into(),
+        detail: BUSY_CODE.into(),
+    };
+    // Without a second descriptor the request cannot be read; the legacy
+    // refusal is still typed and still better than a close.
+    let Ok(half) = writer.try_clone() else {
+        let _ = write_response(&mut writer, &busy);
+        return;
+    };
+    let mut reader = BufReader::new(half);
+    let line = read_line(&mut reader, REFUSAL_READ_BUDGET);
+    let value = line
+        .as_deref()
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|value| value.get("api_version").is_some());
+    match (line.as_deref(), value) {
+        (Some(line), Some(value))
+            if value
+                .get("op")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(attempt::is_attempt_operation) =>
+        {
+            attempt::busy(line, &state.store_id, &mut writer);
+        }
+        (Some(line), Some(_)) => producer::busy_v1(line, &mut writer),
+        _ => {
+            let _ = write_response(&mut writer, &busy);
+        }
+    }
+}
+
+/// Whether a channel refusal is the typed busy reply: the request was not
+/// read, so a client may repeat it unchanged.
+pub(crate) fn is_busy(class: &str, detail: &str) -> bool {
+    class == BUSY_CLASS && detail == BUSY_CODE
 }
 
 /// Reads one bounded strict UTF-8 line under one absolute timeout. Partial
@@ -745,10 +1028,14 @@ fn write_response(stream: &mut UnixStream, response: &ChannelResponse) -> std::i
 fn serve(stream: UnixStream, state: &ChannelState) {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+    // A failure here is the server's own (or the peer already left): the typed
+    // busy reply tells a live client nothing ran, where a close would reset it.
     let Ok(peer) = os::peer_identity(&stream) else {
+        refuse_busy(stream, state);
         return;
     };
     let Ok(mut writer) = stream.try_clone() else {
+        refuse_busy(stream, state);
         return;
     };
     let mut reader = BufReader::new(stream);

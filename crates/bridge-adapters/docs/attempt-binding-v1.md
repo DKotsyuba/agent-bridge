@@ -43,6 +43,22 @@ Codes: `unsupported_version`, `capability_missing`, `transport_unsupported`, `ro
 
 Managed ancestry checks bracket kernel reads and require each parent start tick not exceed its child. The current safe dependency set does not expose pidfd/SO_PEERPIDFD; kernel peer PID reuse between peer-credential acquisition and inspection remains a residual requiring a separately reviewed safe wrapper.
 
+## Channel capacity and busy refusal
+
+The channel serves at most 256 connections at once, one thread each. A connection accepted while all slots are taken is never dropped: it waits in a bounded queue (128; beyond that the kernel listen queue holds later arrivals and clients wait in `connect`) for at most two seconds, which is shorter than every client's five-second timeout. If no slot frees in that time, or the server is stopping, the connection is refused with a typed busy reply and counted (`connections_refused_busy` in the log carries the counts, never a payload). The reply is sent before the request is decoded or executed, so nothing ran: the identical request may simply be repeated.
+
+* B1 operations: the versioned outcome `{"status":"error","error":{"version":1,"store_id":UUID,"code":"capacity_exhausted","recovery":"same_key_lookup"}}`, correlated by the request's own `request_id` and `op`. Repeat the exact request (same request id, keys and native proof).
+* Producer v1 operations: the outer error `class: "unavailable"`, `reason: "capacity_exhausted"`, `retry_hint: "same_identity"`, with `effect: "not_committed"` and the usual reconciliation identity when the request names one.
+* Legacy hook and attestation requests: `{"result":"refused","class":"unavailable","detail":"capacity_exhausted"}`. The hook client repeats such a refusal with a short backoff for one operation timeout before reporting it, so a `PreToolUse` hook, which the harness runs once per native call, still delivers its token to the same call.
+
+`capacity_exhausted` with recovery `operator` or `same_key_lookup` from inside an operation (journal, claim or role capacity) is a different, operation-level condition and keeps its documented recovery. A client never changes an identity because of any of these.
+
+### Retry after a lost or refused exchange
+
+* A typed busy refusal: repeat the identical request on the same native call; nothing was read.
+* A hook that never ran or never delivered its token (connection reset, timeout, fail-open): the harness runs `PreToolUse` once per native call, so that call carries no token and cannot be attested later, and no reservation or fence of the old call blocks its replacement. The retry is a new native tool call, which gets its own hook and token.
+* A `prepare_native_context_v1` whose reply was lost: replay the exact request from the same native call and Bridge returns the original context reference. A different native call under the same invocation key is `intent_conflict` while the reservation lives and `invocation_spent` with recovery `fresh_invocation` after it is sealed: use a new invocation key together with the new native call. This is by design: an invocation key is bound to exactly one native call.
+
 ## Managed clients and owner recovery
 
 Every managed SDK method requires an explicit pinned Bridge server executable path and SHA-256; the connected kernel UID, PID, full incarnation and live executable inode are verified before credentials are sent. Managed methods never automatically retry an uncertain write. See the [SDK transport contract](../../bridge-sdk/README.md#transport-and-errors).

@@ -12,7 +12,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bridge_core::Harness;
 
@@ -20,7 +20,7 @@ use crate::os;
 use crate::registry::{
     CallerAttestor, CorrelationError, PresentedMeta, SealedProof, VerifiedCaller,
 };
-use crate::server::{ChannelRequest, ChannelResponse, sha256_hex};
+use crate::server::{ChannelRequest, ChannelResponse, is_busy, sha256_hex};
 
 /// Largest hook payload read from the harness, in bytes.
 pub const MAX_HOOK_INPUT_BYTES: usize = 64 * 1024;
@@ -89,7 +89,36 @@ impl ChannelClient {
     }
 
     /// Sends one request and reads one response.
+    ///
+    /// A typed busy refusal ([`crate::server::BUSY_CODE`]) means the channel
+    /// was at capacity and never read the request, so repeating it unchanged
+    /// cannot duplicate anything: it is repeated with a short backoff for as
+    /// long as one operation timeout lasts, then reported to the caller as the
+    /// refusal it is. This is what lets a `PreToolUse` hook, which the harness
+    /// runs once per native call, still deliver its token to the same call
+    /// after a burst. Every other failure (a reset, EOF or timeout after the
+    /// request was written is uncertain) is returned at once and never retried.
     fn exchange(
+        &self,
+        request: &ChannelRequest,
+    ) -> std::io::Result<(ChannelResponse, UnixStream, BufReader<UnixStream>)> {
+        let started = Instant::now();
+        // Spread concurrent clients (one process each) so they do not return together.
+        let mut backoff = Duration::from_millis(40 + u64::from(std::process::id() % 40));
+        loop {
+            let exchange = self.exchange_once(request)?;
+            let busy = matches!(&exchange.0, ChannelResponse::Refused { class, detail }
+                if is_busy(class, detail));
+            if !busy || started.elapsed() + backoff >= self.timeout {
+                return Ok(exchange);
+            }
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(Duration::from_millis(400));
+        }
+    }
+
+    /// One connection, one request, one response.
+    fn exchange_once(
         &self,
         request: &ChannelRequest,
     ) -> std::io::Result<(ChannelResponse, UnixStream, BufReader<UnixStream>)> {

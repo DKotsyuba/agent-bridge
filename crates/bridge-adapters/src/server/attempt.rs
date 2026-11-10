@@ -197,6 +197,43 @@ pub(super) fn write_outer_error(
     }
 }
 
+/// Refuses a not-yet-decoded B1 frame because the channel is at capacity: the
+/// versioned `capacity_exhausted` outcome with the `same_key_lookup` recovery
+/// class, correlated by the request's own id and operation. Nothing was
+/// decoded or executed, so the identical request (same id and keys) may simply
+/// be repeated. A frame without a usable id or operation gets the producer
+/// protocol's outer busy error instead.
+pub(super) fn busy(line: &str, store_id: &str, writer: &mut UnixStream) {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok();
+    let field = |name: &str| {
+        value
+            .as_ref()
+            .and_then(|value| value.get(name))
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| id(text))
+            .map(str::to_string)
+    };
+    let (Some(request_id), Some(op)) = (field("request_id"), field("op")) else {
+        producer::busy_v1(line, writer);
+        return;
+    };
+    let response = serde_json::json!({
+        "api_version": 1,
+        "request_id": request_id,
+        "success": true,
+        "result": {"op": op, "value": {"status": "error", "error": {
+            "version": 1,
+            "store_id": store_id,
+            "code": super::BUSY_CODE,
+            "recovery": "same_key_lookup",
+        }}},
+    });
+    if let Ok(mut bytes) = serde_json::to_vec(&response) {
+        bytes.push(b'\n');
+        let _ = writer.write_all(&bytes);
+    }
+}
+
 /// Serves one strict B1 frame; malformed/authentication errors use the existing
 /// outer error shape and managed operation refusals use the versioned outcome.
 pub(super) fn serve(

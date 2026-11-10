@@ -52,6 +52,20 @@ source, and the crates are not published to crates.io.
   fails closed when a wall-clock discontinuity cannot be excluded: a process
   that started before Bridge, or before a step Bridge observed, is not
   re-observed from its descriptor until its next hook.
+- Never drop an accepted adapter-channel connection. At the connection limit the
+  server used to accept a connection and close it unread, so a burst of about
+  20 members' hooks, frontends and resident calls reset most of them
+  (`Connection reset by peer`) and a `PreToolUse` hook, which runs once per
+  native call, lost the call's token for good. The limit is now 256, waiting
+  connections queue (bounded, backed by the kernel listen queue) for up to two
+  seconds, and a connection that still finds no slot, or that the server cannot
+  serve, gets a typed, counted `capacity_exhausted` refusal in its own protocol
+  (B1 outcome with recovery `same_key_lookup`, producer v1 `unavailable` with the
+  exact-retry hint, or the legacy `unavailable` refusal) before anything is
+  decoded, so the identical request can be repeated. The hook and attestation
+  client repeats only that refusal, with backoff, for one operation timeout. See
+  `crates/bridge-adapters/docs/attempt-binding-v1.md` for the retry rules after a
+  lost or refused exchange.
 
 ## [0.6.6] - 2026-11-07
 

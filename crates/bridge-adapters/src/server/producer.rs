@@ -67,6 +67,54 @@ pub(super) fn serve_v1(
     }
 }
 
+/// Refuses a not-yet-executed producer v1 request because the channel is at
+/// capacity: an `unavailable` error with reason `capacity_exhausted` and the
+/// exact-retry hint. The effect is a certain `NotCommitted` (the request was
+/// never run) whenever the request decodes far enough to name its identity.
+pub(super) fn busy_v1(line: &str, writer: &mut UnixStream) {
+    let response = match decode_request(line.strip_suffix('\n').unwrap_or(line).as_bytes()) {
+        Ok(request) => Response::error(
+            &request.request_id,
+            error(
+                &request,
+                ErrorClass::Unavailable,
+                super::BUSY_CODE,
+                RetryHint::SameIdentity,
+                false,
+            ),
+        ),
+        Err(_) => {
+            let id = serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("request_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .filter(|value| {
+                    !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+                })
+                .unwrap_or_else(|| "invalid-request".into());
+            Response::error(
+                id,
+                ApiError {
+                    class: ErrorClass::Unavailable,
+                    reason: super::BUSY_CODE.into(),
+                    retry_hint: RetryHint::SameIdentity,
+                    effect: None,
+                    reconciliation: None,
+                    detail: "Channel at capacity; the request was not executed".into(),
+                },
+            )
+        }
+    };
+    if let Ok(mut bytes) = encode_response(&response) {
+        bytes.push(b'\n');
+        let _ = writer.write_all(&bytes);
+    }
+}
+
 /// Dispatches only native ingress operations through the same authoritative
 /// producer authorizer already installed in custody. Authentication precedes
 /// registry refresh, so diagnostic/invalid credentials cannot trigger native
