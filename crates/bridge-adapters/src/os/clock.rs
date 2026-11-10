@@ -10,21 +10,36 @@
 //! recovered afterwards, so this module only trusts it when no discontinuity can
 //! have occurred.
 //!
+//! The kernel keeps the offset constant except for steps: frequency and offset
+//! slewing (`adjtimex`, NTP, `chrony`) advance `REALTIME` and `BOOTTIME`
+//! together, and suspend adds the sleep to both. Only a step (`clock_settime`,
+//! `settimeofday`, `ADJ_SETOFFSET`, a leap second) moves it.
+//!
 //! One process-wide `Tracker` samples the offset whenever Bridge looks at the
 //! clocks (at registry construction, every executable refresh pass and every
-//! check). A change between two consecutive samples beyond slew, rounding and
-//! scheduling slack is a discontinuity and is remembered by the boot time of the
-//! sample that saw it. A check passes only for a process that
+//! check). Each sample brackets the offset rigorously (the wall clock read
+//! before and after one `/proc/uptime` read, which truncates to hundredths), and
+//! the tracker keeps the *cumulative* feasible interval since Bridge start (or
+//! since the last discontinuity): the intersection of every sample's interval.
+//! There is no fresh per-sample slack, only one global drift bound
+//! (`DRIFT_NS`) for the whole history, so repeated small steps cannot accumulate
+//! unseen: once the samples no longer share an offset within that bound, a
+//! discontinuity is remembered (by the boot time of the sample that saw it) and
+//! the interval restarts from that sample. A check passes only for a process
+//! that
 //!
 //! * started after the first sample (Bridge start), so every moment since its
 //!   start was covered by continuous sampling, and
 //! * started after the last observed discontinuity,
 //!
 //! and only when the file time lies between the start placed on the wall clock
-//! (rounded up by every uncertainty) and the current wall time. Any other case
-//! refuses ("not fresh"; the caller keeps the route unobserved and the next
-//! genuine hook or event re-observes it). A step that is undone again between two
-//! samples is not visible; Bridge samples about once a second.
+//! with the highest feasible offset (rounded up by every uncertainty) and the
+//! current wall time. Any other case refuses ("not fresh"; the caller keeps the
+//! route unobserved and the next genuine hook or event re-observes it).
+//!
+//! Accepted residual: a step that is undone again between two samples (Bridge
+//! samples about once a second) is not visible. Stepping the clock needs
+//! `CAP_SYS_TIME`, outside the same-user threat model Bridge defends against.
 
 #[cfg(not(test))]
 use std::sync::Mutex;
@@ -34,12 +49,13 @@ use super::ProcessFacts;
 /// Resolution of `/proc/uptime`, which truncates to hundredths of a second.
 const QUANTUM_NS: i128 = 10_000_000;
 /// Kernel clock ticks per second of `/proc/<pid>/stat` times (`USER_HZ`, fixed
-/// by the Linux userspace ABI) in nanoseconds.
+/// by the Linux userspace ABI) in nanoseconds; start ticks are truncated.
 const TICK_NS: i128 = 10_000_000;
-/// Allowance for scheduling between the clock reads of one sample.
-const STEP_SLACK_NS: i128 = 50_000_000;
-/// Slew budget: the wall clock may be slewed by 500 ppm (1 / 2000).
-const SLEW_DIVISOR: i128 = 2_000;
+/// Global drift bound: how far, over the whole history since Bridge start, the
+/// samples may disagree on the offset beyond their own rigorous brackets. The
+/// kernel keeps the offset constant without a step, so this only absorbs
+/// representation rounding; it is not renewed per sample.
+const DRIFT_NS: i128 = 2_000_000;
 /// Widest accepted spread between the two wall reads bracketing the uptime read.
 const MAX_SPREAD_NS: i128 = 5_000_000;
 
@@ -77,7 +93,12 @@ impl Sample {
 pub(crate) struct Tracker {
     /// Highest boot time of the first sample: later starts are covered.
     first_boot_high: i128,
+    /// The latest sample.
     last: Sample,
+    /// Highest lower offset bound of every sample since the interval started.
+    low: i128,
+    /// Lowest upper offset bound of every sample since the interval started.
+    high: i128,
     /// Highest boot time of the sample that last saw a discontinuity.
     break_boot: Option<i128>,
 }
@@ -88,21 +109,26 @@ impl Tracker {
         Self {
             first_boot_high: first.boot_high(),
             last: first,
+            low: first.offset_low(),
+            high: first.offset_high(),
             break_boot: None,
         }
     }
 
-    /// Records `sample`, remembering a discontinuity when the offset left the
-    /// interval its predecessor, widened by rounding, scheduling and slew, allows.
+    /// Records `sample` into the cumulative feasible interval, remembering a
+    /// discontinuity (and restarting the interval at `sample`) when boot time
+    /// went backwards or the interval would become empty beyond the global drift
+    /// bound.
     pub(crate) fn observe(&mut self, sample: Sample) {
-        let last = self.last;
-        let elapsed = sample.boot - last.boot;
-        let budget = STEP_SLACK_NS + elapsed.max(0) / SLEW_DIVISOR;
-        if elapsed < 0
-            || sample.offset_low() > last.offset_high() + budget
-            || sample.offset_high() < last.offset_low() - budget
-        {
+        let low = self.low.max(sample.offset_low());
+        let high = self.high.min(sample.offset_high());
+        if sample.boot < self.last.boot || low > high + DRIFT_NS {
             self.break_boot = Some(sample.boot_high());
+            self.low = sample.offset_low();
+            self.high = sample.offset_high();
+        } else {
+            self.low = low;
+            self.high = high;
         }
         self.last = sample;
     }
@@ -120,9 +146,8 @@ impl Tracker {
             return false;
         }
         let written = i128::from(written_at.0) * 1_000_000_000 + i128::from(written_at.1);
-        let drift = (now.boot - start).max(0) / SLEW_DIVISOR;
-        let earliest = start + now.offset_high() + drift;
-        let latest = now.real_after + STEP_SLACK_NS;
+        let earliest = start + TICK_NS + self.high.max(self.low) + DRIFT_NS;
+        let latest = now.real_after + DRIFT_NS;
         written >= earliest && written <= latest
     }
 }
@@ -309,32 +334,72 @@ mod tests {
         assert!(tracker.fresh(at(110 * SECOND, offset), 105 * 100, secs(1006)));
     }
 
-    /// Slew, rounding and scheduling jitter are not discontinuities.
+    /// A sample read at true boot time `boot` (any nanosecond) with true offset
+    /// `offset`: `/proc/uptime` truncates to hundredths, and the wall reads land
+    /// `before` and `after` nanoseconds around it (scheduling).
+    fn read(boot: i128, offset: i128, before: i128, after: i128) -> Sample {
+        Sample {
+            boot: boot - boot.rem_euclid(QUANTUM_NS),
+            real_before: boot + offset - before,
+            real_after: boot + offset + after,
+        }
+    }
+
+    /// Normal slewing is not a discontinuity: the kernel advances both clocks
+    /// together, so an hour of samples at a slewed rate (the boot-time spacing
+    /// varies by ±500 ppm and an odd period crosses every truncation phase), with
+    /// scheduling jitter of up to the accepted read spread, keeps one feasible
+    /// offset, and a process started in that hour is fresh.
     #[test]
-    fn slew_and_jitter_are_tolerated() {
-        let offset = 900 * SECOND;
-        let mut tracker = Tracker::new(at(10 * SECOND, offset));
-        // 400 ppm slew over an hour, observed every minute: 24 ms per minute.
-        let mut boot = 10 * SECOND;
-        let mut off = offset;
-        for _ in 0..60 {
-            boot += 60 * SECOND;
-            off += 24_000_000;
-            tracker.observe(at(boot, off));
+    fn normal_slew_and_jitter_stay_fresh() {
+        let offset = 900 * SECOND + 3_456_789;
+        let mut boot = 10 * SECOND + 1_234_567;
+        let mut tracker = Tracker::new(read(boot, offset, 0, 100_000));
+        for step in 0..3_600_i128 {
+            boot += SECOND + 7_777 + (step % 7 - 3) * 166_666;
+            let before = (step * 1_301) % 3_000_000;
+            let after = (step * 977) % (MAX_SPREAD_NS - before);
+            tracker.observe(read(boot, offset, before, after));
         }
         assert_eq!(tracker.break_boot, None);
-        // 30 ms of scheduling noise on one sample.
-        tracker.observe(at(boot + SECOND, off + 30_000_000));
-        assert_eq!(tracker.break_boot, None);
-        let start = (boot - 30 * SECOND) / TICK_NS;
+        let start = boot - 30 * SECOND;
+        let written = start + offset + SECOND;
         assert!(tracker.fresh(
-            at(boot + 2 * SECOND, off),
-            u64::try_from(start).unwrap(),
+            read(boot + SECOND, offset, 4_000_000, 900_000),
+            u64::try_from(start / TICK_NS).unwrap(),
             (
-                i64::try_from((boot - 20 * SECOND + off) / SECOND).unwrap(),
-                0
+                i64::try_from(written / SECOND).unwrap(),
+                i64::try_from(written % SECOND).unwrap()
             )
         ));
+    }
+
+    /// Repeated small backward steps, each one below the 50 ms slack the
+    /// per-sample rule used to grant, accumulate in the cumulative interval and
+    /// are refused: forty 40 ms steps a second apart move the start placement by
+    /// 1.6 s, and a stale descriptor written before the process started would
+    /// otherwise look fresh. Steps far below one bracket (1 ms each) are refused
+    /// as soon as their sum leaves the global drift bound.
+    #[test]
+    fn accumulated_small_backward_steps_are_refused() {
+        let offset = 900 * SECOND;
+        for size in [40_000_000, 1_000_000] {
+            let mut tracker = Tracker::new(at(50 * SECOND, offset));
+            let start_ticks = 100 * 100;
+            assert!(tracker.fresh(at(101 * SECOND, offset), start_ticks, secs(1001)));
+            let mut off = offset;
+            for second in 0..40 {
+                off -= size;
+                tracker.observe(at((102 + second) * SECOND, off));
+            }
+            assert!(tracker.break_boot.is_some(), "step size {size}");
+            // Placed with the drifted offset, the start would be 1.6 s (40 ms
+            // steps) earlier on the wall clock; a descriptor written 1 s before
+            // the real start would pass. It is refused, and so is a genuine one.
+            let now = at(150 * SECOND, off);
+            assert!(!tracker.fresh(now, start_ticks, secs(999)));
+            assert!(!tracker.fresh(now, start_ticks, secs(1001)));
+        }
     }
 
     /// A file time in the future (a backward step before Bridge started leaves old

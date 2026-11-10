@@ -89,6 +89,15 @@ source, and the crates are not published to crates.io.
   `/proc/self/mountinfo` record; a missing `mnt_id`, a mount with no or several
   records (another mount namespace, a detached mount) and any type other than
   ext2/3/4, xfs, btrfs or tmpfs fail closed.
+- Detect accumulated wall-clock steps for Claude session-descriptor freshness.
+  The tracker granted 50 ms of fresh slack per sample, so repeated small steps
+  added up unseen. It now keeps one cumulative feasible `REALTIME - BOOTTIME`
+  interval since Bridge start (or the last discontinuity) with a single global
+  2 ms drift bound, and fails closed once the samples no longer agree; the start
+  placement also rounds the truncated start tick up. Normal slewing moves both
+  clocks together and stays fresh. A step undone between two samples (about a
+  second apart) remains invisible; it requires `CAP_SYS_TIME`, outside the
+  same-user threat model.
 - Refuse managed attempt-binding executable proofs (managed frontends and
   harnesses, Run readers, the owner-v2 Run server) on platforms other than
   Linux, which have no immutable loaded-build evidence. Ordinary native
