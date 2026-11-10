@@ -1314,9 +1314,13 @@ mod tests {
         assert!(!client_gone(&mut reader), "unread bytes are not an exit");
         assert!(!client_gone(&mut reader), "buffered bytes are not an exit");
         drop(client);
+        // A plain buffered read: macOS refuses to set a socket timeout once the
+        // peer is gone, which would make `read_line` fail for a reason unrelated
+        // to what this test proves.
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
         assert_eq!(
-            read_line(&mut reader, Duration::from_secs(1)).as_deref(),
-            Some("pending\n"),
+            line, "pending\n",
             "nothing was consumed and blocking reads still work"
         );
         assert!(client_gone(&mut reader), "a closed client is gone");

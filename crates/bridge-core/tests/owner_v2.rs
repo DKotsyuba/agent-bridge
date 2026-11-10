@@ -637,7 +637,10 @@ fn producer_capacity_is_isolated_and_payload_is_not_stored() {
         )
         .unwrap();
     assert_eq!(retained_text, 0);
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // The inspector accepts only a private ledger; the default creation mode
+    // depends on the caller's umask, so state the fixture's mode explicitly.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     let capacity = bridge_core::owner_v2::inspect_owner_capacity(
         &path,
         std::fs::metadata(&path).unwrap().uid(),

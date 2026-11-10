@@ -6004,6 +6004,28 @@ mod tests {
             os::clock::observe();
             std::thread::sleep(std::time::Duration::from_millis(40));
         }
+        // Off Linux the executable is judged by whole-second file times against
+        // the process start: wait until the clock is a full second past the
+        // copy, since kernel birth seconds and filesystem timestamps are
+        // quantized independently.
+        #[cfg(not(target_os = "linux"))]
+        {
+            let metadata = std::fs::metadata(path).unwrap();
+            let written = u64::try_from(metadata.mtime().max(metadata.ctime())).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+            while std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                <= written.saturating_add(1)
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fixture executable clock did not become older than process birth"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
         let mut child = LiveChild(
             std::process::Command::new(path)
                 .args([
