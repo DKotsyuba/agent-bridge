@@ -243,7 +243,7 @@ impl Registry {
                 "assertion_audience_mismatch".into(),
             ));
         }
-        self.verify_loaded(&executable.path, facts.start_time, &executable.sha256)?;
+        self.verify_loaded(&executable.path, &facts, &executable.sha256)?;
         Ok((facts.pid, facts.start_time))
     }
 

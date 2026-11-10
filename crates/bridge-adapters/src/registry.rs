@@ -2915,7 +2915,7 @@ impl Registry {
         };
         if facts.uid != Some(self.owner_uid)
             || !same_incarnation
-            || i128::from(hint.written_at) < i128::from(facts.start_time)
+            || facts.start_bound().is_after(hint.written_at)
             || facts.exe.as_ref() != Some(&known.executable)
             || harness_store(&facts, &policy).as_ref() != Some(&known.store)
             || private_store(&known.store, self.owner_uid).is_err()
@@ -3245,10 +3245,10 @@ impl Registry {
     fn verify_loaded(
         &self,
         exe: &Path,
-        started: u64,
+        started: impl Into<os::StartBound>,
         qualified: &str,
     ) -> Result<(), CorrelationError> {
-        let key = self.stable_identity(exe, started)?;
+        let key = self.stable_identity(exe, started.into())?;
         let Some(digest) = self.digests.get(&key) else {
             return Err(CorrelationError::NotEvidence(
                 "configured executable has no hashed digest for its current file identity (new, replaced or modified since the last hash); unqualified until it is hashed again"
@@ -3264,20 +3264,24 @@ impl Registry {
     }
 
     /// The current identity of `exe` when it was neither written nor changed
-    /// (mtime and ctime) at or after the process start second `started`, the
+    /// (mtime and ctime) at or after the process start `started`, the
     /// file-time gate of [`Registry::verify_loaded`].
     ///
     /// # Errors
     ///
-    /// The file is unreadable, or its mtime or ctime second is not strictly
-    /// before `started` (the loaded build is then unproven).
-    fn stable_identity(&self, exe: &Path, started: u64) -> Result<FileKey, CorrelationError> {
+    /// The file is unreadable, or its mtime or ctime is not strictly before
+    /// `started` (the loaded build is then unproven).
+    fn stable_identity(
+        &self,
+        exe: &Path,
+        started: os::StartBound,
+    ) -> Result<FileKey, CorrelationError> {
         let key = file_key(exe).ok_or_else(|| {
             CorrelationError::NotEvidence("configured executable unreadable".into())
         })?;
-        if i128::from(key.mtime.0.max(key.ctime.0)) >= i128::from(started) {
+        if !started.is_after_change(key.mtime, key.ctime) {
             return Err(CorrelationError::NotEvidence(
-                "configured executable written or changed on disk at or after the process start second; loaded build unproven"
+                "configured executable written or changed on disk at or after the process start; loaded build unproven"
                     .into(),
             ));
         }
@@ -4624,9 +4628,10 @@ fn private_store(store: &Path, owner_uid: u32) -> Result<(), String> {
 
 /// Proves the executable `exe` of the process `facts` may be run by Bridge: a
 /// regular file owned by `owner_uid` or root that no group or other user can
-/// write, whose modification and status-change seconds are strictly before the
-/// process start second (so it is unchanged since the process began). No digest
-/// or path is allowlisted.
+/// write, whose modification and status-change times are strictly before the
+/// process start on one wall clock at nanosecond resolution ([`os::StartBound`],
+/// so it is unchanged since the process began). No digest or path is
+/// allowlisted.
 ///
 /// # Errors
 ///
@@ -4637,7 +4642,7 @@ fn executable_current(exe: &Path, facts: &ProcessFacts, owner_uid: u32) -> Resul
     {
         return Err("executable is not a regular, trusted-owner, non-writable file".into());
     }
-    if i128::from(meta.mtime().max(meta.ctime())) >= i128::from(facts.start_time) {
+    if !facts.start_bound().is_after_file(&meta) {
         return Err("executable was written or changed at or after the process start".into());
     }
     Ok(())
@@ -6181,6 +6186,10 @@ mod tests {
         // chmod moves the status-change time: the file counts as changed again.
         let mut older = facts.clone();
         older.start_time = u64::MAX / 2;
+        #[cfg(target_os = "linux")]
+        {
+            older.start_ticks = None;
+        }
         assert!(executable_current(&exe, &older, uid).is_ok());
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o775)).unwrap();
         assert!(
@@ -6190,6 +6199,85 @@ mod tests {
         assert!(executable_current(&dir, &older, uid).is_err(), "directory");
         assert!(executable_current(&exe, &older, uid.wrapping_add(1)).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The executable gate compares full-resolution file times with the process
+    /// start placed on the same wall clock: a file written about one second
+    /// before the process started is current (a whole-second `btime` start
+    /// refused it), a file written after the process started is not, and the
+    /// same holds for the digest gate and the session-descriptor check.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn executable_times_are_compared_with_process_start_on_one_clock() {
+        use std::os::unix::fs::PermissionsExt;
+        let wall = || {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap();
+            (
+                i64::try_from(now.as_secs()).unwrap(),
+                i64::from(now.subsec_nanos()),
+            )
+        };
+        let before = |(seconds, nanos): (i64, i64), millis: i64| {
+            let total = seconds * 1000 + nanos / 1_000_000 - millis;
+            (total.div_euclid(1000), total.rem_euclid(1000) * 1_000_000)
+        };
+        let dir = scratch("clk");
+        let exe = dir.join("exe");
+        std::fs::write(&exe, vec![3u8; 4096]).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let digest = file_sha256(&exe).unwrap();
+        let registry = registry_with(&[(&exe, &digest)]);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let spawned_after_write = wall();
+        let child = LiveChild::own(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        let spawned = wall();
+        let facts = os::process_facts(child.id()).unwrap();
+        let uid = facts.uid.unwrap();
+        assert!(facts.start_ticks.is_some(), "kernel start tick");
+        let bound = facts.start_bound();
+        assert!(!bound.is_after(spawned), "bound is never after the spawn");
+        assert!(
+            bound.is_after(before(spawned_after_write, 100)),
+            "bound is within the clock quanta of the true start"
+        );
+        let written = std::fs::metadata(&exe).unwrap();
+        assert!(bound.is_after_file(&written));
+        assert_eq!(executable_current(&exe, &facts, uid), Ok(()));
+        registry
+            .verify_loaded(&exe, &facts, &digest)
+            .expect("written about a second before the process started");
+
+        // Rewritten after the process started: refused, even at the same second.
+        std::fs::write(&exe, vec![4u8; 4096]).unwrap();
+        assert!(executable_current(&exe, &facts, uid).is_err());
+        assert!(
+            registry
+                .verify_loaded(&exe, &facts, &file_sha256(&exe).unwrap())
+                .is_err()
+        );
+        let rewritten = std::fs::metadata(&exe).unwrap();
+        assert!(!bound.is_after_file(&rewritten));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// File times and a whole-second start meet at nanosecond resolution: only
+    /// a time strictly before the start second is older than the process.
+    #[test]
+    fn start_bound_compares_at_nanosecond_resolution() {
+        let bound = os::StartBound::from_secs(10);
+        assert!(bound.is_after((9, 999_999_999)));
+        assert!(!bound.is_after((10, 0)));
+        assert!(!bound.is_after((10, 1)));
+        assert!(bound.is_after_change((1, 0), (9, 999_999_999)));
+        assert!(!bound.is_after_change((1, 0), (10, 0)));
+        assert!(!bound.is_after_change((10, 5), (1, 0)));
     }
 
     /// Message delivery rechecks the executable after admission: changing the

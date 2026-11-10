@@ -322,8 +322,9 @@ pub(crate) struct SessionHint {
     pub pid: u32,
     /// Positive native idle/busy status; unknown or waiting descriptors cannot bootstrap.
     pub lifecycle: bridge_core::dispatch::Lifecycle,
-    /// Descriptor modification time in Unix seconds; predating a process refuses PID reuse.
-    pub written_at: i64,
+    /// Descriptor modification time as Unix `(seconds, nanoseconds)`; predating a
+    /// process start refuses PID reuse.
+    pub written_at: (i64, i64),
 }
 
 /// Finds an owner-owned bounded native descriptor naming exactly `session` in
@@ -349,7 +350,8 @@ pub(crate) fn session_hint(store: &Path, session: &str, uid: u32) -> Option<Sess
                 Some("busy") => bridge_core::dispatch::Lifecycle::Active,
                 _ => return None,
             };
-            let written_at = std::fs::symlink_metadata(&path).ok()?.mtime();
+            let metadata = std::fs::symlink_metadata(&path).ok()?;
+            let written_at = (metadata.mtime(), metadata.mtime_nsec());
             Some(SessionHint {
                 pid,
                 lifecycle,

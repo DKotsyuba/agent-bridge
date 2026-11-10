@@ -619,6 +619,7 @@ mod tests {
             pid,
             parent,
             start_time: 1,
+            start_ticks: Some(ticks),
             kernel_incarnation: Some(KernelIncarnation {
                 boot_id: "01234567-89ab-4cde-8fab-0123456789ab".into(),
                 pid_namespace_inode: 7,

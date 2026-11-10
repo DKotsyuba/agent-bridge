@@ -109,6 +109,12 @@ pub struct ProcessFacts {
     /// Start time in seconds since the Unix epoch; with `pid` it names one
     /// process incarnation (a reused PID has a later start time).
     pub start_time: u64,
+    /// Kernel start tick (since boot) read from `/proc/<pid>/stat` before and
+    /// after the process-table read, when both reads agree. Only
+    /// [`ProcessFacts::start_bound`] uses it, to place the start on the wall
+    /// clock; the incarnation identity stays `(pid, start_time)`.
+    #[cfg(target_os = "linux")]
+    pub start_ticks: Option<u64>,
     /// Full Linux identity sampled around the process-table read, if available.
     #[cfg(target_os = "linux")]
     pub kernel_incarnation: Option<attempt::KernelIncarnation>,
@@ -121,6 +127,8 @@ pub struct ProcessFacts {
 /// Reads the facts of one process, or `None` when it does not exist (or is
 /// not visible to this user).
 pub fn process_facts(pid: u32) -> Option<ProcessFacts> {
+    #[cfg(target_os = "linux")]
+    let ticks_before = proc_start_ticks(pid);
     let mut system = System::new();
     let target = Pid::from_u32(pid);
     system.refresh_processes_specifics(
@@ -134,12 +142,135 @@ pub fn process_facts(pid: u32) -> Option<ProcessFacts> {
     Some(ProcessFacts {
         pid,
         #[cfg(target_os = "linux")]
+        start_ticks: ticks_before.filter(|ticks| proc_start_ticks(pid) == Some(*ticks)),
+        #[cfg(target_os = "linux")]
         kernel_incarnation: None,
         parent: process.parent().map(Pid::as_u32),
         start_time: process.start_time(),
         exe: process.exe().map(PathBuf::from),
         uid: process.user_id().map(|uid| **uid),
     })
+}
+
+/// Kernel clock ticks per second of `/proc/<pid>/stat` times (`USER_HZ`, fixed
+/// by the Linux userspace ABI on every architecture Bridge supports).
+#[cfg(target_os = "linux")]
+const USER_HZ: u128 = 100;
+
+/// Resolution of `/proc/uptime`, which truncates to hundredths of a second.
+#[cfg(target_os = "linux")]
+const UPTIME_QUANTUM_NS: i128 = 10_000_000;
+
+/// Start tick of `pid` from `/proc/<pid>/stat` (field 22), or `None`.
+#[cfg(target_os = "linux")]
+fn proc_start_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_ascii_whitespace()
+        .nth(19)?
+        .parse::<u64>()
+        .ok()
+        .filter(|ticks| *ticks > 0)
+}
+
+/// A lower bound of the wall-clock time the system booted, in nanoseconds
+/// since the Unix epoch: `CLOCK_REALTIME` is sampled before the uptime
+/// (`CLOCK_BOOTTIME`, truncated to hundredths by `/proc/uptime`, so one full
+/// quantum is added back), so no step of the sampling can make the bound exceed
+/// the true boot time. Derived from the same two kernel clocks the start tick
+/// and file timestamps come from, not from `/proc/stat` `btime`.
+#[cfg(target_os = "linux")]
+fn boot_wall_lower_bound_ns() -> Option<i128> {
+    let realtime = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let uptime = std::fs::read_to_string("/proc/uptime").ok()?;
+    let (seconds, hundredths) = uptime.split_ascii_whitespace().next()?.split_once('.')?;
+    let hundredths = match hundredths.len() {
+        2 => hundredths.parse::<u128>().ok()?,
+        _ => return None,
+    };
+    let boot_ns = seconds
+        .parse::<u128>()
+        .ok()?
+        .checked_mul(1_000_000_000)?
+        .checked_add(hundredths * 10_000_000)?;
+    Some(i128::try_from(realtime).ok()? - i128::try_from(boot_ns).ok()? - UPTIME_QUANTUM_NS)
+}
+
+/// The earliest wall-clock instant, in nanoseconds since the Unix epoch, at
+/// which a process may have started, for comparison with full-resolution file
+/// timestamps. Both sides are then read from the same kernel clocks.
+///
+/// A process whose start tick is known is placed exactly (`boot + ticks /
+/// USER_HZ`, never later than its true start); otherwise only its whole start
+/// second is known and the bound is the start of that second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartBound(i128);
+
+impl StartBound {
+    /// The start of whole Unix second `seconds`.
+    #[must_use]
+    pub fn from_secs(seconds: u64) -> Self {
+        Self(i128::from(seconds) * 1_000_000_000)
+    }
+
+    /// Whether the Unix `(seconds, nanoseconds)` instant `time` is strictly
+    /// before the process start bound.
+    #[must_use]
+    pub fn is_after(self, time: (i64, i64)) -> bool {
+        i128::from(time.0) * 1_000_000_000 + i128::from(time.1) < self.0
+    }
+
+    /// Whether a file last written at `mtime` and last changed at `ctime`
+    /// (each `(seconds, nanoseconds)`) was unchanged since before the process
+    /// started: the later of the two must be strictly before the bound.
+    #[must_use]
+    pub fn is_after_change(self, mtime: (i64, i64), ctime: (i64, i64)) -> bool {
+        self.is_after(mtime.max(ctime))
+    }
+
+    /// [`StartBound::is_after_change`] for the current metadata of a file.
+    #[must_use]
+    pub fn is_after_file(self, metadata: &std::fs::Metadata) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        self.is_after_change(
+            (metadata.mtime(), metadata.mtime_nsec()),
+            (metadata.ctime(), metadata.ctime_nsec()),
+        )
+    }
+}
+
+impl From<u64> for StartBound {
+    /// A start known only to whole second resolution.
+    fn from(seconds: u64) -> Self {
+        Self::from_secs(seconds)
+    }
+}
+
+impl From<&ProcessFacts> for StartBound {
+    fn from(facts: &ProcessFacts) -> Self {
+        facts.start_bound()
+    }
+}
+
+impl ProcessFacts {
+    /// The wall-clock lower bound of this process's start; see [`StartBound`].
+    /// Falls back to the whole start second when the kernel start tick or the
+    /// boot clocks are unreadable.
+    #[must_use]
+    pub fn start_bound(&self) -> StartBound {
+        #[cfg(target_os = "linux")]
+        if let (Some(ticks), Some(boot)) = (self.start_ticks, boot_wall_lower_bound_ns()) {
+            let since_boot = u128::from(ticks) * 1_000_000_000 / USER_HZ;
+            if let Ok(since_boot) = i128::try_from(since_boot) {
+                return StartBound(boot + since_boot);
+            }
+        }
+        StartBound::from_secs(self.start_time)
+    }
 }
 
 /// Samples a Linux process-table record between equal full identity reads.

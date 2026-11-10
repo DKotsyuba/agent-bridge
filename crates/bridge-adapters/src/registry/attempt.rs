@@ -1064,7 +1064,7 @@ impl Registry {
             || self
                 .verify_loaded(
                     &route.run_executable.path,
-                    facts.start_time,
+                    &facts,
                     &route.run_executable.sha256,
                 )
                 .is_err()
@@ -1597,7 +1597,7 @@ impl Registry {
         {
             return Err(AttemptError::new("peer_not_authorized", "none"));
         }
-        self.verify_loaded(&frontend.path, facts.start_time, &frontend.sha256)
+        self.verify_loaded(&frontend.path, &facts, &frontend.sha256)
             .map_err(source_error)?;
         let stdio = [0, 1]
             .iter()
@@ -2058,7 +2058,7 @@ impl Registry {
         if facts.uid != Some(self.owner_uid) || facts.exe.as_ref() != Some(&executable.path) {
             return Err(AttemptError::new("peer_not_authorized", "none"));
         }
-        self.verify_loaded(&executable.path, facts.start_time, &executable.sha256)
+        self.verify_loaded(&executable.path, &facts, &executable.sha256)
             .map_err(source_error)?;
         if os::attempt::kernel_incarnation(peer.pid, peer.uid)
             .ok()

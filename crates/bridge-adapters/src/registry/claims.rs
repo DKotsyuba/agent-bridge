@@ -324,6 +324,7 @@ impl Registry {
             .ok_or_else(|| CorrelationError::NotEvidence("relay process is gone".into()))?;
         let exe = facts
             .exe
+            .clone()
             .ok_or_else(|| CorrelationError::NotEvidence("relay executable unreadable".into()))?;
         let digest = self
             .config
@@ -334,7 +335,7 @@ impl Registry {
             .ok_or_else(|| {
                 CorrelationError::NotEvidence("peer is not a configured relay".into())
             })?;
-        self.verify_loaded(&exe, facts.start_time, &digest)
+        self.verify_loaded(&exe, &facts, &digest)
     }
 
     /// Whether an issued source still belongs to the same live endpoint.
