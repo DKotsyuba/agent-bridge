@@ -665,15 +665,19 @@ impl Drop for Harnessed {
 
 /// Waits, for at most five seconds, until a just-spawned fixture finished its
 /// `exec`: a vfork-based spawn may return while `/proc/<pid>/exe` still names
-/// this test binary, and a test reading the child's process facts at once
-/// would see the parent's executable. Returns at once where there is no
-/// `/proc` or the child already exited.
+/// this test binary, and right after the switch `/proc/<pid>/environ` is empty
+/// until the loader has placed the new environment, so a test reading the
+/// child's process facts or environment at once would see the parent's
+/// executable or no environment. Every fixture is started with an
+/// environment. Returns at once where there is no `/proc` or the child
+/// already exited.
 fn exec_settled(child: &Child) {
     let own = std::fs::read_link("/proc/self/exe").ok();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
         let exe = std::fs::read_link(format!("/proc/{}/exe", child.id())).ok();
-        if exe.is_none() || exe != own {
+        let environ = std::fs::read(format!("/proc/{}/environ", child.id()));
+        if exe.is_none() || (exe != own && environ.is_ok_and(|bytes| !bytes.is_empty())) {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
