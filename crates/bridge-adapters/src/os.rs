@@ -11,7 +11,10 @@
 //!
 //! The crate forbids first-party `unsafe`; peer credentials come from
 //! tokio's stable `peer_cred` (LOCAL_PEEREPID + getpeereid on macOS,
-//! SO_PEERCRED on Linux) and process facts from `sysinfo`.
+//! SO_PEERCRED on Linux). Process facts come from `sysinfo`, except that on
+//! Linux one process is read from its own `/proc/<pid>` entries: a `sysinfo`
+//! refresh of even one PID lists the whole process and thread table, which
+//! under a hook burst made each admission cost tens of milliseconds.
 
 /// Linux-only attempt identity and direct launch-environment capture.
 pub mod attempt;
@@ -27,7 +30,9 @@ use std::ffi::{OsStr, OsString};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+#[cfg(any(not(target_os = "linux"), test))]
+use sysinfo::{Pid, UpdateKind};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
 /// Deepest parent chain walked when looking for a harness ancestor.
 ///
@@ -116,8 +121,8 @@ pub struct ProcessFacts {
     /// Start time in seconds since the Unix epoch; with `pid` it names one
     /// process incarnation (a reused PID has a later start time).
     pub start_time: u64,
-    /// Kernel start tick (since boot) read from `/proc/<pid>/stat` before and
-    /// after the process-table read, when both reads agree. It fences the
+    /// Kernel start tick (since boot) read from `/proc/<pid>/stat` at the start
+    /// and at the end of the facts read, when both reads agree. It fences the
     /// loaded-build proof ([`loaded_executable`]) and the descriptor freshness
     /// check (`clock`) to this incarnation; the incarnation identity stays
     /// `(pid, start_time)`.
@@ -134,9 +139,131 @@ pub struct ProcessFacts {
 
 /// Reads the facts of one process, or `None` when it does not exist (or is
 /// not visible to this user).
+///
+/// On Linux only `/proc/<pid>` is read (see `proc_process`): `stat` for the
+/// parent and start tick, `status` for the real UID, the `exe` link, then
+/// `stat` again, so `start_ticks` is set only when both reads name the same
+/// incarnation. The start time is the `sysinfo` value exactly (boot time plus
+/// whole seconds of start ticks), so recorded incarnations stay comparable.
+#[cfg(target_os = "linux")]
 pub fn process_facts(pid: u32) -> Option<ProcessFacts> {
-    #[cfg(target_os = "linux")]
-    let ticks_before = proc_start_ticks(pid);
+    let record = proc_process(pid)?;
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+    let after = proc_start_ticks(pid);
+    Some(ProcessFacts {
+        pid,
+        start_ticks: Some(record.start_ticks).filter(|ticks| *ticks > 0 && after == Some(*ticks)),
+        kernel_incarnation: None,
+        parent: record.parent,
+        start_time: System::boot_time().saturating_add(record.start_ticks / clock_ticks()),
+        exe,
+        uid: record.uid,
+    })
+}
+
+/// The `stat` and `status` facts of one Linux process.
+#[cfg(target_os = "linux")]
+struct ProcProcess {
+    /// Kernel-reported parent, `None` for parent 0.
+    parent: Option<u32>,
+    /// Start tick since boot (stat field 22).
+    start_ticks: u64,
+    /// Real UID, when the status record is readable.
+    uid: Option<u32>,
+}
+
+/// Reads one Linux process's `stat` and then `status`, or `None` when the
+/// process is gone, invisible or `pid` names a thread other than its group
+/// leader (a process table lists only processes).
+#[cfg(target_os = "linux")]
+fn proc_process(pid: u32) -> Option<ProcProcess> {
+    let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+    let (head, tail) = stat.split_at(stat.iter().rposition(|byte| *byte == b')')?);
+    let stat_pid = std::str::from_utf8(head.split(|byte| *byte == b' ').next()?).ok()?;
+    if stat_pid.parse::<u32>().ok()? != pid {
+        return None;
+    }
+    let fields: Vec<&[u8]> = tail[1..]
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty())
+        .collect();
+    let number = |index: usize| -> Option<u64> {
+        std::str::from_utf8(fields.get(index)?).ok()?.parse().ok()
+    };
+    let parent = number(1)
+        .and_then(|parent| u32::try_from(parent).ok())
+        .filter(|parent| *parent != 0);
+    let start_ticks = number(19).unwrap_or(0);
+    let mut uid = None;
+    if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .and_then(|rest| rest.split_ascii_whitespace().next())
+                .and_then(|value| value.parse::<u32>().ok())
+        };
+        if field("Tgid:").is_some_and(|group| group != pid) {
+            return None;
+        }
+        uid = field("Uid:");
+    }
+    Some(ProcProcess {
+        parent,
+        start_ticks,
+        uid,
+    })
+}
+
+/// Clock ticks per second of `/proc` start times (`AT_CLKTCK` from this
+/// process's auxiliary vector, else the Linux `USER_HZ` of 100, as the C
+/// library's `sysconf(_SC_CLK_TCK)` that `sysinfo` uses).
+#[cfg(target_os = "linux")]
+fn clock_ticks() -> u64 {
+    /// `AT_CLKTCK` auxiliary vector key.
+    const AT_CLKTCK: usize = 17;
+    static TICKS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *TICKS.get_or_init(|| {
+        let width = std::mem::size_of::<usize>();
+        std::fs::read("/proc/self/auxv")
+            .ok()
+            .and_then(|auxv| {
+                auxv.chunks_exact(2 * width).find_map(|pair| {
+                    let word = |bytes: &[u8]| bytes.try_into().ok().map(usize::from_ne_bytes);
+                    (word(&pair[..width]) == Some(AT_CLKTCK))
+                        .then(|| word(&pair[width..]))
+                        .flatten()
+                })
+            })
+            .and_then(|ticks: usize| u64::try_from(ticks).ok())
+            .filter(|ticks| *ticks > 0)
+            .unwrap_or(100)
+    })
+}
+
+/// Reads the NUL-separated strings of one `/proc/<pid>/<name>` record as
+/// `sysinfo` reports them: each entry trimmed of ASCII whitespace, empty
+/// entries and an unterminated tail dropped, an unreadable record empty.
+#[cfg(target_os = "linux")]
+fn proc_strings(pid: u32, name: &str) -> Vec<Vec<u8>> {
+    let Ok(bytes) = std::fs::read(format!("/proc/{pid}/{name}")) else {
+        return Vec::new();
+    };
+    let Some(end) = bytes.iter().rposition(|byte| *byte == 0) else {
+        return Vec::new();
+    };
+    bytes[..end]
+        .split(|byte| *byte == 0)
+        .map(<[u8]>::trim_ascii)
+        .filter(|entry| !entry.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
+/// Reads the facts of one process, or `None` when it does not exist (or is
+/// not visible to this user).
+#[cfg(not(target_os = "linux"))]
+pub fn process_facts(pid: u32) -> Option<ProcessFacts> {
     let mut system = System::new();
     let target = Pid::from_u32(pid);
     system.refresh_processes_specifics(
@@ -149,10 +276,6 @@ pub fn process_facts(pid: u32) -> Option<ProcessFacts> {
     let process = system.process(target)?;
     Some(ProcessFacts {
         pid,
-        #[cfg(target_os = "linux")]
-        start_ticks: ticks_before.filter(|ticks| proc_start_ticks(pid) == Some(*ticks)),
-        #[cfg(target_os = "linux")]
-        kernel_incarnation: None,
         parent: process.parent().map(Pid::as_u32),
         start_time: process.start_time(),
         exe: process.exe().map(PathBuf::from),
@@ -281,31 +404,75 @@ pub fn process_env(pid: u32, name: &str) -> Option<OsString> {
 /// unknown metadata as absence (the native owner locator) holds on `Err`.
 pub fn process_env_checked(pid: u32, name: &str) -> std::io::Result<Option<OsString>> {
     use std::io::{Error, ErrorKind};
-    use std::os::unix::ffi::OsStrExt;
-    let mut system = System::new();
-    let target = Pid::from_u32(pid);
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[target]),
-        true,
-        ProcessRefreshKind::nothing().with_environ(UpdateKind::Always),
-    );
-    let process = system
-        .process(target)
+    let environ = process_strings(pid, Strings::Environ)
         .ok_or_else(|| Error::new(ErrorKind::NotFound, "process is gone"))?;
-    if process.environ().is_empty() {
+    if environ.is_empty() {
         return Err(Error::new(
             ErrorKind::Unsupported,
             "process environment is empty or unreadable",
         ));
     }
+    Ok(find_entry(&environ, name))
+}
+
+/// The NUL-separated process records [`process_strings`] reads.
+#[derive(Clone, Copy)]
+enum Strings {
+    /// The exec-time environment.
+    Environ,
+    /// The (possibly retitled) argument area.
+    Cmdline,
+}
+
+/// The entries of one record of a live process, trimmed of ASCII whitespace
+/// with empty entries dropped (an unreadable record is empty), or `None` when
+/// the process is gone. Linux reads only `/proc/<pid>`.
+#[cfg(target_os = "linux")]
+fn process_strings(pid: u32, record: Strings) -> Option<Vec<Vec<u8>>> {
+    proc_process(pid)?;
+    Some(proc_strings(
+        pid,
+        match record {
+            Strings::Environ => "environ",
+            Strings::Cmdline => "cmdline",
+        },
+    ))
+}
+
+/// See the Linux version; read through one `sysinfo` refresh of `pid`.
+#[cfg(not(target_os = "linux"))]
+fn process_strings(pid: u32, record: Strings) -> Option<Vec<Vec<u8>>> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut system = System::new();
+    let target = Pid::from_u32(pid);
+    let kind = match record {
+        Strings::Environ => ProcessRefreshKind::nothing().with_environ(UpdateKind::Always),
+        Strings::Cmdline => ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+    };
+    system.refresh_processes_specifics(ProcessesToUpdate::Some(&[target]), true, kind);
+    let process = system.process(target)?;
+    let entries = match record {
+        Strings::Environ => process.environ(),
+        Strings::Cmdline => process.cmd(),
+    };
+    Some(
+        entries
+            .iter()
+            .map(|entry| entry.as_bytes().to_vec())
+            .collect(),
+    )
+}
+
+/// The value of the first exact `name=` entry, byte-exact.
+fn find_entry(entries: &[Vec<u8>], name: &str) -> Option<OsString> {
+    use std::os::unix::ffi::OsStrExt;
     let key = name.as_bytes();
-    Ok(process.environ().iter().find_map(|entry| {
-        let bytes = entry.as_bytes();
-        match bytes.strip_prefix(key) {
+    entries
+        .iter()
+        .find_map(|entry| match entry.strip_prefix(key) {
             Some([b'=', value @ ..]) => Some(OsStr::from_bytes(value).to_os_string()),
             _ => None,
-        }
-    }))
+        })
 }
 
 /// Like [`process_env`], but also finds an entry that a process-title rewrite
@@ -319,27 +486,11 @@ pub fn process_env_checked(pid: u32, name: &str) -> std::io::Result<Option<OsStr
 /// for an exact `name=` entry. Used only for a profile-only harness's store
 /// selection, whose result is still proven canonical, owned and private.
 pub fn process_env_shifted(pid: u32, name: &str) -> Option<OsString> {
-    use std::os::unix::ffi::OsStrExt;
     if let Some(value) = process_env(pid, name) {
         return Some(value);
     }
-    let mut system = System::new();
-    let target = Pid::from_u32(pid);
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[target]),
-        true,
-        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
-    );
-    let key = name.as_bytes();
-    system
-        .process(target)?
-        .cmd()
-        .iter()
-        .skip(1)
-        .find_map(|entry| match entry.as_bytes().strip_prefix(key) {
-            Some([b'=', value @ ..]) => Some(OsStr::from_bytes(value).to_os_string()),
-            _ => None,
-        })
+    let arguments = process_strings(pid, Strings::Cmdline)?;
+    find_entry(arguments.get(1..).unwrap_or_default(), name)
 }
 
 #[cfg(test)]
@@ -496,6 +647,83 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// The direct Linux `/proc/<pid>` reads report exactly what a `sysinfo`
+    /// process-table refresh reports (parent, start time, executable, real UID,
+    /// environment and arguments) for this process, its parent and init, and a
+    /// thread that is not its group leader is not a process.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn direct_reads_match_the_process_table() {
+        use std::os::unix::ffi::OsStrExt;
+        let me = std::process::id();
+        let parent = process_facts(me).unwrap().parent.unwrap();
+        for pid in [me, parent, 1] {
+            let mut system = System::new();
+            let target = Pid::from_u32(pid);
+            system.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[target]),
+                true,
+                ProcessRefreshKind::nothing()
+                    .with_exe(UpdateKind::Always)
+                    .with_user(UpdateKind::Always)
+                    .with_environ(UpdateKind::Always)
+                    .with_cmd(UpdateKind::Always),
+            );
+            let Some(process) = system.process(target) else {
+                continue;
+            };
+            let facts = process_facts(pid).unwrap();
+            assert_eq!(
+                (
+                    facts.parent,
+                    facts.start_time,
+                    facts.exe.as_deref(),
+                    facts.uid
+                ),
+                (
+                    process.parent().map(Pid::as_u32),
+                    process.start_time(),
+                    process.exe(),
+                    process.user_id().map(|uid| **uid)
+                ),
+                "pid {pid}"
+            );
+            let bytes = |entries: &[OsString]| -> Vec<Vec<u8>> {
+                entries
+                    .iter()
+                    .map(|entry| entry.as_bytes().to_vec())
+                    .collect()
+            };
+            assert_eq!(
+                process_strings(pid, Strings::Environ).unwrap(),
+                bytes(process.environ())
+            );
+            assert_eq!(
+                process_strings(pid, Strings::Cmdline).unwrap(),
+                bytes(process.cmd())
+            );
+        }
+        let (stop, wait) = std::sync::mpsc::channel::<()>();
+        let (send, receive) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            send.send(std::fs::read_link("/proc/thread-self").unwrap())
+                .unwrap();
+            let _ = wait.recv();
+        });
+        let link = receive.recv().unwrap();
+        let tid: u32 = link
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_ne!(tid, me);
+        assert!(process_facts(tid).is_none());
+        assert!(process_env_checked(tid, "PATH").is_err());
+        drop(stop);
+        thread.join().unwrap();
     }
 
     /// Ancestry starts with this process and its exact incarnation is alive.

@@ -12,6 +12,10 @@
 //!     (through `/bin/sh`), feeding the payload; answers its stdout and
 //!     exit status. `close_stdout` closes the hook's stdout before it can
 //!     print (a lost reply).
+//!   - `{"cmd":"hook_burst","bin":..,"socket":..,"harness":..,"payloads":[..]}`
+//!     runs one real `bridge-hook` child per payload at once (each as `hook`
+//!     does) and answers their results in payload order, each with its
+//!     spawn-to-exit `elapsed_ms`.
 //!   - `{"cmd":"mcp","socket":..,"meta":{..}}` runs `bridge-fixture mcp`
 //!     as its child (a harness-launched MCP server) and answers its
 //!     attestation result. With `"node":<path>` the child is instead the
@@ -276,6 +280,7 @@ fn harness() {
                 json!({"ok": true})
             }
             "hook" => run_hook(&command),
+            "hook_burst" => run_hook_burst(&command),
             "delayed_hook" => run_delayed_hook(&command),
             "mcp" => run_mcp(&command),
             "v1" => run_v1_frontend(&command),
@@ -867,6 +872,34 @@ fn run_hook(command: &Value) -> Value {
     let _ = child.stderr.take().map(|mut e| e.read_to_string(&mut err));
     let status = child.wait().map(|s| s.code()).ok().flatten();
     json!({"stdout": out, "stderr": err, "status": status})
+}
+
+/// Runs one real hook child per payload concurrently (each exactly as
+/// [`run_hook`]) and answers the results in payload order with their
+/// spawn-to-exit time.
+fn run_hook_burst(command: &Value) -> Value {
+    let payloads = command["payloads"].as_array().cloned().unwrap_or_default();
+    let start = Arc::new(std::sync::Barrier::new(payloads.len()));
+    let runs: Vec<_> = payloads
+        .into_iter()
+        .map(|payload| {
+            let mut single = command.clone();
+            single["payload"] = payload;
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                let began = std::time::Instant::now();
+                let mut result = run_hook(&single);
+                result["elapsed_ms"] = json!(began.elapsed().as_millis() as u64);
+                result
+            })
+        })
+        .collect();
+    Value::Array(
+        runs.into_iter()
+            .map(|run| run.join().expect("hook burst thread"))
+            .collect(),
+    )
 }
 
 /// Feeds the hook whose stdout was already closed, then reaps it.

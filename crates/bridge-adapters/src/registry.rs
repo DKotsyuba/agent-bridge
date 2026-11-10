@@ -1390,6 +1390,225 @@ struct HarnessMatch {
     executable: PathBuf,
     /// The harness-level policy of the matched harness kind.
     policy: HarnessPolicy,
+    /// The connected peer's incarnation (PID, start second) at the proof.
+    peer: (u32, u64),
+    /// The peer's start tick at the proof, when both reads agreed.
+    #[cfg(target_os = "linux")]
+    peer_ticks: Option<u64>,
+    /// The harness's start tick at the proof, when both reads agreed.
+    #[cfg(target_os = "linux")]
+    harness_ticks: Option<u64>,
+}
+
+impl HarnessMatch {
+    /// Whether the peer and the harness proven by this match are still the
+    /// same incarnations: the full kernel identity of the harness when it was
+    /// sampled, else its start tick, and the peer's start tick (on other
+    /// platforms the start seconds). Used to validate a proof taken outside
+    /// the registry lock at the moment it is committed.
+    fn still_current(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            let harness = match &self.kernel_incarnation {
+                Some(identity) => {
+                    os::attempt::kernel_incarnation(identity.pid, identity.uid)
+                        .ok()
+                        .as_ref()
+                        == Some(identity)
+                }
+                None => self
+                    .harness_ticks
+                    .is_some_and(|ticks| os::proc_start_ticks(self.incarnation.0) == Some(ticks)),
+            };
+            harness
+                && self
+                    .peer_ticks
+                    .is_some_and(|ticks| os::proc_start_ticks(self.peer.0) == Some(ticks))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            os::incarnation_alive(self.incarnation.0, self.incarnation.1)
+                && os::incarnation_alive(self.peer.0, self.peer.1)
+        }
+    }
+}
+
+/// The immutable configuration a harness proof reads, copied from the
+/// registry so the proof can run without holding the registry lock.
+#[derive(Debug, Clone)]
+pub(crate) struct HarnessProbe {
+    /// The only user id accepted on the channel.
+    owner_uid: u32,
+    /// Managed tool routes are configured (full kernel identities are read).
+    managed: bool,
+    /// Allowlisted intermediate executables between a peer and its harness.
+    intermediates: Vec<PathBuf>,
+    /// The harness-level policy of the requested harness kind, if enabled.
+    policy: Option<HarnessPolicy>,
+}
+
+/// The process evidence of one hook, read by [`probe_hook`] without the
+/// registry lock and committed by [`Registry::admit_proven_hook`] only after
+/// it re-checked that the peer and the harness are still the proven
+/// incarnations. It carries no registry state, so it grants nothing alone.
+#[derive(Debug)]
+pub(crate) struct HookEvidence {
+    /// The proven harness, or the refusal the proof produced.
+    matched: Result<HarnessMatch, CorrelationError>,
+    /// The original launch read at a managed `PreToolUse`, equal to the
+    /// harness identity sampled by the proof.
+    #[cfg(target_os = "linux")]
+    launch_observation: Option<os::attempt::LaunchObservation>,
+}
+
+/// The event kind, session and optional child agent of a hook payload, or
+/// the refusal of a payload that is not a hook of `harness`.
+fn hook_shape(
+    harness: Harness,
+    payload: &HookPayload,
+) -> Result<(HookKind, String, Option<String>), CorrelationError> {
+    let kind = HookKind::parse(&payload.hook_event_name)
+        .ok_or_else(|| CorrelationError::NotEvidence("unsupported hook event".into()))?;
+    if harness != Harness::OPENCODE
+        && matches!(kind, HookKind::OpenCodeActivity | HookKind::OpenCodeUnknown)
+    {
+        return Err(CorrelationError::NotEvidence(
+            "hook event belongs to another harness".into(),
+        ));
+    }
+    let session =
+        checked_id(&payload.session_id, "session_id").map_err(CorrelationError::NotEvidence)?;
+    let agent = payload
+        .agent_id
+        .as_deref()
+        .map(|agent| checked_id(agent, "agent_id"))
+        .transpose()
+        .map_err(CorrelationError::NotEvidence)?;
+    Ok((kind, session, agent))
+}
+
+/// Reads the process evidence of one hook without any registry state: the
+/// harness proof of [`prove_harness`] and, at a managed `PreToolUse` of a
+/// Codex or Claude Code harness with complete managed ancestry, the original
+/// launch capture bracketed by the identity the proof sampled. A payload that
+/// is not a hook skips the process reads; its refusal is reported again by
+/// the commit.
+pub(crate) fn probe_hook(
+    probe: &HarnessProbe,
+    peer: PeerIdentity,
+    harness: Harness,
+    payload: &HookPayload,
+) -> HookEvidence {
+    let matched =
+        hook_shape(harness, payload).and_then(|_| prove_harness(probe, peer, harness, false));
+    #[cfg(target_os = "linux")]
+    let launch_observation = match (&matched, HookKind::parse(&payload.hook_event_name)) {
+        (Ok(matched), Some(HookKind::PreToolUse))
+            if probe.managed
+                && (harness == Harness::CODEX || harness == Harness::CLAUDE_CODE)
+                && matched.managed_ancestry =>
+        {
+            os::attempt::capture_launch(matched.incarnation.0, probe.owner_uid)
+                .ok()
+                .filter(|capture| Some(&capture.incarnation) == matched.kernel_incarnation.as_ref())
+        }
+        _ => None,
+    };
+    HookEvidence {
+        matched,
+        #[cfg(target_os = "linux")]
+        launch_observation,
+    }
+}
+
+/// Resolves the harness a channel peer belongs to, from process facts and the
+/// copied configuration only (see [`Registry::harness_of`], which documents
+/// every check); it reads no registry state, so a hook proves it before taking
+/// the registry lock.
+fn prove_harness(
+    probe: &HarnessProbe,
+    peer: PeerIdentity,
+    harness: Harness,
+    frontend: bool,
+) -> Result<HarnessMatch, CorrelationError> {
+    if peer.uid != probe.owner_uid {
+        return Err(CorrelationError::NotEvidence(
+            "peer runs as another user".into(),
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    let chain = if probe.managed {
+        os::ancestry_managed(peer.pid)
+    } else {
+        os::ancestry(peer.pid)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let chain = os::ancestry(peer.pid);
+    let Some((_, ancestors)) = chain.split_first() else {
+        return Err(CorrelationError::NotEvidence("peer process is gone".into()));
+    };
+    let hop = frontend
+        && harness == Harness::CODEX
+        && ancestors
+            .first()
+            .is_some_and(|parent| signed_node_hop(peer.pid, parent, probe.owner_uid));
+    let candidate = ancestors[usize::from(hop)..].iter().find(|facts| {
+        !facts
+            .exe
+            .as_ref()
+            .is_some_and(|exe| probe.intermediates.contains(exe))
+    });
+    let Some(facts) = candidate else {
+        return Err(CorrelationError::NotEvidence("no harness ancestor".into()));
+    };
+    if facts.uid != Some(probe.owner_uid) {
+        return Err(CorrelationError::NotEvidence(
+            "harness runs as another user".into(),
+        ));
+    }
+    let policy = probe.policy.clone().ok_or_else(|| {
+        CorrelationError::NotEvidence(format!(
+            "{harness}: this harness is not enabled by any harness profile"
+        ))
+    })?;
+    if !product_marked(facts, &policy) {
+        return Err(CorrelationError::NotEvidence(format!(
+            "{harness}: the ancestor is not a marked harness process (executable_markers)"
+        )));
+    }
+    let exe = facts
+        .exe
+        .clone()
+        .ok_or_else(|| CorrelationError::NotEvidence("harness executable unreadable".into()))?;
+    executable_current(&exe, facts, probe.owner_uid).map_err(CorrelationError::NotEvidence)?;
+    let store = harness_store(facts, &policy).ok_or_else(|| {
+        CorrelationError::NotEvidence(format!(
+            "{harness}: harness store unresolvable (store_env / store_home)"
+        ))
+    })?;
+    private_store(&store, probe.owner_uid).map_err(CorrelationError::NotEvidence)?;
+    #[cfg(target_os = "linux")]
+    let managed_ancestry = chain
+        .iter()
+        .position(|entry| entry.pid == facts.pid)
+        .is_some_and(|index| {
+            os::attempt::ordered_managed_ancestry(&chain[..=index], probe.owner_uid)
+        });
+    Ok(HarnessMatch {
+        incarnation: (facts.pid, facts.start_time),
+        #[cfg(target_os = "linux")]
+        kernel_incarnation: facts.kernel_incarnation.clone(),
+        #[cfg(target_os = "linux")]
+        managed_ancestry,
+        store,
+        executable: exe,
+        policy,
+        peer: (chain[0].pid, chain[0].start_time),
+        #[cfg(target_os = "linux")]
+        peer_ticks: chain[0].start_ticks,
+        #[cfg(target_os = "linux")]
+        harness_ticks: facts.start_ticks,
+    })
 }
 
 /// Identity of one exact executable file, the key of its hashed digest.
@@ -1932,6 +2151,10 @@ pub struct Registry {
     bindings: HashMap<String, Binding>,
     /// Optional private atomic route snapshot.
     journal: Option<PathBuf>,
+    /// The journal path and SHA-256 of the snapshot bytes this registry last
+    /// committed there (written, fsynced, renamed and the directory fsynced);
+    /// cleared by every failed or uncertain commit.
+    routes_committed: Option<(PathBuf, String)>,
     /// Separate private managed assertion/consume snapshot.
     attempt_journal: Option<PathBuf>,
     /// Frozen schema-2 ledger retained only when migration cannot commit.
@@ -2418,6 +2641,7 @@ impl Registry {
             epoch_floor: 0,
             bindings: HashMap::new(),
             journal: None,
+            routes_committed: None,
             attempt_journal: None,
             legacy_embedded_attempts: None,
             store_id: new_store_id()?,
@@ -2834,8 +3058,12 @@ impl Registry {
     /// Atomically fsyncs the bounded verified-route snapshot with mode 0600 and
     /// an owner-only parent directory. Failure is reported without payload/path
     /// diagnostics; a failed write leaves the previous snapshot intact. No-op
-    /// when persistence is disabled for an isolated registry.
-    fn persist_routes(&self) -> Result<(), String> {
+    /// when persistence is disabled for an isolated registry, and when the
+    /// snapshot is byte-identical to the one this registry last committed with
+    /// no failed or uncertain commit since: the durable file already holds
+    /// exactly these bytes (only this daemon writes its private journal), so a
+    /// hook that changed no route costs no write or fsync.
+    fn persist_routes(&mut self) -> Result<(), String> {
         let Some(path) = &self.journal else {
             return Ok(());
         };
@@ -2862,7 +3090,17 @@ impl Registry {
         if bytes.len() as u64 > MAX_ROUTE_SNAPSHOT_BYTES {
             return Err("route snapshot oversized".into());
         }
-        write_private_journal(path, &bytes)
+        let digest = crate::server::sha256_hex(&bytes);
+        if self
+            .routes_committed
+            .as_ref()
+            .is_some_and(|(committed, sha)| committed == path && *sha == digest)
+        {
+            return Ok(());
+        }
+        let committed = write_private_journal(path, &bytes);
+        self.routes_committed = committed.is_ok().then(|| (path.clone(), digest));
+        committed
     }
 
     /// Re-observes the lifecycle of a known live interactive Claude route stuck at
@@ -3074,84 +3312,23 @@ impl Registry {
     /// peer's direct parent alone may be the signed Node frontend hop (see
     /// [`signed_node_hop`]) and is skipped before the walk; hooks never get it.
     fn harness_of(
-        &mut self,
+        &self,
         peer: PeerIdentity,
         harness: Harness,
         frontend: bool,
     ) -> Result<HarnessMatch, CorrelationError> {
-        if peer.uid != self.owner_uid {
-            return Err(CorrelationError::NotEvidence(
-                "peer runs as another user".into(),
-            ));
+        prove_harness(&self.harness_probe(harness), peer, harness, frontend)
+    }
+
+    /// The immutable configuration [`prove_harness`] reads for `harness`,
+    /// copied so the proof can run after the registry lock is released.
+    pub(crate) fn harness_probe(&self, harness: Harness) -> HarnessProbe {
+        HarnessProbe {
+            owner_uid: self.owner_uid,
+            managed: !self.config.managed_tools.is_empty(),
+            intermediates: self.config.intermediates.clone(),
+            policy: self.policy(harness).cloned(),
         }
-        #[cfg(target_os = "linux")]
-        let chain = if self.config.managed_tools.is_empty() {
-            os::ancestry(peer.pid)
-        } else {
-            os::ancestry_managed(peer.pid)
-        };
-        #[cfg(not(target_os = "linux"))]
-        let chain = os::ancestry(peer.pid);
-        let Some((_, ancestors)) = chain.split_first() else {
-            return Err(CorrelationError::NotEvidence("peer process is gone".into()));
-        };
-        let hop = frontend
-            && harness == Harness::CODEX
-            && ancestors
-                .first()
-                .is_some_and(|parent| signed_node_hop(peer.pid, parent, self.owner_uid));
-        let candidate = ancestors[usize::from(hop)..].iter().find(|facts| {
-            !facts
-                .exe
-                .as_ref()
-                .is_some_and(|exe| self.config.intermediates.contains(exe))
-        });
-        let Some(facts) = candidate else {
-            return Err(CorrelationError::NotEvidence("no harness ancestor".into()));
-        };
-        if facts.uid != Some(self.owner_uid) {
-            return Err(CorrelationError::NotEvidence(
-                "harness runs as another user".into(),
-            ));
-        }
-        let policy = self.policy(harness).cloned().ok_or_else(|| {
-            CorrelationError::NotEvidence(format!(
-                "{harness}: this harness is not enabled by any harness profile"
-            ))
-        })?;
-        if !product_marked(facts, &policy) {
-            return Err(CorrelationError::NotEvidence(format!(
-                "{harness}: the ancestor is not a marked harness process (executable_markers)"
-            )));
-        }
-        let exe = facts
-            .exe
-            .clone()
-            .ok_or_else(|| CorrelationError::NotEvidence("harness executable unreadable".into()))?;
-        executable_current(&exe, facts, self.owner_uid).map_err(CorrelationError::NotEvidence)?;
-        let store = harness_store(facts, &policy).ok_or_else(|| {
-            CorrelationError::NotEvidence(format!(
-                "{harness}: harness store unresolvable (store_env / store_home)"
-            ))
-        })?;
-        private_store(&store, self.owner_uid).map_err(CorrelationError::NotEvidence)?;
-        #[cfg(target_os = "linux")]
-        let managed_ancestry = chain
-            .iter()
-            .position(|entry| entry.pid == facts.pid)
-            .is_some_and(|index| {
-                os::attempt::ordered_managed_ancestry(&chain[..=index], self.owner_uid)
-            });
-        Ok(HarnessMatch {
-            incarnation: (facts.pid, facts.start_time),
-            #[cfg(target_os = "linux")]
-            kernel_incarnation: facts.kernel_incarnation.clone(),
-            #[cfg(target_os = "linux")]
-            managed_ancestry,
-            store,
-            executable: exe,
-            policy,
-        })
     }
 
     /// Hashes every configured relay and backend executable into the digest
@@ -3362,42 +3539,45 @@ impl Registry {
         payload: &HookPayload,
         now_ms: u64,
     ) -> Result<HookAdmission, CorrelationError> {
-        let kind = HookKind::parse(&payload.hook_event_name)
-            .ok_or_else(|| CorrelationError::NotEvidence("unsupported hook event".into()))?;
-        if harness != Harness::OPENCODE
-            && matches!(kind, HookKind::OpenCodeActivity | HookKind::OpenCodeUnknown)
-        {
-            return Err(CorrelationError::NotEvidence(
-                "hook event belongs to another harness".into(),
-            ));
-        }
-        let session =
-            checked_id(&payload.session_id, "session_id").map_err(CorrelationError::NotEvidence)?;
-        let agent = payload
-            .agent_id
-            .as_deref()
-            .map(|agent| checked_id(agent, "agent_id"))
-            .transpose()
-            .map_err(CorrelationError::NotEvidence)?;
+        let evidence = probe_hook(&self.harness_probe(harness), peer, harness, payload);
+        self.admit_proven_hook(harness, payload, now_ms, evidence)
+    }
+
+    /// [`Registry::admit_hook`] with the process evidence that [`probe_hook`]
+    /// read before the caller took the registry lock, so a burst of hooks does
+    /// not serialize behind each other's process reads.
+    ///
+    /// The payload is checked first and the claim-capacity refusals come before
+    /// the proof's own refusal, exactly as in [`Registry::admit_hook`]. Before
+    /// anything is decided or changed, the peer and the harness must still be
+    /// the incarnations the proof read (the harness's full kernel identity when
+    /// it was sampled, else its start tick, and the peer's start tick); a hook
+    /// whose peer or harness was replaced in between is refused as not
+    /// evidence. Every registry decision is then taken under the caller's
+    /// lock, from the registry state of this moment.
+    pub(crate) fn admit_proven_hook(
+        &mut self,
+        harness: Harness,
+        payload: &HookPayload,
+        now_ms: u64,
+        evidence: HookEvidence,
+    ) -> Result<HookAdmission, CorrelationError> {
+        let (kind, session, agent) = hook_shape(harness, payload)?;
         if kind == HookKind::PreToolUse && payload.tool_use_id.is_some() {
             self.expire_attempt_contexts(now_ms)?;
             self.ensure_call_capacity()?;
         }
-        let matched = self.harness_of(peer, harness, false)?;
-        // Capture only at this original hook. Missing or changed evidence stays
-        // absent; legacy observations remain independent of managed authority.
+        let matched = evidence.matched?;
+        if !matched.still_current() {
+            return Err(CorrelationError::NotEvidence(
+                "hook peer or harness changed during admission".into(),
+            ));
+        }
+        // Captured only at this original hook (see [`probe_hook`]). Missing or
+        // changed evidence stays absent; legacy observations remain independent
+        // of managed authority.
         #[cfg(target_os = "linux")]
-        let launch_observation = if !self.config.managed_tools.is_empty()
-            && kind == HookKind::PreToolUse
-            && (harness == Harness::CODEX || harness == Harness::CLAUDE_CODE)
-            && matched.managed_ancestry
-        {
-            os::attempt::capture_launch(matched.incarnation.0, self.owner_uid)
-                .ok()
-                .filter(|capture| Some(&capture.incarnation) == matched.kernel_incarnation.as_ref())
-        } else {
-            None
-        };
+        let launch_observation = evidence.launch_observation;
         // Claude children share the root session's address; Codex children
         // are their own threads with their own addresses; any other harness
         // follows its profile.
@@ -5197,6 +5377,46 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// The route journal is rewritten only for new bytes: an unchanged snapshot
+    /// already committed by this registry is not written again (same inode),
+    /// a changed route is, and a failed commit (here to another path) forgets
+    /// what was committed, so the next commit writes even unchanged bytes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unchanged_route_snapshot_is_not_rewritten() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = scratch("routeskip");
+        let path = dir.join("routes.json");
+        let inode = || std::fs::metadata(&path).unwrap().ino();
+        let mut registry = claude_registry();
+        registry.attach_journal(&path, 1).unwrap();
+        let attached = inode();
+        registry.persist_routes().unwrap();
+        assert_eq!(inode(), attached, "unchanged bytes are not rewritten");
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let address = NativeAddress::new("h", Harness::CLAUDE_CODE, "ns", "skip").unwrap();
+        let binding = unknown_binding(&address, &child, &dir, Path::new("/bin/sleep"));
+        registry
+            .bindings
+            .insert(address.to_canonical_string(), binding);
+        registry.persist_routes().unwrap();
+        let changed = inode();
+        assert_ne!(changed, attached, "a changed route is committed");
+        registry.persist_routes().unwrap();
+        assert_eq!(inode(), changed);
+        let original = registry.fixture_fail_route_commit();
+        assert!(registry.persist_routes().is_err());
+        registry.fixture_restore_route_commit(original);
+        registry.persist_routes().unwrap();
+        assert_ne!(inode(), changed, "a failed commit forces the next write");
+        let _ = child.kill();
+        let _ = child.wait();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// A private temporary directory for one test, including under inherited
     /// default ACLs that would otherwise make a new store group-writable.
     fn scratch(tag: &str) -> PathBuf {
@@ -6534,6 +6754,85 @@ mod tests {
         assert!(!product_marked(&named, &custom));
         named.exe = None;
         assert!(!product_marked(&named, &codex));
+    }
+
+    /// A hook proof read outside the registry lock commits only while its peer
+    /// and harness are still the proven incarnations: a changed harness
+    /// identity (full kernel identity or start tick) or a peer that exited (its
+    /// client gave up) is refused at the commit as not evidence, before any
+    /// route or call record exists.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lock_free_hook_proof_is_revalidated_at_commit() {
+        let mut registry = claude_registry();
+        let me = own_facts();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let peer = os::process_facts(child.id()).unwrap();
+        let identity = os::attempt::kernel_incarnation(me.pid, me.uid.unwrap()).unwrap();
+        let matched = HarnessMatch {
+            incarnation: (me.pid, me.start_time),
+            kernel_incarnation: None,
+            managed_ancestry: false,
+            store: std::env::temp_dir(),
+            executable: me.exe.clone().unwrap(),
+            policy: registry.policies[0].clone(),
+            peer: (peer.pid, peer.start_time),
+            peer_ticks: peer.start_ticks,
+            harness_ticks: me.start_ticks,
+        };
+        let managed = HarnessMatch {
+            kernel_incarnation: Some(identity.clone()),
+            ..matched.clone()
+        };
+        assert!(matched.still_current() && managed.still_current());
+        let reborn_harness = HarnessMatch {
+            harness_ticks: me.start_ticks.map(|ticks| ticks + 1),
+            ..matched.clone()
+        };
+        let reborn_identity = HarnessMatch {
+            kernel_incarnation: Some(os::attempt::KernelIncarnation {
+                start_ticks: identity.start_ticks + 1,
+                ..identity
+            }),
+            ..matched.clone()
+        };
+        assert!(!reborn_harness.still_current());
+        assert!(!reborn_identity.still_current());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!matched.still_current(), "the peer is gone");
+        let payload = HookPayload {
+            hook_event_name: "SessionStart".into(),
+            session_id: "s".into(),
+            agent_id: None,
+            tool_use_id: None,
+            tool_name: None,
+            notification_type: None,
+            transcript_path: None,
+            source: None,
+        };
+        for stale in [matched, reborn_identity] {
+            let error = registry
+                .admit_proven_hook(
+                    Harness::CLAUDE_CODE,
+                    &payload,
+                    1_000,
+                    HookEvidence {
+                        matched: Ok(stale),
+                        launch_observation: None,
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(error.class(), "not_evidence", "{error}");
+            assert!(
+                error.detail().contains("changed during admission"),
+                "{error}"
+            );
+        }
+        assert!(registry.bindings.is_empty() && registry.calls.is_empty());
     }
 
     /// A channel peer of another user, a harness the policy does not serve, and a

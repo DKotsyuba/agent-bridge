@@ -51,6 +51,8 @@ The channel serves at most 256 connections at once, one thread each. A connectio
 * Producer v1 operations: the outer error `class: "unavailable"`, `reason: "capacity_exhausted"`, `retry_hint: "same_identity"`, with `effect: "not_committed"` and the usual reconciliation identity when the request names one.
 * Legacy hook and attestation requests: `{"result":"refused","class":"unavailable","detail":"capacity_exhausted"}`. The hook client repeats such a refusal with a short backoff for one operation timeout before reporting it, so a `PreToolUse` hook, which the harness runs once per native call, still delivers its token to the same call.
 
+A served hook proves its process ancestry, harness executable and store from `/proc/<pid>` of only the processes involved, without holding the registry lock. Under the lock it re-checks that the peer and the harness are still the proven incarnations (the harness's full kernel identity when sampled, else its start tick, and the peer's start tick) before deciding anything. A changed incarnation is refused as `not_evidence`. A hook whose client has already disconnected, after its own timeout, is dropped without a reply or any state change (`hook_abandoned` in the log), both before the proof and again before the commit.
+
 `capacity_exhausted` with recovery `operator` or `same_key_lookup` from inside an operation (journal, claim or role capacity) is a different, operation-level condition and keeps its documented recovery. A client never changes an identity because of any of these.
 
 ### Retry after a lost or refused exchange

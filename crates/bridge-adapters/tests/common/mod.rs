@@ -377,6 +377,7 @@ impl Harnessed {
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
+        exec_settled(&child);
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         Harnessed {
@@ -539,6 +540,7 @@ impl Harnessed {
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
+        exec_settled(&child);
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         Harnessed {
@@ -599,6 +601,7 @@ impl Harnessed {
             command.env("BRIDGE_NATIVE_OWNER_SOCKET", locator);
         }
         let mut child = command.spawn().unwrap();
+        exec_settled(&child);
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         Harnessed {
@@ -657,6 +660,23 @@ impl Drop for Harnessed {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// Waits, for at most five seconds, until a just-spawned fixture finished its
+/// `exec`: a vfork-based spawn may return while `/proc/<pid>/exe` still names
+/// this test binary, and a test reading the child's process facts at once
+/// would see the parent's executable. Returns at once where there is no
+/// `/proc` or the child already exited.
+fn exec_settled(child: &Child) {
+    let own = std::fs::read_link("/proc/self/exe").ok();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let exe = std::fs::read_link(format!("/proc/{}/exe", child.id())).ok();
+        if exe.is_none() || exe != own {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
 

@@ -82,6 +82,24 @@ source, and the crates are not published to crates.io.
   looks the digest up by the descriptor's identity, applies the owner and mode
   checks to the descriptor, and rechecks the descriptor, `/proc/<pid>/exe` and
   the process incarnation after the whole proof.
+- Serve a burst of concurrent first hooks within the hook client timeout. Twenty
+  Pool members joining at once (about 100 simultaneous connections) left 19 of
+  20 unjoined: every hook proved its process ancestry under the registry lock,
+  and on Linux each process read was a `sysinfo` refresh that lists the whole
+  process and thread table (about 14 ms per process on a host with 3,000
+  threads, more than 100 ms per hook). Hooks queued behind each other until
+  their five-second client timeout. When the lock finally came, the peer was
+  gone and the hook was refused as `not_evidence`. Linux now reads only
+  `/proc/<pid>` for one process (same facts and the same start seconds;
+  a thread that is not a group leader is not a process). A hook proves its
+  harness before it takes the lock, and under the lock it re-checks that the
+  peer and the harness are still the proven incarnations before it decides
+  anything. A hook whose client already disconnected is dropped
+  (`hook_abandoned`) before the proof and again before the commit. The route
+  journal is not rewritten or fsynced when its bytes equal the snapshot this
+  registry last committed. In a synthetic test, 100 concurrent hooks from 20
+  live members completed with a 95th percentile of 0.5–0.8 s, where 78 of 100
+  had timed out.
 - Judge the executable filesystem by the loaded file's own mount. The type was
   looked up by device number, but a non-directory on an overlay reports the
   device of its backing filesystem, so an overlay file could pass. Linux now

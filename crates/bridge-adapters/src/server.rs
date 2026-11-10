@@ -1015,6 +1015,24 @@ fn read_line(reader: &mut BufReader<UnixStream>, budget: Duration) -> Option<Str
     }
 }
 
+/// Whether the client of a hook connection has already gone: its end of the
+/// socket reports end of stream or a reset while it should be waiting for the
+/// reply (it gave up after its own timeout). A hook client sends nothing more
+/// before it is answered, so buffered bytes or a read that would block mean it
+/// is still there, and the probe never consumes a byte. A connection whose
+/// blocking mode cannot be restored is treated as gone, so nothing is
+/// committed for a reply that could not be written.
+fn client_gone(reader: &mut BufReader<UnixStream>) -> bool {
+    if !reader.buffer().is_empty() || reader.get_ref().set_nonblocking(true).is_err() {
+        return false;
+    }
+    let gone = match reader.fill_buf() {
+        Ok(bytes) => bytes.is_empty(),
+        Err(error) => error.kind() == std::io::ErrorKind::ConnectionReset,
+    };
+    gone || reader.get_ref().set_nonblocking(false).is_err()
+}
+
 /// Writes one response line.
 fn write_response(stream: &mut UnixStream, response: &ChannelResponse) -> std::io::Result<()> {
     let mut line = serde_json::to_vec(response).map_err(std::io::Error::other)?;
@@ -1140,8 +1158,24 @@ fn serve_hook(
             return;
         }
     };
+    if client_gone(reader) {
+        log_event("warn", "hook_abandoned", &[]);
+        return;
+    }
+    // The process proof reads only the immutable configuration and the OS, so
+    // it runs without the registry lock; the commit re-checks the proven
+    // incarnations under the lock before deciding anything.
+    let probe = lock_registry(&state.registry).harness_probe(harness);
+    let evidence = crate::registry::probe_hook(&probe, peer, harness, &payload);
+    let mut registry = lock_registry(&state.registry);
+    if client_gone(reader) {
+        drop(registry);
+        log_event("warn", "hook_abandoned", &[]);
+        return;
+    }
     let now = current_unix_millis();
-    let admitted = lock_registry(&state.registry).admit_hook(peer, harness, &payload, now);
+    let admitted = registry.admit_proven_hook(harness, &payload, now, evidence);
+    drop(registry);
     let admission = match admitted {
         Ok(admission) => admission,
         Err(error) => {
@@ -1266,6 +1300,26 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         dir
+    }
+
+    /// A hook client still waiting is not gone, nor is one whose extra bytes are
+    /// already buffered (they stay unconsumed for the confirmation read, and
+    /// the stream stays blocking); a client that closed its end is gone.
+    #[test]
+    fn client_gone_detects_only_a_closed_peer() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let mut reader = BufReader::new(server);
+        assert!(!client_gone(&mut reader), "a waiting client is present");
+        client.write_all(b"pending\n").unwrap();
+        assert!(!client_gone(&mut reader), "unread bytes are not an exit");
+        assert!(!client_gone(&mut reader), "buffered bytes are not an exit");
+        drop(client);
+        assert_eq!(
+            read_line(&mut reader, Duration::from_secs(1)).as_deref(),
+            Some("pending\n"),
+            "nothing was consumed and blocking reads still work"
+        );
+        assert!(client_gone(&mut reader), "a closed client is gone");
     }
 
     /// A crashed server's socket (bound, listener gone) is removed; a live
