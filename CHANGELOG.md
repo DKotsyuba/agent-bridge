@@ -6,9 +6,16 @@ source, and the crates are not published to crates.io.
 
 ## Unreleased
 
+## [0.7.0] - 2026-11-10
+
+This release adds managed attempt binding (B1/B2), the owner v2 effect
+protocol, loaded-build executable proof on Linux, and fixes for connection
+backpressure and hook throughput. It upgrades the core store to schema 9 and
+the private route journal to schema 4; both are forward-only.
+
 ### Added
 
-- Add versioned managed-attempt SDK methods with mandatory pinned server
+- Add versioned managed-attempt binding (B1/B2) SDK methods with mandatory pinned server
   executable verification, and separate managed-owner v2 effect custody,
   lookup and abort with authenticated Run recovery.
 - Add producer-owned scope prefixes for managed-owner routes and a pinned SDK

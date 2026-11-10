@@ -1,6 +1,6 @@
 {
   "name": "@agent-bridge/opencode",
-  "version": "0.6.6",
+  "version": "0.7.0",
   "type": "module",
   "main": "index.js",
   "agentBridge": {
