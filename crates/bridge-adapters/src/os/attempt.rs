@@ -601,14 +601,25 @@ mod tests {
         assert!(!unix_table_contains(b"invalid\xff", 1234));
     }
 
-    /// A device descriptor cannot qualify as a stdio transport.
+    /// A device descriptor cannot qualify as a stdio transport. A parallel test
+    /// may hold thousands of sockets for a moment, so the descriptor is
+    /// reopened (bounded) until its number fits the `u8` the check takes.
     #[cfg(target_os = "linux")]
     #[test]
     fn non_stdio_device_is_refused() {
         use std::os::fd::AsRawFd;
-        let file = std::fs::File::open("/dev/null").unwrap();
-        let fd = u8::try_from(file.as_raw_fd()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let (file, fd) = loop {
+            let file = std::fs::File::open("/dev/null").unwrap();
+            if let Ok(fd) = u8::try_from(file.as_raw_fd()) {
+                break (file, fd);
+            }
+            assert!(std::time::Instant::now() < deadline, "no small descriptor");
+            drop(file);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
         assert!(!managed_stdio(std::process::id(), fd));
+        drop(file);
     }
 
     /// A parent born after its claimed child cannot establish managed ancestry.
