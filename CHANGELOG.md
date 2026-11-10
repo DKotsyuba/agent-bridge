@@ -66,6 +66,13 @@ source, and the crates are not published to crates.io.
   client repeats only that refusal, with backoff, for one operation timeout. See
   `crates/bridge-adapters/docs/attempt-binding-v1.md` for the retry rules after a
   lost or refused exchange.
+- Accept `attempt_mismatch` as a closed `known_unsent` reason of the managed
+  owner v2 protocol (protocol validation, core custody, the protected channel
+  and the SDK). A still-running execution pinned to an older Bridge build
+  refuses this way after a Bridge upgrade; Bridge now persists and returns it
+  as `known_unsent`/`attempt_mismatch` instead of treating the reply as
+  malformed. It is never retried by Bridge, and a producer must not resend the
+  effect to the same execution.
 
 ## [0.6.6] - 2026-11-07
 

@@ -549,6 +549,7 @@ impl OwnerReplyV2 {
                     | "capacity"
                     | "conflict"
                     | "attempt_not_ready"
+                    | "attempt_mismatch"
                     | "qualification_pending",
                 ),
             ) => Ok(()),
@@ -689,7 +690,11 @@ mod tests {
         request.call_id = "dispatch-b".into();
         request.validate().unwrap();
         assert_eq!(request.effect_digest, digest);
-        for reason in ["attempt_not_ready", "qualification_pending"] {
+        for reason in [
+            "attempt_not_ready",
+            "attempt_mismatch",
+            "qualification_pending",
+        ] {
             let reply = OwnerReplyV2 {
                 version: 2,
                 call_id: request.call_id.clone(),
@@ -702,6 +707,18 @@ mod tests {
             };
             reply.validate_for(&request, "codex_turn").unwrap();
         }
+        // The reason list is closed: a near miss is still malformed.
+        let unknown_reason = OwnerReplyV2 {
+            version: 2,
+            call_id: request.call_id.clone(),
+            effect_id: request.outbox_intent.effect_id.clone(),
+            effect_digest: digest.clone(),
+            state: OwnerStateV2::KnownUnsent,
+            protocol: None,
+            native_id: None,
+            reason: Some("attempt_mismatched".into()),
+        };
+        assert!(unknown_reason.validate_for(&request, "codex_turn").is_err());
         request.outbox_intent.target_binding.binding_generation += 1;
         assert!(request.validate().is_err());
         assert!(!format!("{request:?}").contains("text\""));

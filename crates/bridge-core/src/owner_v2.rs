@@ -259,6 +259,7 @@ fn outcome(
                 | "capacity"
                 | "conflict"
                 | "attempt_not_ready"
+                | "attempt_mismatch"
                 | "qualification_pending",
             ),
         ) => true,

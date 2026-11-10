@@ -2539,6 +2539,23 @@ fn managed_owner_v2_exact_effect_and_no_legacy_fallback() {
         value(&call(&mut consumer, &lab, qualification_retry, true))["value"]["state"],
         "accepted"
     );
+    // A still-running execution pinned to an older Bridge build refuses with
+    // the closed reason `attempt_mismatch`: a definitive pre-handoff refusal
+    // that is reported as `known_unsent`, never as a malformed reply.
+    native.cmd(json!({"cmd":"owner_script","mode":"known_unsent:attempt_mismatch"}));
+    let mismatch = build("effect-m", "dispatch-m");
+    let refused = call(&mut consumer, &lab, mismatch.clone(), true);
+    assert_eq!(value(&refused)["value"]["state"], "known_unsent");
+    assert_eq!(value(&refused)["value"]["reason"], "attempt_mismatch");
+    let mismatch_lookup = request(
+        PRODUCER_TOKEN,
+        "mismatch-lookup",
+        "lookup_managed_owner_v1",
+        json!({"version":1,"expected_store_id":store,"audience":"backend","producer_scope":"scope","effect_id":"effect-m","effect_digest":mismatch["params"]["effect_digest"]}),
+    );
+    let looked_up = call(&mut consumer, &lab, mismatch_lookup, true);
+    assert_eq!(value(&looked_up)["value"]["state"], "known_unsent");
+    assert_eq!(value(&looked_up)["value"]["reason"], "attempt_mismatch");
     native.cmd(json!({"cmd":"owner_script","mode":"silent"}));
     let unknown = build("effect-c", "dispatch-c");
     assert_eq!(
@@ -2546,7 +2563,7 @@ fn managed_owner_v2_exact_effect_and_no_legacy_fallback() {
         "unknown"
     );
     let before = native.cmd(json!({"cmd":"owner_log"}));
-    assert_eq!(before["v2_frames"].as_array().unwrap().len(), 6);
+    assert_eq!(before["v2_frames"].as_array().unwrap().len(), 7);
     let mut unknown_replay = unknown.clone();
     unknown_replay["request_id"] = json!("dispatch-c-replay");
     assert_eq!(
@@ -2556,7 +2573,7 @@ fn managed_owner_v2_exact_effect_and_no_legacy_fallback() {
     let after_unknown_replay = native.cmd(json!({"cmd":"owner_log"}));
     assert_eq!(
         after_unknown_replay["v2_frames"].as_array().unwrap().len(),
-        6
+        7
     );
     assert_eq!(after_unknown_replay["run_queries"], before["run_queries"]);
     let unknown_lookup = request(
@@ -2595,7 +2612,7 @@ fn managed_owner_v2_exact_effect_and_no_legacy_fallback() {
             .as_array()
             .unwrap()
             .len(),
-        6
+        7
     );
     native.cmd(json!({"cmd":"owner_set_receipt","receipt":receipt}));
     native.cmd(json!({"cmd":"owner_script","mode":"claude_accept"}));
@@ -2709,7 +2726,7 @@ fn managed_owner_v2_exact_effect_and_no_legacy_fallback() {
         assert_eq!(value(&cancelled)["value"]["reason"], "cancelled");
     });
     let before = native.cmd(json!({"cmd":"owner_log"}));
-    assert_eq!(before["v2_frames"].as_array().unwrap().len(), 8);
+    assert_eq!(before["v2_frames"].as_array().unwrap().len(), 9);
     let effects: Vec<_> = before["v2_frames"]
         .as_array()
         .unwrap()
@@ -2719,8 +2736,8 @@ fn managed_owner_v2_exact_effect_and_no_legacy_fallback() {
     assert_eq!(
         effects,
         [
-            "effect-a", "effect-b", "effect-b", "effect-q", "effect-q", "effect-c", "effect-e",
-            "effect-f"
+            "effect-a", "effect-b", "effect-b", "effect-q", "effect-q", "effect-m", "effect-c",
+            "effect-e", "effect-f"
         ]
     );
     let mut wrong_route = build("effect-route", "dispatch-route");
@@ -2736,7 +2753,7 @@ fn managed_owner_v2_exact_effect_and_no_legacy_fallback() {
         "capability_missing"
     );
     let route_check = native.cmd(json!({"cmd":"owner_log"}));
-    assert_eq!(route_check["v2_frames"].as_array().unwrap().len(), 8);
+    assert_eq!(route_check["v2_frames"].as_array().unwrap().len(), 9);
     assert_eq!(route_check["run_queries"], before["run_queries"]);
 
     // Dynamic prefixes cover every managed custody operation, while retiring
@@ -3056,7 +3073,7 @@ fn managed_owner_v2_exact_effect_and_no_legacy_fallback() {
             .as_array()
             .unwrap()
             .len(),
-        10
+        11
     );
 }
 

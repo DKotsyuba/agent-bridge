@@ -294,6 +294,7 @@ fn owner_result(value: &ManagedOwnerResultV1, scope: &str, effect: &str, digest:
                 | "capacity"
                 | "conflict"
                 | "attempt_not_ready"
+                | "attempt_mismatch"
                 | "qualification_pending",
             ),
         ) => true,
