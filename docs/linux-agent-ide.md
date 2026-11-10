@@ -237,7 +237,8 @@ The current owner peer must be the native process's exact direct parent with
 matching UID, birth and trusted loaded executable: the file at the owner's executable path
 must be the very inode the process runs (a replaced file is refused until the owner is restarted),
 owned by the registry user or root, not group- or other-writable, on a filesystem where the kernel
-denies writes to a running executable (ext2/3/4, xfs, btrfs, tmpfs). File timestamps and the wall
+denies writes to a running executable (ext2/3/4, xfs, btrfs, tmpfs; judged by the mount of the
+descriptor opened on `/proc/<pid>/exe`, so an overlay is refused). File timestamps and the wall
 clock are not consulted. A socket bound by the
 OpenCode plugin itself has the same PID as the native process and fails that
 parent check. Although the actual SDK has `ctx.session.prompt`, this bundle does

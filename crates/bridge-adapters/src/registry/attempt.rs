@@ -1062,7 +1062,7 @@ impl Registry {
         if facts.uid != Some(peer.uid)
             || facts.exe.as_ref() != Some(&route.run_executable.path)
             || self
-                .verify_loaded(
+                .verify_managed_loaded(
                     &route.run_executable.path,
                     &facts,
                     &route.run_executable.sha256,
@@ -1143,7 +1143,7 @@ impl Registry {
             && os::process_facts(expected.pid).is_some_and(|facts| {
                 facts.uid == Some(expected.uid)
                     && facts.exe.as_ref() == Some(&binding.executable)
-                    && executable_current(&binding.executable, &facts, expected.uid).is_ok()
+                    && managed_executable_current(&binding.executable, &facts, expected.uid).is_ok()
             })
             && os::attempt::kernel_incarnation(expected.pid, expected.uid)
                 .is_ok_and(|actual| actual == expected)
@@ -1228,7 +1228,8 @@ impl Registry {
                 && os::process_facts(expected.pid).is_some_and(|facts| {
                     facts.uid == Some(expected.uid)
                         && facts.exe.as_ref() == Some(&binding.executable)
-                        && executable_current(&binding.executable, &facts, expected.uid).is_ok()
+                        && managed_executable_current(&binding.executable, &facts, expected.uid)
+                            .is_ok()
                 })
                 && os::attempt::kernel_incarnation(expected.pid, expected.uid)
                     .is_ok_and(|actual| actual == expected)
@@ -1562,8 +1563,12 @@ impl Registry {
                             })
                         && os::process_facts(observation.incarnation.pid).is_some_and(|facts| {
                             facts.exe.as_ref() == Some(&binding.executable)
-                                && executable_current(&binding.executable, &facts, self.owner_uid)
-                                    .is_ok()
+                                && managed_executable_current(
+                                    &binding.executable,
+                                    &facts,
+                                    self.owner_uid,
+                                )
+                                .is_ok()
                         })
                 });
         let still_same = os::attempt::kernel_incarnation(
@@ -1597,7 +1602,7 @@ impl Registry {
         {
             return Err(AttemptError::new("peer_not_authorized", "none"));
         }
-        self.verify_loaded(&frontend.path, &facts, &frontend.sha256)
+        self.verify_managed_loaded(&frontend.path, &facts, &frontend.sha256)
             .map_err(source_error)?;
         let stdio = [0, 1]
             .iter()
@@ -2058,7 +2063,7 @@ impl Registry {
         if facts.uid != Some(self.owner_uid) || facts.exe.as_ref() != Some(&executable.path) {
             return Err(AttemptError::new("peer_not_authorized", "none"));
         }
-        self.verify_loaded(&executable.path, &facts, &executable.sha256)
+        self.verify_managed_loaded(&executable.path, &facts, &executable.sha256)
             .map_err(source_error)?;
         if os::attempt::kernel_incarnation(peer.pid, peer.uid)
             .ok()

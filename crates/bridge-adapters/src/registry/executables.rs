@@ -15,7 +15,9 @@
 //! harness-level policy, not by a predeclared build. Trust never comes from this
 //! module's work alone: an exact digest still has to equal a configured one and
 //! [`Registry::verify_loaded`] additionally requires that the process runs exactly
-//! that file, on a filesystem where its content cannot change while it runs.
+//! that file, on a filesystem where its content cannot change while it runs, and
+//! looks the digest up by the identity of the descriptor opened on the loaded
+//! file itself, never by resolving the configured path a second time.
 
 use super::*;
 

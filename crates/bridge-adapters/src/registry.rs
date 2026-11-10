@@ -3214,18 +3214,22 @@ impl Registry {
 
     /// Proves the loaded build of a configured relay, audience or other Bridge
     /// executable (never a native recipient's binary): the process `facts` runs
-    /// exactly the file `exe` ([`os::loaded_executable`]: `/proc/<pid>/exe` is the
-    /// same device and inode as `exe`, on a filesystem where the kernel denies
-    /// writes to a running executable, with the process incarnation unchanged
-    /// around the read) and the digest hashed by [`Registry::warm_digests`] or
-    /// [`refresh_stale`] for this exact file identity (device, inode, length,
-    /// nanosecond mtime and ctime) equals `qualified`.
+    /// exactly the file `exe` ([`os::loaded_executable`]: the descriptor opened on
+    /// `/proc/<pid>/exe` has exactly the identity `exe` resolves to, on a mount
+    /// where the kernel denies writes to a running executable, with the process
+    /// incarnation unchanged around the whole proof) and the digest hashed by
+    /// [`Registry::warm_digests`] or [`refresh_stale`] for the *descriptor's* exact
+    /// file identity (device, inode, length, nanosecond mtime and ctime, under
+    /// the configured path) equals `qualified`.
     ///
     /// What this proves: the inode the process mapped cannot have been written
     /// since it was loaded (the kernel refuses to open a running executable for
     /// writing on the allowed filesystems), a replacement by rename is a
     /// different inode and is refused, so the bytes of that inode, hashed at any
-    /// later time under the same identity, are the bytes the process runs. No
+    /// later time under the same identity, are the bytes the process runs. The
+    /// digest is looked up by the loaded descriptor's identity, never by
+    /// resolving `exe` again, so swapping the file or a parent directory between
+    /// two resolutions cannot pair the loaded file with another file's digest. No
     /// wall clock is consulted: a clock step cannot make a later change look
     /// older than the process, and a metadata-only change (chmod, `touch`, link)
     /// moves the nanosecond ctime and so needs a new digest identity
@@ -3246,9 +3250,34 @@ impl Registry {
         facts: &ProcessFacts,
         qualified: &str,
     ) -> Result<(), CorrelationError> {
-        os::loaded_executable(facts, exe)
-            .map_err(|reason| CorrelationError::NotEvidence(reason.into()))?;
-        self.verify_digest(exe, qualified)
+        self.verify_loaded_for(os::loaded::Route::Ordinary, exe, facts, qualified)
+    }
+
+    /// [`Registry::verify_loaded`] for a managed attempt-binding route: the same
+    /// proof on Linux, refused on platforms without immutable loaded-build
+    /// evidence.
+    fn verify_managed_loaded(
+        &self,
+        exe: &Path,
+        facts: &ProcessFacts,
+        qualified: &str,
+    ) -> Result<(), CorrelationError> {
+        self.verify_loaded_for(os::loaded::Route::Managed, exe, facts, qualified)
+    }
+
+    /// The loaded-build and digest proof of `route`.
+    fn verify_loaded_for(
+        &self,
+        route: os::loaded::Route,
+        exe: &Path,
+        facts: &ProcessFacts,
+        qualified: &str,
+    ) -> Result<(), CorrelationError> {
+        os::loaded::prove_loaded(route, facts, exe, |loaded| {
+            self.digest_matches(&key_of(exe, loaded), qualified)
+        })
+        .map(|_| ())
+        .map_err(|reason| CorrelationError::NotEvidence(reason.into()))
     }
 
     /// The digest half of [`Registry::verify_loaded`], with no process: the
@@ -3262,16 +3291,24 @@ impl Registry {
         let key = file_key(exe).ok_or_else(|| {
             CorrelationError::NotEvidence("configured executable unreadable".into())
         })?;
-        let Some(digest) = self.digests.get(&key) else {
-            return Err(CorrelationError::NotEvidence(
-                "configured executable has no hashed digest for its current file identity (new, replaced or modified since the last hash); unqualified until it is hashed again"
-                    .into(),
-            ));
+        self.digest_matches(&key, qualified)
+            .map_err(|reason| CorrelationError::NotEvidence(reason.into()))
+    }
+
+    /// Whether the digest hashed for exactly the file identity `key` is
+    /// `qualified`.
+    ///
+    /// # Errors
+    ///
+    /// No digest was hashed for that identity, or it is another build.
+    fn digest_matches(&self, key: &FileKey, qualified: &str) -> Result<(), &'static str> {
+        let Some(digest) = self.digests.get(key) else {
+            return Err(
+                "configured executable has no hashed digest for its current file identity (new, replaced or modified since the last hash); unqualified until it is hashed again",
+            );
         };
         if !digest.eq_ignore_ascii_case(qualified) {
-            return Err(CorrelationError::NotEvidence(
-                "executable digest is not the configured build".into(),
-            ));
+            return Err("executable digest is not the configured build");
         }
         Ok(())
     }
@@ -4616,33 +4653,65 @@ fn private_store(store: &Path, owner_uid: u32) -> Result<(), String> {
 
 /// Proves the executable `exe` of the process `facts` may be run by Bridge: a
 /// regular file owned by `owner_uid` or root that no group or other user can
-/// write, and the very build the process loaded ([`os::loaded_executable`]:
-/// `/proc/<pid>/exe` is the same device and inode as `exe`, on a filesystem where
-/// the kernel denies writes to a running executable). No wall clock and no
-/// timestamp of the file is consulted, so neither a clock step nor a metadata-only
-/// change (`touch`, ownership or link changes that keep mode, owner and inode
-/// acceptable) decides the result; a replaced inode or an unsupported filesystem
-/// is refused. No digest or path is allowlisted.
+/// write, and the very build the process loaded ([`os::loaded_executable`]: the
+/// descriptor opened on `/proc/<pid>/exe` has exactly the identity of `exe`, on a
+/// mount where the kernel denies writes to a running executable). Owner and mode
+/// are those of the opened loaded file, checked inside the proof. No wall clock
+/// and no timestamp of the file is consulted on Linux, so neither a clock step
+/// nor a metadata-only change (`touch`, ownership or link changes that keep mode,
+/// owner and inode acceptable) decides the result; a replaced inode or an
+/// unsupported filesystem is refused. No digest or path is allowlisted. Off
+/// Linux this ordinary-route proof keeps the earlier whole-second comparison
+/// (see [`os::loaded_executable`]).
 ///
 /// # Errors
 ///
 /// The reason the executable is refused (a static text, never the path).
 fn executable_current(exe: &Path, facts: &ProcessFacts, owner_uid: u32) -> Result<(), String> {
-    let loaded = os::loaded_executable(facts, exe).map_err(str::to_owned)?;
-    if !loaded.is_file()
-        || !(loaded.uid() == owner_uid || loaded.uid() == 0)
-        || loaded.mode() & 0o022 != 0
-    {
-        return Err("executable is not a regular, trusted-owner, non-writable file".into());
-    }
-    Ok(())
+    executable_current_for(os::loaded::Route::Ordinary, exe, facts, owner_uid)
+}
+
+/// [`executable_current`] for a managed attempt-binding route: the same proof on
+/// Linux, refused on platforms without immutable loaded-build evidence.
+///
+/// # Errors
+///
+/// The reason the executable is refused (a static text, never the path).
+fn managed_executable_current(
+    exe: &Path,
+    facts: &ProcessFacts,
+    owner_uid: u32,
+) -> Result<(), String> {
+    executable_current_for(os::loaded::Route::Managed, exe, facts, owner_uid)
+}
+
+/// The executable proof of `route` with the owner and mode checks of the loaded
+/// file.
+fn executable_current_for(
+    route: os::loaded::Route,
+    exe: &Path,
+    facts: &ProcessFacts,
+    owner_uid: u32,
+) -> Result<(), String> {
+    os::loaded::prove_loaded(route, facts, exe, |loaded| {
+        if !loaded.is_file()
+            || !(loaded.uid() == owner_uid || loaded.uid() == 0)
+            || loaded.mode() & 0o022 != 0
+        {
+            return Err("executable is not a regular, trusted-owner, non-writable file");
+        }
+        Ok(())
+    })
+    .map(|_| ())
+    .map_err(str::to_owned)
 }
 
 /// Whether the descriptor written at `written_at` is positively no older than the
 /// process `facts`: on Linux the clock-discontinuity check of
 /// [`os::clock::written_after_start`] (refused for a process that started before
 /// Bridge or whenever a wall-clock step cannot be excluded); elsewhere the
-/// whole-second start time.
+/// earlier whole-second start time, a documented non-Linux residual (a wall-clock
+/// step can move it) kept for the ordinary Claude recipient route.
 fn descriptor_written_after_start(facts: &ProcessFacts, written_at: (i64, i64)) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -6275,6 +6344,82 @@ mod tests {
             registry.verify_loaded(&exe, &facts, &digest).is_err(),
             "the process still runs the replaced inode"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+        os::clock::reset();
+    }
+
+    /// A parent-directory swap at the boundary between the loaded-file check and
+    /// the digest lookup cannot pair the loaded build A with the cached digest of
+    /// the approved build B: the digest is looked up by the loaded descriptor's
+    /// identity, not by resolving the configured path again. Before the swap
+    /// the path names A (the running file); during the proof it is swapped to
+    /// name B, whose digest is the pin and is cached for that path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_path_swap_at_the_proof_boundary_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("swp");
+        let store = dir.join("store");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&store)
+            .unwrap();
+        let (loaded_dir, approved_dir, current) =
+            (dir.join("a"), dir.join("b"), dir.join("current"));
+        for side in [&loaded_dir, &approved_dir] {
+            std::fs::DirBuilder::new().mode(0o700).create(side).unwrap();
+        }
+        let child = live_child(&loaded_dir.join("exe"), "CLAUDE_CONFIG_DIR", &store);
+        let facts = os::process_facts(child.id()).unwrap();
+        // B: another build (A's bytes plus one) that is the configured pin.
+        let mut bytes = std::fs::read(loaded_dir.join("exe")).unwrap();
+        bytes.push(0);
+        std::fs::write(approved_dir.join("exe"), bytes).unwrap();
+        std::fs::set_permissions(
+            approved_dir.join("exe"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let approved = file_sha256(&approved_dir.join("exe")).unwrap();
+        let exe = current.join("exe");
+        // Cache B's digest under the configured path (directory renames keep the
+        // files' own identities), then let the path name the running A.
+        std::fs::rename(&approved_dir, &current).unwrap();
+        let registry = registry_with(&[(&exe, &approved)]);
+        registry
+            .verify_digest(&exe, &approved)
+            .expect("B is cached");
+        std::fs::rename(&current, &approved_dir).unwrap();
+        std::fs::rename(&loaded_dir, &current).unwrap();
+        assert!(
+            registry.verify_loaded(&exe, &facts, &approved).is_err(),
+            "A"
+        );
+
+        let swap = {
+            let (current, loaded_dir, approved_dir) =
+                (current.clone(), loaded_dir.clone(), approved_dir.clone());
+            move || {
+                std::fs::rename(&current, &loaded_dir).unwrap();
+                std::fs::rename(&approved_dir, &current).unwrap();
+            }
+        };
+        os::loaded::injected::at_boundary(swap);
+        let refused = registry.verify_loaded(&exe, &facts, &approved).unwrap_err();
+        assert!(
+            format!("{refused:?}").contains("no hashed digest"),
+            "{refused:?}"
+        );
+        // The swap really happened: a second resolution of the path now finds
+        // B and its cached digest, which is what the proof must not consult.
+        registry
+            .verify_digest(&exe, &approved)
+            .expect("the path names B after the swap");
+        assert!(
+            registry.verify_loaded(&exe, &facts, &approved).is_err(),
+            "B is not the loaded file"
+        );
+        drop(child);
         std::fs::remove_dir_all(&dir).unwrap();
         os::clock::reset();
     }

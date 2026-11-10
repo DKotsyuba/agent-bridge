@@ -73,6 +73,29 @@ source, and the crates are not published to crates.io.
   as `known_unsent`/`attempt_mismatch` instead of treating the reply as
   malformed. It is never retried by Bridge, and a producer must not resend the
   effect to the same execution.
+- Bind the executable digest to the exact loaded file. The digest gate looked
+  the digest up by resolving the configured path again after the loaded-file
+  check, so swapping a parent directory between the two could pair a loaded
+  build with the cached digest of another file. Linux now opens
+  `/proc/<pid>/exe`, requires that descriptor to have exactly the identity
+  (device, inode, length, nanosecond mtime and ctime) the path resolves to,
+  looks the digest up by the descriptor's identity, applies the owner and mode
+  checks to the descriptor, and rechecks the descriptor, `/proc/<pid>/exe` and
+  the process incarnation after the whole proof.
+- Judge the executable filesystem by the loaded file's own mount. The type was
+  looked up by device number, but a non-directory on an overlay reports the
+  device of its backing filesystem, so an overlay file could pass. Linux now
+  resolves the descriptor's `mnt_id` (`/proc/self/fdinfo`) to exactly one
+  `/proc/self/mountinfo` record; a missing `mnt_id`, a mount with no or several
+  records (another mount namespace, a detached mount) and any type other than
+  ext2/3/4, xfs, btrfs or tmpfs fail closed.
+- Refuse managed attempt-binding executable proofs (managed frontends and
+  harnesses, Run readers, the owner-v2 Run server) on platforms other than
+  Linux, which have no immutable loaded-build evidence. Ordinary native
+  harness, owner v1, Desktop hop, relay and audience routes off Linux keep the
+  earlier whole-second comparison of file times with the process start, as does
+  Claude session-descriptor freshness there; this is a documented residual,
+  because a wall-clock step can defeat it.
 
 ## [0.6.6] - 2026-11-07
 

@@ -36,9 +36,12 @@ touched by anything here, and nothing in this crate installs a hook for you.
   harness identifier of a profile-only harness, or a configured `executable_markers` entry; an environment variable never counts,
   because every descendant of a harness inherits its store variables), the file
   is a regular file owned by that user or root that no group or other user can
-  write and was last modified *and* last changed (kernel ctime, which `cp -p` /
-  `install -p` / `touch` cannot restore) strictly before the whole second the
-  process started, and its own store (`CODEX_HOME` / `CLAUDE_CONFIG_DIR`, else
+  write and is the very build the process loaded (on Linux: a descriptor
+  opened on `/proc/<pid>/exe` has exactly the identity the path resolves to,
+  and its own mount, found by its `mnt_id`, is ext2/3/4, xfs, btrfs or tmpfs,
+  where the kernel denies writes to a running executable; elsewhere, a
+  documented residual, the file was last modified and changed before the whole
+  second the process started), and its own store (`CODEX_HOME` / `CLAUDE_CONFIG_DIR`, else
   `$HOME/.codex` / `$HOME/.claude`; OpenCode uses the parent of its explicit
   `OPENCODE_DB`; a profile-only harness uses its profile's `store_env`, else
   `$HOME/<store_home>` — all read from that process's own environment) is

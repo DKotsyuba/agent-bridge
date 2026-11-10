@@ -266,8 +266,11 @@ process must be positively marked as the product (its resolved executable path n
 or `claude` (or `opencode` for the plugin, or the identifier of a profile-only harness), or
 matches an explicit `executable_markers` entry), run from a regular
 file owned by you or root that no group or other user can write and that is the very file the
-process loaded (kernel-proven by device and inode, on ext2/3/4, xfs, btrfs or tmpfs, where the
-kernel denies writes to a running executable; any other filesystem is refused), and its own store, taken from its environment (`CODEX_HOME`,
+process loaded (on Linux kernel-proven through a descriptor opened on `/proc/<pid>/exe`: the same
+device, inode, length and times as the path, on a mount, found by that descriptor's own `mnt_id`, of
+ext2/3/4, xfs, btrfs or tmpfs, where the kernel denies writes to a running executable; overlay and any
+other filesystem are refused. Off Linux the file must instead predate the process start second, a
+residual a wall-clock step can defeat), and its own store, taken from its environment (`CODEX_HOME`,
 `CLAUDE_CONFIG_DIR`, else `$HOME/.codex` or `$HOME/.claude`; OpenCode uses its private
 `OPENCODE_DB` parent; a profile-only harness uses `store_env`, else `$HOME/<store_home>`),
 must be a canonical directory
@@ -353,7 +356,8 @@ owned by the daemon's user with mode `0600` in a private `0700` directory, and t
 connected process is the exact direct parent (PID, start time and user) of the
 attested harness, and that owner runs from a trusted executable: a regular file owned by
 you or root that no group or other user can write and that is the very file the owner process
-loaded (same device and inode on a filesystem that denies writes to a running executable). No owner path or digest is configured, and no enrollment exists; an
+loaded (on Linux the same identity through `/proc/<pid>/exe`, on a mount that denies writes to a
+running executable; off Linux the earlier start-second comparison). No owner path or digest is configured, and no enrollment exists; an
 `owner_relays` entry from an earlier release is ignored and authorizes nothing.
 
 - Codex and Claude without an owner keep their legacy routes. OpenCode has no
