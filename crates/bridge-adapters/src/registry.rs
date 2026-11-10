@@ -492,6 +492,7 @@ fn owner_scope_prefix_matches(prefix: &str, scope: &str) -> bool {
 
 impl ManagedOwnerRoute {
     /// Checks the exact scope against this route's owned literals and prefixes.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn permits_scope(&self, scope: &str) -> bool {
         self.producer_scopes.iter().any(|entry| entry == scope)
             || self
@@ -1440,6 +1441,7 @@ pub(crate) struct HarnessProbe {
     /// The only user id accepted on the channel.
     owner_uid: u32,
     /// Managed tool routes are configured (full kernel identities are read).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     managed: bool,
     /// Allowlisted intermediate executables between a peer and its harness.
     intermediates: Vec<PathBuf>,
@@ -6307,28 +6309,33 @@ mod tests {
         observe(&mut registry);
         assert_eq!(lifecycle(&registry), Lifecycle::Unknown, "other store");
 
-        // Fail closed when a clock discontinuity cannot be excluded: a forward
-        // step of the wall clock after the process started makes even a fresh
-        // descriptor unprovable; so does a process that predates the history.
-        descriptor(&store, "sess", pid, "idle", 0);
-        reset(&mut registry, &|_| {});
-        observe(&mut registry);
-        assert_eq!(lifecycle(&registry), Lifecycle::Inactive, "before the step");
-        os::clock::inject_step(60_000_000_000);
-        descriptor(&store, "sess", pid, "idle", 0);
-        reset(&mut registry, &|_| {});
-        observe(&mut registry);
-        assert_eq!(lifecycle(&registry), Lifecycle::Unknown, "forward step");
-        os::clock::reset();
-        descriptor(&store, "sess", pid, "idle", 0);
-        reset(&mut registry, &|_| {});
-        observe(&mut registry);
-        assert_eq!(
-            lifecycle(&registry),
-            Lifecycle::Unknown,
-            "the process started before this history began"
-        );
-        os::clock::reset();
+        // The discontinuity tracker exists only on Linux; other platforms keep
+        // the whole-second comparison of file times and have nothing to step.
+        #[cfg(target_os = "linux")]
+        {
+            // Fail closed when a clock discontinuity cannot be excluded: a forward
+            // step of the wall clock after the process started makes even a fresh
+            // descriptor unprovable; so does a process that predates the history.
+            descriptor(&store, "sess", pid, "idle", 0);
+            reset(&mut registry, &|_| {});
+            observe(&mut registry);
+            assert_eq!(lifecycle(&registry), Lifecycle::Inactive, "before the step");
+            os::clock::inject_step(60_000_000_000);
+            descriptor(&store, "sess", pid, "idle", 0);
+            reset(&mut registry, &|_| {});
+            observe(&mut registry);
+            assert_eq!(lifecycle(&registry), Lifecycle::Unknown, "forward step");
+            os::clock::reset();
+            descriptor(&store, "sess", pid, "idle", 0);
+            reset(&mut registry, &|_| {});
+            observe(&mut registry);
+            assert_eq!(
+                lifecycle(&registry),
+                Lifecycle::Unknown,
+                "the process started before this history began"
+            );
+            os::clock::reset();
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -6383,6 +6390,7 @@ mod tests {
     }
 
     /// Metadata of `path` as `(device, inode)`.
+    #[cfg(target_os = "linux")]
     fn file_identity(path: &Path) -> (u64, u64) {
         let meta = std::fs::metadata(path).unwrap();
         (meta.dev(), meta.ino())

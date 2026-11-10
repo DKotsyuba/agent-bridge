@@ -143,19 +143,33 @@ fn burst_of(
 }
 
 /// Replaces the lab's server with one using explicit limits.
+///
+/// The endpoint lock of the stopped server is closed before this returns, but
+/// another test of this binary may fork a fixture process in the same instant:
+/// the child briefly holds a copy of the descriptor (and so the advisory lock)
+/// until its `exec`. Starting the replacement therefore retries a
+/// `WouldBlock` refusal for a bounded time; any other failure still panics.
 fn with_limits(lab: &mut Lab, max_connections: usize, grace: Duration) {
     lab.channel.take().unwrap().stop();
-    lab.channel = Some(
-        ChannelServer::start_with_limits(
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let channel = loop {
+        match ChannelServer::start_with_limits(
             &lab.socket,
             Arc::clone(&lab.registry),
             Arc::clone(&lab.storage) as Arc<dyn Custody>,
             DispatchTiming::default(),
             max_connections,
             grace,
-        )
-        .unwrap(),
-    );
+        ) {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            other => break other.unwrap(),
+        }
+    };
+    lab.channel = Some(channel);
 }
 
 /// Waits until `check` holds, up to ten seconds.

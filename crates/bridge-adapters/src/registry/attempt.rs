@@ -882,6 +882,7 @@ fn random_secret() -> Result<Secret, CorrelationError> {
 }
 
 /// Exact configured native host tool mapping, never prefix-only matching.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn tool_matches(mapping: &ManagedTools, producer: &str, command: &str, tool: &str) -> bool {
     mapping.producer == producer
         && mapping.commands.iter().any(|allowed| allowed == command)
@@ -982,6 +983,7 @@ fn source_error(_: CorrelationError) -> AttemptError {
 
 impl Registry {
     /// Authenticates a managed producer audience and resolves one pinned route.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn owner_v2_route(
         &mut self,
         expected_store: &str,
@@ -1022,6 +1024,7 @@ impl Registry {
     }
 
     /// Authenticates the same producer audience for durable effect lookup.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn owner_v2_access(
         &mut self,
         expected_store: &str,
@@ -1047,6 +1050,7 @@ impl Registry {
     }
 
     /// Proves the connected Run server's same-UID, loaded executable identity.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn verify_owner_v2_run_peer(
         &self,
         peer: PeerIdentity,
@@ -1150,6 +1154,7 @@ impl Registry {
     }
 
     /// Unsupported hosts cannot establish a managed owner target.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     #[cfg(not(target_os = "linux"))]
     pub(crate) fn owner_v2_target_current(
         &self,
@@ -1706,6 +1711,7 @@ impl Registry {
     }
 
     /// Unsupported platforms cannot qualify a managed stdio frontend.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     #[cfg(not(target_os = "linux"))]
     fn verify_managed_frontend(
         &mut self,

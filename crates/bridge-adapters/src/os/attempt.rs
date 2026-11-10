@@ -294,6 +294,7 @@ pub(crate) fn sample_start_ticks() -> io::Result<u64> {
 }
 
 /// Checks the inode column of a synthetic or kernel Unix-socket table.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn unix_table_contains(bytes: &[u8], inode: u64) -> bool {
     std::str::from_utf8(bytes).ok().is_some_and(|table| {
         table.lines().skip(1).any(|line| {
@@ -307,6 +308,7 @@ fn unix_table_contains(bytes: &[u8], inode: u64) -> bool {
 
 /// Verifies one stdio descriptor is a pipe or a socket in the kernel Unix table.
 /// Missing or changed descriptors and unreadable socket tables refuse.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn managed_stdio(pid: u32, fd: u8) -> bool {
     use std::os::unix::fs::FileTypeExt;
     let path = format!("/proc/{pid}/fd/{fd}");
