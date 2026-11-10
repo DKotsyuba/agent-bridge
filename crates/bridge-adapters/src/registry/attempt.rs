@@ -1400,7 +1400,7 @@ impl Registry {
             .iter()
             .any(|tool| tool.producer == principal)
         {
-            self.verify_producer_frontend(peer, principal)?;
+            self.verify_discovery_principal(peer, principal)?;
             principal.to_string()
         } else if let Some(source) = reader_source {
             self.verify_run_reader(peer, principal, &source)?;
@@ -1651,6 +1651,29 @@ impl Registry {
             return Err(AttemptError::new("peer_not_authorized", "none"));
         }
         Ok(())
+    }
+
+    /// Authenticates a producer for capability discovery, which grants no
+    /// authority: either the stdio frontend, or a configured resident whose
+    /// executable and loaded build are pinned by `adapters.audiences`. Every
+    /// later operation keeps its own role and transport checks. A resident
+    /// refusal is reported only when the peer is not the frontend build.
+    fn verify_discovery_principal(&mut self, peer: PeerIdentity, producer: &str) -> ResultV1<()> {
+        let Err(refusal) = self.verify_producer_frontend(peer, producer) else {
+            return Ok(());
+        };
+        let audiences: Vec<String> = self
+            .config
+            .audiences
+            .iter()
+            .filter(|entry| entry.producer == producer)
+            .map(|entry| entry.name.clone())
+            .collect();
+        match self.verify_any_attempt_consumer(peer, producer, &audiences) {
+            Ok(()) => Ok(()),
+            Err(error) if refusal.code == "peer_not_authorized" => Err(error),
+            Err(_) => Err(refusal),
+        }
     }
 
     /// Samples all configured managed harness matches in stable policy order;

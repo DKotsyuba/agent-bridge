@@ -587,6 +587,94 @@ fn discover(harness: &mut Harnessed, lab: &Lab) -> (String, String) {
     )
 }
 
+/// Discovery grants no authority: the stdio frontend and the pinned audience
+/// resident both receive it, any unpinned peer or unconfigured producer is
+/// refused, and the resident keeps every frontend-only refusal.
+#[test]
+fn discovery_answers_pinned_resident_without_granting_authority() {
+    let lab = lab_with_other_producer(true);
+    let discovery = |id: &str, token: &str| {
+        request(
+            token,
+            id,
+            "attempt_binding_capabilities_v1",
+            json!({"version":1}),
+        )
+    };
+    let mut source = Harnessed::start_with_launch(Harness::CLAUDE_CODE, &lab.claude_store, LAUNCH);
+    let (store, issuer) = discover(&mut source, &lab);
+
+    let mut resident = start_consumer(&lab);
+    let reply = call(
+        &mut resident,
+        &lab,
+        discovery("resident-discover", PRODUCER_TOKEN),
+        true,
+    );
+    assert_eq!(value(&reply)["status"], "ok");
+    let found = &value(&reply)["value"];
+    assert_eq!(found["version"], 1);
+    assert_eq!(found["store_id"], json!(store));
+    assert_eq!(found["issuer_epoch"], json!(issuer));
+    let capabilities = found["capabilities"].as_array().unwrap();
+    assert!(capabilities.contains(&json!("attempt_launch_v1")));
+    assert!(capabilities.contains(&json!("run_actor_lookup_v1")));
+    // No owner-v2 route is configured, so none is advertised to anyone.
+    assert!(!capabilities.contains(&json!("managed_owner_v2")));
+    // The frontend is still answered after the resident discovered.
+    discover(&mut source, &lab);
+
+    // An unpinned executable cannot use the producer credential to discover.
+    let mut reader = start_reader(&lab);
+    let mut foreign = Harnessed::start_from(
+        &distinct_fixture(&lab, "foreign-resident").path,
+        Harness::CLAUDE_CODE,
+        &lab.claude_store,
+    );
+    for (name, harness) in [("reader", &mut reader), ("foreign", &mut foreign)] {
+        let refused = call(
+            harness,
+            &lab,
+            discovery(&format!("{name}-discover"), PRODUCER_TOKEN),
+            true,
+        );
+        assert_eq!(value(&refused)["error"]["code"], "peer_not_authorized");
+        assert!(value(&refused)["value"].is_null());
+    }
+    // A producer without a managed route is not answered, even to a pinned build.
+    let unconfigured = call(
+        &mut resident,
+        &lab,
+        discovery("unconfigured-discover", "synthetic-other-producer-token"),
+        true,
+    );
+    assert_eq!(value(&unconfigured)["error"]["code"], "peer_not_authorized");
+
+    // Discovery never widens authority: frontend-only operations stay refused.
+    let prepare = request(
+        PRODUCER_TOKEN,
+        "resident-prepare",
+        "prepare_native_context_v1",
+        json!({"version":1,"expected_store_id":store,"expected_issuer_epoch":issuer,"invocation_key":"resident-inv","command_name":"vote","native_proof":proof("resident-call")}),
+    );
+    let refused = call(&mut resident, &lab, prepare, true);
+    assert_eq!(value(&refused)["status"], "error");
+    assert!(
+        ["peer_not_authorized", "transport_unsupported"]
+            .contains(&value(&refused)["error"]["code"].as_str().unwrap())
+    );
+    let register = request(
+        PRODUCER_TOKEN,
+        "resident-register",
+        "register_launch_assertion_v1",
+        json!({"version":1,"expected_store_id":store,"bridge_context_ref":"x","invocation_key":"resident-inv","command_name":"vote","security_digest":DIGEST,"audience":"backend","nonce":"n","native_proof":proof("resident-call")}),
+    );
+    assert_eq!(
+        value(&call(&mut resident, &lab, register, true))["status"],
+        "error"
+    );
+}
+
 /// Launch must have been in the original exec environment, and the exact
 /// configured native tool name must agree with the command name.
 #[test]
@@ -2219,6 +2307,26 @@ fn managed_owner_v2_exact_effect_and_no_legacy_fallback() {
             .as_array()
             .unwrap()
             .contains(&json!("run_actor_lookup_v1"))
+    );
+    // The pinned audience resident discovers the same owner-v2 route.
+    let resident = call(
+        &mut consumer,
+        &lab,
+        request(
+            PRODUCER_TOKEN,
+            "owner-resident-capabilities",
+            "attempt_binding_capabilities_v1",
+            json!({"version":1}),
+        ),
+        true,
+    );
+    assert_eq!(value(&resident)["status"], "ok");
+    assert_eq!(value(&resident)["value"]["store_id"], json!(store));
+    assert!(
+        value(&resident)["value"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("managed_owner_v2"))
     );
     assert_eq!(
         native.hook(

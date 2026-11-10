@@ -36,6 +36,10 @@ source, and the crates are not published to crates.io.
 - Create the lifecycle state directory with mode `0700` atomically, including
   under inherited default ACLs, so concurrent starts cannot observe an
   intermediate writable directory.
+- Answer managed capability discovery for the configured audience resident
+  (executable and build pinned by `adapters.audiences`) as well as the stdio
+  frontend. Discovery grants no authority; every other operation keeps its
+  role and transport checks.
 
 ## [0.6.6] - 2026-11-07
 
