@@ -22,7 +22,7 @@ repository = "https://github.com/DKotsyuba/agent-bridge"
 bridge-core = { path = "crates/bridge-core" }
 bridge-protocol = { path = "crates/bridge-protocol" }
 bridge-sdk = { path = "crates/bridge-sdk" }
-rusqlite = { version = "0.37.0", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled", "fallible_uint"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "=1.0.154", features = ["float_roundtrip"] }
 signal-hook = "0.3.18"
