@@ -469,7 +469,7 @@ impl MessageCandidate {
 
     /// Whether `gateway` is a live Desktop harness for this binding: the same
     /// user, started from the binding's exact recorded executable (a trusted,
-    /// non-writable file unchanged since before it started, as for any harness),
+    /// non-writable file that is the build it loaded, as for any harness),
     /// the same canonical owner-only store, with the application's native pipe in
     /// its own environment, and started strictly after the recorded incarnation.
     /// Pure OS facts; I/O only

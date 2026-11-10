@@ -978,22 +978,22 @@ fn non_parent_owner_is_refused_with_no_effect() {
 }
 
 /// The owner route needs no predeclared owner path or digest (the lab names
-/// none), but the owner's own executable must be trusted and unchanged since the
-/// owner started: from a private copy of the fixture the control delivers once,
-/// then making the running owner's file group-writable, or merely changing its
-/// status time again, refuses the next attempt before any request byte is
-/// written, with no owner frame and no legacy fallback.
+/// none), but the owner's own executable must be trusted and the build the owner
+/// loaded: from a private copy of the fixture the control delivers once, then
+/// making the running owner's file group-writable refuses the next attempt
+/// before any request byte is written, with no owner frame and no legacy
+/// fallback. A change of only the status time that keeps owner, mode and inode
+/// acceptable does not make the loaded build untrusted and still delivers.
 #[test]
 fn unsafe_or_changed_owner_executable_is_refused_with_no_effect() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     for harness in [Harness::CODEX, Harness::CLAUDE_CODE] {
         for (label, mode) in [("group-writable", 0o775), ("status change only", 0o755)] {
+            let refused = mode == 0o775;
             let dir = TempDir::new("ow9");
             let owner_exe = dir.0.join("bridge-fixture-owner");
             std::fs::copy(fixture_exe(), &owner_exe).unwrap();
             std::fs::set_permissions(&owner_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-            // The owner must start in a later second than its file's last change.
-            std::thread::sleep(Duration::from_millis(1100));
             let mut rig = Rig::with_owner_exe("ow9", harness, Some(&owner_exe));
             rig.script(rig.accept());
             let control = rig.send("evt-ok", Mode::Message, "control");
@@ -1038,6 +1038,21 @@ fn unsafe_or_changed_owner_executable_is_refused_with_no_effect() {
                 );
             }
             let report = rig.send("evt-bad", Mode::Message, "must not reach the owner");
+            if !refused {
+                assert!(
+                    matches!(
+                        report,
+                        DispatchReport::Sent {
+                            state: AttemptState::NativeAccepted,
+                            ..
+                        }
+                    ),
+                    "{harness:?} {label}: a metadata-time-only change keeps the loaded build: {report:?}"
+                );
+                assert_eq!(rig.frames(), 2, "{harness:?} {label}: delivered again");
+                rig.native.stop();
+                continue;
+            }
             assert!(
                 !matches!(
                     report,

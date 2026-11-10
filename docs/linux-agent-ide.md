@@ -234,9 +234,11 @@ See [the native owner contract](../crates/bridge-adapters/src/owner.rs) for exac
 reason sets. One absolute 35-second exchange budget is not renewed by partial I/O.
 
 The current owner peer must be the native process's exact direct parent with
-matching UID, birth and trusted unchanged executable. Actual executable mtime and
-ctime must predate process birth; start a freshly provisioned owner only after that
-condition can hold. Never backdate a file or rewrite process facts to pass it. A socket bound by the
+matching UID, birth and trusted loaded executable: the file at the owner's executable path
+must be the very inode the process runs (a replaced file is refused until the owner is restarted),
+owned by the registry user or root, not group- or other-writable, on a filesystem where the kernel
+denies writes to a running executable (ext2/3/4, xfs, btrfs, tmpfs). File timestamps and the wall
+clock are not consulted. A socket bound by the
 OpenCode plugin itself has the same PID as the native process and fails that
 parent check. Although the actual SDK has `ctx.session.prompt`, this bundle does
 not treat a same-process socket as a parent or claim a built-in OpenCode owner.

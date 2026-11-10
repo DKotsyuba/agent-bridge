@@ -40,6 +40,18 @@ source, and the crates are not published to crates.io.
   (executable and build pinned by `adapters.audiences`) as well as the stdio
   frontend. Discovery grants no authority; every other operation keeps its
   role and transport checks.
+- Prove a peer executable by the immutable loaded build instead of wall-clock
+  freshness. A process start estimated from the wall clock is not a historical
+  bound across clock steps, so file times can no longer decide executable
+  currency. Linux now requires `/proc/<pid>/exe` to be the same device and inode
+  as the configured path, the usual owner and mode checks, and a filesystem
+  where the kernel denies writes to a running executable (ext2/3/4, xfs, btrfs,
+  tmpfs, read from `/proc/self/mountinfo`; overlay, network, FUSE and unknown
+  filesystems are refused). A metadata-only change after start no longer
+  refuses a harness; a replaced inode does. Claude session-descriptor freshness
+  fails closed when a wall-clock discontinuity cannot be excluded: a process
+  that started before Bridge, or before a step Bridge observed, is not
+  re-observed from its descriptor until its next hook.
 
 ## [0.6.6] - 2026-11-07
 

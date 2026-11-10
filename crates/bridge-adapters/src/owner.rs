@@ -11,7 +11,7 @@
 //! kernel peer must be the exact direct parent of the attested harness
 //! incarnation, run as the registry user and run from a trusted executable (a
 //! regular file owned by that user or root, not writable by group or other and
-//! unchanged since the owner process started). No owner path or digest is
+//! the build the owner process loaded). No owner path or digest is
 //! configured.
 //!
 //! Wire format (one request and one receipt per connection): a four-byte
@@ -179,7 +179,7 @@ pub(crate) fn check_socket(path: &Path, uid: u32) -> Result<(), String> {
 /// Proves the connected peer is the exact direct parent of the harness
 /// incarnation: same registry user, a process born no later than the harness,
 /// the harness's recorded parent, and an owner executable that is trusted and
-/// unchanged since the owner started ([`owner_executable_current`]). Process
+/// the build the owner loaded ([`owner_executable_current`]). Process
 /// facts are re-read here, so a reused or replaced process never inherits an
 /// earlier proof.
 fn verify_peer(

@@ -323,7 +323,7 @@ pub(crate) struct SessionHint {
     /// Positive native idle/busy status; unknown or waiting descriptors cannot bootstrap.
     pub lifecycle: bridge_core::dispatch::Lifecycle,
     /// Descriptor modification time as Unix `(seconds, nanoseconds)`; predating a
-    /// process start refuses PID reuse.
+    /// process start refuses PID reuse (see `os::clock` for when that is provable).
     pub written_at: (i64, i64),
 }
 

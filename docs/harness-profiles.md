@@ -15,7 +15,7 @@ speaks a Bridge-owned protocol, like the existing OpenCode plugin).
 
 Profiles say where to look, never whom to trust. Every existing kernel check
 stays in Bridge: peer UID and ancestry, the marked harness process, an
-executable unchanged since its process started, a private canonical store, the
+executable proven to be the build its process loaded, a private canonical store, the
 single-use join of a protected `PreToolUse` record, endpoint epochs and the
 dispatch fences. A wrong profile can only make Bridge refuse.
 

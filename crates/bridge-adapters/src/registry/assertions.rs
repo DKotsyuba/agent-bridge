@@ -289,7 +289,7 @@ impl Registry {
             .map(|entry| entry.executable.clone())
             .collect();
         candidates.iter().any(|executable| {
-            self.verify_loaded(&executable.path, u64::MAX, &executable.sha256)
+            self.verify_digest(&executable.path, &executable.sha256)
                 .is_ok()
         })
     }

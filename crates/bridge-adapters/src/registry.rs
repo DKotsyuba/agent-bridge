@@ -7,8 +7,8 @@
 //! chain reaches the harness process through allowlisted intermediates
 //! (shells), as the same user, for a harness kind enabled by the configured
 //! harness policy. That process must be a marked harness (its resolved
-//! executable path carries the product marker), run an executable that is
-//! unchanged since it started, and have its own store (derived from its
+//! executable path carries the product marker), run an executable that is the
+//! build it loaded ([`os::loaded_executable`]), and have its own store (derived from its
 //! environment) be a canonical directory owned by this user that no group or
 //! other user can write. No store path or harness executable is predeclared.
 //! That harness process incarnation (PID plus start time) is the protected
@@ -1675,7 +1675,7 @@ impl MessageCandidate {
     /// Re-reads the live harness of the snapshot and proves it still is the
     /// recorded incarnation (exact PID and start time), the same user, executable
     /// and store, an executable that is still owner/root-owned, non-writable and
-    /// unchanged since process birth, and a store that is still a canonical
+    /// still the build the process loaded, and a store that is still a canonical
     /// directory owned by this user and not writable by group or other. Returns
     /// its facts.
     ///
@@ -2171,6 +2171,9 @@ impl Registry {
     /// validates policy and warms privileged-component digests once. Unresolvable paths retain
     /// their configured spelling; no fallback executable or trust policy is introduced.
     fn build(mut config: RegistryConfig, owner_uid: u32) -> Result<Self, String> {
+        // Bridge start for the clock-discontinuity tracking of descriptor freshness.
+        #[cfg(target_os = "linux")]
+        os::clock::observe();
         // Kernel process facts report resolved executable paths. Preserve each operator-selected
         // executable across aliases such as Debian's /bin/sh -> /usr/bin/dash.
         for path in &mut config.intermediates {
@@ -2870,11 +2873,12 @@ impl Registry {
     ///
     /// Only a fresh owned descriptor in the route's own store that positively
     /// reports `idle` or `busy` for exactly the recorded session, PID and start
-    /// time, executable and store, written at or after the process start, sets the
+    /// time, executable and store, written at or after the process start (proven
+    /// without a clock discontinuity, see [`os::clock`]), sets the
     /// lifecycle (same epoch, no capability or caller change, journaled with
     /// rollback on failure). The store must still be a canonical owner-only
-    /// directory, the process a marked harness running a trusted executable
-    /// unchanged since it started. An unreadable, unknown-status, stale,
+    /// directory, the process a marked harness running a trusted executable that
+    /// is the build it loaded. An unreadable, unknown-status, stale,
     /// foreign-store or reused-PID descriptor changes nothing; nothing is inferred
     /// from the earlier saved state.
     pub(crate) fn discover_claude_recipient(
@@ -2915,7 +2919,7 @@ impl Registry {
         };
         if facts.uid != Some(self.owner_uid)
             || !same_incarnation
-            || facts.start_bound().is_after(hint.written_at)
+            || !descriptor_written_after_start(&facts, hint.written_at)
             || facts.exe.as_ref() != Some(&known.executable)
             || harness_store(&facts, &policy).as_ref() != Some(&known.store)
             || private_store(&known.store, self.owner_uid).is_err()
@@ -3060,8 +3064,8 @@ impl Registry {
     /// positive product marker ([`product_marked`]: the product name or a
     /// configured marker in its resolved executable path; an inherited
     /// environment variable never counts), have an executable that is a regular file owned by the owner or
-    /// root, not writable by group or other and unchanged since that process
-    /// started ([`executable_current`]), and a store, derived from its own
+    /// root, not writable by group or other and the build that process loaded
+    /// ([`executable_current`]), and a store, derived from its own
     /// environment, that is a canonical directory owned by the owner and not
     /// writable by group or other ([`private_store`]). No store path and no
     /// executable is predeclared.
@@ -3167,7 +3171,7 @@ impl Registry {
     /// after the read.
     ///
     /// Qualified afterwards: exactly the files whose cached digest equals the
-    /// configured one, unchanged since. Not qualified, with a `NotEvidence`
+    /// configured one for the file's current identity. Not qualified, with a `NotEvidence`
     /// refusal from every route that needs the file: a configured file that was
     /// missing, unreadable or changing at this call, one whose real digest is not
     /// the configured one (a new build is never accepted by hashing it), and any
@@ -3195,7 +3199,7 @@ impl Registry {
     /// configured ones (never trusting the configured value, never reading
     /// a file), so it is cheap and safe at startup, after
     /// [`Registry::new`], to tell the operator that a route is
-    /// unqualified. It does not look at process start times.
+    /// unqualified. It does not look at any process.
     pub fn unqualified_executables(&self) -> usize {
         self.config
             .relays
@@ -3209,33 +3213,27 @@ impl Registry {
     }
 
     /// Proves the loaded build of a configured relay, audience or other Bridge
-    /// executable (never a native recipient's binary): both the modification second and the
-    /// status-change (ctime) second of the file are strictly before the
-    /// process start (`started` is the process start in Unix seconds, or
-    /// `u64::MAX` when no process is involved) and its digest, hashed by
-    /// [`Registry::warm_digests`] or [`refresh_stale`] for this exact file
-    /// identity (which includes the nanosecond ctime), equals `qualified`.
+    /// executable (never a native recipient's binary): the process `facts` runs
+    /// exactly the file `exe` ([`os::loaded_executable`]: `/proc/<pid>/exe` is the
+    /// same device and inode as `exe`, on a filesystem where the kernel denies
+    /// writes to a running executable, with the process incarnation unchanged
+    /// around the read) and the digest hashed by [`Registry::warm_digests`] or
+    /// [`refresh_stale`] for this exact file identity (device, inode, length,
+    /// nanosecond mtime and ctime) equals `qualified`.
     ///
-    /// What this proves: since before the process was born, the file at the
-    /// path has not been written, replaced, renamed into place or chmod-ed,
-    /// so the bytes on disk, hashed at any later time under the same identity,
-    /// are the bytes the process started from. mtime alone is not enough: an
-    /// installer that restores timestamps (`cp -p`, `install -p`, `touch`)
-    /// keeps an old mtime, but the kernel sets ctime on every such change and
-    /// a program cannot set it back, and the OS keeps reporting the same
-    /// executable path for the live process after a replacement (probed on
-    /// macOS), so the path alone shows nothing. Times are whole seconds, so a
-    /// change in the very second the process was born is ambiguous and
-    /// refused; restarting the harness a second or more after the last change
-    /// to the file resolves the birth-second ambiguity. A benign chmod or link
-    /// change moves the nanosecond ctime and so needs a new digest identity
-    /// ([`refresh_stale`], automatic and outside this lock) and a harness
-    /// started after it. A process that started before the change is never
-    /// proven loaded, whatever the digest. A run that wants to show the stock
-    /// binary was not touched should record its inode, mtime and ctime before
-    /// and after; nothing here claims the operating system can never write it.
-    /// It does not defend against code that already runs as the user with the
-    /// ability to move the system clock backwards.
+    /// What this proves: the inode the process mapped cannot have been written
+    /// since it was loaded (the kernel refuses to open a running executable for
+    /// writing on the allowed filesystems), a replacement by rename is a
+    /// different inode and is refused, so the bytes of that inode, hashed at any
+    /// later time under the same identity, are the bytes the process runs. No
+    /// wall clock is consulted: a clock step cannot make a later change look
+    /// older than the process, and a metadata-only change (chmod, `touch`, link)
+    /// moves the nanosecond ctime and so needs a new digest identity
+    /// ([`refresh_stale`], automatic and outside this lock) but does not change the
+    /// loaded build. A file on any other filesystem (network, FUSE, overlay,
+    /// unknown) is refused: the kernel gives no such promise there. It does not
+    /// defend against code with the power to write the device itself or to swap
+    /// the kernel's view (root).
     ///
     /// Never reads the file: a file without a cached digest for its current
     /// identity (missing, or installed, replaced or changed since the last
@@ -3245,10 +3243,25 @@ impl Registry {
     fn verify_loaded(
         &self,
         exe: &Path,
-        started: impl Into<os::StartBound>,
+        facts: &ProcessFacts,
         qualified: &str,
     ) -> Result<(), CorrelationError> {
-        let key = self.stable_identity(exe, started.into())?;
+        os::loaded_executable(facts, exe)
+            .map_err(|reason| CorrelationError::NotEvidence(reason.into()))?;
+        self.verify_digest(exe, qualified)
+    }
+
+    /// The digest half of [`Registry::verify_loaded`], with no process: the
+    /// current file identity of `exe` has a hashed digest equal to `qualified`.
+    ///
+    /// # Errors
+    ///
+    /// The file is unreadable, has no hashed digest for its current identity, or
+    /// its digest is not `qualified`.
+    fn verify_digest(&self, exe: &Path, qualified: &str) -> Result<(), CorrelationError> {
+        let key = file_key(exe).ok_or_else(|| {
+            CorrelationError::NotEvidence("configured executable unreadable".into())
+        })?;
         let Some(digest) = self.digests.get(&key) else {
             return Err(CorrelationError::NotEvidence(
                 "configured executable has no hashed digest for its current file identity (new, replaced or modified since the last hash); unqualified until it is hashed again"
@@ -3261,31 +3274,6 @@ impl Registry {
             ));
         }
         Ok(())
-    }
-
-    /// The current identity of `exe` when it was neither written nor changed
-    /// (mtime and ctime) at or after the process start `started`, the
-    /// file-time gate of [`Registry::verify_loaded`].
-    ///
-    /// # Errors
-    ///
-    /// The file is unreadable, or its mtime or ctime is not strictly before
-    /// `started` (the loaded build is then unproven).
-    fn stable_identity(
-        &self,
-        exe: &Path,
-        started: os::StartBound,
-    ) -> Result<FileKey, CorrelationError> {
-        let key = file_key(exe).ok_or_else(|| {
-            CorrelationError::NotEvidence("configured executable unreadable".into())
-        })?;
-        if !started.is_after_change(key.mtime, key.ctime) {
-            return Err(CorrelationError::NotEvidence(
-                "configured executable written or changed on disk at or after the process start; loaded build unproven"
-                    .into(),
-            ));
-        }
-        Ok(key)
     }
 
     /// Admits one hook event from a channel peer.
@@ -4561,8 +4549,8 @@ fn built_in_store(facts: &ProcessFacts, harness: Harness) -> Option<PathBuf> {
 
 /// Whether the native owner process `owner` runs from a trusted executable:
 /// the resolved path exists and [`executable_current`] holds for it (a regular
-/// file owned by `owner_uid` or root, not writable by group or other, unchanged
-/// since the owner process started). No path or digest is predeclared and
+/// file owned by `owner_uid` or root, not writable by group or other, and the
+/// build the owner process loaded). No path or digest is predeclared and
 /// nothing else is granted; used only by the native owner route.
 ///
 /// # Errors
@@ -4628,24 +4616,42 @@ fn private_store(store: &Path, owner_uid: u32) -> Result<(), String> {
 
 /// Proves the executable `exe` of the process `facts` may be run by Bridge: a
 /// regular file owned by `owner_uid` or root that no group or other user can
-/// write, whose modification and status-change times are strictly before the
-/// process start on one wall clock at nanosecond resolution ([`os::StartBound`],
-/// so it is unchanged since the process began). No digest or path is
-/// allowlisted.
+/// write, and the very build the process loaded ([`os::loaded_executable`]:
+/// `/proc/<pid>/exe` is the same device and inode as `exe`, on a filesystem where
+/// the kernel denies writes to a running executable). No wall clock and no
+/// timestamp of the file is consulted, so neither a clock step nor a metadata-only
+/// change (`touch`, ownership or link changes that keep mode, owner and inode
+/// acceptable) decides the result; a replaced inode or an unsupported filesystem
+/// is refused. No digest or path is allowlisted.
 ///
 /// # Errors
 ///
 /// The reason the executable is refused (a static text, never the path).
 fn executable_current(exe: &Path, facts: &ProcessFacts, owner_uid: u32) -> Result<(), String> {
-    let meta = std::fs::metadata(exe).map_err(|_| "executable is unreadable")?;
-    if !meta.is_file() || !(meta.uid() == owner_uid || meta.uid() == 0) || meta.mode() & 0o022 != 0
+    let loaded = os::loaded_executable(facts, exe).map_err(str::to_owned)?;
+    if !loaded.is_file()
+        || !(loaded.uid() == owner_uid || loaded.uid() == 0)
+        || loaded.mode() & 0o022 != 0
     {
         return Err("executable is not a regular, trusted-owner, non-writable file".into());
     }
-    if !facts.start_bound().is_after_file(&meta) {
-        return Err("executable was written or changed at or after the process start".into());
-    }
     Ok(())
+}
+
+/// Whether the descriptor written at `written_at` is positively no older than the
+/// process `facts`: on Linux the clock-discontinuity check of
+/// [`os::clock::written_after_start`] (refused for a process that started before
+/// Bridge or whenever a wall-clock step cannot be excluded); elsewhere the
+/// whole-second start time.
+fn descriptor_written_after_start(facts: &ProcessFacts, written_at: (i64, i64)) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        os::clock::written_after_start(facts, written_at)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        i128::from(written_at.0) >= i128::from(facts.start_time)
+    }
 }
 
 /// Whether `parent`, the kernel parent of the MCP peer `peer_pid`, is the
@@ -4684,6 +4690,9 @@ fn signed_node_hop(peer_pid: u32, parent: &ProcessFacts, owner_uid: u32) -> bool
 /// from its main loop, so an application update is covered within about a
 /// second plus one hash pass, with no request and no restart involved.
 pub fn refresh_executables(registry: &Arc<Mutex<Registry>>) {
+    // The periodic pass also keeps the clock history that descriptor freshness needs.
+    #[cfg(target_os = "linux")]
+    os::clock::observe();
     refresh_stale(registry);
 }
 
@@ -5272,7 +5281,7 @@ mod tests {
             (&missing, &good_digest),
         ]);
         registry
-            .verify_loaded(&good, u64::MAX, &good_digest)
+            .verify_digest(&good, &good_digest)
             .expect("the warmed, unchanged file attests");
         let sentinel = "5".repeat(64);
         registry
@@ -5280,18 +5289,10 @@ mod tests {
             .insert(file_key(&good).unwrap(), sentinel.clone());
         assert_eq!(registry.warm_digests(), (2, 1));
         registry
-            .verify_loaded(&good, u64::MAX, &sentinel)
+            .verify_digest(&good, &sentinel)
             .expect("an unchanged file's cached digest is not re-read");
-        assert!(
-            registry
-                .verify_loaded(&wrong, u64::MAX, &bad_config)
-                .is_err()
-        );
-        assert!(
-            registry
-                .verify_loaded(&missing, u64::MAX, &good_digest)
-                .is_err()
-        );
+        assert!(registry.verify_digest(&wrong, &bad_config).is_err());
+        assert!(registry.verify_digest(&missing, &good_digest).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -5320,12 +5321,12 @@ mod tests {
         // refusal proves the request path did not hash.
         let mut cold = registry_with(&config);
         cold.digests.clear();
-        assert!(cold.verify_loaded(&kept, u64::MAX, &digest).is_err());
+        assert!(cold.verify_digest(&kept, &digest).is_err());
 
         let mut registry = registry_with(&config);
         assert_eq!(registry.warm_digests(), (4, 1), "late does not exist yet");
         for path in [&kept, &renamed, &rewritten, &removed] {
-            registry.verify_loaded(path, u64::MAX, &digest).unwrap();
+            registry.verify_digest(path, &digest).unwrap();
         }
         // Installed after startup, with the configured contents.
         std::fs::write(&late, vec![1u8; 4096]).unwrap();
@@ -5337,43 +5338,12 @@ mod tests {
         std::fs::write(&rewritten, vec![2u8; 4096]).unwrap();
         std::fs::remove_file(&removed).unwrap();
         for path in [&renamed, &rewritten, &removed, &late] {
-            let error = registry.verify_loaded(path, u64::MAX, &digest);
+            let error = registry.verify_digest(path, &digest);
             assert!(error.is_err(), "{path:?} must be unqualified");
         }
         registry
-            .verify_loaded(&kept, u64::MAX, &digest)
+            .verify_digest(&kept, &digest)
             .expect("an untouched warmed file still attests");
-        // A file modified after the process started is refused before any
-        // digest question.
-        assert!(registry.verify_loaded(&kept, 0, &digest).is_err());
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// The process start time and the file mtime are both whole seconds, so
-    /// a file written in the very second a process was born may be the bytes
-    /// that process loaded or newer ones written right after it loaded the
-    /// old ones; that second is unknown and refused. Only a file strictly
-    /// older than the process start (or no process at all, `u64::MAX`)
-    /// attests.
-    #[test]
-    fn a_file_written_in_the_process_birth_second_is_not_proven_loaded() {
-        let dir = scratch("birth");
-        let exe = dir.join("exe");
-        std::fs::write(&exe, vec![5u8; 4096]).unwrap();
-        let digest = file_sha256(&exe).unwrap();
-        let registry = registry_with(&[(&exe, &digest)]);
-        let second = u64::try_from(file_key(&exe).unwrap().mtime.0).unwrap();
-        assert!(
-            registry.verify_loaded(&exe, second, &digest).is_err(),
-            "same second as the process birth is ambiguous"
-        );
-        assert!(registry.verify_loaded(&exe, second - 1, &digest).is_err());
-        registry
-            .verify_loaded(&exe, second + 1, &digest)
-            .expect("strictly older than the process start attests");
-        registry
-            .verify_loaded(&exe, u64::MAX, &digest)
-            .expect("no process involved");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -5446,45 +5416,6 @@ mod tests {
         }
     }
 
-    /// An ordinary update that keeps an old mtime (installer-style: new bytes
-    /// written, mtime backdated, renamed over the path) after the process
-    /// started is still refused, because the kernel status-change time of
-    /// the new file is not before the process birth second, even though the
-    /// configured digest matches the new bytes and the mtime looks old. The
-    /// process's own reported executable path does not change in this case
-    /// (probed on this platform), so the file times are the only evidence.
-    #[test]
-    fn backdated_replacement_after_process_start_is_not_proven_loaded() {
-        let dir = scratch("upd");
-        let exe = dir.join("exe");
-        std::fs::write(&exe, vec![1u8; 4096]).unwrap();
-        backdate(&exe);
-        let installed = u64::try_from(status_change_second(&exe)).unwrap();
-        let born = installed + 1;
-        let digest_old = file_sha256(&exe).unwrap();
-        let before = registry_with(&[(&exe, &digest_old)]);
-        before
-            .verify_loaded(&exe, born, &digest_old)
-            .expect("installed before the process was born");
-
-        // The update happens after the process birth second.
-        wait_until_second(born);
-        let staged = dir.join("staged");
-        std::fs::write(&staged, vec![2u8; 4096]).unwrap();
-        backdate(&staged);
-        std::fs::rename(&staged, &exe).unwrap();
-        let digest_new = file_sha256(&exe).unwrap();
-        assert_ne!(digest_old, digest_new);
-        // A daemon constructed after the update warms and is configured
-        // with the new digest.
-        let after = registry_with(&[(&exe, &digest_new)]);
-        assert!(
-            after.verify_loaded(&exe, born, &digest_new).is_err(),
-            "the old process cannot have loaded the new bytes"
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
     /// An in-place same-size rewrite whose mtime is restored after startup
     /// cannot reuse the digest hashed before it: the status-change time is
     /// part of the file identity.
@@ -5497,14 +5428,14 @@ mod tests {
         let digest = file_sha256(&exe).unwrap();
         let registry = registry_with(&[(&exe, &digest)]);
         registry
-            .verify_loaded(&exe, u64::MAX, &digest)
+            .verify_digest(&exe, &digest)
             .expect("warmed and unchanged");
         // Same size, other bytes, original mtime put back.
         wait_until_second(u64::try_from(status_change_second(&exe)).unwrap() + 1);
         std::fs::write(&exe, vec![2u8; 4096]).unwrap();
         backdate(&exe);
         assert!(
-            registry.verify_loaded(&exe, u64::MAX, &digest).is_err(),
+            registry.verify_digest(&exe, &digest).is_err(),
             "the stale digest must not vouch for the rewritten file"
         );
         std::fs::remove_dir_all(&dir).unwrap();
@@ -5530,43 +5461,32 @@ mod tests {
     /// An application update that leaves the approved bytes identical (a new
     /// inode and ctime) is refused until the cache is refreshed and then attests
     /// again without a daemon restart; the daemon-held registry is only locked
-    /// to stage and commit. The process-birth gate still refuses a process that
-    /// started before the update, whatever the digest, and repeated updates keep
-    /// exactly one cached identity per path.
+    /// to stage and commit. Repeated updates keep exactly one cached identity per
+    /// path. Whether a process loaded that inode is [`os::loaded_executable`]'s
+    /// question, covered with live processes.
     #[test]
-    fn refresh_requalifies_identical_bytes_but_never_an_old_process() {
+    fn refresh_requalifies_identical_bytes() {
         let dir = scratch("rfs");
         let exe = dir.join("exe");
         std::fs::write(&exe, vec![3u8; 4096]).unwrap();
         backdate(&exe);
         let digest = file_sha256(&exe).unwrap();
         let registry = Arc::new(Mutex::new(registry_with(&[(&exe, &digest)])));
-        let first = u64::try_from(status_change_second(&exe)).unwrap();
         for round in 0..3 {
             update_in_place(&exe, vec![3u8; 4096]);
-            let updated = u64::try_from(status_change_second(&exe)).unwrap();
-            assert!(first <= updated);
             assert!(
                 registry
                     .lock()
                     .unwrap()
-                    .verify_loaded(&exe, u64::MAX, &digest)
+                    .verify_digest(&exe, &digest)
                     .is_err(),
                 "round {round}: a new identity has no digest until refreshed"
             );
             refresh(&registry);
             let registry = registry.lock().unwrap();
             registry
-                .verify_loaded(&exe, updated + 1, &digest)
-                .expect("identical approved bytes qualify a process born after the update");
-            assert!(
-                registry.verify_loaded(&exe, updated, &digest).is_err(),
-                "a process born in the update second is unproven"
-            );
-            assert!(
-                registry.verify_loaded(&exe, first, &digest).is_err(),
-                "a process that predates the update is never proven loaded"
-            );
+                .verify_digest(&exe, &digest)
+                .expect("identical approved bytes qualify again");
             assert_eq!(
                 registry.digests.len(),
                 1,
@@ -5596,14 +5516,14 @@ mod tests {
         update_in_place(&exe, vec![5u8; 4096]);
         refresh(&registry);
         let registry = registry.lock().unwrap();
-        let refused = registry.verify_loaded(&exe, u64::MAX, &digest).unwrap_err();
+        let refused = registry.verify_digest(&exe, &digest).unwrap_err();
         assert!(
             refused.detail().contains("not the configured build"),
             "{}",
             refused.detail()
         );
         registry
-            .verify_loaded(&other, u64::MAX, &other_digest)
+            .verify_digest(&other, &other_digest)
             .expect("an unaffected approved path keeps attesting");
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -5660,7 +5580,7 @@ mod tests {
             registry
                 .lock()
                 .unwrap()
-                .verify_loaded(&exe, u64::MAX, &digest)
+                .verify_digest(&exe, &digest)
                 .is_err(),
             "an identity that changed during the read is not cached"
         );
@@ -5694,7 +5614,7 @@ mod tests {
             registry.commit_checked(item);
         }
         assert_eq!(registry.digests, before, "nothing pruned or inserted");
-        assert!(registry.verify_loaded(&exe, u64::MAX, &digest).is_err());
+        assert!(registry.verify_digest(&exe, &digest).is_err());
         assert_eq!(
             registry.stale_files().len(),
             1,
@@ -5721,7 +5641,7 @@ mod tests {
             registry
                 .lock()
                 .unwrap()
-                .verify_loaded(&exe, u64::MAX, &digest)
+                .verify_digest(&exe, &digest)
                 .is_err()
         );
         std::fs::remove_dir_all(&dir).unwrap();
@@ -5773,8 +5693,8 @@ mod tests {
     }
 
     /// A copy of this test binary at `path` (the "harness" executable) and a live
-    /// child started from it that parks, born in a later second than the copy so
-    /// the loaded-build file-time gate can prove it. Only the child gets the
+    /// child started from it that parks, born after this thread's clock history
+    /// began (so descriptor freshness can be proven). Only the child gets the
     /// marker variable `BRIDGE_TEST_PARK` and `store` as its store through the
     /// environment variable `variable`; it runs exactly the parking test. The
     /// fixture asserts the child is still alive after startup and that the OS
@@ -5787,22 +5707,11 @@ mod tests {
         // Cargo's executable can inherit group-write ACLs; this owned fixture
         // must satisfy the same private executable check as a real harness.
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let metadata = std::fs::metadata(path).unwrap();
-        let written = u64::try_from(metadata.mtime().max(metadata.ctime())).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
-        // Kernel birth seconds and filesystem timestamps have independent quantization. Wait
-        // against observed metadata with one second of margin, then prove the actual child below.
-        while std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            <= written.saturating_add(1)
+        // Bridge start of this test thread's clock history: the child starts after it.
+        #[cfg(target_os = "linux")]
         {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "fixture executable clock did not become older than process birth"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(25));
+            os::clock::observe();
+            std::thread::sleep(std::time::Duration::from_millis(40));
         }
         let mut child = LiveChild(
             std::process::Command::new(path)
@@ -5830,14 +5739,10 @@ mod tests {
             Some(store.as_os_str()),
             "fixture store"
         );
-        let metadata = std::fs::metadata(path).unwrap();
         let executable_proof = executable_current(path, &facts, facts.uid.unwrap());
         assert!(
             executable_proof.is_ok(),
-            "fixture executable proof: {executable_proof:?}; mtime {},ctime {},birth {}",
-            metadata.mtime(),
-            metadata.ctime(),
-            facts.start_time
+            "fixture executable proof: {executable_proof:?}"
         );
         let store_proof = private_store(store, facts.uid.unwrap());
         assert!(store_proof.is_ok(), "fixture store proof: {store_proof:?}");
@@ -6112,6 +6017,29 @@ mod tests {
         reset(&mut registry, &|_| {});
         observe(&mut registry);
         assert_eq!(lifecycle(&registry), Lifecycle::Unknown, "other store");
+
+        // Fail closed when a clock discontinuity cannot be excluded: a forward
+        // step of the wall clock after the process started makes even a fresh
+        // descriptor unprovable; so does a process that predates the history.
+        descriptor(&store, "sess", pid, "idle", 0);
+        reset(&mut registry, &|_| {});
+        observe(&mut registry);
+        assert_eq!(lifecycle(&registry), Lifecycle::Inactive, "before the step");
+        os::clock::inject_step(60_000_000_000);
+        descriptor(&store, "sess", pid, "idle", 0);
+        reset(&mut registry, &|_| {});
+        observe(&mut registry);
+        assert_eq!(lifecycle(&registry), Lifecycle::Unknown, "forward step");
+        os::clock::reset();
+        descriptor(&store, "sess", pid, "idle", 0);
+        reset(&mut registry, &|_| {});
+        observe(&mut registry);
+        assert_eq!(
+            lifecycle(&registry),
+            Lifecycle::Unknown,
+            "the process started before this history began"
+        );
+        os::clock::reset();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -6165,119 +6093,190 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A process executable must be a regular file of this user or root that
-    /// no group or other user can write and that is unchanged since the process
-    /// started: a freshly written file, a group-writable one and a directory are
-    /// refused, a backdated private file passes. No digest is involved.
-    #[test]
-    fn a_process_executable_must_be_trusted_and_unchanged_since_start() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = scratch("exc");
-        let facts = own_facts();
-        let uid = facts.uid.unwrap();
-        let exe = dir.join("exe");
-        std::fs::write(&exe, b"x").unwrap();
-        assert!(
-            executable_current(&exe, &facts, uid).is_err(),
-            "written after the process started"
-        );
-        backdate(&exe);
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // chmod moves the status-change time: the file counts as changed again.
-        let mut older = facts.clone();
-        older.start_time = u64::MAX / 2;
-        #[cfg(target_os = "linux")]
-        {
-            older.start_ticks = None;
-        }
-        assert!(executable_current(&exe, &older, uid).is_ok());
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o775)).unwrap();
-        assert!(
-            executable_current(&exe, &older, uid).is_err(),
-            "group writable"
-        );
-        assert!(executable_current(&dir, &older, uid).is_err(), "directory");
-        assert!(executable_current(&exe, &older, uid.wrapping_add(1)).is_err());
-        std::fs::remove_dir_all(&dir).unwrap();
+    /// Metadata of `path` as `(device, inode)`.
+    fn file_identity(path: &Path) -> (u64, u64) {
+        let meta = std::fs::metadata(path).unwrap();
+        (meta.dev(), meta.ino())
     }
 
-    /// The executable gate compares full-resolution file times with the process
-    /// start placed on the same wall clock: a file written about one second
-    /// before the process started is current (a whole-second `btime` start
-    /// refused it), a file written after the process started is not, and the
-    /// same holds for the digest gate and the session-descriptor check.
+    /// A process executable must be the build the process loaded, a regular file
+    /// of this user or root that no group or other user can write, on a filesystem
+    /// where the kernel denies writes to a running executable: the live copy is
+    /// accepted; a post-start change of only its metadata times (touch, a mode
+    /// change that keeps it non-writable) is accepted; group- or other-writable
+    /// modes, a replaced inode, a directory, a foreign owner, an unreadable start
+    /// tick or another incarnation, and an unsupported filesystem are refused.
+    /// A stepped wall clock changes no result.
     #[cfg(target_os = "linux")]
     #[test]
-    fn executable_times_are_compared_with_process_start_on_one_clock() {
+    fn a_process_executable_must_be_the_trusted_loaded_build() {
         use std::os::unix::fs::PermissionsExt;
-        let wall = || {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap();
-            (
-                i64::try_from(now.as_secs()).unwrap(),
-                i64::from(now.subsec_nanos()),
-            )
-        };
-        let before = |(seconds, nanos): (i64, i64), millis: i64| {
-            let total = seconds * 1000 + nanos / 1_000_000 - millis;
-            (total.div_euclid(1000), total.rem_euclid(1000) * 1_000_000)
-        };
-        let dir = scratch("clk");
+        let dir = scratch("exc");
+        let store = dir.join("store");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&store)
+            .unwrap();
         let exe = dir.join("exe");
-        std::fs::write(&exe, vec![3u8; 4096]).unwrap();
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let digest = file_sha256(&exe).unwrap();
-        let registry = registry_with(&[(&exe, &digest)]);
-        std::thread::sleep(std::time::Duration::from_millis(1100));
-        let spawned_after_write = wall();
-        let child = LiveChild::own(
-            std::process::Command::new("sleep")
-                .arg("30")
-                .spawn()
-                .unwrap(),
-        );
-        let spawned = wall();
+        let child = live_child(&exe, "CLAUDE_CONFIG_DIR", &store);
         let facts = os::process_facts(child.id()).unwrap();
         let uid = facts.uid.unwrap();
-        assert!(facts.start_ticks.is_some(), "kernel start tick");
-        let bound = facts.start_bound();
-        assert!(!bound.is_after(spawned), "bound is never after the spawn");
-        assert!(
-            bound.is_after(before(spawned_after_write, 100)),
-            "bound is within the clock quanta of the true start"
-        );
-        let written = std::fs::metadata(&exe).unwrap();
-        assert!(bound.is_after_file(&written));
-        assert_eq!(executable_current(&exe, &facts, uid), Ok(()));
-        registry
-            .verify_loaded(&exe, &facts, &digest)
-            .expect("written about a second before the process started");
+        let mode = |bits: u32| {
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(bits)).unwrap();
+        };
+        let steps = [0, 3_600_000_000_000, -7_200_000_000_000, 0];
+        let judged = |facts: &ProcessFacts| {
+            steps
+                .iter()
+                .map(|step| {
+                    os::clock::inject_step(*step);
+                    executable_current(&exe, facts, uid)
+                })
+                .collect::<Vec<_>>()
+        };
+        let stable = |facts: &ProcessFacts, accepted: bool| {
+            let results = judged(facts);
+            assert!(
+                results.iter().all(|result| result.is_ok() == accepted),
+                "clock steps must not change the result: {results:?}"
+            );
+        };
+        stable(&facts, true);
 
-        // Rewritten after the process started: refused, even at the same second.
-        std::fs::write(&exe, vec![4u8; 4096]).unwrap();
-        assert!(executable_current(&exe, &facts, uid).is_err());
-        assert!(
-            registry
-                .verify_loaded(&exe, &facts, &file_sha256(&exe).unwrap())
-                .is_err()
-        );
-        let rewritten = std::fs::metadata(&exe).unwrap();
-        assert!(!bound.is_after_file(&rewritten));
+        // A metadata-only change after the process started: touch and a mode
+        // change that stays non-writable keep the loaded inode, owner and fs.
+        let inode = file_identity(&exe);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&exe)
+            .expect_err("the kernel denies writing a running executable");
+        std::fs::File::open(&exe)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        mode(0o750);
+        assert_eq!(file_identity(&exe), inode);
+        stable(&facts, true);
+
+        // Group- and other-writable files are refused, and accepted again once
+        // closed.
+        for bits in [0o770, 0o702, 0o722, 0o777] {
+            mode(bits);
+            stable(&facts, false);
+        }
+        mode(0o700);
+        stable(&facts, true);
+        assert!(executable_current(&dir, &facts, uid).is_err(), "directory");
+        if uid != 0 {
+            assert!(executable_current(&exe, &facts, uid.wrapping_add(1)).is_err());
+        }
+
+        // Another incarnation or an unreadable start tick never proves the build.
+        let mut reused = facts.clone();
+        reused.start_ticks = reused.start_ticks.map(|ticks| ticks + 1);
+        stable(&reused, false);
+        reused.start_ticks = None;
+        stable(&reused, false);
+
+        // A filesystem without the kernel's text-busy denial is refused; the
+        // allowlisted types are accepted.
+        for (fstype, accepted) in [
+            ("ext4", true),
+            ("xfs", true),
+            ("btrfs", true),
+            ("tmpfs", true),
+            ("overlay", false),
+            ("nfs4", false),
+            ("fuse.sshfs", false),
+            ("vfat", false),
+            ("", false),
+        ] {
+            os::loaded::injected::set(Some(fstype));
+            stable(&facts, accepted);
+        }
+        os::loaded::injected::set(None);
+        stable(&facts, true);
+
+        // A replaced inode (installer-style rename over the path) is a different
+        // file than the one the process runs, whatever its bytes, owner or mode.
+        let staged = dir.join("staged");
+        std::fs::copy(&exe, &staged).unwrap();
+        mode(0o700);
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::rename(&staged, &exe).unwrap();
+        assert_ne!(file_identity(&exe), inode);
+        stable(&facts, false);
         std::fs::remove_dir_all(&dir).unwrap();
+        os::clock::reset();
     }
 
-    /// File times and a whole-second start meet at nanosecond resolution: only
-    /// a time strictly before the start second is older than the process.
+    /// The digest gate proves the loaded build the same way: the live process and
+    /// the configured file must be one inode on a supported filesystem and the
+    /// digest of that identity must match. A post-start metadata-only change needs
+    /// a re-hash (new ctime) and then attests; a replaced inode never attests; an
+    /// unsupported filesystem and a wrong configured digest are refused; clock
+    /// steps change nothing.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn start_bound_compares_at_nanosecond_resolution() {
-        let bound = os::StartBound::from_secs(10);
-        assert!(bound.is_after((9, 999_999_999)));
-        assert!(!bound.is_after((10, 0)));
-        assert!(!bound.is_after((10, 1)));
-        assert!(bound.is_after_change((1, 0), (9, 999_999_999)));
-        assert!(!bound.is_after_change((1, 0), (10, 0)));
-        assert!(!bound.is_after_change((10, 5), (1, 0)));
+    fn the_digest_gate_requires_the_loaded_inode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("ldd");
+        let store = dir.join("store");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&store)
+            .unwrap();
+        let exe = dir.join("exe");
+        let child = live_child(&exe, "CLAUDE_CONFIG_DIR", &store);
+        let facts = os::process_facts(child.id()).unwrap();
+        let digest = file_sha256(&exe).unwrap();
+        let mut registry = registry_with(&[(&exe, &digest)]);
+        for step in [0, 86_400_000_000_000, -86_400_000_000_000, 0] {
+            os::clock::inject_step(step);
+            registry
+                .verify_loaded(&exe, &facts, &digest)
+                .expect("loaded, warmed and matching");
+        }
+        let wrong = "0".repeat(64);
+        assert!(registry.verify_loaded(&exe, &facts, &wrong).is_err());
+        os::loaded::injected::set(Some("overlay"));
+        assert!(registry.verify_loaded(&exe, &facts, &digest).is_err());
+        os::loaded::injected::set(None);
+        let mut reused = facts.clone();
+        reused.start_ticks = None;
+        assert!(registry.verify_loaded(&exe, &reused, &digest).is_err());
+
+        // Touch and chmod after the process started: the identity moved, so the
+        // old digest no longer vouches until the file is hashed again, and then
+        // the same loaded inode attests.
+        std::fs::File::open(&exe)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(9))
+            .unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(
+            registry.verify_loaded(&exe, &facts, &digest).is_err(),
+            "unqualified until re-hashed"
+        );
+        registry.warm_digests();
+        registry
+            .verify_loaded(&exe, &facts, &digest)
+            .expect("metadata-only change of the loaded inode");
+
+        // A replacement inode with identical bytes is not what the process runs.
+        let staged = dir.join("staged");
+        std::fs::copy(&exe, &staged).unwrap();
+        std::fs::rename(&staged, &exe).unwrap();
+        registry.warm_digests();
+        registry
+            .verify_digest(&exe, &digest)
+            .expect("the file itself is the approved build");
+        assert!(
+            registry.verify_loaded(&exe, &facts, &digest).is_err(),
+            "the process still runs the replaced inode"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        os::clock::reset();
     }
 
     /// Message delivery rechecks the executable after admission: changing the

@@ -14,8 +14,8 @@
 //! recipient: native recipients are identified by their process facts and
 //! harness-level policy, not by a predeclared build. Trust never comes from this
 //! module's work alone: an exact digest still has to equal a configured one and
-//! [`Registry::verify_loaded`] additionally requires the file's mtime and ctime
-//! to precede the process start second.
+//! [`Registry::verify_loaded`] additionally requires that the process runs exactly
+//! that file, on a filesystem where its content cannot change while it runs.
 
 use super::*;
 
@@ -210,7 +210,7 @@ impl Drop for Flight {
 /// only the results whose file still has the identity they were computed for,
 /// dropping superseded identities of the same path. Nothing is trusted by this
 /// call: a digest only becomes evidence through [`Registry::verify_loaded`], and a
-/// process started before the file's last change stays unproven. [`stop_refresh`]
+/// process that does not run exactly this inode stays unproven. [`stop_refresh`]
 /// ends the pass at shutdown.
 // ponytail: a file rewritten continuously is re-hashed once per pass; add a per-path cooldown if that is ever observed.
 pub(crate) fn refresh_stale(registry: &Arc<Mutex<Registry>>) -> bool {

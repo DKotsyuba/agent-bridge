@@ -1196,7 +1196,10 @@ fn node_hop_diagnostics() -> Value {
         "parent_uid_matches": parent.uid == chain.first().and_then(|facts| facts.uid),
         "executable_owner_trusted": metadata.as_ref().is_some_and(|m| m.uid() == 0 || Some(m.uid()) == parent.uid),
         "executable_not_writable": metadata.as_ref().is_some_and(|m| m.mode() & 0o022 == 0),
-        "executable_older_than_process": metadata.as_ref().is_some_and(|m| parent.start_bound().is_after_file(m)),
+        "executable_loaded_build": parent
+            .exe
+            .as_ref()
+            .is_some_and(|path| bridge_adapters::os::loaded_executable(parent, path).is_ok()),
         "environment_readable": declared.is_ok() && pipe.is_ok(),
         "declared_runtime_matches": named.is_some() && named == executable,
         "pipe_present": pipe.is_ok_and(|value| value.is_some()),

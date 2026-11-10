@@ -676,27 +676,19 @@ fn lifecycle_holds_unknown_input_waits_pause_and_ended_sessions() {
     assert!(matches!(report, DispatchReport::Held(_)), "{report:?}");
 }
 
-/// An executable changed after attestation holds before a write, while a changed
-/// executable's late receipt cannot accept or replay an already-written attempt.
+/// An executable made unsafe (group-writable) after attestation holds before a
+/// write, while its late receipt cannot accept or replay an already-written
+/// attempt.
 #[test]
 fn claude_changed_executable_holds_before_write_and_rejects_late_receipt() {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
 
     for before_write in [true, false] {
         let lab = Lab::new(if before_write { "cxpre" } else { "cxlate" });
         let address = lab.claude_address("sess-changed");
         let executable = lab.dir.0.join("bridge-fixture-claude");
         std::fs::copy(fixture_exe(), &executable).unwrap();
-        let metadata = std::fs::metadata(&executable).unwrap();
-        let changed = u64::try_from(metadata.mtime().max(metadata.ctime())).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(4);
-        while now() / 1000 <= changed.saturating_add(1) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "fixture clock did not advance"
-            );
-            std::thread::sleep(Duration::from_millis(25));
-        }
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut harness =
             Harnessed::start_from(&executable, Harness::CLAUDE_CODE, &lab.claude_store);
         harness.cmd(json!({"cmd": "inbox", "session_id": "sess-changed", "behavior": "none"}));
@@ -724,7 +716,7 @@ fn claude_changed_executable_holds_before_write_and_rejects_late_receipt() {
             ClaudeLaterCarrier::new(Arc::clone(&lab.registry), custody, timing).unwrap();
         lab.publish("evt-changed", &address, Mode::Message, "retained payload");
         if before_write {
-            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o770)).unwrap();
         }
         let report = dispatch_message(
             &lab.storage,
@@ -757,7 +749,7 @@ fn claude_changed_executable_holds_before_write_and_rejects_late_receipt() {
             let attempt = lab.attempt("evt-changed").unwrap();
             let frames = harness.cmd(json!({"cmd": "frames"}));
             let msg_id = frames["frames"][0]["msg_id"].as_str().unwrap();
-            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o770)).unwrap();
             assert_eq!(
                 harness.cmd(json!({"cmd": "receipt", "msg_id": msg_id, "status": "delivered", "close": true}))["sent"],
                 true
