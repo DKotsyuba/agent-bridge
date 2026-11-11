@@ -6,6 +6,12 @@ source, and the crates are not published to crates.io.
 
 ## Unreleased
 
+## [0.7.1] - 2026-11-11
+
+This release fixes Codex managed tool-name matching and tightens the
+`adapters.managed_tools` configuration check. It has no store migration; core
+storage stays at schema 9.
+
 ### Changed
 
 - `adapters.managed_tools` now refuses configurations Codex could not present
