@@ -46,7 +46,7 @@ jobs:
       - name: Clippy
         run: cargo +1.98.1 clippy --offline --workspace --all-targets -- -D warnings
       - name: Test
-        run: cargo +1.98.1 test --offline --workspace
+        run: cargo +1.98.1 test --offline --workspace --no-fail-fast
       - name: Private Rustdoc
         run: cargo +1.98.1 doc --offline --workspace --no-deps --document-private-items
         env:

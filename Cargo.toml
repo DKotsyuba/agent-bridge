@@ -40,6 +40,21 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 dbg_macro = "deny"
 
+# Backtraces keep file/line; dependencies carry no debug info. This keeps test
+# binaries small and links fast. Use `--profile debugging` for full debug info.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.debugging]
+inherits = "dev"
+debug = true
+
+[profile.debugging.package."*"]
+debug = true
+
 [profile.release]
 lto = "thin"
 strip = true
