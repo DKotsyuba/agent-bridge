@@ -508,12 +508,66 @@ impl ManagedOwnerRoute {
 pub struct ManagedTools {
     /// Producer allowed to associate this native call.
     pub producer: String,
-    /// Exact native MCP server segment.
+    /// Exact native MCP server name: Claude presents it raw, Codex as its
+    /// `[A-Za-z0-9_]` segment.
     pub server: String,
     /// Exact command names accepted for this server.
     pub commands: Vec<String>,
     /// Exact trusted stdio frontend executable and loaded build.
     pub frontend: RelayExecutable,
+}
+
+/// Longest native tool name Codex presents without a hashed substitute.
+const MAX_CODEX_TOOL_NAME_BYTES: usize = 128;
+
+/// Codex's MCP name segment: every character outside `[A-Za-z0-9_]` becomes
+/// `_` (codex-mcp `sanitize_responses_api_tool_name`).
+fn codex_segment(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// A segment Codex joins without trimming, prefix elision or ambiguity.
+fn plain_codex_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && !segment.starts_with('_')
+        && !segment.ends_with('_')
+        && !segment.contains("__")
+}
+
+/// A command Codex presents verbatim: already a segment fixed point and not
+/// trimmed by the hook join.
+fn plain_codex_command(command: &str) -> bool {
+    !command.is_empty() && !command.starts_with('_') && codex_segment(command) == command
+}
+
+/// The exact native tool name `harness` presents for a configured server and
+/// command; `None` when that harness has no unambiguous managed name.
+///
+/// Claude presents the raw server. Codex presents `mcp__` + seg(server) +
+/// `__` + command and substitutes a hash for colliding or overlong names,
+/// so only plain segments and fixed-point commands map to a name; anything
+/// else is refused rather than guessed.
+pub(crate) fn managed_tool_name(harness: Harness, server: &str, command: &str) -> Option<String> {
+    if harness == Harness::CLAUDE_CODE {
+        return Some(format!("mcp__{server}__{command}"));
+    }
+    if harness != Harness::CODEX {
+        return None;
+    }
+    let segment = codex_segment(server);
+    let name = format!("mcp__{segment}__{command}");
+    (plain_codex_segment(&segment)
+        && plain_codex_command(command)
+        && name.len() <= MAX_CODEX_TOOL_NAME_BYTES)
+        .then_some(name)
 }
 
 /// Lifetime of a sealed caller proof, in milliseconds.
@@ -2568,6 +2622,10 @@ impl Registry {
         }
         let mut tools = std::collections::HashSet::new();
         let mut tool_owners = std::collections::HashMap::new();
+        // Codex presents seg(server); distinct servers or commands that
+        // normalize to one name would make a presented name ambiguous.
+        let mut codex_servers = std::collections::HashMap::new();
+        let mut codex_names = std::collections::HashMap::new();
         for mapping in &config.managed_tools {
             checked_id(&mapping.producer, "producer")?;
             if !mapping.frontend.path.is_absolute()
@@ -2589,19 +2647,34 @@ impl Registry {
             {
                 return Err("invalid managed tool mapping".into());
             }
+            let segment = codex_segment(&mapping.server);
+            if !plain_codex_segment(&segment) {
+                return Err("managed tool server has no unambiguous Codex name".into());
+            }
+            if codex_servers
+                .insert(segment, &mapping.server)
+                .is_some_and(|other| other != &mapping.server)
+            {
+                return Err("managed tool servers collide after Codex normalization".into());
+            }
             for command in &mapping.commands {
-                if command.is_empty()
+                if !plain_codex_command(command)
                     || command
                         .len()
                         .saturating_add(mapping.server.len())
                         .saturating_add(7)
-                        > MAX_NATIVE_ID_BYTES
-                    || !command
-                        .bytes()
-                        .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+                        > MAX_CODEX_TOOL_NAME_BYTES
                     || !tools.insert((&mapping.producer, &mapping.server, command))
                 {
                     return Err("invalid or duplicate managed command".into());
+                }
+                let name = managed_tool_name(Harness::CODEX, &mapping.server, command)
+                    .ok_or("managed command has no unambiguous Codex name")?;
+                if codex_names
+                    .insert(name, (&mapping.server, command))
+                    .is_some_and(|other| other != (&mapping.server, command))
+                {
+                    return Err("managed commands collide after Codex normalization".into());
                 }
                 if tool_owners
                     .insert((&mapping.server, command), &mapping.producer)
@@ -3732,7 +3805,8 @@ impl Registry {
                         payload.tool_name.as_deref().is_some_and(|tool| {
                             self.config.managed_tools.iter().any(|mapping| {
                                 mapping.commands.iter().any(|command| {
-                                    tool == format!("mcp__{}__{command}", mapping.server)
+                                    managed_tool_name(harness, &mapping.server, command)
+                                        .is_some_and(|name| tool == name)
                                 })
                             })
                         })
@@ -5211,6 +5285,105 @@ mod tests {
         second.producer = "other".into();
         cross_producer.managed_tools.push(second);
         assert!(Registry::new(cross_producer, 0).is_err());
+    }
+
+    /// A managed configuration must give every command one exact Codex name:
+    /// servers whose Codex segments collide, segments Codex would trim or
+    /// split, commands Codex would rewrite, and hash-substituted lengths refuse.
+    #[test]
+    fn managed_tools_refuse_ambiguous_codex_names() {
+        let mapping = |producer: &str, server: &str, commands: &[&str], digit: char| ManagedTools {
+            producer: producer.into(),
+            server: server.into(),
+            commands: commands.iter().map(|command| (*command).into()).collect(),
+            frontend: RelayExecutable {
+                path: format!("/frontend-{digit}").into(),
+                sha256: digit.to_string().repeat(64),
+            },
+        };
+        let build = |tools: Vec<ManagedTools>| {
+            let mut config = registry_with(&[]).config;
+            config.managed_tools = tools;
+            Registry::new(config, 0)
+        };
+        assert!(build(vec![mapping("p", "agent-pool", &["pool_get", "vote"], 'a')]).is_ok());
+        // The same raw server may be split across entries and producers.
+        assert!(
+            build(vec![
+                mapping("p", "agent-pool", &["pool_get"], 'a'),
+                mapping("q", "agent-pool", &["vote"], 'b'),
+            ])
+            .is_ok()
+        );
+        let long = "a".repeat(128 - "mcp__agent-pool__".len());
+        assert!(build(vec![mapping("p", "agent-pool", &[long.as_str()], 'a')]).is_ok());
+        let too_long = format!("{long}a");
+        for (tools, reason) in [
+            (
+                vec![
+                    mapping("p", "agent-pool", &["pool_get"], 'a'),
+                    mapping("q", "agent_pool", &["vote"], 'b'),
+                ],
+                "managed tool servers collide after Codex normalization",
+            ),
+            (
+                vec![
+                    mapping("p", "agent-pool", &["pool_get"], 'a'),
+                    mapping("p", "agent_pool", &["pool_get"], 'a'),
+                ],
+                "managed tool servers collide after Codex normalization",
+            ),
+            (
+                vec![mapping("p", "-pool", &["vote"], 'a')],
+                "managed tool server has no unambiguous Codex name",
+            ),
+            (
+                vec![mapping("p", "pool-", &["vote"], 'a')],
+                "managed tool server has no unambiguous Codex name",
+            ),
+            (
+                vec![mapping("p", "_pool", &["vote"], 'a')],
+                "managed tool server has no unambiguous Codex name",
+            ),
+            (
+                vec![mapping("p", "agent-_pool", &["vote"], 'a')],
+                "managed tool server has no unambiguous Codex name",
+            ),
+            (
+                vec![mapping("p", "mcp-_pool", &["vote"], 'a')],
+                "managed tool server has no unambiguous Codex name",
+            ),
+            (
+                vec![mapping("p", "pool", &["pool-get"], 'a')],
+                "invalid or duplicate managed command",
+            ),
+            (
+                vec![mapping("p", "pool", &["_vote"], 'a')],
+                "invalid or duplicate managed command",
+            ),
+            (
+                vec![mapping("p", "pool", &[""], 'a')],
+                "invalid or duplicate managed command",
+            ),
+            (
+                vec![mapping("p", "agent-pool", &[too_long.as_str()], 'a')],
+                "invalid or duplicate managed command",
+            ),
+            (
+                vec![mapping("p", "pool", &["vote", "vote"], 'a')],
+                "invalid or duplicate managed command",
+            ),
+            (
+                vec![mapping("p", "agent--pool", &["vote"], 'a')],
+                "managed tool server has no unambiguous Codex name",
+            ),
+            (
+                vec![mapping("p", "agent__pool", &["vote"], 'a')],
+                "invalid managed tool mapping",
+            ),
+        ] {
+            assert_eq!(build(tools).err().as_deref(), Some(reason));
+        }
     }
 
     /// Slash prefixes authorize only nonempty descendant segments and cannot

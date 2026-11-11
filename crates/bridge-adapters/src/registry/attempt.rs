@@ -881,12 +881,19 @@ fn random_secret() -> Result<Secret, CorrelationError> {
     ))
 }
 
-/// Exact configured native host tool mapping, never prefix-only matching.
+/// Exact configured native host tool mapping, never prefix-only matching:
+/// the full name the presenting harness uses for this server and command.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn tool_matches(mapping: &ManagedTools, producer: &str, command: &str, tool: &str) -> bool {
+fn tool_matches(
+    mapping: &ManagedTools,
+    harness: Harness,
+    producer: &str,
+    command: &str,
+    tool: &str,
+) -> bool {
     mapping.producer == producer
         && mapping.commands.iter().any(|allowed| allowed == command)
-        && tool == format!("mcp__{}__{command}", mapping.server)
+        && managed_tool_name(harness, &mapping.server, command).is_some_and(|name| tool == name)
 }
 
 impl Registry {
@@ -1809,7 +1816,7 @@ impl Registry {
             .config
             .managed_tools
             .iter()
-            .find(|mapping| tool_matches(mapping, producer, command, &tool))
+            .find(|mapping| tool_matches(mapping, harness, producer, command, &tool))
             .map(|mapping| mapping.frontend.clone())
             .ok_or_else(|| AttemptError::new("route_mismatch", "none"))?;
         self.verify_managed_frontend(peer, &frontend)?;
@@ -3480,14 +3487,91 @@ mod tests {
                 sha256: "a".repeat(64),
             },
         };
-        assert!(tool_matches(&mapping, "pool", "vote", "mcp__pool__vote"));
-        for (producer, command, tool) in [
-            ("other", "vote", "mcp__pool__vote"),
-            ("pool", "ready", "mcp__pool__vote"),
-            ("pool", "vote", "mcp__other__vote"),
-            ("pool", "vote", "mcp__pool__vote_extra"),
-        ] {
-            assert!(!tool_matches(&mapping, producer, command, tool));
+        for harness in [Harness::CLAUDE_CODE, Harness::CODEX] {
+            assert!(tool_matches(
+                &mapping,
+                harness,
+                "pool",
+                "vote",
+                "mcp__pool__vote"
+            ));
+            for (producer, command, tool) in [
+                ("other", "vote", "mcp__pool__vote"),
+                ("pool", "ready", "mcp__pool__vote"),
+                ("pool", "vote", "mcp__other__vote"),
+                ("pool", "vote", "mcp__pool__vote_extra"),
+            ] {
+                assert!(!tool_matches(&mapping, harness, producer, command, tool));
+            }
         }
+        assert!(!tool_matches(
+            &mapping,
+            Harness::OPENCODE,
+            "pool",
+            "vote",
+            "mcp__pool__vote"
+        ));
+    }
+
+    /// Codex presents seg(server) and only that exact name matches; Claude
+    /// keeps the raw server, and hashed or unnormalized names never match.
+    #[test]
+    fn codex_tool_name_is_normalized_and_claude_stays_raw() {
+        let mapping = ManagedTools {
+            producer: "pool".into(),
+            server: "agent-pool".into(),
+            commands: vec!["pool_get".into()],
+            frontend: RelayExecutable {
+                path: "/fixture".into(),
+                sha256: "a".repeat(64),
+            },
+        };
+        let matches = |harness, tool| tool_matches(&mapping, harness, "pool", "pool_get", tool);
+        assert!(matches(Harness::CODEX, "mcp__agent_pool__pool_get"));
+        assert!(matches(Harness::CLAUDE_CODE, "mcp__agent-pool__pool_get"));
+        assert!(!matches(Harness::CODEX, "mcp__agent-pool__pool_get"));
+        assert!(!matches(Harness::CLAUDE_CODE, "mcp__agent_pool__pool_get"));
+        for tool in [
+            "mcp__agent_pool__pool_get_0beec7b5ea3f0fdbc95d0dd47f3c5bc275da8a33",
+            "mcp__agent_pool_0beec7b5ea3f0fdbc95d0dd47f3c5bc275da8a33__pool_get",
+            "mcp__0beec7b5ea3f0fdbc95d0dd47f3c5bc275da8a33",
+            "0beec7b5ea3f0fdbc95d0dd47f3c5bc275da8a33",
+            "mcp__agent_pool_pool_get",
+            "mcp__agent_pool___pool_get",
+            "mcp__agent_pool__pool_get_",
+            "mcp__AGENT_POOL__pool_get",
+        ] {
+            assert!(!matches(Harness::CODEX, tool), "{tool}");
+        }
+        // A command Codex would itself rewrite or trim has no presented name.
+        for command in ["pool-get", "_pool_get", "pool get", ""] {
+            let mut odd = mapping.clone();
+            odd.commands = vec![command.into()];
+            let normalized = format!("mcp__agent_pool__{}", command.replace(['-', ' '], "_"));
+            assert!(!tool_matches(
+                &odd,
+                Harness::CODEX,
+                "pool",
+                command,
+                &normalized
+            ));
+            assert!(!tool_matches(
+                &odd,
+                Harness::CODEX,
+                "pool",
+                command,
+                &format!("mcp__agent_pool__{command}")
+            ));
+        }
+        // A server segment Codex would trim, elide or split has no name either.
+        for server in ["-pool", "pool-", "agent--pool", "mcp-_pool"] {
+            assert!(managed_tool_name(Harness::CODEX, server, "pool_get").is_none());
+        }
+        let long = "a".repeat(128 - "mcp__agent_pool__".len());
+        assert_eq!(
+            managed_tool_name(Harness::CODEX, "agent-pool", &long).map(|name| name.len()),
+            Some(128)
+        );
+        assert!(managed_tool_name(Harness::CODEX, "agent-pool", &format!("{long}a")).is_none());
     }
 }

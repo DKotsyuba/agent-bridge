@@ -1405,6 +1405,58 @@ fn codex_managed_original_hook() {
     assert_eq!(value(&response)["status"], "ok");
 }
 
+/// Codex presents seg(server) (`agent-pool` as `agent_pool`) and only that
+/// name maps; Claude presents the raw server and only the raw name maps.
+#[test]
+fn hyphenated_server_names_follow_each_harness() {
+    let mut lab = lab();
+    lab.config.managed_tools[0].server = "agent-pool".into();
+    restart(&mut lab);
+    let mut codex = Harnessed::start_with_launch(Harness::CODEX, &lab.codex_store, LAUNCH);
+    let (store, issuer) = discover(&mut codex, &lab);
+    let prepare = |harness: &mut Harnessed, key: &str, native: Value| {
+        let response = call(
+            harness,
+            &lab,
+            request(
+                PRODUCER_TOKEN,
+                key,
+                "prepare_native_context_v1",
+                json!({"version":1,"expected_store_id":store,"expected_issuer_epoch":issuer,"invocation_key":key,"command_name":"vote","native_proof":native}),
+            ),
+            false,
+        );
+        value(&response).clone()
+    };
+    let codex_proof = |call: &str| json!({"type":"native","host":"codex","metadata":{"threadId":"thread","callId":call,"x-codex-turn-metadata":{}}});
+    for (call_id, tool) in [
+        ("codex-raw", "mcp__agent-pool__vote"),
+        ("codex-seg", "mcp__agent_pool__vote"),
+    ] {
+        codex.hook(&lab.socket, Harness::CODEX, json!({"hook_event_name":"PreToolUse","session_id":"thread","tool_use_id":call_id,"tool_name":tool}));
+    }
+    assert_eq!(
+        prepare(&mut codex, "codex-raw", codex_proof("codex-raw"))["error"]["code"],
+        "route_mismatch"
+    );
+    assert_eq!(
+        prepare(&mut codex, "codex-seg", codex_proof("codex-seg"))["status"],
+        "ok"
+    );
+    codex.stop();
+    let mut claude = Harnessed::start_with_launch(Harness::CLAUDE_CODE, &lab.claude_store, LAUNCH);
+    pre(&mut claude, &lab, "claude-seg", "mcp__agent_pool__vote");
+    pre(&mut claude, &lab, "claude-raw", "mcp__agent-pool__vote");
+    assert_eq!(
+        prepare(&mut claude, "claude-seg", proof("claude-seg"))["error"]["code"],
+        "route_mismatch"
+    );
+    assert_eq!(
+        prepare(&mut claude, "claude-raw", proof("claude-raw"))["status"],
+        "ok"
+    );
+}
+
 /// A Claude child sharing the root session cannot become a managed root actor.
 #[test]
 fn claude_child_is_not_managed_root() {

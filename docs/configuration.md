@@ -242,6 +242,14 @@ commands = ["vote"]
 frontend = { path = "/ABS/stdio-frontend", sha256 = "<64 hex>" }
 ```
 
+Commands are `[A-Za-z0-9_]` names that do not start with `_`. Codex presents a
+server as its segment, every character outside `[A-Za-z0-9_]` replaced by `_`
+(`agent-pool` becomes `mcp__agent_pool__vote`); Claude presents the raw server
+(`mcp__agent-pool__vote`), and each harness matches only its own form. Bridge
+refuses a server whose segment is empty, starts or ends with `_` or contains
+`__`, two servers with the same segment, and names over 128 bytes, because Codex
+would rewrite or hash them.
+
 The managed frontend and backend audience may use the same path and build. The
 Run reader and managed owner builds must remain distinct from both. The
 frontend must be a verified stdio descendant of the managed harness; the

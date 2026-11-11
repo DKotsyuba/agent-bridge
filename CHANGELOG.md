@@ -6,6 +6,21 @@ source, and the crates are not published to crates.io.
 
 ## Unreleased
 
+### Changed
+
+- `adapters.managed_tools` now refuses configurations Codex could not present
+  unambiguously: commands outside `[A-Za-z0-9_]` or starting with `_`, server
+  segments that are empty, start or end with `_` or contain `__`, distinct
+  servers or commands with the same normalized name, and names over 128 bytes.
+
+### Fixed
+
+- Match managed attempt-binding calls from Codex by the tool name Codex
+  actually presents, `mcp__<seg(server)>__<command>` with every character of
+  the server outside `[A-Za-z0-9_]` replaced by `_`; a hyphenated server such
+  as `agent-pool` previously never matched. Claude keeps the raw byte-exact
+  name, and neither harness accepts the other's form.
+
 ## [0.7.0] - 2026-11-10
 
 This release adds managed attempt binding (B1/B2), the owner v2 effect
