@@ -69,6 +69,12 @@ lowercase SHA-256. Pass it to every managed call, for example
 `client.attempt_binding_capabilities_v1(id, &pin, params)`. The SDK hashes that
 file and verifies the UID, PID, full kernel incarnation and live executable
 inode of the same connected server before writing any credential or request.
+The server must also have started without any `LD_*` loader variable, have no
+tracer, and run a loaded file whose mount (found by the `/proc/<pid>/exe`
+descriptor's own `mnt_id`) is ext2/3/4, xfs, btrfs or tmpfs; the pin must not
+name a generic interpreter (`python3`, `node`, `bash`, `env` and similar), and
+`/etc/ld.so.preload` must be absent or blank. A server started under a test
+runner that exports `LD_LIBRARY_PATH` is therefore refused.
 Failure returns `AttemptClientError::PeerNotAuthorized`. Managed operations
 are Linux-only, use one exchange without automatic reconnect, and report an
 uncertain mutation for same-key recovery. Their versioned DTOs live in

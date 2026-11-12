@@ -6,6 +6,21 @@ source, and the crates are not published to crates.io.
 
 ## Unreleased
 
+### Security
+
+- The SDK's managed-attempt server proof (`AttemptServerPin`) now matches the
+  peer proofs of Agent Run and Agent Pool (attempt-binding errata E13/E14): it
+  also refuses a server started with any `LD_*` variable or running under a
+  tracer (both checked before and after the proof), a loaded file whose
+  `/proc/<pid>/exe` descriptor `mnt_id` does not resolve to exactly one
+  ext2/3/4, xfs, btrfs or tmpfs mount, a pin naming a generic interpreter, and
+  a non-blank `/etc/ld.so.preload`. Consumers of the pinned SDK methods need
+  this SDK revision; their server must be launched without loader variables.
+- Bridge's proof of digest-pinned managed peers (Run reader, managed frontend,
+  owner v2 Run server) applies the same loader, tracer, interpreter and
+  preload checks. The shared rules live in `bridge_protocol::peer_proof`.
+  Ordinary routes and the managed harness proof are unchanged.
+
 ### Changed
 
 - `cargo xtask check-public` ignores commented-out integration-test module lines and requires `autotests = false` in crates with an `it` binary.

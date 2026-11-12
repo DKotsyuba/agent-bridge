@@ -267,6 +267,14 @@ the configured reader may attest retirement of a fully settled old issuer
 namespace. See the [attempt-binding wire](../crates/bridge-adapters/docs/attempt-binding-v1.md)
 for its recovery, retention and transport boundaries.
 
+On Linux every digest-pinned managed peer (the Run reader, the managed
+frontend and the managed owner v2 `run_executable`) must, besides its pinned
+build on a write-excluding mount, have started without any `LD_*` variable in
+its initial environment and have no tracer (checked before and after the
+proof), its configured path must not name a generic interpreter (`python3`,
+`node`, `bash`, `env` and similar), and `/etc/ld.so.preload` must be absent or
+blank. Launch these peers with a clean loader environment.
+
 No store path and no harness executable is declared. A hook counts as a hook of a harness
 only when its parent chain reaches a process of that harness product (through the
 allowlisted `intermediates`, as the same user) for a harness kind that has a policy. That
