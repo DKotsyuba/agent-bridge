@@ -148,9 +148,33 @@ pub fn check(root: &Path) -> Result<Vec<Finding>, String> {
         ));
     }
     release_rules(root, &mut findings);
+    integration_tests_included(root, &files, &mut findings);
     findings.sort_by(|a, b| (&a.path, a.line, &a.message).cmp(&(&b.path, b.line, &b.message)));
     findings.dedup();
     Ok(findings)
+}
+
+/// Each crate builds its integration tests as one `tests/it/main.rs` binary with
+/// `autotests = false`, so a `tests/*.rs` file that is not a module there would
+/// silently never compile or run.
+fn integration_tests_included(root: &Path, files: &[String], findings: &mut Vec<Finding>) {
+    for path in files {
+        let Some((tests, name)) = path.rsplit_once('/') else {
+            continue;
+        };
+        if !(tests == "tests" || tests.ends_with("/tests")) || !name.ends_with(".rs") {
+            continue;
+        }
+        let index =
+            std::fs::read_to_string(root.join(tests).join("it/main.rs")).unwrap_or_default();
+        if !index.contains(&format!("\"../{name}\"")) {
+            findings.push(found(
+                path,
+                0,
+                "integration-test file is not a module of tests/it/main.rs",
+            ));
+        }
+    }
 }
 
 /// Lists every regular file below `root` as sorted `/`-separated relative

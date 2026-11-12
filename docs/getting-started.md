@@ -42,7 +42,7 @@ never substitute an unconfining executable. A missing native owner holds deliver
 rustup toolchain install 1.98.1 --profile minimal -c rustfmt -c clippy
 cargo +1.98.1 fetch --locked                     # the only step that uses the network
 export TMPDIR="$HOME/.agent-bridge-tmp" TMP="$HOME/.agent-bridge-tmp" TEMP="$HOME/.agent-bridge-tmp" && mkdir -p -m 700 "$TMPDIR"
-BRIDGE_TEST_NODE="$(command -v node)" cargo +1.98.1 test --offline --workspace
+BRIDGE_TEST_NODE="$(command -v node)" cargo +1.98.1 nextest run --offline --workspace && cargo +1.98.1 test --offline --workspace --doc --no-fail-fast
 ```
 
 The tests use synthetic state only (temporary databases, private sockets, fixture

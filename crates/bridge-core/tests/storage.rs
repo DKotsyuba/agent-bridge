@@ -354,7 +354,7 @@ fn fault_kill_during_commit_recovers_on_reopen() {
     drop(Storage::open(&db, Limits::new(100)).unwrap());
     let child = Command::new(std::env::current_exe().unwrap())
         .args([
-            "fault_kill_during_commit_recovers_on_reopen",
+            exact_test("fault_kill_during_commit_recovers_on_reopen").as_str(),
             "--exact",
             "--nocapture",
         ])
@@ -410,4 +410,13 @@ fn frozen_recipient_allows_only_exact_replays() {
             .receipt
             .replayed
     );
+}
+
+/// Exact libtest name of a test defined in this module: integration tests run as
+/// modules of the crate's single `it` binary, so the name carries the module path.
+fn exact_test(name: &str) -> String {
+    match module_path!().split_once("::") {
+        Some((_, module)) => format!("{module}::{name}"),
+        None => name.to_owned(),
+    }
 }

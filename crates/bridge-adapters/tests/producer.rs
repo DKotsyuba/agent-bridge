@@ -1,6 +1,6 @@
 //! Universal native-provider boundary tests over owned kernel processes and
 //! the actual core SQLite store. No consumer code or installed session is used.
-mod common;
+use crate::common;
 
 use bridge_adapters::registry::{BackendAudience, RelayExecutable};
 use bridge_adapters::server::{ChannelServer, Custody};

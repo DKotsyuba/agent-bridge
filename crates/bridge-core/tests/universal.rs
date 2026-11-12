@@ -1,6 +1,6 @@
 //! Real isolated SQLite/socket controls for generic unknown producers. No
 //! consumer source, installed daemon or real native session is touched.
-mod common;
+use crate::common;
 use bridge_core::dispatch::{DispatchTiming, EffectiveMode, Lifecycle, Outcome, Selection};
 use bridge_core::service::GrantConfig;
 use bridge_core::{

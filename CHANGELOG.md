@@ -6,6 +6,10 @@ source, and the crates are not published to crates.io.
 
 ## Unreleased
 
+### Changed
+
+- Tests follow the Rust gate standard: CI runs them under cargo-nextest (installed from the checksum-verified 0.9.149 release archive) with every failure reported, plus doctests via `cargo test --doc`; each crate builds its integration tests as one `tests/it/main.rs` binary and `cargo xtask check-public` rejects a `tests/*.rs` file missing there. Self re-running tests pass module-qualified `--exact` names. Test temporaries stay in a short owned disk directory (trusted-path checks reject tmpfs parents).
+
 ## [0.7.1] - 2026-11-11
 
 This release fixes Codex managed tool-name matching and tightens the

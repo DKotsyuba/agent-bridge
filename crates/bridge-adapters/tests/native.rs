@@ -6,7 +6,7 @@
 //! the trust boundaries and the evidence each carrier records; they do
 //! not establish delivery to, or context in, a real model.
 
-mod common;
+use crate::common;
 
 use std::os::unix::fs::DirBuilderExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5151,7 +5151,7 @@ fn fixture_harness_environment_is_isolated() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "fixture_harness_environment_is_isolated",
+                exact_test("fixture_harness_environment_is_isolated").as_str(),
                 "--nocapture",
             ])
             .env("BRIDGE_FIXTURE_ENV_CONTROL", "child")
@@ -5217,4 +5217,13 @@ fn fixture_harness_environment_is_isolated() {
             .is_some_and(|value| value == "/ABS/synthetic-explicit-owner.sock")
     );
     explicit.stop();
+}
+
+/// Exact libtest name of a test defined in this module: integration tests run as
+/// modules of the crate's single `it` binary, so the name carries the module path.
+fn exact_test(name: &str) -> String {
+    match module_path!().split_once("::") {
+        Some((_, module)) => format!("{module}::{name}"),
+        None => name.to_owned(),
+    }
 }

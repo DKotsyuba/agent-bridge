@@ -6,7 +6,7 @@
 //! All state is isolated synthetic fixtures; no real session, adapter or
 //! credential is touched.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

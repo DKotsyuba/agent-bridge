@@ -1,5 +1,5 @@
 //! Synthetic regressions for bounded native sends and nonrecursive sender reports.
-mod common;
+use crate::common;
 
 use bridge_core::dispatch::{
     AttemptFence, DispatchTiming, EffectiveMode, Invoked, Lifecycle, Outcome, Selection,

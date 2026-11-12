@@ -2,7 +2,7 @@
 //! hot rollback to committed content before supported-schema fencing.
 
 /// Shared isolated event and temporary-path fixtures, with no installed state.
-mod common;
+use crate::common;
 
 use bridge_core::{Limits, Storage};
 use common::TempDir;
@@ -86,7 +86,7 @@ fn crash_fixture(path: &Path, mode: &str, foreign: bool) {
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "unsupported_crash_child",
+            exact_test("unsupported_crash_child").as_str(),
             "--ignored",
             "--nocapture",
         ])
@@ -293,5 +293,14 @@ fn supported_crash_restart_preserves_custody_and_migrates() {
             "normal close checkpoint policy is restored on success"
         );
         assert!(!path.with_extension("db-shm").exists());
+    }
+}
+
+/// Exact libtest name of a test defined in this module: integration tests run as
+/// modules of the crate's single `it` binary, so the name carries the module path.
+fn exact_test(name: &str) -> String {
+    match module_path!().split_once("::") {
+        Some((_, module)) => format!("{module}::{name}"),
+        None => name.to_owned(),
     }
 }

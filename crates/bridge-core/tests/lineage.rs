@@ -7,7 +7,7 @@
 //! All state is isolated synthetic fixtures; publishers authenticate
 //! through fixture grants, never through event metadata.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

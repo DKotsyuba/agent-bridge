@@ -3,8 +3,6 @@
 //! faults were reproduced (canonical decode, direct deserialization,
 //! storage admission), not just constructors.
 
-mod common;
-
 use bridge_core::{
     Envelope, EventId, ExpiresAt, Harness, Kind, Limits, MAX_SQLITE_INT, Metadata, Mode,
     NativeAddress, Payload, Policy, PublisherId, Storage, StreamId,

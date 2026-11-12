@@ -1,7 +1,7 @@
 //! Hook-token caller proof over real processes: the real channel, the real
 //! `bridge-hook` and the registry, with a profile-only stand-in harness.
 
-mod common;
+use crate::common;
 
 use bridge_core::Harness;
 use common::*;

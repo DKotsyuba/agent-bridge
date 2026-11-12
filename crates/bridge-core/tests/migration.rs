@@ -7,7 +7,7 @@
 //! attempt that may have reached a carrier must never become dispatchable;
 //! a refused or failed migration must leave the file untouched.
 
-mod common;
+use crate::common;
 
 use bridge_core::dispatch::{DispatchTiming, EffectiveMode, Lifecycle, Selection};
 use bridge_core::recovery::{DeliveryState, IncidentState};

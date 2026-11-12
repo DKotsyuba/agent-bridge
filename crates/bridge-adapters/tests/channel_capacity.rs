@@ -3,7 +3,7 @@
 //! client nothing ran; a refused request can be repeated and succeeds. Real
 //! sockets, the real registry, and a real `bridge-hook` for the recovery case.
 #![cfg(target_os = "linux")]
-mod common;
+use crate::common;
 
 use bridge_adapters::client::{ChannelClient, HookRun};
 use bridge_adapters::server::{ChannelServer, Custody};

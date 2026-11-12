@@ -1,6 +1,6 @@
 //! B1 protected-channel tests using only owned same-UID fixture processes.
 #![cfg(target_os = "linux")]
-mod common;
+use crate::common;
 
 use bridge_adapters::registry::{
     BackendAudience, ManagedTools, Registry, RelayExecutable, RunReader, file_sha256,
@@ -1686,7 +1686,7 @@ fn sdk_b1_client_against_protected_server() {
         let output = std::process::Command::new(&executable)
             .args([
                 "--exact",
-                "sdk_b1_client_against_protected_server",
+                exact_test("sdk_b1_client_against_protected_server").as_str(),
                 "--nocapture",
             ])
             .env("BRIDGE_SDK_B1_PARENT", "1")
@@ -1947,7 +1947,7 @@ fn sdk_b1_client_against_protected_server() {
     let mut child = std::process::Command::new(&reader_exe)
         .args([
             "--exact",
-            "sdk_b1_client_against_protected_server",
+            exact_test("sdk_b1_client_against_protected_server").as_str(),
             "--nocapture",
         ])
         .env("BRIDGE_SDK_B1_CHILD", "1")
@@ -1990,7 +1990,7 @@ fn sdk_pinned_scope_retirement_against_owned_core() {
         let output = std::process::Command::new(&executable)
             .args([
                 "--exact",
-                "sdk_pinned_scope_retirement_against_owned_core",
+                exact_test("sdk_pinned_scope_retirement_against_owned_core").as_str(),
                 "--nocapture",
             ])
             .env("BRIDGE_PINNED_RETIRE_CHILD", "1")
@@ -3182,4 +3182,13 @@ fn missing_root_capture_with_failed_route_commit_never_repairs() {
         value(&call(&mut valid, &lab, prepare, false))["status"],
         "ok"
     );
+}
+
+/// Exact libtest name of a test defined in this module: integration tests run as
+/// modules of the crate's single `it` binary, so the name carries the module path.
+fn exact_test(name: &str) -> String {
+    match module_path!().split_once("::") {
+        Some((_, module)) => format!("{module}::{name}"),
+        None => name.to_owned(),
+    }
 }

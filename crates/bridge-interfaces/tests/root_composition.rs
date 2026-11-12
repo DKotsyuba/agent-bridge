@@ -78,7 +78,7 @@ fn harness_loop() {
                 let mut child = Command::new(std::env::current_exe().unwrap())
                     .args([
                         "--exact",
-                        "role_entry",
+                        exact_test("role_entry").as_str(),
                         "--nocapture",
                         "--test-threads",
                         "1",
@@ -203,7 +203,7 @@ impl Harnessed {
         let mut child = Command::new(executable)
             .args([
                 "--exact",
-                "role_entry",
+                exact_test("role_entry").as_str(),
                 "--nocapture",
                 "--test-threads",
                 "1",
@@ -1445,4 +1445,13 @@ fn bounded_root_delivery_uses_attested_sender_and_retains_status_report() {
         foreign["structuredContent"]["custody"]["state"],
         "not_found"
     );
+}
+
+/// Exact libtest name of a test defined in this module: integration tests run as
+/// modules of the crate's single `it` binary, so the name carries the module path.
+fn exact_test(name: &str) -> String {
+    match module_path!().split_once("::") {
+        Some((_, module)) => format!("{module}::{name}"),
+        None => name.to_owned(),
+    }
 }

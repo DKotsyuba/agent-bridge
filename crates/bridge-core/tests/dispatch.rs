@@ -5,7 +5,7 @@
 //! All carriers are synthetic; all state is isolated (fresh temporary
 //! databases or in-memory stores). No native host is touched.
 
-mod common;
+use crate::common;
 
 use std::sync::{Arc, Barrier, Mutex};
 

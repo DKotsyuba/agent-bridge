@@ -1,5 +1,5 @@
 //! Synthetic durable owner effect custody, including migration and restart.
-mod common;
+use crate::common;
 
 use bridge_core::{
     Limits, Storage,

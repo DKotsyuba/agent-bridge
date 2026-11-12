@@ -62,7 +62,7 @@ build toolchain for a candidate build) and
 ```sh
 rustup toolchain install 1.98.1 --profile minimal -c rustfmt -c clippy
 cargo +1.98.1 fetch --locked
-BRIDGE_TEST_NODE="$(command -v node)" cargo +1.98.1 test --offline --workspace
+BRIDGE_TEST_NODE="$(command -v node)" cargo +1.98.1 nextest run --offline --workspace && cargo +1.98.1 test --offline --workspace --doc --no-fail-fast
 cargo +1.98.1 xtask package          # prints the bundle manifest and sums_sha256
 ```
 
@@ -103,7 +103,7 @@ write private configuration, install the hooks and send a first message.
 ```sh
 cargo +1.98.1 fmt --all --check
 cargo +1.98.1 clippy --offline --workspace --all-targets -- -D warnings
-BRIDGE_TEST_NODE="$(command -v node)" cargo +1.98.1 test --offline --workspace
+BRIDGE_TEST_NODE="$(command -v node)" cargo +1.98.1 nextest run --offline --workspace && cargo +1.98.1 test --offline --workspace --doc --no-fail-fast
 RUSTDOCFLAGS="-D warnings" cargo +1.98.1 doc --offline --workspace --no-deps --document-private-items
 cargo +1.98.1 xtask check-public
 ```

@@ -6,7 +6,7 @@
 //! route's fences and outcome mapping; they do not establish a native turn or
 //! context in a real model.
 
-mod common;
+use crate::common;
 
 use std::io::Read;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};

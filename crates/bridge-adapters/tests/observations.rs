@@ -1,5 +1,5 @@
 //! Exact read-grant controls over owned synthetic native processes and sockets.
-mod common;
+use crate::common;
 use bridge_core::{GrantConfig, Harness, ProducerAuthorizer};
 use bridge_protocol::*;
 use common::*;

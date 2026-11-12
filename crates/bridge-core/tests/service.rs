@@ -4,7 +4,7 @@
 //! All state is isolated: fresh temporary directories for the database and
 //! socket; the binary test spawns its own daemon on a private socket.
 
-mod common;
+use crate::common;
 
 use std::time::{Duration, Instant};
 

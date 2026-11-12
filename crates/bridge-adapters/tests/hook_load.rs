@@ -8,7 +8,7 @@
 //! timeout or a refusal, and every session must end up bound. The latency
 //! distribution is reported, never asserted as a hard threshold.
 #![cfg(target_os = "linux")]
-mod common;
+use crate::common;
 
 use bridge_adapters::registry::{ManagedTools, Registry, RelayExecutable, file_sha256};
 use bridge_adapters::server::{ChannelServer, Custody, private_directory};

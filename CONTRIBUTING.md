@@ -26,7 +26,7 @@ dependencies once; later commands run offline against `Cargo.lock`.
 cargo +1.98.1 fetch --locked
 cargo +1.98.1 fmt --all --check
 cargo +1.98.1 clippy --offline --workspace --all-targets -- -D warnings
-BRIDGE_TEST_NODE="$(command -v node)" cargo +1.98.1 test --offline --workspace
+BRIDGE_TEST_NODE="$(command -v node)" cargo +1.98.1 nextest run --offline --workspace && cargo +1.98.1 test --offline --workspace --doc --no-fail-fast
 RUSTDOCFLAGS="-D warnings" cargo +1.98.1 doc --offline --workspace --no-deps --document-private-items
 cargo +1.98.1 xtask check-public
 ```

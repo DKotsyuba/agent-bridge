@@ -7,7 +7,7 @@
 //! sockets, a daemon binary spawned on its own socket. No real session,
 //! installed application or credential is touched.
 
-mod common;
+use crate::common;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};

@@ -1,5 +1,5 @@
 //! Exact process/IPC tests of the native MCP context transport; synthetic data only.
-mod common;
+use crate::common;
 use common::{TempDir, fixture_exe, hook_exe};
 use serde_json::{Value, json};
 use std::{
