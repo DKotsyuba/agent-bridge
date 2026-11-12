@@ -1,9 +1,19 @@
-//! Linux same-connection managed-server process and loaded-build verification.
+//! Linux same-connection managed-server process and loaded-build verification
+//! (attempt-binding errata E13/E14), to the level Agent Run and Agent Pool
+//! prove their own peers.
 //!
 //! All procfs reads are bounded; any unavailable fact refuses before the SDK
 //! writes credentials. This uses the kernel executable inode, never argv labels.
+//! Besides the pinned digest, owner/mode and full kernel incarnation, the
+//! connected server must have started without any `LD_*` loader variable, have
+//! no tracer (both checked before and after the executable proof), and its
+//! loaded file must lie on a write-excluding filesystem resolved through the
+//! `/proc/PID/exe` descriptor's own `mnt_id`; the pin must not name a generic
+//! interpreter and `/etc/ld.so.preload` must be absent or blank
+//! ([`bridge_protocol::peer_proof`]).
 
 use crate::AttemptServerPin;
+use bridge_protocol::peer_proof;
 use std::{
     io::{self, Read},
     os::unix::fs::MetadataExt,
@@ -167,7 +177,10 @@ pub(crate) fn prepare(uid: u32, pin: &AttemptServerPin, deadline: Instant) -> io
     /// Small process-local cache; every use still checks the full live FileKey.
     static CACHE: OnceLock<Mutex<std::collections::HashMap<FileKey, String>>> = OnceLock::new();
     let invalid = || io::Error::other("server identity not authorized");
-    if pin.executable.canonicalize().ok().as_deref() != Some(pin.executable.as_path()) {
+    if pin.executable.canonicalize().ok().as_deref() != Some(pin.executable.as_path())
+        || peer_proof::forbidden_interpreter(&pin.executable)
+        || !peer_proof::loader_preload_safe()
+    {
         return Err(invalid());
     }
     let expected = std::fs::metadata(&pin.executable)?;
@@ -179,7 +192,7 @@ pub(crate) fn prepare(uid: u32, pin: &AttemptServerPin, deadline: Instant) -> io
     }
     let file = std::fs::File::open(&pin.executable)?;
     let opened = file.metadata()?;
-    if file_key(&opened) != file_key(&expected) {
+    if file_key(&opened) != file_key(&expected) || !peer_proof::write_excluded(&file) {
         return Err(invalid());
     }
     let key = file_key(&opened);
@@ -218,6 +231,13 @@ pub(crate) fn prepare(uid: u32, pin: &AttemptServerPin, deadline: Instant) -> io
 /// Proves the same connected peer's live executable is exactly the previously
 /// hashed file; full kernel and file identities must remain equal around the
 /// check. The PID and UID come from the very socket that receives the request.
+///
+/// The peer must also carry no `LD_*` variable in its initial environment and
+/// have no tracer, both before and after the file checks; the descriptor opened
+/// through `/proc/PID/exe` must have the hashed file's full identity (so its
+/// owner and mode are the ones `prepare` accepted) and lie on a write-excluding
+/// filesystem by its own `mnt_id`, so the hashed bytes are the bytes it runs;
+/// and `/etc/ld.so.preload` must stay absent or blank throughout.
 pub(crate) fn verify(
     pid: u32,
     uid: u32,
@@ -228,20 +248,38 @@ pub(crate) fn verify(
 ) -> io::Result<()> {
     let invalid = || io::Error::other("server identity not authorized");
     let root = Path::new("/proc");
+    if !peer_proof::loader_preload_safe() || peer_proof::forbidden_interpreter(&pin.executable) {
+        return Err(invalid());
+    }
     let before = incarnation(root, pid, uid)?;
+    if before.start_ticks > before_connect_ticks || !peer_proof::clean_process(pid) {
+        return Err(invalid());
+    }
     let process_exe: PathBuf = root.join(pid.to_string()).join("exe");
-    if before.start_ticks > before_connect_ticks
-        || Instant::now() >= deadline
-        || std::fs::read_link(&process_exe).ok().as_deref() != Some(pin.executable.as_path())
-        || std::fs::File::open(&process_exe)?
+    if std::fs::read_link(&process_exe).ok().as_deref() != Some(pin.executable.as_path()) {
+        return Err(invalid());
+    }
+    let loaded = std::fs::File::open(&process_exe)?;
+    if Instant::now() >= deadline
+        || loaded
             .metadata()
             .ok()
             .is_none_or(|meta| file_key(&meta) != expected)
+        || !peer_proof::write_excluded(&loaded)
         || std::fs::metadata(&pin.executable)
             .ok()
             .is_none_or(|meta| file_key(&meta) != expected)
         || pin.executable.canonicalize().ok().as_deref() != Some(pin.executable.as_path())
         || std::fs::read_link(&process_exe).ok().as_deref() != Some(pin.executable.as_path())
+        || std::fs::metadata(&process_exe)
+            .ok()
+            .is_none_or(|meta| file_key(&meta) != expected)
+        || loaded
+            .metadata()
+            .ok()
+            .is_none_or(|meta| file_key(&meta) != expected)
+        || !peer_proof::clean_process(pid)
+        || !peer_proof::loader_preload_safe()
         || incarnation(root, pid, uid)? != before
     {
         return Err(invalid());
@@ -252,32 +290,73 @@ pub(crate) fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::{Command, Stdio};
 
-    /// A peer born after the supplied pre-connect bound is refused, while the
-    /// same executable and full incarnation pass a current kernel sample.
-    #[test]
-    fn peer_birth_must_not_follow_the_preconnect_sample() {
-        /// Reaps the synthetic peer even if an assertion fails.
-        struct ChildGuard(std::process::Child);
-        impl Drop for ChildGuard {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
+    /// Reaps a synthetic peer even if an assertion fails.
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
         }
-        let uid = std::fs::metadata("/proc/self").unwrap().uid();
-        let executable = PathBuf::from("/usr/bin/sleep").canonicalize().unwrap();
-        let child = ChildGuard(
-            std::process::Command::new(&executable)
-                .arg("20")
+    }
+
+    /// Spawns `program args` with exactly `env` (no inherited test-runner
+    /// variables such as nextest's `LD_LIBRARY_PATH`).
+    fn spawn(program: &Path, args: &[&str], env: &[(&str, &str)]) -> ChildGuard {
+        ChildGuard(
+            Command::new(program)
+                .args(args)
+                .env_clear()
+                .envs(env.iter().copied())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .spawn()
                 .unwrap(),
-        );
-        let pid = child.0.id();
-        let current = incarnation(Path::new("/proc"), pid, uid).unwrap();
+        )
+    }
+
+    /// Waits until `pid` has run `exec` into `executable`.
+    fn exec_into(pid: u32, executable: &Path) {
+        let until = Instant::now() + std::time::Duration::from_secs(10);
+        while std::fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .as_deref()
+            != Some(executable)
+        {
+            assert!(Instant::now() < until, "fixture did not exec");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// A pinned system executable, its digest pin and the current UID.
+    fn sleep_pin() -> (u32, AttemptServerPin) {
+        let uid = std::fs::metadata("/proc/self").unwrap().uid();
+        let executable = PathBuf::from("/usr/bin/sleep").canonicalize().unwrap();
         let digest =
             bridge_protocol::sha256_reader(&mut std::fs::File::open(&executable).unwrap()).unwrap();
-        let pin = AttemptServerPin::new(executable, digest).unwrap();
+        (uid, AttemptServerPin::new(executable, digest).unwrap())
+    }
+
+    /// Proves `pid` against `pin` with a fresh pre-connect sample.
+    fn proves(pid: u32, uid: u32, pin: &AttemptServerPin) -> bool {
+        let deadline = Instant::now() + std::time::Duration::from_secs(20);
+        prepare(uid, pin, deadline)
+            .and_then(|key| verify(pid, uid, pin, key, sample_start_ticks()?, deadline))
+            .is_ok()
+    }
+
+    /// A peer born after the supplied pre-connect bound is refused, while the
+    /// same executable and full incarnation pass a current kernel sample; a
+    /// pin with another digest never prepares.
+    #[test]
+    fn peer_birth_must_not_follow_the_preconnect_sample() {
+        let (uid, pin) = sleep_pin();
+        let child = spawn(&pin.executable, &["20"], &[]);
+        let pid = child.0.id();
+        exec_into(pid, &pin.executable);
+        let current = incarnation(Path::new("/proc"), pid, uid).unwrap();
         let deadline = Instant::now() + std::time::Duration::from_secs(20);
         let key = prepare(uid, &pin, deadline).unwrap();
         assert!(verify(pid, uid, &pin, key, current.start_ticks - 1, deadline).is_err());
@@ -285,5 +364,87 @@ mod tests {
         assert_eq!(prepare(uid, &pin, deadline).unwrap(), key);
         let wrong = AttemptServerPin::new(pin.executable.clone(), "a".repeat(64)).unwrap();
         assert!(prepare(uid, &wrong, deadline).is_err());
+        assert!(!proves(pid, uid, &wrong), "wrong digest");
+    }
+
+    /// A genuine pinned server started with any dynamic-loader variable is
+    /// refused; the same build started cleanly is accepted.
+    #[test]
+    fn loader_environment_is_refused() {
+        let (uid, pin) = sleep_pin();
+        let clean = spawn(&pin.executable, &["20"], &[("PATH", "/usr/bin:/bin")]);
+        exec_into(clean.0.id(), &pin.executable);
+        assert!(proves(clean.0.id(), uid, &pin), "clean peer");
+        for variable in [
+            ("LD_PRELOAD", "/nonexistent/synthetic-preload.so"),
+            ("LD_LIBRARY_PATH", "/nonexistent"),
+            ("LD_AUDIT", "/nonexistent/synthetic-audit.so"),
+        ] {
+            let loaded = spawn(&pin.executable, &["20"], &[variable]);
+            exec_into(loaded.0.id(), &pin.executable);
+            assert!(!proves(loaded.0.id(), uid, &pin), "{}", variable.0);
+        }
+    }
+
+    /// A genuine pinned server running under a tracer is refused. strace is
+    /// optional host tooling; the `TracerPid` parser is covered by
+    /// `bridge_protocol::peer_proof` unit tests either way.
+    #[test]
+    fn traced_peer_is_refused() {
+        let strace = Path::new("/usr/bin/strace");
+        if !strace.is_file() {
+            eprintln!("traced-peer case not run: /usr/bin/strace is absent");
+            return;
+        }
+        let (uid, pin) = sleep_pin();
+        let program = pin.executable.to_str().unwrap();
+        let tracer = spawn(
+            strace,
+            &["-qq", "-o", "/dev/null", "--", program, "20"],
+            &[],
+        );
+        let children = format!("/proc/{0}/task/{0}/children", tracer.0.id());
+        let until = Instant::now() + std::time::Duration::from_secs(10);
+        let traced = loop {
+            let pid = std::fs::read_to_string(&children)
+                .ok()
+                .and_then(|list| list.split_ascii_whitespace().next()?.parse::<u32>().ok());
+            if let Some(pid) = pid.filter(|pid| {
+                std::fs::read_link(format!("/proc/{pid}/exe"))
+                    .ok()
+                    .as_deref()
+                    == Some(pin.executable.as_path())
+            }) {
+                break pid;
+            }
+            assert!(Instant::now() < until, "traced fixture did not start");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let status = std::fs::read_to_string(format!("/proc/{traced}/status")).unwrap();
+        assert!(!status.contains("TracerPid:\t0\n"), "fixture is traced");
+        assert!(!proves(traced, uid, &pin));
+    }
+
+    /// A pin naming a generic interpreter is refused even with the right
+    /// digest of the very file the peer runs.
+    #[test]
+    fn interpreter_pin_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let (uid, system) = sleep_pin();
+        let parent = std::env::var_os("TMPDIR").map_or_else(std::env::temp_dir, PathBuf::from);
+        let directory = parent
+            .canonicalize()
+            .unwrap()
+            .join(format!("sdk-peer-interpreter-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let interpreter = directory.join("python3");
+        std::fs::copy(&system.executable, &interpreter).unwrap();
+        std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pin = AttemptServerPin::new(&interpreter, system.sha256.clone()).unwrap();
+        let named = spawn(&interpreter, &["20"], &[]);
+        exec_into(named.0.id(), &interpreter);
+        assert!(!proves(named.0.id(), uid, &pin));
+        drop(named);
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 }

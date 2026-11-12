@@ -4,6 +4,7 @@ pub mod attempt;
 mod dto;
 mod fingerprint;
 pub mod managed_owner;
+pub mod peer_proof;
 mod validate;
 mod values;
 mod wire;

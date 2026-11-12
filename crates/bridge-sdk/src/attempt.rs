@@ -928,6 +928,16 @@ mod tests {
         }
     }
 
+    /// Removes every inherited dynamic-loader (`LD_*`) variable from `command`.
+    fn without_loader_environment(command: &mut std::process::Command) {
+        use std::os::unix::ffi::OsStrExt;
+        for (key, _) in std::env::vars_os() {
+            if key.as_bytes().starts_with(b"LD_") {
+                command.env_remove(key);
+            }
+        }
+    }
+
     /// Starts one same-UID server child from a distinct trusted executable copy.
     fn mock(answer: Option<String>) -> (Client, MockServer) {
         mock_case(answer, false)
@@ -964,6 +974,9 @@ mod tests {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
+        // Test runners such as nextest export `LD_LIBRARY_PATH`; the peer proof
+        // correctly refuses a server started with any loader variable.
+        without_loader_environment(&mut command);
         if let Some(answer) = answer {
             command.env("BRIDGE_SDK_MOCK_ANSWER", answer);
         } else {
