@@ -155,8 +155,9 @@ pub fn check(root: &Path) -> Result<Vec<Finding>, String> {
 }
 
 /// Each crate builds its integration tests as one `tests/it/main.rs` binary with
-/// `autotests = false`, so a `tests/*.rs` file that is not a module there would
-/// silently never compile or run.
+/// `autotests = false`, so a `tests/*.rs` file that is not a module there (a
+/// commented-out line does not count) would silently never compile or run, and a
+/// crate without `autotests = false` would build each file separately again.
 fn integration_tests_included(root: &Path, files: &[String], findings: &mut Vec<Finding>) {
     for path in files {
         let Some((tests, name)) = path.rsplit_once('/') else {
@@ -167,7 +168,19 @@ fn integration_tests_included(root: &Path, files: &[String], findings: &mut Vec<
         }
         let index =
             std::fs::read_to_string(root.join(tests).join("it/main.rs")).unwrap_or_default();
-        if !index.contains(&format!("\"../{name}\"")) {
+        let package = tests.strip_suffix("tests").unwrap_or_default();
+        let manifest = format!("{package}Cargo.toml");
+        let autotests_off = std::fs::read_to_string(root.join(&manifest))
+            .is_ok_and(|text| text.lines().any(|line| line.trim() == "autotests = false"));
+        if !autotests_off {
+            findings.push(found(
+                &manifest,
+                0,
+                "crate with integration tests must set autotests = false",
+            ));
+        }
+        let wanted = format!("#[path = \"../{name}\"]");
+        if !index.lines().any(|line| line.trim() == wanted) {
             findings.push(found(
                 path,
                 0,

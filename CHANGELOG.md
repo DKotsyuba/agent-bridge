@@ -8,6 +8,8 @@ source, and the crates are not published to crates.io.
 
 ### Changed
 
+- `cargo xtask check-public` ignores commented-out integration-test module lines and requires `autotests = false` in crates with an `it` binary.
+- CI installs cargo-nextest into a runner-owned directory added to `PATH` (macOS runners lack `~/.cargo/bin`).
 - Tests follow the Rust gate standard: CI runs them under cargo-nextest (installed from the checksum-verified 0.9.149 release archive) with every failure reported, plus doctests via `cargo test --doc`; each crate builds its integration tests as one `tests/it/main.rs` binary and `cargo xtask check-public` rejects a `tests/*.rs` file missing there. Self re-running tests pass module-qualified `--exact` names. Test temporaries stay in a short owned disk directory (trusted-path checks reject tmpfs parents).
 
 ## [0.7.1] - 2026-11-11
