@@ -309,6 +309,21 @@ impl Lab {
     }
 }
 
+/// A command for `program` without any inherited dynamic-loader (`LD_*`)
+/// variable. Test runners such as nextest export `LD_LIBRARY_PATH`, and the
+/// managed and SDK peer proofs correctly refuse a peer started with any loader
+/// variable, so every owned fixture process starts without them.
+pub fn loader_free_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    use std::os::unix::ffi::OsStrExt;
+    let mut command = Command::new(program);
+    for (key, _) in std::env::vars_os() {
+        if key.as_bytes().starts_with(b"LD_") {
+            command.env_remove(key);
+        }
+    }
+    command
+}
+
 /// A running owned fixture harness process.
 pub struct Harnessed {
     /// The process.
@@ -323,7 +338,7 @@ impl Harnessed {
     /// Starts a distinct owned synthetic Run recovery endpoint in an existing
     /// private directory after the previous socket path has been removed.
     pub fn start_receipt_only(executable: &Path, directory: &Path) -> Harnessed {
-        let mut child = Command::new(executable)
+        let mut child = loader_free_command(executable)
             .arg("receipt-only")
             .arg(directory)
             .env_remove("AGENT_RUN_LAUNCH_ID")
@@ -362,7 +377,7 @@ impl Harnessed {
     /// native-owner locators are removed so this fixture cannot probe a live owner.
     pub fn start_unmarked(copy: &Path, store: &Path) -> Harnessed {
         std::fs::copy(fixture_exe(), copy).unwrap();
-        let mut child = Command::new(copy)
+        let mut child = loader_free_command(copy)
             .arg("harness")
             .env("HOME", "/nonexistent-bridge-test-home")
             .env("CLAUDE_CONFIG_DIR", store)
@@ -465,7 +480,7 @@ impl Harnessed {
         } else {
             store.to_path_buf()
         };
-        let mut command = Command::new(owner_exe);
+        let mut command = loader_free_command(owner_exe);
         command
             .arg("owner")
             .arg(directory)
@@ -525,7 +540,7 @@ impl Harnessed {
     /// Starts one owned harness with two valid synthetic product stores so
     /// overlapping executable markers do not invent frontend role ambiguity.
     pub fn start_with_dual_stores(claude: &Path, codex: &Path, launch: &str) -> Harnessed {
-        let mut child = Command::new(fixture_exe())
+        let mut child = loader_free_command(fixture_exe())
             .arg("harness")
             .env("HOME", "/nonexistent-bridge-test-home")
             .env("CLAUDE_CONFIG_DIR", claude)
@@ -574,7 +589,7 @@ impl Harnessed {
         } else {
             store.to_path_buf()
         };
-        let mut command = Command::new(exe);
+        let mut command = loader_free_command(exe);
         command
             .arg("harness")
             // No default store exists for the other product: only the store
@@ -721,7 +736,7 @@ pub fn relay_redeem(socket: &Path, proof: &str) -> Value {
 
 /// Like [`relay_redeem`] but the relay process runs from the executable `exe`.
 pub fn relay_redeem_from(exe: &Path, socket: &Path, proof: &str) -> Value {
-    let mut child = Command::new(exe)
+    let mut child = loader_free_command(exe)
         .arg("relay")
         .arg(socket)
         .stdin(Stdio::piped())

@@ -1683,7 +1683,7 @@ fn sdk_b1_client_against_protected_server() {
         let executable = directory.0.join("server-test");
         std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let output = std::process::Command::new(&executable)
+        let output = common::loader_free_command(&executable)
             .args([
                 "--exact",
                 exact_test("sdk_b1_client_against_protected_server").as_str(),
@@ -1944,7 +1944,7 @@ fn sdk_b1_client_against_protected_server() {
     while i64::try_from(now() / 1000).unwrap() <= written {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let mut child = std::process::Command::new(&reader_exe)
+    let mut child = common::loader_free_command(&reader_exe)
         .args([
             "--exact",
             exact_test("sdk_b1_client_against_protected_server").as_str(),
@@ -1987,7 +1987,7 @@ fn sdk_pinned_scope_retirement_against_owned_core() {
         let executable = dir.0.join("owned-core-test");
         std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let output = std::process::Command::new(&executable)
+        let output = common::loader_free_command(&executable)
             .args([
                 "--exact",
                 exact_test("sdk_pinned_scope_retirement_against_owned_core").as_str(),

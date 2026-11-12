@@ -3505,15 +3505,46 @@ impl Registry {
         self.verify_loaded_for(os::loaded::Route::Ordinary, exe, facts, qualified)
     }
 
-    /// [`Registry::verify_loaded`] for a managed attempt-binding route: the same
-    /// proof on Linux, refused on platforms without immutable loaded-build
+    /// [`Registry::verify_loaded`] for a digest-pinned managed attempt-binding
+    /// peer (the owner-v2 Run server, a Run reader, a managed frontend): the
+    /// same proof on Linux, refused on platforms without immutable loaded-build
     /// evidence.
+    ///
+    /// A pinned digest identifies the code a peer runs only while nothing else
+    /// decides that code, so this also requires, to the level Agent Run and
+    /// Agent Pool prove their peers ([`bridge_protocol::peer_proof`]): the pin
+    /// names no generic interpreter, `/etc/ld.so.preload` is absent or blank,
+    /// and the process started without any `LD_*` variable and has no tracer,
+    /// checked before the loaded-build proof and again after the digest inside
+    /// it (so its closing incarnation check covers them).
     fn verify_managed_loaded(
         &self,
         exe: &Path,
         facts: &ProcessFacts,
         qualified: &str,
     ) -> Result<(), CorrelationError> {
+        #[cfg(target_os = "linux")]
+        {
+            use bridge_protocol::peer_proof;
+            let clean =
+                || peer_proof::clean_process(facts.pid) && peer_proof::loader_preload_safe();
+            if peer_proof::forbidden_interpreter(exe) || !clean() {
+                return Err(CorrelationError::NotEvidence(
+                    "managed peer runs under a loader override, a tracer or an interpreter; loaded build unproven".into(),
+                ));
+            }
+            os::loaded::prove_loaded(os::loaded::Route::Managed, facts, exe, |loaded| {
+                self.digest_matches(&key_of(exe, loaded), qualified)?;
+                if clean() {
+                    Ok(())
+                } else {
+                    Err("managed peer gained a loader override or a tracer during the proof")
+                }
+            })
+            .map(|_| ())
+            .map_err(|reason| CorrelationError::NotEvidence(reason.into()))
+        }
+        #[cfg(not(target_os = "linux"))]
         self.verify_loaded_for(os::loaded::Route::Managed, exe, facts, qualified)
     }
 
@@ -6700,6 +6731,133 @@ mod tests {
         stable(&facts, false);
         std::fs::remove_dir_all(&dir).unwrap();
         os::clock::reset();
+    }
+
+    /// A digest-pinned managed peer must also have started without loader
+    /// variables, be untraced and not be pinned under an interpreter name; the
+    /// same build started cleanly is accepted. Children run a private copy of a
+    /// system executable with an explicit environment, so the test runner's own
+    /// `LD_LIBRARY_PATH` never reaches them.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_digest_proof_refuses_loader_tracer_and_interpreter() {
+        use std::os::unix::fs::PermissionsExt;
+        /// Reaps a synthetic peer even if an assertion fails.
+        struct Peer(std::process::Child);
+        impl Drop for Peer {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let dir = scratch("mpp");
+        let copy = |name: &str| {
+            let path = dir.join(name);
+            std::fs::copy("/usr/bin/sleep", &path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            path
+        };
+        let spawn = |program: &Path, args: &[&str], env: &[(&str, &str)]| {
+            Peer(
+                std::process::Command::new(program)
+                    .args(args)
+                    .env_clear()
+                    .envs(env.iter().copied())
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            )
+        };
+        // Facts of the first descendant of `pid` (itself included) running `exe`.
+        let facts_of = |pid: u32, exe: &Path| {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let children = format!("/proc/{pid}/task/{pid}/children");
+                let candidates = std::iter::once(pid).chain(
+                    std::fs::read_to_string(children)
+                        .unwrap_or_default()
+                        .split_ascii_whitespace()
+                        .filter_map(|value| value.parse().ok())
+                        .collect::<Vec<u32>>(),
+                );
+                for candidate in candidates {
+                    if let Some(facts) = os::process_facts(candidate)
+                        .filter(|facts| facts.exe.as_deref() == Some(exe))
+                    {
+                        return facts;
+                    }
+                }
+                assert!(std::time::Instant::now() < until, "peer did not start");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        let exe = copy("peer");
+        let digest = file_sha256(&exe).unwrap();
+        let interpreter = copy("python3");
+        let registry = registry_with(&[(&exe, &digest), (&interpreter, &digest)]);
+
+        let clean = spawn(&exe, &["20"], &[("PATH", "/usr/bin:/bin")]);
+        let facts = facts_of(clean.0.id(), &exe);
+        registry
+            .verify_managed_loaded(&exe, &facts, &digest)
+            .expect("clean pinned peer");
+        assert!(
+            registry
+                .verify_managed_loaded(&exe, &facts, &"0".repeat(64))
+                .is_err(),
+            "wrong digest"
+        );
+        for variable in [
+            ("LD_PRELOAD", "/nonexistent/synthetic-preload.so"),
+            ("LD_LIBRARY_PATH", "/nonexistent"),
+            ("LD_AUDIT", "/nonexistent/synthetic-audit.so"),
+        ] {
+            let loaded = spawn(&exe, &["20"], &[variable]);
+            let facts = facts_of(loaded.0.id(), &exe);
+            assert!(
+                registry
+                    .verify_managed_loaded(&exe, &facts, &digest)
+                    .is_err(),
+                "{}",
+                variable.0
+            );
+            assert!(
+                registry.verify_loaded(&exe, &facts, &digest).is_ok(),
+                "ordinary routes are unchanged"
+            );
+        }
+        let named = spawn(&interpreter, &["20"], &[]);
+        let facts = facts_of(named.0.id(), &interpreter);
+        assert!(
+            registry
+                .verify_managed_loaded(&interpreter, &facts, &digest)
+                .is_err(),
+            "interpreter name"
+        );
+        let strace = Path::new("/usr/bin/strace");
+        if strace.is_file() {
+            let program = exe.to_str().unwrap();
+            let tracer = spawn(
+                strace,
+                &["-qq", "-o", "/dev/null", "--", program, "20"],
+                &[],
+            );
+            let facts = facts_of(tracer.0.id(), &exe);
+            let status = std::fs::read_to_string(format!("/proc/{}/status", facts.pid)).unwrap();
+            assert!(!status.contains("TracerPid:\t0\n"), "fixture is traced");
+            assert!(
+                registry
+                    .verify_managed_loaded(&exe, &facts, &digest)
+                    .is_err(),
+                "traced"
+            );
+        } else {
+            eprintln!("traced-peer case not run: /usr/bin/strace is absent");
+        }
+        drop(clean);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The digest gate proves the loaded build the same way: the live process and

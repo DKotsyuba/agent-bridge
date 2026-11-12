@@ -27,7 +27,9 @@
 //!   (overlay, network, FUSE, unknown), a missing `mnt_id`, and a mount without
 //!   exactly one record (a mount of another mount namespace or a detached mount;
 //!   mount IDs are unique system-wide) fail closed: there the kernel makes no
-//!   such promise, or Bridge cannot see which filesystem it is.
+//!   such promise, or Bridge cannot see which filesystem it is. The parser and
+//!   allowlist are [`bridge_protocol::peer_proof`]'s, shared with the SDK's
+//!   server proof.
 //! * The process incarnation (`pid`, start tick) is read before and after the
 //!   whole proof, the caller's digest and mode checks included, so a recycled
 //!   PID is never judged by another process's executable.
@@ -52,85 +54,14 @@ pub(crate) enum Route {
     Managed,
 }
 
-/// Filesystem type names (the field after the `-` separator of `mountinfo`, the
-/// same filesystems the listed `statfs` magic numbers identify) on which the kernel denies opening a
-/// running executable for writing.
-#[cfg(target_os = "linux")]
-const WRITE_DENYING: [(&str, u64); 6] = [
-    ("ext2", 0xEF53),
-    ("ext3", 0xEF53),
-    ("ext4", 0xEF53),
-    ("xfs", 0x5846_5342),
-    ("btrfs", 0x9123_683E),
-    ("tmpfs", 0x0102_1994),
-];
-
-/// Whether the filesystem type named `fstype` denies writes to a running
-/// executable.
-#[cfg(target_os = "linux")]
-fn denies_running_writes(fstype: &str) -> bool {
-    WRITE_DENYING.iter().any(|(name, _)| *name == fstype)
-}
-
-/// The mount ID of an open descriptor from its `fdinfo` text: exactly one
-/// `mnt_id:` line with a decimal value, else `None`.
-#[cfg(target_os = "linux")]
-fn fdinfo_mount_id(fdinfo: &str) -> Option<u64> {
-    let mut ids = fdinfo
-        .lines()
-        .filter_map(|line| line.strip_prefix("mnt_id:"));
-    let id = ids.next()?.trim().parse::<u64>().ok()?;
-    ids.next().is_none().then_some(id)
-}
-
-/// The filesystem type of the mount `id` in `mountinfo`, when exactly one
-/// well-formed record has that ID.
-///
-/// Fields before the `-` separator are `id parent major:minor root mountpoint
-/// options [optional...]`; after it `fstype source superoptions`. Spaces inside
-/// paths are escaped (`\040`) by the kernel, so fields split on single spaces.
-#[cfg(target_os = "linux")]
-fn mount_type(mountinfo: &str, id: u64) -> Option<&str> {
-    let wanted = id.to_string();
-    let mut records = mountinfo
-        .lines()
-        .filter(|line| line.split(' ').next() == Some(wanted.as_str()));
-    let record = records.next()?;
-    if records.next().is_some() {
-        return None;
-    }
-    let fields: Vec<&str> = record.split(' ').collect();
-    let dash = fields.iter().position(|field| *field == "-")?;
-    (dash >= 6)
-        .then(|| fields.get(dash + 1).copied())
-        .flatten()
-        .filter(|fstype| !fstype.is_empty())
-}
-
-/// Whether the descriptor with `fdinfo` lies on a write-denying filesystem
-/// according to `mountinfo`: its single `mnt_id` has exactly one record whose
-/// type is allowlisted.
-#[cfg(target_os = "linux")]
-fn mount_denies_running_writes(fdinfo: &str, mountinfo: &str) -> bool {
-    fdinfo_mount_id(fdinfo)
-        .and_then(|id| mount_type(mountinfo, id))
-        .is_some_and(denies_running_writes)
-}
-
 /// The filesystem check of [`loaded_executable`] for the opened loaded file.
 #[cfg(target_os = "linux")]
 fn descriptor_denies_running_writes(file: &std::fs::File) -> bool {
-    use std::os::fd::AsRawFd;
     #[cfg(test)]
     if let Some(fstype) = injected::get() {
-        return denies_running_writes(&fstype);
+        return bridge_protocol::peer_proof::write_excluding_type(&fstype);
     }
-    let Ok(fdinfo) = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))
-    else {
-        return false;
-    };
-    std::fs::read_to_string("/proc/self/mountinfo")
-        .is_ok_and(|mountinfo| mount_denies_running_writes(&fdinfo, &mountinfo))
+    bridge_protocol::peer_proof::write_excluded(file)
 }
 
 /// Test-only injection, per thread: the filesystem type of every executable, and
@@ -296,84 +227,6 @@ pub(crate) fn prove_loaded<T>(
     }
     let proved = also(&meta)?;
     Ok((meta, proved))
-}
-
-#[cfg(all(test, target_os = "linux"))]
-mod tests {
-    use super::*;
-
-    const MOUNTS: &str = "\
-22 1 0:21 / /proc rw,nosuid shared:5 - proc proc rw
-30 1 259:2 / / rw,relatime shared:1 - ext4 /dev/md2 rw
-31 30 0:27 / /run rw,nosuid shared:2 - tmpfs tmpfs rw,mode=755
-32 30 0:50 /sub /mnt\\040space rw - fuse.sshfs host:/ rw
-33 30 0:51 / /ov rw - overlay overlay rw,lowerdir=/srv/lower,upperdir=/srv/up,workdir=/srv/w
-34 30 259:2 /srv/lower/bin /bound rw,relatime shared:1 - ext4 /dev/md2 rw
-35 30 259:2 /data /nfsish rw - nfs4 other rw
-36 30 0:51 /bin/tool /tool rw - overlay overlay rw
-37 30 259:2 / /short rw
-38 30 259:2 / /empty rw -
-";
-
-    fn info(id: &str) -> String {
-        format!("pos:\t0\nflags:\t0100000\nmnt_id:\t{id}\nino:\t42\n")
-    }
-
-    /// The allowlist names exactly the filesystems whose kernel denies writes to
-    /// a running executable, and the mount is the descriptor's own record.
-    #[test]
-    fn mount_id_resolution_and_allowlist() {
-        assert_eq!(fdinfo_mount_id(&info("30")), Some(30));
-        assert_eq!(fdinfo_mount_id("pos:\t0\nflags:\t0\n"), None, "missing");
-        assert_eq!(fdinfo_mount_id("mnt_id:\tx\n"), None, "malformed");
-        assert_eq!(fdinfo_mount_id("mnt_id:\t30\nmnt_id:\t30\n"), None, "twice");
-        assert_eq!(mount_type(MOUNTS, 30), Some("ext4"));
-        assert_eq!(mount_type(MOUNTS, 32), Some("fuse.sshfs"));
-        assert_eq!(mount_type(MOUNTS, 37), None, "no separator");
-        assert_eq!(mount_type(MOUNTS, 38), None, "no type");
-        assert_eq!(mount_type(MOUNTS, 99), None, "unlisted");
-        let doubled = format!("{MOUNTS}30 1 259:2 / /again rw - ext4 /dev/md2 rw\n");
-        assert_eq!(mount_type(&doubled, 30), None, "ambiguous record");
-
-        let denies = |id: &str| mount_denies_running_writes(&info(id), MOUNTS);
-        assert!(denies("30"), "ext4 root");
-        assert!(denies("31"), "tmpfs");
-        assert!(!denies("22"), "proc");
-        assert!(!denies("32"), "fuse");
-        assert!(!denies("33"), "overlay");
-        // An overlay non-directory reports the backing device 259:2, which also
-        // has the ext4 mounts 30 and 34; only the descriptor's own mount counts.
-        assert!(!denies("36"), "bind of an overlay file");
-        assert!(denies("34"), "bind mount of an ext4 subtree is that ext4");
-        assert!(!denies("35"), "same device under another type");
-        assert!(!denies("99"), "foreign namespace or detached: no record");
-        assert!(
-            !mount_denies_running_writes("flags:\t0\n", MOUNTS),
-            "no mnt_id"
-        );
-        assert!(!mount_denies_running_writes(&info("30"), ""), "empty table");
-        for name in ["ext2", "ext3", "ext4", "xfs", "btrfs", "tmpfs"] {
-            assert!(denies_running_writes(name), "{name}");
-        }
-        for name in ["overlay", "nfs", "fuse", "vfat", "9p", "ext", ""] {
-            assert!(!denies_running_writes(name), "{name}");
-        }
-        let magic: Vec<u64> = WRITE_DENYING.iter().map(|(_, magic)| *magic).collect();
-        assert!(magic.contains(&0x0102_1994) && magic.contains(&0x9123_683E));
-    }
-
-    /// The kernel really reports the mount of an opened scratch file, and that
-    /// mount has exactly one record in this process's table.
-    #[test]
-    fn this_hosts_fdinfo_names_one_mount_record() {
-        use std::os::fd::AsRawFd;
-        let file = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
-        let fdinfo =
-            std::fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd())).unwrap();
-        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
-        let id = fdinfo_mount_id(&fdinfo).expect("mnt_id in fdinfo");
-        assert!(mount_type(&mountinfo, id).is_some());
-    }
 }
 
 #[cfg(all(test, not(target_os = "linux")))]
