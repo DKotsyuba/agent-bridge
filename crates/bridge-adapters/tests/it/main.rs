@@ -5,10 +5,6 @@
 mod attempt_binding;
 #[path = "../channel_capacity.rs"]
 mod channel_capacity;
-#[cfg_attr(
-    not(target_os = "linux"),
-    allow(dead_code, reason = "some helpers serve Linux-only test modules")
-)]
 #[path = "../common/mod.rs"]
 mod common;
 #[path = "../hook_load.rs"]

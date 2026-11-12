@@ -6,7 +6,7 @@
 //! a fresh directory under `TMPDIR`, every harness is a `bridge-fixture`
 //! process started by the test.
 
-#![allow(dead_code)]
+#![allow(dead_code, reason = "some helpers serve Linux-only test modules")]
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
