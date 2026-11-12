@@ -6,6 +6,12 @@ source, and the crates are not published to crates.io.
 
 ## Unreleased
 
+## [0.7.2] - 2026-11-12
+
+This release hardens the SDK's managed-attempt server proof and Bridge's proof
+of digest-pinned managed peers. It has no store migration; core storage stays at
+schema 9.
+
 ### Security
 
 - The SDK's managed-attempt server proof (`AttemptServerPin`) now matches the

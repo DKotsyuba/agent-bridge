@@ -10,7 +10,7 @@ automatically.
 
 | | |
 |---|---|
-| Version | 0.7.1 (not published to crates.io; build from source) |
+| Version | 0.7.2 (not published to crates.io; build from source) |
 | Producer API | v1 (`bridge-protocol` / `bridge-sdk`), plus the legacy publisher and operator socket API |
 | Database | storage schema 9, forward migration only |
 | Platform | macOS Apple silicon; Linux x86_64 and ARM64 candidates (see qualification limits below) |
