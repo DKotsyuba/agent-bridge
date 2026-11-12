@@ -30,8 +30,12 @@ def literal(value):
 
 def manifest(member, workspace):
     """Resolve only the supported member sections, preserving dependency features and lints."""
-    if set(member) != {"package", "dependencies", "lints"}:
+    sections = set(member) - {"test"}
+    if sections != {"package", "dependencies", "lints"}:
         raise ValueError("SDK manifest sections changed; review standalone packaging")
+    tests = member.get("test", [])
+    if any(set(entry) != {"name", "path"} for entry in tests):
+        raise ValueError("SDK test targets changed; review standalone packaging")
     package = {
         key: workspace["package"][key] if value == {"workspace": True} else value
         for key, value in member["package"].items()
@@ -49,10 +53,15 @@ def manifest(member, workspace):
         raise ValueError("SDK lints changed; review standalone packaging")
     tables = {"package": package, "dependencies": dependencies}
     tables.update({"lints." + key: value for key, value in workspace["lints"].items()})
-    return "\n\n".join(
+    blocks = [
         "[" + name + "]\n" + "\n".join(f"{json.dumps(k)} = {literal(v)}" for k, v in values.items())
         for name, values in tables.items()
-    ) + "\n"
+    ]
+    blocks += [
+        "[[test]]\n" + "\n".join(f"{json.dumps(k)} = {literal(v)}" for k, v in entry.items())
+        for entry in tests
+    ]
+    return "\n\n".join(blocks) + "\n"
 
 
 def external_identities(lock):
