@@ -5,6 +5,8 @@
 mod attempt_binding;
 #[path = "../channel_capacity.rs"]
 mod channel_capacity;
+#[path = "../child_guard.rs"]
+mod child_guard;
 #[path = "../common/mod.rs"]
 mod common;
 #[path = "../hook_load.rs"]

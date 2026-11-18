@@ -42,7 +42,7 @@ The historical native observations below do not qualify the new delivery policy.
 
 These need no native harness and are configured in CI for macOS and Linux (see
 [Contributing](../CONTRIBUTING.md#build-and-check)): formatting, strict Clippy over all
-targets, the workspace tests, private-item Rustdoc and `cargo xtask check-public`. The
+targets, the workspace tests, private-item Rustdoc, `cargo xtask check-public` and `cargo xtask check-daemons` (no test daemon survives). The
 tests exercise real service, adapter-channel, hook, relay and CLI executables with
 labeled stand-in harnesses (`bridge-fixture`) and scripted carriers. A stand-in harness is
 **not** native Claude Code, Codex or OpenCode evidence.

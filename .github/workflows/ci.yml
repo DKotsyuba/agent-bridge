@@ -64,6 +64,9 @@ jobs:
         run: |
           cargo +1.98.1 nextest run --offline --workspace --no-fail-fast
           cargo +1.98.1 test --offline --workspace --doc --no-fail-fast
+      - name: No test daemon survives
+        if: always()
+        run: cargo +1.98.1 xtask check-daemons
       - name: Private Rustdoc
         run: cargo +1.98.1 doc --offline --workspace --no-deps --document-private-items
         env:

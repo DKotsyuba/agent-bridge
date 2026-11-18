@@ -37,6 +37,7 @@ cargo +1.98.1 clippy --offline --workspace --all-targets -- -D warnings
 BRIDGE_TEST_NODE="$(command -v node)" cargo +1.98.1 test --offline --workspace   # + short owned TMPDIR, see below
 RUSTDOCFLAGS="-D warnings" cargo +1.98.1 doc --offline --workspace --no-deps --document-private-items
 cargo +1.98.1 xtask check-public
+cargo +1.98.1 xtask check-daemons   # after the tests: fails if a test daemon survived
 ```
 
 Run the narrowest test for what you changed first (`cargo test -p bridge-core
