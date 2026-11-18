@@ -588,7 +588,11 @@ pub(crate) fn lock_registry(registry: &Mutex<Registry>) -> MutexGuard<'_, Regist
 }
 
 /// Creates or verifies the private channel directory: owned by this user
-/// and not accessible by group or others. Returns the owner uid.
+/// and not accessible by group or others. A missing directory is created
+/// atomically with mode `0700` (never created wider and narrowed later), so
+/// concurrent first callers all succeed; an existing directory is only
+/// verified, never changed, and a group/other-accessible one is refused.
+/// Returns the owner uid.
 pub fn private_directory(path: &Path) -> std::io::Result<u32> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -599,8 +603,25 @@ pub fn private_directory(path: &Path) -> std::io::Result<u32> {
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(path)?;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+            use std::os::unix::fs::DirBuilderExt;
+            // Created with mode 0700 in one step: there is no window in which
+            // a concurrent first user could see a group-writable directory
+            // (a parent's default ACL or the umask would otherwise grant one
+            // before a later chmod). Only the final component is created
+            // private; a missing ancestor keeps the ordinary creation rules.
+            // Losing the creation race is fine: the winner's directory is
+            // verified below like any existing one.
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+            match std::fs::DirBuilder::new().mode(0o700).create(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
         }
         Err(error) => return Err(error),
     }
@@ -1300,6 +1321,69 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         dir
+    }
+
+    /// Runs [`private_directory`] on `path` from `threads` threads released
+    /// together; panics if any caller is refused, returns the owner uids.
+    fn race_private_directory(path: &Path, threads: usize) -> Vec<u32> {
+        let barrier = std::sync::Barrier::new(threads);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        private_directory(path)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap().expect("no false refusal"))
+                .collect()
+        })
+    }
+
+    /// Concurrent first callers of [`private_directory`] all succeed on a
+    /// missing directory, which is private from the moment it exists (no
+    /// window with the umask or an inherited default ACL), while an existing
+    /// group-accessible directory is still refused and left unchanged.
+    /// Many rounds make the former create-then-chmod window observable.
+    #[test]
+    fn concurrent_private_directory_creation_has_no_insecure_window() {
+        let root = scratch("pd");
+        for round in 0..64 {
+            let path = root.join(format!("r{round}/channel"));
+            let owners = race_private_directory(&path, 16);
+            assert!(owners.windows(2).all(|pair| pair[0] == pair[1]));
+            assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o700);
+        }
+        let path = root.join("r0/channel");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(private_directory(&path).is_err(), "insecure dir refused");
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o775);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Under a parent default ACL that grants the group write access, a new
+    /// directory is still private (the creation mode caps the ACL mask) and
+    /// concurrent creators do not refuse each other. Skipped when `setfacl`
+    /// is unavailable or the filesystem rejects ACLs.
+    #[test]
+    fn private_directory_ignores_a_parent_default_acl() {
+        let root = scratch("pa");
+        let applied = std::process::Command::new("setfacl")
+            .args(["-d", "-m", "g::rwx,o::rx"])
+            .arg(&root)
+            .status()
+            .is_ok_and(|status| status.success());
+        if applied {
+            for round in 0..64 {
+                let path = root.join(format!("c{round}"));
+                race_private_directory(&path, 8);
+                assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o077, 0);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A hook client still waiting is not gone, nor is one whose extra bytes are
