@@ -29,6 +29,7 @@ cargo +1.98.1 clippy --offline --workspace --all-targets -- -D warnings
 BRIDGE_TEST_NODE="$(command -v node)" cargo +1.98.1 nextest run --offline --workspace && cargo +1.98.1 test --offline --workspace --doc --no-fail-fast
 RUSTDOCFLAGS="-D warnings" cargo +1.98.1 doc --offline --workspace --no-deps --document-private-items
 cargo +1.98.1 xtask check-public
+cargo +1.98.1 xtask check-daemons
 ```
 
 These are the checks CI runs. Set `TMPDIR` to a short directory you own; tests
@@ -36,7 +37,11 @@ create Unix sockets beneath it. Leave room for a seven-digit PID and a socket
 name plus its terminator: on Linux, a temporary root longer than 62 bytes can
 exceed the 108-byte Unix socket path limit. Use a private root without a
 group-writable default ACL and run the suite with `umask 077`.
-Lifecycle startup creates new state directories with private permissions atomically.
+Lifecycle startup and `private_directory` create new state and channel directories with private permissions atomically.
+A test that starts `bridge-native-daemon` must spawn it through `common::spawn_native_daemon`
+(a `ChildGuard`) so a failed assertion cannot leave it running; `cargo xtask check-daemons`
+runs after the tests and fails when a daemon whose command line points into `TMPDIR`,
+`TMP` or `TEMP` survived (it only reports, it never kills).
 Set `BRIDGE_TEST_NODE` to an absolute Node.js
 executable (`command -v node`): the full workspace tests, including the deterministic
 Desktop regressions, require it and fail without it. Node is not needed to build or use

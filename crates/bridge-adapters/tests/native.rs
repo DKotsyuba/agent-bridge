@@ -2443,13 +2443,7 @@ fn native_daemon_restarts_after_a_crash_left_stale_sockets() {
             .replace("b.db", "r.db"),
     )
     .unwrap();
-    let spawn = |config: &std::path::Path| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_bridge-native-daemon"))
-            .arg(config)
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap()
-    };
+    let spawn = |config: &std::path::Path| spawn_native_daemon(config, std::process::Stdio::null());
     let served_by = |socket: &std::path::Path, pid: u32| {
         std::os::unix::net::UnixStream::connect(socket)
             .ok()
@@ -2538,11 +2532,7 @@ executable_markers = ["bridge-fixture"]
     );
     let config_path = dir.0.join("bridge.toml");
     std::fs::write(&config_path, config).unwrap();
-    let mut daemon = std::process::Command::new(env!("CARGO_BIN_EXE_bridge-native-daemon"))
-        .arg(&config_path)
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut daemon = spawn_native_daemon(&config_path, std::process::Stdio::null());
     assert!(eventually(5_000, || channel.exists() && core.exists()));
 
     let mut harness = Harnessed::start(Harness::CLAUDE_CODE, &store);
@@ -5100,11 +5090,7 @@ host_id = "{HOST}"
         );
         let config_path = dir.0.join("bridge.toml");
         std::fs::write(&config_path, config).unwrap();
-        let mut daemon = std::process::Command::new(env!("CARGO_BIN_EXE_bridge-native-daemon"))
-            .arg(&config_path)
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut daemon = spawn_native_daemon(&config_path, std::process::Stdio::piped());
         assert!(eventually(10_000, || channel.exists() && core.exists()));
         daemon.kill().unwrap();
         let mut log = String::new();

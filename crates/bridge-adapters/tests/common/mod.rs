@@ -324,6 +324,88 @@ pub fn loader_free_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     command
 }
 
+/// An owned child process that is killed and reaped when the guard drops,
+/// including while a failed assertion unwinds, so a failing test cannot leave
+/// the process running.
+///
+/// The child stays in the test's own process group on purpose: a runner that
+/// terminates a slow or cancelled test (nextest on timeout or Ctrl-C) signals
+/// that whole group and so reaches the child too, which a separate group would
+/// escape. On Linux the child is also started with `PR_SET_PDEATHSIG=SIGKILL`
+/// (through `setpriv`, see [`ChildGuard::command`]) so it
+/// still dies when the test process itself is killed without running `Drop`.
+/// Without `setpriv` only the guard and the runner's group signal apply, and
+/// `cargo xtask check-daemons` is the backstop that reports a survivor.
+pub struct ChildGuard(Child);
+
+impl ChildGuard {
+    /// A command that runs `program` and dies with the spawning test process.
+    ///
+    /// Where `setpriv` exists the command is `setpriv --pdeathsig=KILL --
+    /// <program>`, which `exec`s `program` in the same process (same pid,
+    /// argument vector after the program, and executable); elsewhere it is
+    /// plain `program`. The caller adds arguments, environment and stdio to the
+    /// returned command, then passes it to [`ChildGuard::spawn`].
+    pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+        const SETPRIV: &str = "/usr/bin/setpriv";
+        if cfg!(target_os = "linux") && Path::new(SETPRIV).exists() {
+            let mut command = Command::new(SETPRIV);
+            command.arg("--pdeathsig=KILL").arg("--").arg(program);
+            command
+        } else {
+            Command::new(program)
+        }
+    }
+
+    /// Spawns `command` (built by [`ChildGuard::command`]) under this guard;
+    /// panics if it cannot be started.
+    pub fn spawn(mut command: Command) -> ChildGuard {
+        ChildGuard(command.spawn().unwrap())
+    }
+
+    /// Kills the child if it still runs and reaps it. Never panics; calling it
+    /// again, or after the test already waited, is harmless.
+    pub fn kill_and_wait(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl std::ops::Deref for ChildGuard {
+    type Target = Child;
+
+    /// The guarded child, for `id`, `try_wait` and its pipes.
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ChildGuard {
+    /// The guarded child, for `kill`, `wait` and taking its pipes.
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for ChildGuard {
+    /// Kills and reaps the child; never panics.
+    fn drop(&mut self) {
+        self.kill_and_wait();
+    }
+}
+
+/// Starts the real `bridge-native-daemon` on `config` under a [`ChildGuard`];
+/// its stderr goes to `stderr`, stdin and stdout are closed.
+pub fn spawn_native_daemon(config: &Path, stderr: Stdio) -> ChildGuard {
+    let mut command = ChildGuard::command(env!("CARGO_BIN_EXE_bridge-native-daemon"));
+    command
+        .arg(config)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr);
+    ChildGuard::spawn(command)
+}
+
 /// A running owned fixture harness process.
 pub struct Harnessed {
     /// The process.

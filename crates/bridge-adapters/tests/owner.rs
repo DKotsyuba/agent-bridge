@@ -235,22 +235,8 @@ executable_markers = ["bridge-fixture"]
     );
     let config_path = dir.0.join("daemon.toml");
     std::fs::write(&config_path, config).unwrap();
-    /// Always reap the exact test daemon, including on assertion failure.
-    struct Daemon(std::process::Child);
-    impl Drop for Daemon {
-        /// Stop only the daemon child owned by this fixture and wait for its exit.
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-    let _daemon = Daemon(
-        std::process::Command::new(env!("CARGO_BIN_EXE_bridge-native-daemon"))
-            .arg(config_path)
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
+    // Reaped on every exit path, including a failed assertion.
+    let _daemon = spawn_native_daemon(&config_path, std::process::Stdio::null());
     assert!(eventually(5_000, || channel.exists() && core.exists()));
     let mut native = Harnessed::start_owned(Harness::CODEX, &store, &dir.0.join("ow"));
     native.cmd(json!({"cmd":"owner_script","mode":"codex_accept"}));

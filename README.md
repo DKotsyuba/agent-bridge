@@ -95,7 +95,7 @@ write private configuration, install the hooks and send a first message.
 | `crates/bridge-sdk` | synchronous v1 producer client |
 | `crates/bridge-adapters` | Codex, Claude Code and managed OpenCode adapters, lifecycle plugin, `bridge-hook`, `bridge-native-daemon`, qualification probes |
 | `crates/bridge-interfaces` | restricted root MCP and relay, `bridge` operator and install CLI |
-| `xtask` | `cargo xtask package`, `qualify` and `check-public` |
+| `xtask` | `cargo xtask package`, `qualify`, `check-public` and `check-daemons` |
 | `install.sh` | installer for a locally built bundle |
 
 ## Checks
@@ -106,6 +106,7 @@ cargo +1.98.1 clippy --offline --workspace --all-targets -- -D warnings
 BRIDGE_TEST_NODE="$(command -v node)" cargo +1.98.1 nextest run --offline --workspace && cargo +1.98.1 test --offline --workspace --doc --no-fail-fast
 RUSTDOCFLAGS="-D warnings" cargo +1.98.1 doc --offline --workspace --no-deps --document-private-items
 cargo +1.98.1 xtask check-public
+cargo +1.98.1 xtask check-daemons   # after the tests: fails if a test daemon survived
 ```
 
 Tests use isolated synthetic state: fresh temporary databases, private

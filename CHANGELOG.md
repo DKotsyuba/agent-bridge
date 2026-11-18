@@ -6,6 +6,20 @@ source, and the crates are not published to crates.io.
 
 ## Unreleased
 
+### Fixed
+
+- `bridge_adapters::server::private_directory` now creates a missing channel
+  directory with mode `0700` in one step instead of creating it and narrowing
+  it afterwards. Under a parent default ACL or a permissive umask, a concurrent
+  second start could observe the briefly group-writable directory and refuse it
+  falsely; an existing group- or other-accessible directory is still refused
+  and left unchanged.
+- Tests that start `bridge-native-daemon` now kill and reap it on every exit
+  path, including a failed assertion, and the daemon also dies with its test
+  process on Linux. `cargo xtask check-daemons` (run by CI after the tests)
+  fails when a daemon whose command line points into the test temporary
+  directories survived.
+
 ## [0.7.2] - 2026-11-12
 
 This release hardens the SDK's managed-attempt server proof and Bridge's proof

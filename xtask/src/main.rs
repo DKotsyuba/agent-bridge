@@ -4,7 +4,13 @@
 //! cargo xtask package [--label LABEL] [--out ABS_DIR]
 //! cargo xtask qualify --prefix ABS_DIR
 //! cargo xtask check-public [--root DIR]
+//! cargo xtask check-daemons [--dir ABS_DIR]...
 //! ```
+//!
+//! `check-daemons` fails when a `bridge-native-daemon` whose command line points
+//! into the test temporary directories (`TMPDIR`, `TMP`, `TEMP`, or each
+//! `--dir`) is still running; run it after the tests to catch a daemon a test
+//! leaked. It only reports and never signals a process ([`daemons`]).
 //!
 //! `check-public` runs the public-repository checker ([`public`]): required
 //! files, Markdown links and coverage, private paths and identifiers, and
@@ -33,6 +39,7 @@
 //! check passed. Guard cleanup receives an independent two-minute budget per
 //! component even when the global qualification deadline has already expired.
 
+mod daemons;
 mod public;
 
 use std::io::Read;
@@ -78,8 +85,28 @@ fn main() -> ExitCode {
         Some("check-public") => {
             public::run(&flag("--root").map(PathBuf::from).unwrap_or_else(root))
         }
+        Some("check-daemons") => {
+            let mut roots = Vec::new();
+            let mut index = 1;
+            while index < args.len() {
+                if args[index] == "--dir" {
+                    match args.get(index + 1) {
+                        Some(dir) => roots.push(PathBuf::from(dir)),
+                        None => {
+                            eprintln!("xtask: --dir needs a directory");
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                    index += 2;
+                } else {
+                    eprintln!("xtask: unknown argument {}", args[index]);
+                    return ExitCode::FAILURE;
+                }
+            }
+            daemons::run(&roots)
+        }
         _ => Err(
-            "usage: cargo xtask package [--label L] [--out DIR] | qualify --prefix DIR | check-public [--root DIR]"
+            "usage: cargo xtask package [--label L] [--out DIR] | qualify --prefix DIR | check-public [--root DIR] | check-daemons [--dir DIR]..."
                 .into(),
         ),
     };
