@@ -6,6 +6,12 @@ source, and the crates are not published to crates.io.
 
 ## Unreleased
 
+## [0.7.3] - 2026-11-19
+
+This release fixes a false refusal when two Bridge daemons create the channel
+directory concurrently, and keeps test daemons from outliving failed tests. It
+has no store migration; core storage stays at schema 9.
+
 ### Fixed
 
 - `bridge_adapters::server::private_directory` now creates a missing channel
