@@ -46,6 +46,22 @@ fn gone_within(pid: u32, budget: Duration) -> bool {
     gone(pid)
 }
 
+/// Polls until `pid` has replaced the `setpriv` wrapper with the `sleep`
+/// program, for at most `budget`. `setpriv` arms `PR_SET_PDEATHSIG` before it
+/// executes the program, so a parent killed earlier would leave the child
+/// unprotected; the guard's contract starts once the program runs.
+fn running_program_within(pid: u32, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        let comm = std::fs::read_to_string(Path::new("/proc").join(pid.to_string()).join("comm"));
+        if comm.is_ok_and(|name| name.trim() == "sleep") {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    false
+}
+
 /// Dropping the guard kills and reaps a running child.
 #[test]
 fn dropping_the_guard_kills_the_child() {
@@ -110,7 +126,10 @@ fn a_killed_parent_does_not_leak_the_child() {
                 .and_then(|(_, pid)| pid.trim().parse().ok())
         })
         .expect("the parent reports its guarded child");
-    assert!(!gone(child));
+    assert!(
+        running_program_within(child, Duration::from_secs(5)),
+        "the guarded child reached its program"
+    );
     parent.kill().unwrap();
     parent.wait().unwrap();
     let ended = gone_within(child, Duration::from_secs(5));
