@@ -95,16 +95,7 @@ impl RoleJournal {
 
 /// A role is retained when its exact process exists or cannot be proven gone.
 fn frontend_may_be_live(identity: &os::attempt::KernelIncarnation) -> bool {
-    match os::attempt::kernel_incarnation(identity.pid, identity.uid) {
-        Ok(current) => current == *identity,
-        Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound
-                && os::attempt::definitely_gone(identity.pid) =>
-        {
-            false
-        }
-        Err(_) => true,
-    }
+    os::attempt::incarnation_state(identity) != os::IncarnationState::Ended
 }
 
 impl Registry {
@@ -378,7 +369,7 @@ impl Registry {
         excluded.extend(
             self.bindings
                 .values()
-                .filter_map(|binding| binding.managed_incarnation.clone()),
+                .filter_map(|binding| binding.physical_peer().cloned()),
         );
         excluded.extend(
             self.root_launches

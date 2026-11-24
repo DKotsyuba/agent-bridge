@@ -120,37 +120,25 @@ impl CodexQueueCarrier {
     /// exact live frontend on both attest and send and never select a CLI helper.
     /// A native owner route wakes only a positively idle recipient, whatever the
     /// requested mode; helper and application routes keep their lifecycle rules.
-    /// Typed pre-write outcomes defer only owner epoch/lifecycle races, keeping
-    /// ordinary route errors under the existing bounded transport-failure policy.
+    /// Loss of the frozen route, actor, epoch or eligible lifecycle before
+    /// native input defers the event without charging a transport retry.
     fn binding_for(
         &self,
         attempt: &AttemptRecord,
     ) -> Result<(NativeAddress, RecipientBinding, Route, Lifecycle), Outcome> {
-        let unsent = |reason: String| Outcome::KnownUnsent {
-            evidence: format!("no helper started: {reason}"),
-        };
+        let unsent = |reason: String| Outcome::KnownUnsent { evidence: reason };
         let address = NativeAddress::parse(&attempt.fence.recipient)
             .map_err(|error| unsent(error.to_string()))?;
         if address.harness != Harness::CODEX {
             return Err(unsent("not a Codex recipient".into()));
         }
-        let (attestation, binding, route) =
-            self.message_recipient(&address, false).map_err(unsent)?;
-        let defer_changes = match &route {
-            Route::Owner(_) => true,
-            #[cfg(target_os = "linux")]
-            Route::LiveAppServer(_) | Route::LiveResume(_, _, _, _) | Route::LiveIdle(_, _) => true,
-            _ => false,
+        // Selection and these fences precede all native MESSAGE input.
+        let changed = |reason: &str| Outcome::DeferredKnownUnsent {
+            evidence: reason.into(),
         };
-        let changed = |reason: &str| {
-            if defer_changes {
-                Outcome::DeferredKnownUnsent {
-                    evidence: reason.into(),
-                }
-            } else {
-                unsent(reason.into())
-            }
-        };
+        let (attestation, binding, route) = self
+            .message_recipient(&address, false)
+            .map_err(|reason| changed(&reason))?;
         if binding.epoch != attempt.fence.endpoint_epoch {
             return Err(changed("the endpoint epoch changed since the reservation"));
         }
@@ -276,9 +264,9 @@ impl CodexQueueCarrier {
                 if let Some(socket) = crate::owner::locate(
                     &self.registry,
                     result.1.harness,
-                    result.1.managed_incarnation.as_ref(),
+                    result.1.peer_incarnation.as_ref(),
                 )? {
-                    return if result.1.desktop_message_only {
+                    return if result.1.desktop_message_only || candidate.discovered() {
                         Err("a retired recipient cannot use a native owner route".into())
                     } else {
                         Ok(Route::Owner(socket))
@@ -288,6 +276,9 @@ impl CodexQueueCarrier {
                     || crate::os::process_env(result.1.harness.0, "CODEX_APP_TOOLS_PIPE_PATH")
                         .is_some()
                 {
+                    if candidate.discovered() {
+                        return Err("replacement requires a verified native hook".into());
+                    }
                     return self.desktop_directory.as_ref()
                         .and_then(|directory| crate::desktop::frontend_for(directory, result.1.harness))
                         .map(Route::Application)
@@ -300,7 +291,7 @@ impl CodexQueueCarrier {
                     // Before reservation this is an eligibility hold. During
                     // send, deliver performs the typed lifecycle check itself;
                     // a normal state change must not spend a transport retry.
-                    if _probe_native_state {
+                    if _probe_native_state && !candidate.discovered() {
                         let state = endpoint.state(
                             &address.native_session_id,
                             self.timeout.min(Duration::from_secs(3)),
@@ -310,6 +301,9 @@ impl CodexQueueCarrier {
                         }
                     }
                     return Ok(Route::LiveAppServer(endpoint));
+                }
+                if candidate.discovered() {
+                    return Err("ended binding has no replacement socket".into());
                 }
                 if self.sandbox.is_file() {
                     Ok(Route::Helper)
@@ -456,6 +450,18 @@ impl DispatchCarrier for CodexQueueCarrier {
         if recipient.harness != Harness::CODEX {
             return Err("not a Codex recipient".into());
         }
+        #[cfg(target_os = "linux")]
+        {
+            crate::registry::recovery::recover(&self.registry, recipient)?;
+            let candidate = lock_registry(&self.registry).message_candidate(recipient);
+            if let Ok(candidate) = candidate
+                && candidate.discovered()
+            {
+                let (attestation, _) = candidate.validate()?;
+                lock_registry(&self.registry).message_current(&candidate)?;
+                return Ok(attestation);
+            }
+        }
         let (attestation, _, route) = self.message_recipient(recipient, true)?;
         if matches!(route, Route::Owner(_)) && attestation.lifecycle() != Lifecycle::Inactive {
             return Err("native owner recipient is not positively idle".into());
@@ -510,7 +516,7 @@ impl DispatchCarrier for CodexQueueCarrier {
                     &self.registry,
                     &socket,
                     binding.harness,
-                    binding.managed_incarnation.as_ref(),
+                    binding.peer_incarnation.as_ref(),
                     Harness::CODEX,
                     &crate::owner::Handoff {
                         thread_id: &address.native_session_id,
@@ -561,7 +567,10 @@ impl DispatchCarrier for CodexQueueCarrier {
                         spent.as_ref().map_or(Ok(()), |spent| fence(spent.proof()))
                     },
                 );
-                if let (Some(spent), Outcome::KnownUnsent { .. }) = (spent, &outcome)
+                if let (
+                    Some(spent),
+                    Outcome::KnownUnsent { .. } | Outcome::DeferredKnownUnsent { .. },
+                ) = (spent, &outcome)
                     && fence(spent.proof()).is_ok()
                 {
                     lock_registry(&self.registry).restore_wake(&address, spent);

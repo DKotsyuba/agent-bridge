@@ -70,6 +70,82 @@ pub fn connect_unix(
     Ok(stream)
 }
 
+/// Static hold reason when a listener cannot be tied to this peer's lifetime.
+#[cfg(target_os = "linux")]
+pub(crate) const SOCKET_CONTINUITY: &str = "native socket birth or peer continuity unverified";
+
+/// Connects to the pinned socket inode. Its immutable creation time must
+/// follow the live peer's birth, and the peer must predate the connect. This
+/// also excludes an inherited listener whose original PID was already recycled.
+#[cfg(target_os = "linux")]
+pub(crate) fn connect_verified(
+    path: &std::path::Path,
+    deadline: std::time::Instant,
+) -> Result<(UnixStream, ProcessFacts), &'static str> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+    /// Linux O_PATH on the supported x86_64 and ARM64 ABIs.
+    const O_PATH: i32 = 0o10000000;
+    let named = std::fs::symlink_metadata(path).map_err(|_| "native control socket unavailable")?;
+    if !named.file_type().is_socket() {
+        return Err(SOCKET_CONTINUITY);
+    }
+    let pin = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_PATH)
+        .open(path)
+        .map_err(|_| "native control socket unavailable")?;
+    let metadata = pin.metadata().map_err(|_| SOCKET_CONTINUITY)?;
+    if (named.dev(), named.ino()) != (metadata.dev(), metadata.ino())
+        || !metadata.file_type().is_socket()
+    {
+        return Err(SOCKET_CONTINUITY);
+    }
+    let cutoff = attempt::sample_start_ticks().map_err(|_| SOCKET_CONTINUITY)?;
+    let pinned = PathBuf::from(format!("/proc/self/fd/{}", pin.as_raw_fd()));
+    let stream =
+        connect_unix(&pinned, deadline).map_err(|_| "native control socket connection failed")?;
+    let facts = connected_facts(&stream, cutoff).map_err(|_| SOCKET_CONTINUITY)?;
+    if facts.uid != Some(metadata.uid()) || !socket_created_after_peer(metadata.created(), &facts) {
+        return Err(SOCKET_CONTINUITY);
+    }
+    Ok((stream, facts))
+}
+
+/// Compares only immutable filesystem birth time with the kernel process birth.
+/// Missing birth time or missing clock history leaves the listener unproven.
+#[cfg(target_os = "linux")]
+fn socket_created_after_peer(
+    created: std::io::Result<std::time::SystemTime>,
+    facts: &ProcessFacts,
+) -> bool {
+    created
+        .ok()
+        .and_then(|birth| birth.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|birth| {
+            Some((
+                i64::try_from(birth.as_secs()).ok()?,
+                i64::from(birth.subsec_nanos()),
+            ))
+        })
+        .is_some_and(|birth| clock::written_after_start(facts, birth))
+}
+
+/// Samples identity only from this stream's kernel peer and refuses processes
+/// born at or after its pre-connect cutoff, including reuse during verification.
+#[cfg(target_os = "linux")]
+fn connected_facts(stream: &UnixStream, cutoff: u64) -> std::io::Result<ProcessFacts> {
+    let unavailable = || std::io::Error::other("native socket peer identity unavailable");
+    let peer = peer_identity(stream)?;
+    let facts = process_facts_managed(peer.pid).ok_or_else(unavailable)?;
+    if !facts.kernel_incarnation.as_ref().is_some_and(|id| {
+        id.uid == peer.uid && id.start_ticks < cutoff && Some(id.start_ticks) == facts.start_ticks
+    }) {
+        return Err(unavailable());
+    }
+    Ok(facts)
+}
+
 /// The kernel-reported identity of a connected Unix-socket peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerIdentity {
@@ -177,23 +253,11 @@ struct ProcProcess {
 /// leader (a process table lists only processes).
 #[cfg(target_os = "linux")]
 fn proc_process(pid: u32) -> Option<ProcProcess> {
-    let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
-    let (head, tail) = stat.split_at(stat.iter().rposition(|byte| *byte == b')')?);
-    let stat_pid = std::str::from_utf8(head.split(|byte| *byte == b' ').next()?).ok()?;
-    if stat_pid.parse::<u32>().ok()? != pid {
+    let (state, ppid, start_ticks) = attempt::read_stat(std::path::Path::new("/proc"), pid).ok()?;
+    if state != IncarnationState::Live {
         return None;
     }
-    let fields: Vec<&[u8]> = tail[1..]
-        .split(u8::is_ascii_whitespace)
-        .filter(|field| !field.is_empty())
-        .collect();
-    let number = |index: usize| -> Option<u64> {
-        std::str::from_utf8(fields.get(index)?).ok()?.parse().ok()
-    };
-    let parent = number(1)
-        .and_then(|parent| u32::try_from(parent).ok())
-        .filter(|parent| *parent != 0);
-    let start_ticks = number(19).unwrap_or(0);
+    let parent = (ppid != 0).then_some(ppid);
     let mut uid = None;
     if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
         let field = |name: &str| {
@@ -274,6 +338,9 @@ pub fn process_facts(pid: u32) -> Option<ProcessFacts> {
             .with_user(UpdateKind::Always),
     );
     let process = system.process(target)?;
+    if process.status() == sysinfo::ProcessStatus::Zombie {
+        return None;
+    }
     Some(ProcessFacts {
         pid,
         parent: process.parent().map(Pid::as_u32),
@@ -286,14 +353,8 @@ pub fn process_facts(pid: u32) -> Option<ProcessFacts> {
 /// Start tick of `pid` from `/proc/<pid>/stat` (field 22), or `None`.
 #[cfg(target_os = "linux")]
 pub(crate) fn proc_start_ticks(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat.rsplit_once(')')?
-        .1
-        .split_ascii_whitespace()
-        .nth(19)?
-        .parse::<u64>()
-        .ok()
-        .filter(|ticks| *ticks > 0)
+    let (state, _, ticks) = attempt::read_stat(std::path::Path::new("/proc"), pid).ok()?;
+    (state == IncarnationState::Live).then_some(ticks)
 }
 
 /// Samples a Linux process-table record between equal full identity reads.
@@ -366,10 +427,137 @@ pub fn live_pids() -> std::collections::HashSet<u32> {
     system.processes().keys().map(|pid| pid.as_u32()).collect()
 }
 
+/// A liveness observation authorizes use only when live and replacement only when ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IncarnationState {
+    /// Matching live kernel process.
+    Live,
+    /// Terminated, absent, or replaced by a different process.
+    Ended,
+    /// Missing or unreadable evidence.
+    Unknown,
+}
+
+/// Distinguishes a dead or absent Linux PID from an unreadable stat sample.
+/// The supplied predicate compares the start tick to the caller's recorded identity.
+#[cfg(target_os = "linux")]
+pub(crate) fn process_state(pid: u32, matches: impl FnOnce(u64) -> bool) -> IncarnationState {
+    let sample = attempt::read_stat(std::path::Path::new("/proc"), pid);
+    classify_sample(
+        sample,
+        |ticks| {
+            if matches(ticks) {
+                IncarnationState::Live
+            } else {
+                IncarnationState::Ended
+            }
+        },
+        || attempt::definitely_gone(pid),
+    )
+}
+
+/// Interprets a single stat read. Only ENOENT with independent absence proof
+/// releases an unreadable PID; a stopped or sleeping process remains live.
+#[cfg(target_os = "linux")]
+fn classify_sample(
+    sample: std::io::Result<(IncarnationState, u32, u64)>,
+    compare: impl FnOnce(u64) -> IncarnationState,
+    absent: impl FnOnce() -> bool,
+) -> IncarnationState {
+    match sample {
+        Ok((IncarnationState::Live, _, ticks)) => compare(ticks),
+        Ok((state, _, _)) => state,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && absent() => IncarnationState::Ended,
+        Err(_) => IncarnationState::Unknown,
+    }
+}
+
+/// Observes a seconds-based journal identity without conflating access failure with exit.
+#[cfg(target_os = "linux")]
+pub(crate) fn incarnation_state(pid: u32, start_time: u64) -> IncarnationState {
+    let boot = System::boot_time();
+    classify_sample(
+        attempt::read_stat(std::path::Path::new("/proc"), pid),
+        |ticks| {
+            if boot != 0 && boot.saturating_add(ticks / clock_ticks()) == start_time {
+                IncarnationState::Live
+            } else {
+                IncarnationState::Unknown
+            }
+        },
+        || attempt::definitely_gone(pid),
+    )
+}
+
+/// Returns the kernel boot UUID, caching only a successful read for this daemon.
+#[cfg(target_os = "linux")]
+pub(crate) fn boot_id() -> Option<&'static str> {
+    static BOOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(boot) = BOOT.get() {
+        return Some(boot);
+    }
+    let bytes = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let boot = bytes.trim_end_matches('\n');
+    attempt::canonical_uuid(boot).then(|| BOOT.get_or_init(|| boot.to_owned()).as_str())
+}
+
+/// A recorded birth tick is meaningful only on its original boot. A wall
+/// clock adjustment cannot end a live binding with this identity.
+#[cfg(target_os = "linux")]
+pub(crate) fn birth_state(pid: u32, boot: &str, tick: u64) -> IncarnationState {
+    match boot_id() {
+        Some(current) if current != boot => IncarnationState::Ended,
+        Some(_) => process_state(pid, |ticks| ticks == tick),
+        None => IncarnationState::Unknown,
+    }
+}
+
+/// Uses the native process table for legacy identities, including Darwin zombies.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn incarnation_state(pid: u32, start_time: u64) -> IncarnationState {
+    let mut system = System::new();
+    let target = Pid::from_u32(pid);
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[target]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    match system.process(target) {
+        Some(p) if p.status() == sysinfo::ProcessStatus::Zombie => IncarnationState::Ended,
+        Some(p) if p.start_time() == 0 => IncarnationState::Unknown,
+        Some(p) if p.start_time() == start_time => IncarnationState::Live,
+        Some(_) => IncarnationState::Ended,
+        None => {
+            // sysinfo can omit a PID when BSD process metadata is inaccessible.
+            // Require a successful kernel process listing before treating absence as exit.
+            let listed = std::process::Command::new("/bin/ps")
+                .args(["-A", "-o", "pid="])
+                .output();
+            let absent = listed
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| {
+                    std::str::from_utf8(&out.stdout)
+                        .ok()?
+                        .split_ascii_whitespace()
+                        .map(str::parse::<u32>)
+                        .collect::<Result<Vec<_>, _>>()
+                        .ok()
+                })
+                .is_some_and(|pids| pids.contains(&std::process::id()) && !pids.contains(&pid));
+            if absent {
+                IncarnationState::Ended
+            } else {
+                IncarnationState::Unknown
+            }
+        }
+    }
+}
+
 /// Whether the exact process incarnation (`pid` started at `start_time`)
 /// is still alive.
 pub fn incarnation_alive(pid: u32, start_time: u64) -> bool {
-    process_facts(pid).is_some_and(|facts| facts.start_time == start_time)
+    incarnation_state(pid, start_time) == IncarnationState::Live
 }
 
 /// Reads 32 random bytes from the OS (`/dev/urandom`), for unguessable
@@ -498,6 +686,94 @@ mod tests {
     //! Facts about this very test process and a connected socket pair.
 
     use super::*;
+
+    /// A numeric credential PID alone cannot establish a peer that was born
+    /// during the connection; equal-tick observations are also refused.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_connection_requires_an_earlier_peer_birth() {
+        let (stream, _other) = UnixStream::pair().unwrap();
+        let ticks = proc_start_ticks(std::process::id()).unwrap();
+        assert!(connected_facts(&stream, ticks - 1).is_err());
+        assert!(connected_facts(&stream, ticks).is_err());
+        assert_eq!(
+            connected_facts(&stream, ticks + 1).unwrap().start_ticks,
+            Some(ticks)
+        );
+    }
+
+    /// A listener older than the sampled incarnation cannot authenticate a
+    /// recycled credential PID even when that incarnation predates connect.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn old_listener_cannot_prove_a_peer_born_before_connect() {
+        use std::os::unix::net::UnixListener;
+        use std::time::Duration;
+        clock::cover_protocol_fixture();
+        let mut facts = process_facts(std::process::id()).unwrap();
+        std::thread::sleep(Duration::from_millis(40));
+        let path = std::env::temp_dir().join(format!("birth-{}", facts.pid));
+        let listener = UnixListener::bind(&path).unwrap();
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(socket_created_after_peer(metadata.created(), &facts));
+        assert!(!socket_created_after_peer(
+            Err(std::io::ErrorKind::Unsupported.into()),
+            &facts
+        ));
+        clock::reset();
+        assert!(!socket_created_after_peer(metadata.created(), &facts));
+        clock::cover_protocol_fixture();
+        std::thread::sleep(Duration::from_millis(40));
+        let recycled = attempt::sample_start_ticks().unwrap();
+        facts.start_ticks = Some(recycled);
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(recycled < attempt::sample_start_ticks().unwrap());
+        assert!(!socket_created_after_peer(metadata.created(), &facts));
+        drop(listener);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Access denial, hidden PIDs and malformed samples cannot release an owner.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uncertain_process_state_never_means_ended() {
+        use std::io::ErrorKind::{InvalidData, NotFound, PermissionDenied};
+        for (error, absent, expected) in [
+            (PermissionDenied, true, IncarnationState::Unknown),
+            (InvalidData, true, IncarnationState::Unknown),
+            (NotFound, false, IncarnationState::Unknown),
+            (NotFound, true, IncarnationState::Ended),
+        ] {
+            assert_eq!(
+                classify_sample(Err(error.into()), |_| IncarnationState::Live, || absent),
+                expected
+            );
+        }
+        let me = process_facts(std::process::id()).unwrap();
+        assert_eq!(
+            incarnation_state(me.pid, me.start_time + 1),
+            IncarnationState::Unknown
+        );
+        for state in ["X", "Z", "T"] {
+            let stat = format!("12 (name with )) {state} 1 {} 123 0", ["0"; 17].join(" "));
+            let sample = attempt::parse_stat(stat.as_bytes(), 12, || true);
+            assert_eq!(
+                classify_sample(
+                    sample,
+                    |ticks| {
+                        assert_eq!(ticks, 123);
+                        IncarnationState::Live
+                    },
+                    || false
+                ),
+                if state == "T" {
+                    IncarnationState::Live
+                } else {
+                    IncarnationState::Ended
+                }
+            );
+        }
+    }
 
     /// An elapsed deadline refuses before connecting, even to a live listener.
     #[test]

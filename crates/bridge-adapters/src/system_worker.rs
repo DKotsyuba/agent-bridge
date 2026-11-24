@@ -80,7 +80,7 @@ fn attestation_hold_reason(reason: &str) -> &'static str {
         "native control peer unavailable" | "native control peer incarnation changed" => {
             "native control peer ownership unavailable"
         }
-        _ => "target unavailable",
+        other => safe_hold_reason(other),
     }
 }
 
@@ -96,6 +96,15 @@ pub(crate) fn safe_hold_reason(reason: &str) -> &'static str {
         "retired thread is not idle" => "retired thread is not idle",
         "native control socket unavailable" => "native control socket unavailable",
         "native control peer ownership unavailable" => "native control peer ownership unavailable",
+        crate::os::SOCKET_CONTINUITY => crate::os::SOCKET_CONTINUITY,
+        crate::registry::WAIT_FOR_HOOK => crate::registry::WAIT_FOR_HOOK,
+        "recipient harness incarnation ended" => "recipient harness incarnation ended",
+        "recipient harness identity unavailable" => "recipient harness identity unavailable",
+        "ended binding has no replacement socket" => "ended binding has no replacement socket",
+        "replacement session identity unverified" => "replacement session identity unverified",
+        "replacement requires a verified native hook" => {
+            "replacement requires a verified native hook"
+        }
         _ => "target unavailable",
     }
 }

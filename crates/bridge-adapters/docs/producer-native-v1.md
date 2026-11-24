@@ -294,3 +294,35 @@ Native owners still require exact direct-parent kernel identity, trusted unchang
 executable, canonical private socket and positively idle recipient. An absent or
 unprovable owner cannot activate that path or fall back through an unavailable
 helper. Source/process fixtures and real native-model qualification remain distinct.
+
+### Process replacement
+
+A verified hook can renew an address in its original private store after the old
+process exits. On Linux a zombie leader proves exit only when its task
+directory contains that leader alone. An unreadable identity keeps the ownership fence.
+New ordinary Linux bindings record the boot UUID and birth tick. Restored
+seconds-only rows stay fenced until a verified same-session hook establishes continuity.
+An ended Codex or Claude row is retained after restart as a fenced candidate.
+Renewing ordinary authority requires a verified hook. A managed predecessor still requires managed ancestry on renewal.
+Older binaries reject
+journal rows containing the new birth tick or discovery marker.
+
+With experimental `[adapters].native_discovery = true`, the Linux pending-message
+sweep also probes an ended binding's native route.
+Failed probes for the same address and epoch are limited to one per 30 seconds.
+A verified live replacement is rechecked at intervals of at least 10 seconds.
+Native writes still require fresh peer and route verification. Linux opens the
+socket inode with `O_PATH` and connects through that descriptor. Its immutable
+filesystem birth time must follow the verified peer’s kernel birth tick, which
+must precede the connection. Missing birth time, incomplete clock history
+(including a peer that predates Bridge) or an ambiguous ordering holds the
+socket route with `native socket birth or peer continuity unverified`. A
+verified hook can still renew the session through the hook channel.
+Codex requires a verified control-socket peer in the original store that
+reports the exact thread loaded. Claude requires one fresh interactive session
+descriptor and its matching private inbox peer. A successful probe journals a
+new MESSAGE-only epoch. Caller and inject authority require the successor's
+own verified hook. The existing one-shot Desktop gateway operates with either
+setting and requires its own unspent transcript proof. An inherited listener across a backward clock step cannot be
+qualified by socket birth alone. The Claude uniqueness scan can race with handoff.
+Ordinary expiry and uncertain-attempt fences continue to apply during recovery.

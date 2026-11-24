@@ -56,7 +56,7 @@ impl OwnerOnlyCarrier {
         let socket = crate::owner::locate(
             &self.registry,
             binding.harness,
-            binding.managed_incarnation.as_ref(),
+            binding.peer_incarnation.as_ref(),
         )?
         .ok_or("the recipient has no supported native owner")?;
         lock_registry(&self.registry).message_current(&candidate)?;
@@ -91,7 +91,7 @@ impl DispatchCarrier for OwnerOnlyCarrier {
         let (attestation, binding, socket) = match self.route(&address) {
             Ok(route) => route,
             Err(reason) => {
-                return Outcome::KnownUnsent {
+                return Outcome::DeferredKnownUnsent {
                     evidence: format!("native owner route not proven: {reason}"),
                 };
             }
@@ -112,7 +112,7 @@ impl DispatchCarrier for OwnerOnlyCarrier {
             &self.registry,
             &socket,
             binding.harness,
-            binding.managed_incarnation.as_ref(),
+            binding.peer_incarnation.as_ref(),
             address.harness,
             &crate::owner::Handoff {
                 thread_id: &address.native_session_id,

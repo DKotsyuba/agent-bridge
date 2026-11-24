@@ -186,6 +186,20 @@ pub(crate) fn reset() {
     STEP.with(|step| step.set(0));
 }
 
+/// Supplies synthetic clock coverage to protocol tests where the test process
+/// plays both Bridge and a pre-existing peer. Native integration tests start
+/// the tracker and harness processes separately and use the real samples.
+#[cfg(test)]
+pub(crate) fn cover_protocol_fixture() {
+    let now = read_sample().unwrap();
+    let initial = Sample {
+        boot: 0,
+        real_before: now.real_before - now.boot,
+        real_after: now.real_after - now.boot,
+    };
+    with_tracker(|tracker| *tracker = Some(Tracker::new(initial))).unwrap();
+}
+
 fn wall_ns() -> Option<i128> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

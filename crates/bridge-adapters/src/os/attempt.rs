@@ -113,36 +113,8 @@ fn role_link_at(proc_root: &Path, pid: u32) -> io::Result<RoleLink> {
     if values.len() != 4 || uid_lines.next().is_some() {
         return Err(invalid());
     }
-    let stat = bounded(&process.join("stat"), 64 * 1024)?;
-    let end = stat
-        .iter()
-        .rposition(|byte| *byte == b')')
-        .ok_or_else(invalid)?;
-    let open = stat[..end]
-        .iter()
-        .position(|byte| *byte == b'(')
-        .ok_or_else(invalid)?;
-    if std::str::from_utf8(&stat[..open])
-        .ok()
-        .and_then(|text| text.trim().parse::<u32>().ok())
-        != Some(pid)
-    {
-        return Err(invalid());
-    }
-    let fields: Vec<_> = stat[end + 1..]
-        .split(|byte| byte.is_ascii_whitespace())
-        .filter(|field| !field.is_empty())
-        .collect();
-    let number = |index: usize| {
-        fields
-            .get(index)
-            .and_then(|field| std::str::from_utf8(field).ok())
-            .and_then(|field| field.parse::<u64>().ok())
-            .ok_or_else(invalid)
-    };
-    let parent = u32::try_from(number(1)?).map_err(|_| invalid())?;
-    let start_ticks = number(19)?;
-    if parent == pid {
+    let (state, parent, start_ticks) = read_stat(proc_root, pid)?;
+    if state != super::IncarnationState::Live || parent == pid {
         return Err(invalid());
     }
     Ok(RoleLink {
@@ -353,6 +325,81 @@ fn bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Reads one process stat. A zombie leader proves group exit only when its
+/// task directory contains exactly that leader and no live sibling can remain.
+pub(super) fn read_stat(root: &Path, pid: u32) -> io::Result<(super::IncarnationState, u32, u64)> {
+    let group = root.join(pid.to_string());
+    let stat = bounded(&group.join("stat"), 64 * 1024)?;
+    parse_stat(&stat, pid, || {
+        let Ok(mut tasks) = std::fs::read_dir(group.join("task")) else {
+            return false;
+        };
+        matches!(tasks.next(), Some(Ok(entry)) if entry.file_name() == pid.to_string().as_str())
+            && tasks.next().is_none()
+    })
+}
+
+/// Parses the state, parent and start tick from a single kernel stat sample.
+pub(super) fn parse_stat(
+    stat: &[u8],
+    pid: u32,
+    sole_leader: impl FnOnce() -> bool,
+) -> io::Result<(super::IncarnationState, u32, u64)> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid process stat");
+    let open = stat.iter().position(|b| *b == b'(').ok_or_else(invalid)?;
+    let end = stat
+        .iter()
+        .rposition(|b| *b == b')')
+        .filter(|end| *end > open)
+        .ok_or_else(invalid)?;
+    if std::str::from_utf8(&stat[..open])
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        != Some(pid)
+    {
+        return Err(invalid());
+    }
+    let mut fields = stat[end + 1..]
+        .split(u8::is_ascii_whitespace)
+        .filter(|f| !f.is_empty());
+    let state = match fields.next() {
+        Some(b"Z") if !sole_leader() => super::IncarnationState::Unknown,
+        Some(b"Z" | b"X" | b"x") => super::IncarnationState::Ended,
+        Some(b"R" | b"S" | b"D" | b"T" | b"t" | b"I" | b"W" | b"K" | b"P") => {
+            super::IncarnationState::Live
+        }
+        _ => return Err(invalid()),
+    };
+    let parent = fields
+        .next()
+        .and_then(|v| std::str::from_utf8(v).ok()?.parse().ok())
+        .ok_or_else(invalid)?;
+    let ticks = fields
+        .nth(17)
+        .and_then(|v| std::str::from_utf8(v).ok()?.parse().ok())
+        .filter(|v| *v > 0)
+        .ok_or_else(invalid)?;
+    Ok((state, parent, ticks))
+}
+
+/// Classifies the recorded full identity, retaining uncertainty when its namespace
+/// or UID cannot be read. A zombie can lose its namespace link before reaping.
+pub(crate) fn incarnation_state(identity: &KernelIncarnation) -> super::IncarnationState {
+    use super::IncarnationState::{Ended, Live, Unknown};
+    match kernel_incarnation(identity.pid, identity.uid) {
+        Ok(current) if current == *identity => Live,
+        Ok(_) => Ended,
+        #[cfg(target_os = "linux")]
+        Err(_)
+            if super::process_state(identity.pid, |ticks| ticks == identity.start_ticks)
+                == Ended =>
+        {
+            Ended
+        }
+        Err(_) => Unknown,
+    }
+}
+
 /// Reads one kernel identity from a procfs tree, requiring the local namespace.
 fn incarnation_at(proc_root: &Path, pid: u32, expected_uid: u32) -> io::Result<KernelIncarnation> {
     let invalid = || io::Error::new(io::ErrorKind::InvalidData, "kernel identity unavailable");
@@ -387,30 +434,13 @@ fn incarnation_at(proc_root: &Path, pid: u32, expected_uid: u32) -> io::Result<K
     if uids.len() != 4 || uids[1] != expected_uid {
         return Err(invalid());
     }
-    let stat = bounded(&process.join("stat"), 64 * 1024)?;
-    let end = stat
-        .iter()
-        .rposition(|byte| *byte == b')')
-        .ok_or_else(invalid)?;
-    let open = stat[..end]
-        .iter()
-        .position(|byte| *byte == b'(')
-        .ok_or_else(invalid)?;
-    let stat_pid = std::str::from_utf8(&stat[..open])
-        .map_err(|_| invalid())?
-        .trim();
-    if stat_pid.parse::<u32>().ok() != Some(pid) {
+    let (state, _, ticks) = read_stat(proc_root, pid)?;
+    if state == super::IncarnationState::Unknown {
         return Err(invalid());
     }
-    // Comm is arbitrary bytes; field 3 follows its final ')', field 22 is index 19.
-    let ticks = stat[end + 1..]
-        .split(|byte| byte.is_ascii_whitespace())
-        .filter(|field| !field.is_empty())
-        .nth(19)
-        .and_then(|field| std::str::from_utf8(field).ok())
-        .and_then(|field| field.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .ok_or_else(invalid)?;
+    if state == super::IncarnationState::Ended {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "process ended"));
+    }
     Ok(KernelIncarnation {
         boot_id: boot.to_string(),
         pid_namespace_inode: target_ns,
@@ -504,6 +534,7 @@ fn owner_v2_locator_at(
 
 /// Establishes that a PID is absent from a readable, non-hidepid procfs view.
 /// Unreadable mount information or hidden PID policy is never proof of absence.
+#[cfg(target_os = "linux")]
 pub(crate) fn definitely_gone(pid: u32) -> bool {
     if pid == 0 {
         return false;
@@ -728,6 +759,27 @@ mod tests {
         fn capture(&self) -> io::Result<LaunchObservation> {
             capture_at(&self.0, 42, 1000, || {})
         }
+    }
+    /// A zombie group leader with another task, or unreadable task membership,
+    /// cannot release ownership or qualify as a live managed incarnation.
+    #[test]
+    fn zombie_leader_requires_a_single_task() {
+        use super::super::IncarnationState::{Ended, Unknown};
+        let fixture = ProcFixture::new();
+        let group = fixture.0.join("42");
+        let stat = std::fs::read_to_string(group.join("stat"))
+            .unwrap()
+            .replace(") S ", ") Z ");
+        std::fs::write(group.join("stat"), stat).unwrap();
+        assert_eq!(read_stat(&fixture.0, 42).unwrap().0, Unknown);
+        std::fs::create_dir_all(group.join("task/42")).unwrap();
+        assert_eq!(read_stat(&fixture.0, 42).unwrap().0, Ended);
+        std::fs::create_dir(group.join("task/43")).unwrap();
+        assert_eq!(read_stat(&fixture.0, 42).unwrap().0, Unknown);
+        assert_eq!(
+            incarnation_at(&fixture.0, 42, 1000).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
     impl Drop for ProcFixture {
         /// Removes only the owned fixture tree.

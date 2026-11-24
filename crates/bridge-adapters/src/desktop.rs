@@ -1036,7 +1036,7 @@ pub(crate) fn via_frontend_checked(
             .any(|a| (a.pid, a.start_time) == harness)
     });
     if !trusted {
-        return Outcome::KnownUnsent {
+        return Outcome::DeferredKnownUnsent {
             evidence: "Codex frontend is not owned by the attested recipient harness".into(),
         };
     }
@@ -1046,7 +1046,7 @@ pub(crate) fn via_frontend_checked(
         };
     };
     if let Err(reason) = before_write() {
-        return Outcome::KnownUnsent {
+        return Outcome::DeferredKnownUnsent {
             evidence: format!("final pre-write fence refused; nothing sent: {reason}"),
         };
     }

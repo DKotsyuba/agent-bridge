@@ -28,6 +28,8 @@ const LIMIT: usize = 1 << 20;
 /// A socket path and frozen process incarnation selected by discovery.
 #[derive(Clone)]
 pub(crate) struct Endpoint {
+    /// Physical identity verified on the original connection.
+    identity: os::attempt::KernelIncarnation,
     /// Canonical, protected socket path.
     path: PathBuf,
     /// Process and session facts captured by recipient validation.
@@ -64,7 +66,25 @@ pub(crate) fn locate(binding: &RecipientBinding) -> Result<Option<Endpoint>, Str
     let uid = os::process_facts(std::process::id())
         .and_then(|f| f.uid)
         .ok_or("process owner unavailable")?;
-    let store = fs::canonicalize(&binding.store).map_err(|_| "recipient store unavailable")?;
+    let Some((path, stream, facts)) = connect_control(&binding.store, uid)? else {
+        return Ok(None);
+    };
+    let endpoint = Endpoint {
+        identity: facts.kernel_incarnation.ok_or(os::SOCKET_CONTINUITY)?,
+        path,
+        binding: binding.clone(),
+        uid,
+    };
+    endpoint.verify_peer(&stream)?;
+    Ok(Some(endpoint))
+}
+
+/// Opens the configured store's protected control socket without trusting its peer yet.
+pub(crate) fn connect_control(
+    store: &Path,
+    uid: u32,
+) -> Result<Option<(PathBuf, UnixStream, os::ProcessFacts)>, String> {
+    let store = fs::canonicalize(store).map_err(|_| "recipient store unavailable")?;
     let dir = store.join("app-server-control");
     match fs::symlink_metadata(&dir) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -87,30 +107,31 @@ pub(crate) fn locate(binding: &RecipientBinding) -> Result<Option<Endpoint>, Str
     if !target.file_type().is_socket() || target.uid() != uid || target.mode() & 0o777 != 0o600 {
         return Err("native control socket is not owned mode 0600".into());
     }
-    let endpoint = Endpoint {
-        path,
-        binding: binding.clone(),
-        uid,
-    };
-    let stream = os::connect_unix(&endpoint.path, Instant::now() + Duration::from_secs(3))
-        .map_err(|_| "native control socket connection failed")?;
-    endpoint.verify_peer(&stream)?;
-    Ok(Some(endpoint))
+    let (stream, facts) = os::connect_verified(&path, Instant::now() + Duration::from_secs(1))?;
+    Ok(Some((path, stream, facts)))
 }
 
 impl Endpoint {
     /// Checks the kernel peer and its frozen process incarnation.
     fn verify_peer(&self, stream: &UnixStream) -> Result<(), String> {
-        let peer = os::peer_identity(stream).map_err(|_| "native control peer unavailable")?;
-        let facts =
-            os::process_facts(self.binding.harness.0).ok_or("native process unavailable")?;
-        if peer.pid != self.binding.harness.0
+        let peer = os::peer_identity(stream).map_err(|_| os::SOCKET_CONTINUITY)?;
+        let facts = os::process_facts(self.binding.harness.0).ok_or(os::SOCKET_CONTINUITY)?;
+        if os::attempt::kernel_incarnation(peer.pid, peer.uid)
+            .as_ref()
+            .ok()
+            != Some(&self.identity)
+            || self
+                .binding
+                .peer_incarnation
+                .as_ref()
+                .is_some_and(|id| id != &self.identity)
+            || peer.pid != self.binding.harness.0
             || peer.uid != self.uid
             || facts.uid != Some(self.uid)
             || facts.start_time != self.binding.harness.1
             || facts.exe.as_deref() != Some(self.binding.executable.as_path())
         {
-            return Err("native control peer incarnation changed".into());
+            return Err(os::SOCKET_CONTINUITY.into());
         }
         Ok(())
     }
@@ -121,7 +142,10 @@ impl Endpoint {
             .checked_add(timeout)
             .ok_or("invalid timeout")?;
         let mut ws = self.open(deadline)?;
-        read_state(&mut ws, thread, 2).map_err(|_| "native thread state unavailable".into())
+        let state =
+            read_state(&mut ws, thread, 2).map_err(|_| "native thread state unavailable")?;
+        self.verify_peer(&ws.get_ref().stream)?;
+        Ok(state)
     }
 
     /// Reads the latest completed turn between identical idle/unloaded
@@ -198,7 +222,10 @@ impl Endpoint {
 
     /// Opens and initializes a deadline-bound WebSocket to the verified peer.
     fn open(&self, deadline: Instant) -> Result<WebSocket<DeadlineStream>, String> {
-        let stream = os::connect_unix(&self.path, deadline).map_err(|_| "native connect failed")?;
+        let (stream, facts) = os::connect_verified(&self.path, deadline)?;
+        if facts.kernel_incarnation.as_ref() != Some(&self.identity) {
+            return Err(os::SOCKET_CONTINUITY.into());
+        }
         self.verify_peer(&stream)?;
         let config = WebSocketConfig::default()
             .max_message_size(Some(LIMIT))
@@ -390,6 +417,11 @@ pub(crate) fn deliver(
     };
     let mut ws = match endpoint.open(deadline) {
         Ok(ws) => ws,
+        Err(reason)
+            if reason == os::SOCKET_CONTINUITY || reason == "native control socket unavailable" =>
+        {
+            return Outcome::DeferredKnownUnsent { evidence: reason };
+        }
         Err(_) => {
             return Outcome::KnownUnsent {
                 evidence: "native connection failed before handoff".into(),
@@ -479,6 +511,7 @@ pub(crate) fn deliver(
                         && value.pointer("/result/thread/id").and_then(Value::as_str)
                             == Some(handoff.thread)
                 })
+                || endpoint.verify_peer(&ws.get_ref().stream).is_err()
             {
                 return Outcome::OutcomeUnknown {
                     reason: "native resume has no valid correlated receipt".into(),
@@ -506,14 +539,9 @@ pub(crate) fn deliver(
                 evidence: "native lifecycle unavailable or changed before handoff".into(),
             };
         }
-        Err(StateError::Other) if handoff.cold_expected_turn.is_some() => {
-            return Outcome::DeferredKnownUnsent {
-                evidence: "native recipient state unavailable; nothing sent".into(),
-            };
-        }
         Err(StateError::Other) => {
-            return Outcome::KnownUnsent {
-                evidence: "native thread read failed before handoff".into(),
+            return Outcome::DeferredKnownUnsent {
+                evidence: "native thread state unavailable before handoff; nothing sent".into(),
             };
         }
     }
@@ -554,9 +582,11 @@ pub(crate) fn deliver(
         };
     }
     match response(&mut ws, 3) {
-        Ok(value) if valid_turn(&value) => Outcome::NativeAccepted {
-            evidence: "native turn/start accepted a turn (not processing confirmation)".into(),
-        },
+        Ok(value) if valid_turn(&value) && endpoint.verify_peer(&ws.get_ref().stream).is_ok() => {
+            Outcome::NativeAccepted {
+                evidence: "native turn/start accepted a turn (not processing confirmation)".into(),
+            }
+        }
         _ => Outcome::OutcomeUnknown {
             reason: "native handoff has no valid correlated receipt".into(),
         },
@@ -618,6 +648,8 @@ mod tests {
 
     /// Creates a private socket with this test process as the attested peer.
     fn fixture() -> (PathBuf, UnixListener, RecipientBinding) {
+        os::clock::cover_protocol_fixture();
+        std::thread::sleep(Duration::from_millis(40));
         let dir = std::env::temp_dir().join(format!(
             "live-{}-{}",
             std::process::id(),
@@ -641,7 +673,7 @@ mod tests {
         let facts = os::process_facts(std::process::id()).unwrap();
         let binding = RecipientBinding {
             harness: (facts.pid, facts.start_time),
-            managed_incarnation: None,
+            peer_incarnation: None,
             epoch: 1,
             store: dir.clone(),
             executable: facts.exe.unwrap(),
@@ -758,7 +790,7 @@ mod tests {
             "other-thread",
             false,
         );
-        assert!(!wrote && matches!(result, Outcome::KnownUnsent { .. }));
+        assert!(!wrote && matches!(result, Outcome::DeferredKnownUnsent { .. }));
         for reply in [
             json!({"id":3,"error":{"code":-1,"message":"no"}}),
             json!({"id":3,"result":{"turn":{"id":"turn-1","items":[{"type":"agentMessage"}],"status":"inProgress"}}}),
@@ -1518,6 +1550,43 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
         fs::remove_dir_all(target_dir).unwrap();
     }
+    /// Losing clock coverage after attestation defers the frozen message
+    /// before native input and preserves its transport retry budget.
+    #[test]
+    fn missing_socket_birth_continuity_defers_before_handoff() {
+        let (dir, listener, binding) = fixture();
+        let endpoint = locate(&binding).unwrap().unwrap();
+        os::clock::reset();
+        let outcome = deliver(
+            &endpoint,
+            &Handoff {
+                thread: "thread-1",
+                client_id: "client",
+                text: "fixture",
+                mode: Mode::Message,
+                allow_resume: false,
+                require_idle: false,
+                cold_expected_turn: None,
+                deadline_ms: current_unix_millis() + 1_000,
+                timeout: Duration::from_secs(1),
+            },
+            || unreachable!(),
+            || unreachable!(),
+        );
+        assert!(
+            matches!(outcome, Outcome::DeferredKnownUnsent {evidence} if evidence == os::SOCKET_CONTINUITY)
+        );
+        drop(listener);
+        fs::remove_dir_all(
+            std::env::temp_dir()
+                .parent()
+                .unwrap()
+                .join(dir.file_name().unwrap()),
+        )
+        .unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     /// A live process with matching UID and incarnation cannot impersonate the socket peer.
     #[test]
     fn rejects_wrong_kernel_peer_pid() {

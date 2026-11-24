@@ -344,7 +344,7 @@ impl Registry {
             !binding.retired
                 && binding.harness == sealed.harness
                 && binding.epoch == sealed.caller.epoch()
-                && os::incarnation_alive(binding.harness.0, binding.harness.1)
+                && binding.incarnation_state() == os::IncarnationState::Live
         })
     }
 }
@@ -384,6 +384,7 @@ mod tests {
                 run_readers: Vec::new(),
                 managed_tools: Vec::new(),
                 owner_v2_routes: Vec::new(),
+                native_discovery: false,
                 legacy_owner_relays: 0,
             },
             0,

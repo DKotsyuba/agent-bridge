@@ -418,7 +418,7 @@ pub(crate) fn deliver(
     if let Err(why) =
         check_socket(socket, uid).and_then(|()| verify_peer(&stream, harness, managed, uid))
     {
-        return unsent(&why);
+        return Outcome::DeferredKnownUnsent { evidence: why };
     }
     let body = match serde_json::to_vec(&Request {
         thread_id,

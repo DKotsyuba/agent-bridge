@@ -52,3 +52,24 @@ fn attempt_binding_json_feature_unification() {
     assert!(tree.contains("serde_json feature \"float_roundtrip\""));
     assert!(!tree.contains("serde_json feature \"arbitrary_precision\""));
 }
+
+/// Operators can locate the private journals before crossing the one-way upgrade.
+#[test]
+fn upgrade_notes_name_the_channel_journal_backups() {
+    let notes = include_str!("../../CHANGELOG.md")
+        .split("### Upgrade notes")
+        .nth(1)
+        .unwrap()
+        .split("\n## ")
+        .next()
+        .unwrap();
+    let bindings = std::path::Path::new("c.sock").with_extension("bindings.json");
+    for path in [
+        bindings.clone(),
+        bindings.with_extension("attempts.json"),
+        bindings.with_extension("frontend-roles.json"),
+    ] {
+        assert!(notes.contains(path.to_str().unwrap()));
+    }
+    assert!(notes.contains("pre-upgrade") && notes.contains("route journal malformed"));
+}

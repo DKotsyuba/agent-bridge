@@ -480,6 +480,7 @@ fn lab_with_delivery(tag: &str, any: bool, bounded: bool) -> Lab {
             run_readers: Vec::new(),
             managed_tools: Vec::new(),
             owner_v2_routes: Vec::new(),
+            native_discovery: false,
             legacy_owner_relays: 0,
         },
         owner,

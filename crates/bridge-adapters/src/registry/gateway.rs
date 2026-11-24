@@ -446,7 +446,7 @@ impl MessageCandidate {
                     || (binding.desktop_idle_message
                         && binding.desktop_idle_transcript == Some(wake.transcript))
             })
-            && !os::incarnation_alive(binding.harness.0, binding.harness.1)
+            && binding.incarnation_state() == os::IncarnationState::Ended
     }
 
     /// Whether this is a live Codex Desktop binding that may be woken by its
@@ -458,7 +458,7 @@ impl MessageCandidate {
             && !binding.retired
             && binding.lifecycle == Lifecycle::Unknown
             && binding.wake.is_some()
-            && os::incarnation_alive(binding.harness.0, binding.harness.1)
+            && binding.incarnation_state() == os::IncarnationState::Live
     }
 
     /// The physical gateway incarnation already committed for this snapshot's
@@ -574,19 +574,20 @@ impl MessageCandidate {
         gateway: (u32, u64),
     ) -> Result<(), String> {
         let binding = &self.binding;
-        let live = os::incarnation_alive(binding.harness.0, binding.harness.1);
+        let state = binding.incarnation_state();
         // A live proof route (its own harness, lifecycle still `Unknown`) or a
         // dead-incarnation gateway: each keeps exactly its own preconditions, and a
         // hook that moved the lifecycle (or renewed the binding) refuses either.
-        let route_holds = if live {
+        let route_holds = if state == os::IncarnationState::Live {
             gateway == binding.harness
                 && !binding.retired
                 && binding.lifecycle == Lifecycle::Unknown
                 && self.live_check().is_ok()
         } else {
-            !(binding.retired
-                && !(binding.desktop_idle_message
-                    && binding.desktop_idle_transcript == Some(proof.transcript)))
+            state == os::IncarnationState::Ended
+                && !(binding.retired
+                    && !(binding.desktop_idle_message
+                        && binding.desktop_idle_transcript == Some(proof.transcript)))
                 && self.qualifies_gateway(gateway)
         };
         if binding.address.harness != Harness::CODEX
@@ -656,7 +657,7 @@ impl MessageCandidate {
             attestation,
             RecipientBinding {
                 harness: gateway,
-                managed_incarnation: None,
+                peer_incarnation: None,
                 epoch: binding.epoch,
                 store: binding.store.clone(),
                 executable: binding.executable.clone(),
@@ -912,6 +913,8 @@ mod tests {
             transcript: Some(transcript.to_path_buf()),
             store: store.to_path_buf(),
             executable: "/tmp/executable".into(),
+            birth: None,
+            discovered: None,
             retired: false,
             desktop_idle_message: false,
             desktop_idle_transcript: None,
@@ -1262,6 +1265,7 @@ mod tests {
             run_readers: Vec::new(),
             managed_tools: Vec::new(),
             owner_v2_routes: Vec::new(),
+            native_discovery: false,
             legacy_owner_relays: 0,
         };
         let mut registry = Registry::new(config, uid()).unwrap();
@@ -1443,6 +1447,7 @@ mod tests {
             run_readers: Vec::new(),
             managed_tools: Vec::new(),
             owner_v2_routes: Vec::new(),
+            native_discovery: false,
             legacy_owner_relays: 0,
         };
         let mut registry = Registry::new(config.clone(), uid()).unwrap();
@@ -1719,6 +1724,7 @@ mod tests {
                 run_readers: Vec::new(),
                 managed_tools: Vec::new(),
                 owner_v2_routes: Vec::new(),
+                native_discovery: false,
                 legacy_owner_relays: 0,
             },
             uid(),
@@ -1785,10 +1791,10 @@ mod tests {
     }
     /// Journal restoration of a Codex route whose recorded PID is held by an
     /// unrelated live process with another start time (PID reuse): that process is
-    /// never authority and the incarnation is gone. The row survives only as an
-    /// *unspent*-proof gateway candidate of a still-configured exact thread and
-    /// store, with its committed gateway forgotten; a row without a proof and one
-    /// whose Codex harness policy is no longer configured are dropped.
+    /// never authority and the incarnation is gone. Only an unspent proof permits
+    /// a gateway candidate of a still-configured exact thread and
+    /// store, with its committed gateway forgotten. Linux retains an ended row
+    /// without proof solely for fresh native discovery.
     #[test]
     fn a_reused_pid_is_gone_and_only_an_unspent_configured_proof_survives() {
         use std::os::unix::fs::PermissionsExt;
@@ -1833,6 +1839,7 @@ mod tests {
             run_readers: Vec::new(),
             managed_tools: Vec::new(),
             owner_v2_routes: Vec::new(),
+            native_discovery: false,
             legacy_owner_relays: 0,
         };
         let journal = store.join("routes");
@@ -1848,6 +1855,21 @@ mod tests {
         proven.wake.as_mut().unwrap().gateway = Some((live.pid, live.start_time + 7));
         let mut bare = binding_for(&store, "t2", &path);
         bare.harness = (live.pid, live.start_time + 7);
+        #[cfg(target_os = "linux")]
+        {
+            // Different derived seconds alone could be a wall-clock step. Keep
+            // that legacy case alongside the positively different birth ticks.
+            let mut legacy = proven.clone();
+            legacy.address = NativeAddress::new("h", Harness::CODEX, "ns", "legacy").unwrap();
+            seed.bindings
+                .insert(legacy.address.to_canonical_string(), legacy);
+            let birth = Some((
+                os::boot_id().unwrap().to_owned(),
+                live.start_ticks.unwrap() + 1,
+            ));
+            proven.birth = birth.clone();
+            bare.birth = birth;
+        }
         for binding in [&proven, &bare] {
             seed.bindings
                 .insert(binding.address.to_canonical_string(), binding.clone());
@@ -1859,14 +1881,26 @@ mod tests {
             let mut cold = Registry::new(config(configured), uid()).unwrap();
             let restored = cold.attach_journal(&file, 9_000).unwrap();
             assert!(restored.is_empty(), "a reused PID attests nothing");
+            #[cfg(target_os = "linux")]
+            {
+                let address = NativeAddress::new("h", Harness::CODEX, "ns", "legacy").unwrap();
+                let legacy = &cold.bindings[&address.to_canonical_string()];
+                assert!(legacy.retired && legacy.wake.is_none());
+                assert_eq!(legacy.incarnation_state(), os::IncarnationState::Unknown);
+                assert!(cold.attest_recipient(&address).is_err());
+            }
             let kept = cold.bindings.get(&proven.address.to_canonical_string());
             assert_eq!(kept.is_some(), configured, "configured={configured}");
-            assert!(
-                !cold
-                    .bindings
-                    .contains_key(&bare.address.to_canonical_string()),
-                "no proof: dropped"
-            );
+            if cfg!(target_os = "linux") {
+                let held = &cold.bindings[&bare.address.to_canonical_string()];
+                assert!(held.retired && held.wake.is_none() && !held.capabilities.inject);
+            } else {
+                assert!(
+                    !cold
+                        .bindings
+                        .contains_key(&bare.address.to_canonical_string())
+                );
+            }
             if let Some(kept) = kept {
                 assert_eq!(kept.harness, proven.harness, "the recorded incarnation");
                 assert_eq!(kept.wake.as_ref().unwrap().gateway, None);
@@ -1881,7 +1915,7 @@ mod tests {
     /// every wake route of a gone Codex incarnation under a still-configured policy
     /// survives inert with its idle proof byte-for-byte (its epoch, recorded
     /// incarnation and transcript identity unchanged, no gateway, no capability
-    /// attested, never promoted), rows without a proof are dropped, the retired
+    /// attested, never promoted), rows without a proof cannot use the gateway, the retired
     /// tombstone keeps its exact epoch and fences, and the journal written back
     /// still carries all wake routes at mode 0600.
     #[test]
@@ -1955,6 +1989,7 @@ mod tests {
             run_readers: Vec::new(),
             managed_tools: Vec::new(),
             owner_v2_routes: Vec::new(),
+            native_discovery: false,
             legacy_owner_relays: 0,
         };
         let mut cold = Registry::new(config, uid()).unwrap();
@@ -1975,7 +2010,12 @@ mod tests {
             assert!(cold.attest_recipient(&address).is_err(), "{thread}: inert");
         }
         let plain = NativeAddress::new("h", Harness::CODEX, "ns", "plain").unwrap();
-        assert!(!cold.bindings.contains_key(&plain.to_canonical_string()));
+        if cfg!(target_os = "linux") {
+            let held = &cold.bindings[&plain.to_canonical_string()];
+            assert!(held.retired && held.wake.is_none() && !held.capabilities.inject);
+        } else {
+            assert!(!cold.bindings.contains_key(&plain.to_canonical_string()));
+        }
         let tomb = NativeAddress::new("h", Harness::CODEX, "ns", "tomb").unwrap();
         let tomb = &cold.bindings[&tomb.to_canonical_string()];
         assert!(tomb.retired && tomb.epoch == 1_792_010_500);
@@ -2057,6 +2097,7 @@ mod tests {
             run_readers: Vec::new(),
             managed_tools: Vec::new(),
             owner_v2_routes: Vec::new(),
+            native_discovery: false,
             legacy_owner_relays: 0,
         };
         let mut registry = Registry::new(config, uid()).unwrap();

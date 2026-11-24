@@ -269,6 +269,10 @@ fn restart_over_an_old_journal_never_restores_opencode_child_messages() {
         serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
     for row in snapshot["bindings"].as_array_mut().unwrap() {
         let text = row["address"].to_string();
+        #[cfg(target_os = "linux")]
+        if text.contains("thread-j") {
+            assert!(row.as_object_mut().unwrap().remove("birth").is_some());
+        }
         if text.contains("ses-kid") || text.contains("ses-old") {
             row.as_object_mut().unwrap().remove("role");
         }
@@ -290,10 +294,29 @@ fn restart_over_an_old_journal_never_restores_opencode_child_messages() {
     lab.try_publish("evt-j", &thread, Mode::Message).unwrap();
     let restored = rows();
     assert_eq!(restored.len(), 4, "no row is lost");
-    assert_eq!(
-        restored["thread-j"], before["thread-j"],
-        "the Codex row is unchanged"
-    );
+    #[cfg(target_os = "linux")]
+    {
+        let row = &restored["thread-j"];
+        assert!(row.get("birth").is_none() && row["retired"] == true);
+        assert!(
+            lab.registry
+                .lock()
+                .unwrap()
+                .attest_recipient(&thread)
+                .is_err()
+        );
+        codex.hook(&lab.socket, Harness::CODEX, hook("Stop", "thread-j"));
+        assert!(rows()["thread-j"]["birth"].is_array());
+        assert!(
+            lab.registry
+                .lock()
+                .unwrap()
+                .attest_recipient(&thread)
+                .is_ok()
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    assert_eq!(restored["thread-j"], before["thread-j"]);
     assert!(restored["ses-old"].get("role").is_none());
     harness.hook(
         &lab.socket,
@@ -2241,6 +2264,588 @@ fn unsupported_message_capability_refuses_before_acceptance() {
     harness.stop();
 }
 
+/// Leaves the child waitable until its fixture guard reaps it, independently
+/// observing the kernel zombie state before testing either liveness interface.
+#[cfg(target_os = "linux")]
+fn leave_zombie(child: &mut Harnessed) {
+    use bridge_adapters::os;
+    let pid = child.child.id();
+    let facts = os::process_facts(pid).unwrap();
+    let uid = facts.uid.unwrap();
+    let full = os::attempt::kernel_incarnation(pid, uid).unwrap();
+    assert!(os::incarnation_alive(pid, facts.start_time));
+    child.child.kill().unwrap();
+    assert!(eventually(2000, || {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(')')
+                .is_some_and(|(_, tail)| tail.starts_with(" Z "))
+        })
+    }));
+    assert!(!os::incarnation_alive(pid, facts.start_time));
+    assert_ne!(os::attempt::kernel_incarnation(pid, uid).ok(), Some(full));
+}
+
+/// A still-valid held event reaches the unique verified successor inbox once;
+/// discovery grants no ordinary authority and its later hook starts a fresh epoch.
+#[cfg(target_os = "linux")]
+#[test]
+fn zombie_recovery_delivers_once_without_a_hook() {
+    run_zombie_recovery(true);
+}
+
+/// With discovery omitted, sweeps make no connection and a verified successor
+/// hook renews the epoch and delivers only the still-valid message once.
+#[cfg(target_os = "linux")]
+#[test]
+fn default_waits_for_verified_hook_without_probing_the_successor() {
+    let parsed: bridge_adapters::RegistryConfig = toml::from_str("host_id = 'lab-host'").unwrap();
+    assert!(!parsed.native_discovery);
+    run_zombie_recovery(parsed.native_discovery);
+}
+
+/// Exercises expiry, a prior uncertain attempt and one queued event across
+/// real process replacement under the configured discovery policy.
+#[cfg(target_os = "linux")]
+fn run_zombie_recovery(discover: bool) {
+    let lab = if discover {
+        Lab::with_discovery("zr")
+    } else {
+        Lab::new("zr")
+    };
+    let session = "replacement";
+    let address = lab.claude_address(session);
+    let mut old = Harnessed::start(Harness::CLAUDE_CODE, &lab.claude_store);
+    old.hook(
+        &lab.socket,
+        Harness::CLAUDE_CODE,
+        hook("SessionStart", session),
+    );
+    let epoch = lab
+        .registry
+        .lock()
+        .unwrap()
+        .attest_recipient(&address)
+        .unwrap()
+        .1
+        .epoch;
+
+    let mut carrier = ClaudeLaterCarrier::new(
+        Arc::clone(&lab.registry),
+        Arc::clone(&lab.storage) as Arc<dyn Custody>,
+        ClaudeTiming::default(),
+    )
+    .unwrap();
+    let dispatch = |carrier: &mut ClaudeLaterCarrier| {
+        dispatch_message(
+            &lab.storage,
+            carrier,
+            &address,
+            &now,
+            &DispatchTiming::default(),
+        )
+        .unwrap()
+    };
+    old.cmd(json!({"cmd":"inbox","session_id":session,"behavior":"refused"}));
+    lab.publish("uncertain", &address, Mode::Message, "prior attempt");
+    assert!(matches!(
+        dispatch(&mut carrier),
+        DispatchReport::Sent {
+            state: AttemptState::OutcomeUnknown,
+            ..
+        }
+    ));
+    let uncertain = lab.attempt("uncertain").unwrap().fence;
+    assert_eq!(uncertain.endpoint_epoch, epoch);
+    std::fs::remove_file(
+        lab.claude_store
+            .join("sessions")
+            .join(format!("{}.json", old.child.id())),
+    )
+    .unwrap();
+    lab.publish("held", &address, Mode::Message, "frozen message");
+    let accepted = now();
+    let deadline = accepted + 1000;
+    let expiring = bridge_core::Envelope::new(
+        bridge_core::PublisherId::new(PUBLISHER).unwrap(),
+        bridge_core::EventId::new("expiring").unwrap(),
+        address.clone(),
+        bridge_core::Kind::new("worker.completed").unwrap(),
+        Mode::Message,
+        bridge_core::Policy::KeepAll,
+        bridge_core::Payload::new("expires during hold").unwrap(),
+        bridge_core::Metadata::new(),
+        Some(bridge_core::ExpiresAt::from_unix_millis(deadline).unwrap()),
+    )
+    .unwrap();
+    lab.storage
+        .lock()
+        .unwrap()
+        .publish(&expiring, accepted)
+        .unwrap();
+    assert!(matches!(dispatch(&mut carrier), DispatchReport::Held(_)));
+    assert!(lab.attempt("held").is_none());
+    leave_zombie(&mut old);
+    assert_eq!(lab.storage.lock().unwrap().expire_due(deadline).unwrap(), 1);
+    let mut new = Harnessed::start(Harness::CLAUDE_CODE, &lab.claude_store);
+    // Descriptor freshness accounts for kernel start-tick rounding.
+    std::thread::sleep(Duration::from_millis(80));
+    let socket_path = replacement_inbox_fixture(&lab, &mut new, session);
+    let socket = socket_path.as_path();
+    let sessions = socket.parent().unwrap();
+    if !discover {
+        use std::os::unix::fs::PermissionsExt;
+        let path = sessions.join("test.sock");
+        let probe = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let descriptor = sessions.join(format!("{}.json", new.child.id()));
+        let original = std::fs::read(&descriptor).unwrap();
+        let mut advertised: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        advertised["messagingSocketPath"] = json!(path);
+        std::fs::write(&descriptor, advertised.to_string()).unwrap();
+        let report = dispatch(&mut carrier);
+        assert!(
+            matches!(report, DispatchReport::Held(ref reason) if reason.contains("waiting for replacement verified hook")),
+            "{report:?}"
+        );
+        assert!(lab.attempt("held").is_none());
+        probe.set_nonblocking(true).unwrap();
+        assert_eq!(
+            probe.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        std::fs::write(&descriptor, original).unwrap();
+        new.hook(
+            &lab.socket,
+            Harness::CLAUDE_CODE,
+            hook("SessionStart", session),
+        );
+    }
+    if discover {
+        let mut partial = Vec::new();
+        for missing in ["status", "messagingSocketPath"] {
+            let harness = Harnessed::start(Harness::CLAUDE_CODE, &lab.claude_store);
+            let pid = harness.child.id();
+            std::thread::sleep(Duration::from_millis(60));
+            let mut record = json!({"kind":"interactive","status":"idle","sessionId":session,"pid":pid,"messagingSocketPath":socket});
+            record.as_object_mut().unwrap().remove(missing);
+            std::fs::write(sessions.join(format!("{pid}.json")), record.to_string()).unwrap();
+            partial.push(harness);
+        }
+        // A recycled PID may still have an older, otherwise exact descriptor.
+        let stale = Harnessed::start(Harness::CLAUDE_CODE, &lab.claude_store);
+        let stale_pid = stale.child.id();
+        let stale_path = sessions.join(format!("{stale_pid}.json"));
+        std::fs::write(&stale_path,json!({"kind":"interactive","status":"idle","sessionId":session,"pid":stale_pid,"messagingSocketPath":socket}).to_string()).unwrap();
+        std::fs::File::open(stale_path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH)
+            .unwrap();
+        for n in 0..513 {
+            std::fs::write(sessions.join(format!("{n}.key")), []).unwrap();
+        }
+        std::fs::write(sessions.join("9999999.json"), "{").unwrap();
+        std::fs::write(sessions.join("9999998.json"), vec![0; 128 * 1024]).unwrap();
+    }
+    let report = dispatch(&mut carrier);
+    assert!(
+        matches!(
+            report,
+            DispatchReport::Sent {
+                state: AttemptState::NativeAccepted,
+                events: 1
+            }
+        ),
+        "{report:?}"
+    );
+    let recovered = lab.attempt("held").unwrap().fence.endpoint_epoch;
+    assert!(recovered > epoch);
+    assert_eq!(lab.attempt("uncertain").unwrap().fence, uncertain);
+    assert!(lab.attempt("expiring").is_none());
+    assert_eq!(
+        lab.storage
+            .lock()
+            .unwrap()
+            .lookup(&expiring.publisher, &expiring.event_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        bridge_core::EventState::Expired
+    );
+    assert!(matches!(dispatch(&mut carrier), DispatchReport::Idle));
+    assert_eq!(
+        new.cmd(json!({"cmd":"frames"}))["frames"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    if !discover {
+        assert_eq!(
+            lab.registry
+                .lock()
+                .unwrap()
+                .attest_recipient(&address)
+                .unwrap()
+                .1
+                .epoch,
+            recovered
+        );
+        return;
+    }
+    assert!(
+        lab.registry
+            .lock()
+            .unwrap()
+            .attest_recipient(&address)
+            .is_err()
+    );
+    new.hook(
+        &lab.socket,
+        Harness::CLAUDE_CODE,
+        hook("SessionStart", session),
+    );
+    assert!(
+        lab.registry
+            .lock()
+            .unwrap()
+            .attest_recipient(&address)
+            .unwrap()
+            .1
+            .epoch
+            > recovered
+    );
+}
+
+/// Advertises an owned interactive inbox from the actual fixture harness.
+#[cfg(target_os = "linux")]
+fn replacement_inbox_fixture(
+    lab: &Lab,
+    harness: &mut Harnessed,
+    session: &str,
+) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let inbox = harness.cmd(json!({"cmd":"inbox","session_id":session,"behavior":"delivered"}));
+    let socket = std::path::PathBuf::from(inbox["socket"].as_str().unwrap());
+    let sessions = lab.claude_store.join("sessions");
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let pid = harness.child.id();
+    let path = sessions.join(format!("{pid}.json"));
+    std::fs::write(&path, json!({"kind":"interactive","status":"idle","sessionId":session,"pid":pid,"messagingSocketPath":socket}).to_string()).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    socket
+}
+
+/// Losing a hook-established route after reservation sends zero frames and
+/// yields the outcome that refunds core's transport retry charge.
+#[cfg(target_os = "linux")]
+#[test]
+fn ordinary_hook_proof_loss_defers_without_sending() {
+    use bridge_core::dispatch::{EffectiveMode, Selection};
+    let lab = Lab::new("proof-loss");
+    let mut harness = Harnessed::start(Harness::CLAUDE_CODE, &lab.claude_store);
+    let session = "proof-loss";
+    let address = lab.claude_address(session);
+    replacement_inbox_fixture(&lab, &mut harness, session);
+    harness.hook(
+        &lab.socket,
+        Harness::CLAUDE_CODE,
+        hook("SessionStart", session),
+    );
+    let mut carrier = ClaudeLaterCarrier::new(
+        Arc::clone(&lab.registry),
+        Arc::clone(&lab.storage) as Arc<dyn Custody>,
+        ClaudeTiming::default(),
+    )
+    .unwrap();
+    let att = carrier.attest(&address).unwrap();
+    lab.publish("waiting", &address, Mode::Message, "proof loss");
+    let Selection::Attempt(record) = lab
+        .storage
+        .lock()
+        .unwrap()
+        .reserve_next(
+            &att,
+            EffectiveMode::Message,
+            now(),
+            &DispatchTiming::default(),
+        )
+        .unwrap()
+    else {
+        panic!("expected reservation")
+    };
+    std::fs::remove_file(
+        lab.claude_store
+            .join("sessions")
+            .join(format!("{}.json", harness.child.id())),
+    )
+    .unwrap();
+    assert!(matches!(
+        carrier.send(&record),
+        Outcome::DeferredKnownUnsent { .. }
+    ));
+    assert_eq!(
+        harness.cmd(json!({"cmd":"frames"}))["frames"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+/// Both hook-derived predecessors survive a daemon restart and exact native
+/// rediscovery. Only the managed one still requires managed ancestry at renewal.
+#[cfg(target_os = "linux")]
+#[test]
+fn restart_preserves_discovery_and_predecessor_hook_requirements() {
+    for managed in [false, true] {
+        let mut lab = if managed {
+            crate::attempt_binding::lab()
+        } else {
+            Lab::new("ended")
+        };
+        let session = "restart";
+        let address = lab.claude_address(session);
+        let journal = lab.socket.with_extension("bindings.json");
+        let rows = || {
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&journal).unwrap()).unwrap()
+                ["bindings"][0]
+                .clone()
+        };
+        let mut old = Harnessed::start(Harness::CLAUDE_CODE, &lab.claude_store);
+        old.hook(
+            &lab.socket,
+            Harness::CLAUDE_CODE,
+            hook("SessionStart", session),
+        );
+        assert_eq!(rows()["managed_incarnation"].is_object(), managed);
+        let epoch = rows()["epoch"].as_u64().unwrap();
+        leave_zombie(&mut old);
+        lab.config.native_discovery = true;
+        let mappings = std::mem::take(&mut lab.config.managed_tools);
+        crate::attempt_binding::restart(&mut lab);
+        assert!(
+            lab.registry
+                .lock()
+                .unwrap()
+                .attest_recipient(&address)
+                .is_err()
+        );
+        let mut new = Harnessed::start(Harness::CLAUDE_CODE, &lab.claude_store);
+        std::thread::sleep(Duration::from_millis(80));
+        replacement_inbox_fixture(&lab, &mut new, session);
+        let mut carrier = ClaudeLaterCarrier::new(
+            Arc::clone(&lab.registry),
+            Arc::clone(&lab.storage) as Arc<dyn Custody>,
+            ClaudeTiming::default(),
+        )
+        .unwrap();
+        let discovered = carrier.attest(&address).unwrap();
+        assert!(discovered.endpoint_epoch() > epoch && !discovered.capabilities().inject);
+        let row = rows();
+        assert!(row.get("managed_incarnation").is_none());
+        assert_eq!(row["discovered"]["incarnation"]["pid"], new.child.id());
+        assert_eq!(row["discovered"]["requires_managed_ancestry"], managed);
+        // Restarting with the switch off cannot reactivate a journaled
+        // discovery-only epoch, even while its physical peer is still live.
+        lab.config.native_discovery = false;
+        crate::attempt_binding::restart(&mut lab);
+        let mut disabled = ClaudeLaterCarrier::new(
+            Arc::clone(&lab.registry),
+            Arc::clone(&lab.storage) as Arc<dyn Custody>,
+            ClaudeTiming::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            disabled.attest(&address).unwrap_err(),
+            "waiting for replacement verified hook"
+        );
+        assert_eq!(rows(), row);
+        let reply = new.hook(&lab.socket, Harness::CLAUDE_CODE, hook("Stop", session));
+        if managed {
+            assert!(
+                reply["stderr"].as_str().unwrap().contains("not_evidence"),
+                "{reply}"
+            );
+            assert_eq!(rows(), row);
+            lab.config.managed_tools = mappings;
+            crate::attempt_binding::restart(&mut lab);
+            new.hook(&lab.socket, Harness::CLAUDE_CODE, hook("Stop", session));
+        }
+        assert!(
+            lab.registry
+                .lock()
+                .unwrap()
+                .attest_recipient(&address)
+                .unwrap()
+                .1
+                .epoch
+                > discovered.endpoint_epoch()
+        );
+        assert!(rows().get("discovered").is_none());
+    }
+}
+
+/// Scripted successor App Server. It serves one exact loaded thread and drops
+/// the receipt after recording each native turn; the parent owns its lifetime.
+#[cfg(target_os = "linux")]
+#[test]
+fn replacement_server_fixture() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(dir) = std::env::var_os("BRIDGE_TEST_REPLACEMENT_STORE") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let control = dir.join("app-server-control");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&control)
+        .unwrap();
+    let path = dir.join("s");
+    std::thread::sleep(Duration::from_millis(60));
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::os::unix::fs::symlink(path, control.join("app-server-control.sock")).unwrap();
+    for stream in listener.incoming() {
+        let Ok(mut ws) = tungstenite::accept(stream.unwrap()) else {
+            continue;
+        };
+        while let Ok(tungstenite::Message::Text(text)) = ws.read() {
+            let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let result = match request["method"].as_str().unwrap() {
+                "initialize" => json!({}),
+                "initialized" => continue,
+                "thread/read" => {
+                    json!({"thread":{"id":"loaded", "status":{"type":"idle"}}})
+                }
+                "turn/start" => {
+                    use std::io::Write;
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(dir.join("turns"))
+                        .unwrap()
+                        .write_all(b"1")
+                        .unwrap();
+                    break;
+                }
+                _ => panic!("unexpected fixture method"),
+            };
+            ws.send(tungstenite::Message::Text(
+                json!({"id":request["id"],"result":result})
+                    .to_string()
+                    .into(),
+            ))
+            .unwrap();
+        }
+    }
+}
+
+/// A verified successor can deliver only to its loaded thread. A missing
+/// receipt remains tied to the original attempt even after another attestation.
+#[cfg(target_os = "linux")]
+#[test]
+fn zombie_codex_recovery_requires_loaded_thread_and_preserves_unknown() {
+    use std::os::unix::fs::PermissionsExt;
+    let lab = Lab::with_discovery("zc");
+    let mut old = Harnessed::start(Harness::CODEX, &lab.codex_store);
+    for session in ["loaded", "other", "spoof"] {
+        old.hook(&lab.socket, Harness::CODEX, hook("SessionStart", session));
+        lab.publish(
+            session,
+            &lab.codex_address(session),
+            Mode::Message,
+            "fixture",
+        );
+    }
+    leave_zombie(&mut old);
+    // A same-user socket and exact store name cannot substitute for a marked
+    // native process. The hold is visible without a single delivery attempt.
+    let control = lab.codex_store.join("app-server-control");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&control)
+        .unwrap();
+    let fake = lab.codex_store.join("f");
+    let listener = std::os::unix::net::UnixListener::bind(&fake).unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::os::unix::fs::symlink(fake, control.join("app-server-control.sock")).unwrap();
+    let mut probe = CodexQueueCarrier::new(
+        Arc::clone(&lab.registry),
+        lab.dir.0.join("unused"),
+        Duration::from_secs(2),
+    );
+    assert_eq!(
+        probe.attest(&lab.codex_address("spoof")).unwrap_err(),
+        "native socket birth or peer continuity unverified"
+    );
+    assert!(lab.attempt("spoof").is_none());
+    drop(listener);
+    std::fs::remove_dir_all(control).unwrap();
+    let exe = lab.dir.0.join("bridge-fixture-server");
+    std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut command = ChildGuard::command(exe);
+    command
+        .args(["--exact", "native::replacement_server_fixture"])
+        .env("CODEX_HOME", &lab.codex_store)
+        .env("BRIDGE_TEST_REPLACEMENT_STORE", &lab.codex_store)
+        .env_remove("CODEX_APP_TOOLS_PIPE_PATH")
+        .env_remove("BRIDGE_NATIVE_OWNER_SOCKET");
+    let _child = ChildGuard::spawn(command);
+    assert!(eventually(2000, || lab
+        .codex_store
+        .join("app-server-control/app-server-control.sock")
+        .exists()));
+    let mut carrier = CodexQueueCarrier::new(
+        Arc::clone(&lab.registry),
+        lab.dir.0.join("unused"),
+        Duration::from_secs(2),
+    );
+    let loaded = lab.codex_address("loaded");
+    carrier.attest(&loaded).unwrap();
+    // A second metadata-only sweep uses the recent positive result. Sending
+    // will still need the real endpoint and a fresh native thread state.
+    let control_socket = lab
+        .codex_store
+        .join("app-server-control/app-server-control.sock");
+    let hidden = control_socket.with_extension("hidden");
+    std::fs::rename(&control_socket, &hidden).unwrap();
+    carrier.attest(&loaded).unwrap();
+    std::fs::rename(hidden, control_socket).unwrap();
+    let mut dispatch = |session| {
+        dispatch_message(
+            &lab.storage,
+            &mut carrier,
+            &lab.codex_address(session),
+            &now,
+            &DispatchTiming::default(),
+        )
+        .unwrap()
+    };
+    let refused = dispatch("other");
+    assert!(
+        matches!(refused, DispatchReport::Held(ref reason) if reason.contains("native thread state unavailable")),
+        "{refused:?}"
+    );
+    assert!(lab.attempt("other").is_none());
+    let sent = dispatch("loaded");
+    assert!(
+        matches!(
+            sent,
+            DispatchReport::Sent {
+                state: AttemptState::OutcomeUnknown,
+                ..
+            }
+        ),
+        "{sent:?}"
+    );
+    let original = lab.attempt("loaded").unwrap().fence;
+    assert!(matches!(dispatch("loaded"), DispatchReport::Idle));
+    assert_eq!(lab.attempt("loaded").unwrap().fence, original);
+    assert_eq!(std::fs::read(lab.codex_store.join("turns")).unwrap(), b"1");
+}
+
 /// A second live harness process cannot take over a bound session; a later renewal fences old records.
 #[test]
 fn a_second_live_incarnation_cannot_take_over_a_bound_session() {
@@ -2276,6 +2881,9 @@ fn a_second_live_incarnation_cannot_take_over_a_bound_session() {
         .unwrap()
         .1
         .epoch;
+    #[cfg(target_os = "linux")]
+    leave_zombie(&mut first);
+    #[cfg(not(target_os = "linux"))]
     first.stop();
     second.hook(
         &lab.socket,
@@ -4148,11 +4756,12 @@ fn managed_idle_end_hook_persists_full_transcript_digest() {
 /// and for one retired by `SessionEnd` after the same positive idle (the existing
 /// narrow Desktop exception). Synthetic native-owner input only.
 #[test]
-fn idle_codex_thread_is_woken_through_the_new_gateway_after_restart() {
+fn default_config_wakes_idle_codex_thread_through_desktop_gateway_after_restart() {
     use std::os::unix::net::UnixListener;
     let node = std::env::var("BRIDGE_TEST_NODE").expect("BRIDGE_TEST_NODE required");
     for ended in [false, true] {
         let lab = Lab::new("gw");
+        assert!(!lab.config.native_discovery);
         let pipe = lab.dir.0.join("native.sock");
         let calls = Arc::new(AtomicUsize::new(0));
         let native = gateway_host(
@@ -4171,6 +4780,13 @@ fn idle_codex_thread_is_woken_through_the_new_gateway_after_restart() {
         }
         let before = gateway_journal(&lab);
         assert!(before.get("wake").is_some(), "positive idle was stamped");
+        #[cfg(target_os = "linux")]
+        if ended {
+            leave_zombie(&mut first);
+        } else {
+            first.stop();
+        }
+        #[cfg(not(target_os = "linux"))]
         first.stop();
         // Process start times have whole-second resolution: the new harness must
         // be born in a later second than the one it replaces.
@@ -4499,7 +5115,7 @@ fn gateway_commit_failure_holds_and_unknown_hand_off_spends_the_proof() {
 fn lost_ack_with_a_writable_journal_leaves_no_wake_proof_and_never_rehomes() {
     use std::os::unix::net::UnixListener;
     let node = std::env::var("BRIDGE_TEST_NODE").expect("BRIDGE_TEST_NODE required");
-    let mut lab = Lab::new("gwack");
+    let mut lab = Lab::with_discovery("gwack");
     let pipe = lab.dir.0.join("native.sock");
     let listener = UnixListener::bind(&pipe).unwrap();
     let probe = listener.try_clone().unwrap();

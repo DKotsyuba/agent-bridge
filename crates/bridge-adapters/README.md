@@ -540,9 +540,9 @@ candidate of the same configured thread and store.
 After an application update or restart the Desktop harness is a new process and an
 idle thread fires no hook, so the recorded incarnation is gone and nothing renews
 the binding. A queued message to such an address is delivered through a MESSAGE-only
-**physical gateway** instead, with no caller, call or inject authority and no rebinding
-of the recorded harness (the thread's own next hook renews the binding the ordinary
-way). The route needs all of:
+**physical gateway** with either setting of `[adapters].native_discovery`.
+The gateway grants no caller, call or inject authority. The recorded harness
+binding is renewed by the thread's own next hook. The route needs all of:
 
 1. The owner's own hook last left the lifecycle positively `Inactive` on a Desktop
    harness (the application's native pipe in its environment). That stamps a private

@@ -327,14 +327,16 @@ mod tests {
             run_readers: Vec::new(),
             managed_tools: Vec::new(),
             owner_v2_routes: Vec::new(),
+            native_discovery: false,
             legacy_owner_relays: 0,
         };
         let mut registry = Registry::new(config.clone(), uid).unwrap();
         registry.attach_journal(&journal, 1).unwrap();
+        let facts = os::process_facts(std::process::id()).unwrap();
         let mut binding = Binding {
             managed_incarnation: None,
             address: address.clone(),
-            harness: (1, 2),
+            harness: (facts.pid, facts.start_time),
             epoch: 3,
             capabilities: Capabilities {
                 inject: true,
@@ -349,6 +351,11 @@ mod tests {
             transcript: Some(transcript),
             store: root.join("store"),
             executable: root.join("codex"),
+            birth: Some((
+                os::boot_id().unwrap().to_owned(),
+                facts.start_ticks.unwrap(),
+            )),
+            discovered: None,
             retired: true,
             desktop_idle_message: false,
             desktop_idle_transcript: None,
