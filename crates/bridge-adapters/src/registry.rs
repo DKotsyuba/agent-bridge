@@ -1336,6 +1336,7 @@ impl Binding {
     }
 
     /// Preserves the admission requirement across any number of physical replacements.
+    #[cfg(target_os = "linux")]
     fn requires_managed_ancestry(&self) -> bool {
         self.managed_incarnation.is_some()
             || self

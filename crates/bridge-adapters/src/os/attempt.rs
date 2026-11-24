@@ -534,6 +534,7 @@ fn owner_v2_locator_at(
 
 /// Establishes that a PID is absent from a readable, non-hidepid procfs view.
 /// Unreadable mount information or hidden PID policy is never proof of absence.
+#[cfg(target_os = "linux")]
 pub(crate) fn definitely_gone(pid: u32) -> bool {
     if pid == 0 {
         return false;
