@@ -134,7 +134,7 @@ fn discover(candidate: &MessageCandidate, state: os::IncarnationState) -> Result
     let thread = &old.address.native_session_id;
     let (stream, facts, hint) = if old.address.harness == Harness::CODEX {
         let (_, stream, facts) =
-            crate::codex_live::connect_control(&old.store, uid)?.ok_or(NO_SOCKET)?;
+            crate::codex_live::connect_control(&old.store, uid, true)?.ok_or(NO_SOCKET)?;
         (stream, facts, None)
     } else {
         let (socket, hint) = crate::claude::replacement_inbox(&old.store, thread, uid)?;
@@ -187,7 +187,7 @@ fn discover(candidate: &MessageCandidate, state: os::IncarnationState) -> Result
             ..candidate.clone()
         };
         let (_, route) = physical.validate()?;
-        let endpoint = crate::codex_live::locate(&route)?.ok_or(NO_SOCKET)?;
+        let endpoint = crate::codex_live::locate(&route, true)?.ok_or(NO_SOCKET)?;
         binding.lifecycle = match endpoint.state(thread, Duration::from_secs(1))? {
             crate::codex_live::State::Idle => Lifecycle::Inactive,
             crate::codex_live::State::Active => Lifecycle::Active,
