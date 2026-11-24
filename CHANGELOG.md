@@ -4,7 +4,11 @@ All notable changes to Agent Bridge are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions describe the
 source, and the crates are not published to crates.io.
 
-## Unreleased
+## [0.7.4] - 2026-11-24
+
+This release recovers an address whose harness process was replaced (for example by a Codex
+App Server auto-update) without restarting Bridge. Core storage stays at schema 9; the
+route journal gains fields that the previous release cannot read (see Upgrade notes).
 
 ### Upgrade notes
 
