@@ -36,6 +36,9 @@ pub(crate) struct Endpoint {
     binding: RecipientBinding,
     /// Local process owner required of the socket peer.
     uid: u32,
+    /// Whether every connection must also pass the socket-birth fence
+    /// (only for discovery-only candidates).
+    fence_socket_birth: bool,
 }
 
 /// The native thread states in which a message can be considered.
@@ -62,11 +65,15 @@ fn private_directory(path: &Path, uid: u32) -> Result<(), String> {
 }
 
 /// Finds only the recipient's own control socket; malformed presence is an error.
-pub(crate) fn locate(binding: &RecipientBinding) -> Result<Option<Endpoint>, String> {
+pub(crate) fn locate(
+    binding: &RecipientBinding,
+    fence_socket_birth: bool,
+) -> Result<Option<Endpoint>, String> {
     let uid = os::process_facts(std::process::id())
         .and_then(|f| f.uid)
         .ok_or("process owner unavailable")?;
-    let Some((path, stream, facts)) = connect_control(&binding.store, uid)? else {
+    let Some((path, stream, facts)) = connect_control(&binding.store, uid, fence_socket_birth)?
+    else {
         return Ok(None);
     };
     let endpoint = Endpoint {
@@ -74,6 +81,7 @@ pub(crate) fn locate(binding: &RecipientBinding) -> Result<Option<Endpoint>, Str
         path,
         binding: binding.clone(),
         uid,
+        fence_socket_birth,
     };
     endpoint.verify_peer(&stream)?;
     Ok(Some(endpoint))
@@ -83,6 +91,7 @@ pub(crate) fn locate(binding: &RecipientBinding) -> Result<Option<Endpoint>, Str
 pub(crate) fn connect_control(
     store: &Path,
     uid: u32,
+    fence_socket_birth: bool,
 ) -> Result<Option<(PathBuf, UnixStream, os::ProcessFacts)>, String> {
     let store = fs::canonicalize(store).map_err(|_| "recipient store unavailable")?;
     let dir = store.join("app-server-control");
@@ -107,7 +116,11 @@ pub(crate) fn connect_control(
     if !target.file_type().is_socket() || target.uid() != uid || target.mode() & 0o777 != 0o600 {
         return Err("native control socket is not owned mode 0600".into());
     }
-    let (stream, facts) = os::connect_verified(&path, Instant::now() + Duration::from_secs(1))?;
+    let (stream, facts) = os::connect_verified(
+        &path,
+        Instant::now() + Duration::from_secs(1),
+        fence_socket_birth,
+    )?;
     Ok(Some((path, stream, facts)))
 }
 
@@ -222,7 +235,7 @@ impl Endpoint {
 
     /// Opens and initializes a deadline-bound WebSocket to the verified peer.
     fn open(&self, deadline: Instant) -> Result<WebSocket<DeadlineStream>, String> {
-        let (stream, facts) = os::connect_verified(&self.path, deadline)?;
+        let (stream, facts) = os::connect_verified(&self.path, deadline, self.fence_socket_birth)?;
         if facts.kernel_incarnation.as_ref() != Some(&self.identity) {
             return Err(os::SOCKET_CONTINUITY.into());
         }
@@ -731,7 +744,7 @@ mod tests {
                 _ => false,
             }
         });
-        let endpoint = locate(&binding).unwrap().unwrap();
+        let endpoint = locate(&binding, false).unwrap().unwrap();
         let handoff = Handoff {
             thread: "thread-1",
             client_id: "client-1",
@@ -875,7 +888,7 @@ mod tests {
             }
             mutations
         });
-        let endpoint = locate(&binding).unwrap().unwrap();
+        let endpoint = locate(&binding, false).unwrap().unwrap();
         let initial = endpoint.state("thread-1", Duration::from_secs(3)).unwrap();
         let handoff = Handoff {
             thread: "thread-1",
@@ -1025,7 +1038,7 @@ mod tests {
                     "{case}: unexpected native write"
                 );
             });
-            let endpoint = locate(&binding).unwrap().unwrap();
+            let endpoint = locate(&binding, false).unwrap().unwrap();
             let result = match case {
                 "exact" | "wrong_turn" | "empty_wrong" => endpoint
                     .completed_state("thread-1", "turn-1", Duration::from_secs(3))
@@ -1117,7 +1130,7 @@ mod tests {
                 }
                 true
             });
-            let endpoint = locate(&binding).unwrap().unwrap();
+            let endpoint = locate(&binding, false).unwrap().unwrap();
             let handoff = Handoff {
                 thread: "thread-1",
                 client_id: "client-1",
@@ -1198,7 +1211,7 @@ mod tests {
                 }
                 started
             });
-            let endpoint = locate(&binding).unwrap().unwrap();
+            let endpoint = locate(&binding, false).unwrap().unwrap();
             let oversized = "x".repeat(LIMIT + 1);
             let deadline_ms = current_unix_millis() + if case == "deadline" { 1000 } else { 3000 };
             let handoff = Handoff {
@@ -1451,7 +1464,7 @@ mod tests {
                 }
                 (true, started)
             });
-            let endpoint = locate(&binding).unwrap().unwrap();
+            let endpoint = locate(&binding, false).unwrap().unwrap();
             let deadline_ms = current_unix_millis() + if case == "deadline" { 1000 } else { 3000 };
             let handoff = Handoff {
                 thread: "thread-1",
@@ -1541,7 +1554,7 @@ mod tests {
     fn rejects_wrong_peer_incarnation() {
         let (dir, listener, mut binding) = fixture();
         binding.harness.1 += 1;
-        assert!(locate(&binding).is_err());
+        assert!(locate(&binding, false).is_err());
         drop(listener);
         let target_dir = std::env::temp_dir()
             .parent()
@@ -1550,12 +1563,12 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
         fs::remove_dir_all(target_dir).unwrap();
     }
-    /// Losing clock coverage after attestation defers the frozen message
-    /// before native input and preserves its transport retry budget.
+    /// A hook-attested route does not depend on socket-birth clock history:
+    /// sockets created before the daemon started must stay deliverable.
     #[test]
-    fn missing_socket_birth_continuity_defers_before_handoff() {
+    fn attested_route_ignores_missing_socket_birth_history() {
         let (dir, listener, binding) = fixture();
-        let endpoint = locate(&binding).unwrap().unwrap();
+        let endpoint = locate(&binding, false).unwrap().unwrap();
         os::clock::reset();
         let outcome = deliver(
             &endpoint,
@@ -1574,7 +1587,8 @@ mod tests {
             || unreachable!(),
         );
         assert!(
-            matches!(outcome, Outcome::DeferredKnownUnsent {evidence} if evidence == os::SOCKET_CONTINUITY)
+            !matches!(&outcome, Outcome::DeferredKnownUnsent {evidence} if evidence == os::SOCKET_CONTINUITY),
+            "ordinary delivery must not require socket-birth history: {outcome:?}"
         );
         drop(listener);
         fs::remove_dir_all(
@@ -1598,7 +1612,7 @@ mod tests {
         let facts = os::process_facts(child.id()).unwrap();
         binding.harness = (facts.pid, facts.start_time);
         binding.executable = facts.exe.unwrap();
-        let refused = locate(&binding).is_err();
+        let refused = locate(&binding, false).is_err();
         child.kill().unwrap();
         child.wait().unwrap();
         drop(listener);

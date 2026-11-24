@@ -207,7 +207,7 @@ impl CodexQueueCarrier {
                     // the still-unspent, transcript-bound proof. A failed
                     // advance still permits a fresh, separately fenced cold route.
                     let upgraded = (|| -> Result<_, String> {
-                        let endpoint = crate::codex_live::locate(&binding)?
+                        let endpoint = crate::codex_live::locate(&binding, candidate.discovered())?
                             .ok_or("qualified native control socket unavailable")?;
                         let timeout = self.timeout.min(Duration::from_secs(3));
                         endpoint.completed_state(
@@ -285,7 +285,9 @@ impl CodexQueueCarrier {
                         .ok_or_else(|| "registered Codex application frontend not available yet (transient hold)".into());
                 }
                 #[cfg(target_os = "linux")]
-                if let Some(endpoint) = crate::codex_live::locate(&result.1)? {
+                if let Some(endpoint) =
+                    crate::codex_live::locate(&result.1, candidate.discovered())?
+                {
                     // This read never resumes or starts a thread. A present but
                     // unqualified live route holds instead of falling back.
                     // Before reservation this is an eligibility hold. During
@@ -330,7 +332,7 @@ impl CodexQueueCarrier {
         } else {
             candidate.validate_live_cold()?
         };
-        let endpoint = crate::codex_live::locate(&binding)?
+        let endpoint = crate::codex_live::locate(&binding, candidate.discovered())?
             .ok_or("qualified native control socket unavailable")?;
         let timeout = self.timeout.min(Duration::from_secs(3));
         match endpoint.state(&address.native_session_id, timeout)? {
