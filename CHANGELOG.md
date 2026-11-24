@@ -6,6 +6,28 @@ source, and the crates are not published to crates.io.
 
 ## Unreleased
 
+### Upgrade notes
+
+Before installing, stop Bridge and back up the private journals beside each account's
+configured adapter channel socket. For a channel named `c.sock`, these are
+`c.bindings.json` and, when present, `c.bindings.attempts.json` and
+`c.bindings.frontend-roles.json`. Substitute your configured socket basename for `c`.
+
+The Linux binding journal upgrade is one-way after the first hook. Verified
+native discovery can also write the new fields before a hook. Version 0.7.3 refuses these rows with
+`route journal malformed`. Rolling back requires restoring the pre-upgrade
+binding journal backup while Bridge is stopped. Preserve the current attempt
+and role journals and custody database, including post-upgrade delivery evidence.
+
+A verified successor hook renews an ended binding without a daemon restart.
+The existing one-shot Codex Desktop gateway remains available by default.
+Proactive replacement-socket discovery is experimental and
+requires `[adapters].native_discovery = true`. A socket's immutable filesystem
+birth time is insufficient for kernel peer-lifetime proof across a backward
+clock step and an inherited listener. Claude's descriptor uniqueness check can
+race with handoff. Missing birth time or clock history also holds the socket
+route. The default leaves these replacement probes disabled.
+
 ## [0.7.3] - 2026-11-19
 
 This release fixes a false refusal when two Bridge daemons create the channel

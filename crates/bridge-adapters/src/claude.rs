@@ -275,20 +275,37 @@ pub struct ClaudeLaterCarrier {
 
 /// Reads an owned, regular, bounded JSON object (never through a symlink).
 fn owned_json(path: &Path, uid: u32) -> Option<serde_json::Map<String, Value>> {
-    let metadata = std::fs::symlink_metadata(path).ok()?;
-    if !metadata.is_file() || metadata.uid() != uid || metadata.len() > MAX_DESCRIPTOR_BYTES {
+    owned_record(path, uid).map(|(map, _)| map)
+}
+
+/// Reads one bounded owned descriptor and returns the metadata of the exact
+/// file read. Concurrent writes, renames and symlinks invalidate the sample.
+fn owned_record(
+    path: &Path,
+    uid: u32,
+) -> Option<(serde_json::Map<String, Value>, std::fs::Metadata)> {
+    let before = std::fs::symlink_metadata(path).ok()?;
+    if !before.is_file() || before.uid() != uid || before.len() > MAX_DESCRIPTOR_BYTES {
         return None;
     }
-    let mut text = String::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(MAX_DESCRIPTOR_BYTES)
-        .read_to_string(&mut text)
-        .ok()?;
-    match serde_json::from_str(&text).ok()? {
-        Value::Object(map) => Some(map),
-        _ => None,
+    let mut file = std::fs::File::open(path).ok()?;
+    let stamp = |m: &std::fs::Metadata| (m.dev(), m.ino(), m.ctime(), m.ctime_nsec());
+    let opened = file.metadata().ok()?;
+    if stamp(&before) != stamp(&opened) {
+        return None;
     }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(MAX_DESCRIPTOR_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 != opened.len()
+        || stamp(&opened) != stamp(&std::fs::symlink_metadata(path).ok()?)
+    {
+        return None;
+    }
+    let map = serde_json::from_slice(&bytes).ok()?;
+    Some((map, opened))
 }
 
 /// Sorted entries of the store's session registry that satisfy `keep`, at
@@ -336,28 +353,103 @@ pub(crate) fn session_hint(store: &Path, session: &str, uid: u32) -> Option<Sess
     registry_entries(store, |p| p.extension().is_some_and(|x| x == "json"))
         .into_iter()
         .find_map(|path| {
-            let map = owned_json(&path, uid)?;
-            if map.get("sessionId")?.as_str()? != session
-                || map.get("kind")?.as_str()? != "interactive"
-            {
-                return None;
-            }
-            let pid = u32::try_from(map.get("pid")?.as_u64()?)
-                .ok()
-                .filter(|p| *p > 0)?;
-            let lifecycle = match map.get("status").and_then(Value::as_str) {
-                Some("idle") => bridge_core::dispatch::Lifecycle::Inactive,
-                Some("busy") => bridge_core::dispatch::Lifecycle::Active,
-                _ => return None,
-            };
-            let metadata = std::fs::symlink_metadata(&path).ok()?;
-            let written_at = (metadata.mtime(), metadata.mtime_nsec());
-            Some(SessionHint {
-                pid,
-                lifecycle,
-                written_at,
-            })
+            let (map, metadata) = owned_record(&path, uid)?;
+            interactive_hint(&map, session, &metadata)
         })
+}
+
+/// Extracts a positive native lifecycle and its descriptor timestamp for the exact session.
+fn interactive_hint(
+    map: &serde_json::Map<String, Value>,
+    session: &str,
+    metadata: &std::fs::Metadata,
+) -> Option<SessionHint> {
+    if map.get("sessionId")?.as_str()? != session || map.get("kind")?.as_str()? != "interactive" {
+        return None;
+    }
+    let pid = u32::try_from(map.get("pid")?.as_u64()?)
+        .ok()
+        .filter(|p| *p > 0)?;
+    let lifecycle = match map.get("status").and_then(Value::as_str) {
+        Some("idle") => bridge_core::dispatch::Lifecycle::Inactive,
+        Some("busy") => bridge_core::dispatch::Lifecycle::Active,
+        _ => return None,
+    };
+
+    let written_at = (metadata.mtime(), metadata.mtime_nsec());
+    Some(SessionHint {
+        pid,
+        lifecycle,
+        written_at,
+    })
+}
+
+/// Selects the unique live, canonical per-PID descriptor for this exact session.
+/// Only JSON candidates count toward the bound. Incomplete files and stale
+/// descriptors are skipped. Conflicting fresh owners keep the route closed.
+#[cfg(target_os = "linux")]
+pub(crate) fn replacement_inbox(
+    store: &Path,
+    session: &str,
+    uid: u32,
+) -> Result<(PathBuf, SessionHint), String> {
+    use crate::registry::recovery::{NO_SOCKET, UNVERIFIED};
+    let dir = store.join("sessions");
+    if dir.canonicalize().ok().as_ref() != Some(&dir) {
+        return Err(NO_SOCKET.into());
+    }
+    let meta = std::fs::metadata(&dir).map_err(|_| NO_SOCKET)?;
+    if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o022 != 0 {
+        return Err(UNVERIFIED.into());
+    }
+    let mut found = None;
+    let mut count = 0;
+    for entry in std::fs::read_dir(dir).map_err(|_| NO_SOCKET)? {
+        let path = entry.map_err(|_| UNVERIFIED)?.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("json") {
+            continue;
+        }
+        count += 1;
+        if count > MAX_DESCRIPTORS {
+            return Err(UNVERIFIED.into());
+        }
+        let Some(pid) = path
+            .file_stem()
+            .and_then(|s| s.to_str()?.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Some((map, metadata)) = owned_record(&path, uid) else {
+            continue;
+        };
+        if map.get("sessionId").and_then(Value::as_str) != Some(session) {
+            continue;
+        }
+        let Some(facts) = os::process_facts(pid) else {
+            continue;
+        };
+        if !crate::registry::descriptor_written_after_start(
+            &facts,
+            (metadata.mtime(), metadata.mtime_nsec()),
+        ) {
+            continue;
+        }
+        let Some(hint) = interactive_hint(&map, session, &metadata) else {
+            continue;
+        };
+        let Some(socket) = map
+            .get("messagingSocketPath")
+            .and_then(Value::as_str)
+            .filter(|path| Path::new(path).is_absolute())
+        else {
+            continue;
+        };
+        if found.is_some() || metadata.mode() & 0o022 != 0 || hint.pid != pid {
+            return Err(UNVERIFIED.into());
+        }
+        found = Some((PathBuf::from(socket), hint));
+    }
+    found.ok_or_else(|| NO_SOCKET.into())
 }
 
 /// What the session descriptor of the attested harness process says about
@@ -1185,10 +1277,13 @@ impl ClaudeLaterCarrier {
         crate::registry::refresh_stale(&self.registry);
         let candidate = { lock_registry(&self.registry).message_candidate(recipient)? };
         let (attestation, binding) = candidate.validate()?;
+        if candidate.discovered() {
+            return Err("replacement requires a verified native hook".into());
+        }
         let socket = crate::owner::locate(
             &self.registry,
             binding.harness,
-            binding.managed_incarnation.as_ref(),
+            binding.peer_incarnation.as_ref(),
         )?
         .ok_or("native owner locator is no longer present")?;
         lock_registry(&self.registry).message_current(&candidate)?;
@@ -1198,8 +1293,7 @@ impl ClaudeLaterCarrier {
     /// One native owner hand-off of the frozen manifest for an owner-routed
     /// recipient. The unchanged epoch and a positive idle lifecycle are
     /// required, whatever the requested mode. A proven epoch/idle change is
-    /// deferred without consuming transport retries; other pre-write failures
-    /// are ordinary known-unsent. No inbox frame, callback
+    /// deferred without consuming transport retries, as is loss of owner proof. No inbox frame, callback
     /// socket or second route is ever used after this route is selected.
     fn send_owner(
         &self,
@@ -1210,7 +1304,7 @@ impl ClaudeLaterCarrier {
         let (attestation, binding, socket) = match self.owner_route(address) {
             Ok(found) => found,
             Err(reason) => {
-                return Outcome::KnownUnsent {
+                return Outcome::DeferredKnownUnsent {
                     evidence: format!("native owner route not proven: {reason}"),
                 };
             }
@@ -1226,7 +1320,7 @@ impl ClaudeLaterCarrier {
             &self.registry,
             &socket,
             binding.harness,
-            binding.managed_incarnation.as_ref(),
+            binding.peer_incarnation.as_ref(),
             Harness::CLAUDE_CODE,
             &crate::owner::Handoff {
                 thread_id: &address.native_session_id,
@@ -1255,21 +1349,66 @@ impl ClaudeLaterCarrier {
             deadline_ms,
         } = *frame;
         let unsent = |evidence: String| Outcome::KnownUnsent { evidence };
+        let defer = |evidence: String| Outcome::DeferredKnownUnsent { evidence };
         let limit = Instant::now() + Duration::from_secs(5);
         let budget = remaining_send_time(deadline_ms, limit)
             .ok_or_else(|| unsent("inbox hand-off deadline elapsed".into()))?;
+        #[cfg(target_os = "linux")]
+        let (mut stream, connected) = os::connect_verified(socket, Instant::now() + budget)
+            .map_err(|reason| {
+                if reason == os::SOCKET_CONTINUITY || reason == "native control socket unavailable"
+                {
+                    Outcome::DeferredKnownUnsent {
+                        evidence: reason.into(),
+                    }
+                } else {
+                    unsent(reason.into())
+                }
+            })?;
+        #[cfg(not(target_os = "linux"))]
         let mut stream = crate::desktop::connect(socket, Instant::now() + budget)
             .map_err(|error| unsent(format!("inbox connect failed: {}", error.kind())))?;
         let peer = os::peer_identity(&stream)
-            .map_err(|_| unsent("inbox peer identity unreadable".into()))?;
-        let (_, binding) = recipient
+            .map_err(|_| defer("inbox peer identity unreadable".into()))?;
+        let (attestation, binding) = recipient
             .validate()
-            .map_err(|reason| unsent(format!("inbox recipient changed before write: {reason}")))?;
+            .map_err(|reason| defer(format!("inbox recipient changed before write: {reason}")))?;
+        #[cfg(target_os = "linux")]
+        if connected.kernel_incarnation.as_ref().is_none_or(|id| {
+            binding
+                .peer_incarnation
+                .as_ref()
+                .is_some_and(|expected| expected != id)
+                || os::attempt::kernel_incarnation(peer.pid, peer.uid)
+                    .as_ref()
+                    .ok()
+                    != Some(id)
+        }) {
+            return Err(defer("inbox peer identity changed".into()));
+        }
         if peer.pid != binding.harness.0 || peer.uid != self.hub.uid {
-            return Err(unsent(
+            return Err(defer(
                 "inbox endpoint is not the attested harness process".into(),
             ));
         }
+        #[cfg(target_os = "linux")]
+        if recipient.discovered() {
+            let (current_socket, hint) =
+                replacement_inbox(&binding.store, session, self.hub.uid).map_err(defer)?;
+            if current_socket != socket
+                || hint.pid != peer.pid
+                || hint.lifecycle != attestation.lifecycle()
+                || !os::process_facts(peer.pid).is_some_and(|facts| {
+                    crate::registry::descriptor_written_after_start(&facts, hint.written_at)
+                })
+            {
+                return Err(Outcome::DeferredKnownUnsent {
+                    evidence: "replacement inbox changed before handoff".into(),
+                });
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = attestation;
         let frames = format!(
             "{}\n{}\n",
             json!({"type": "auth", "token": token}),
@@ -1284,7 +1423,7 @@ impl ClaudeLaterCarrier {
         );
         lock_registry(&self.registry)
             .message_current(recipient)
-            .map_err(|reason| unsent(format!("inbox binding changed before write: {reason}")))?;
+            .map_err(|reason| defer(format!("inbox binding changed before write: {reason}")))?;
         write_before_deadline(&mut stream, frames.as_bytes(), deadline_ms, limit)?;
         let _ = stream.shutdown(std::net::Shutdown::Write);
         Ok(())
@@ -1313,24 +1452,25 @@ impl ClaudeLaterCarrier {
     /// Performs one hand-off, retaining the original source for later observations.
     fn send_with_delivery(&mut self, attempt: &AttemptRecord, delivery: DeliveryRef) -> Outcome {
         let unsent = |evidence: String| Outcome::KnownUnsent { evidence };
+        let defer = |evidence: String| Outcome::DeferredKnownUnsent { evidence };
         let Ok(address) = NativeAddress::parse(&attempt.fence.recipient) else {
             return unsent("unparseable recipient".into());
         };
         let candidate = match lock_registry(&self.registry).message_candidate(&address) {
             Ok(candidate) => Arc::new(candidate),
-            Err(reason) => return unsent(format!("recipient not attested: {reason}")),
+            Err(reason) => return defer(format!("recipient not attested: {reason}")),
         };
         let binding = match candidate.validate() {
             Ok((_, binding)) => binding,
-            Err(reason) => return unsent(format!("recipient not attested: {reason}")),
+            Err(reason) => return defer(format!("recipient not attested: {reason}")),
         };
-        match crate::owner::checked_locator(binding.harness, binding.managed_incarnation.as_ref()) {
+        match crate::owner::checked_locator(binding.harness, binding.peer_incarnation.as_ref()) {
             Ok(None) => {}
             Ok(Some(_)) => return self.send_owner(attempt, &address, delivery.source_uid),
-            Err(reason) => return unsent(reason),
+            Err(reason) => return defer(reason),
         }
         if binding.epoch != attempt.fence.endpoint_epoch {
-            return unsent("the endpoint epoch changed since the reservation".into());
+            return defer("the endpoint epoch changed since the reservation".into());
         }
         if attempt.manifest.len() > MAX_MESSAGE_BYTES {
             return Outcome::PermanentRefusal {
@@ -1344,16 +1484,16 @@ impl ClaudeLaterCarrier {
         let socket = match inbox_state(&binding.store, session, pid, self.hub.uid) {
             InboxState::Socket(socket) => socket,
             InboxState::Disabled => {
-                return unsent(
+                return defer(
                     "the attested harness process runs with its native inbox disabled".into(),
                 );
             }
             InboxState::Absent => {
-                return unsent("no inbox descriptor for the attested harness process".into());
+                return defer("no inbox descriptor for the attested harness process".into());
             }
         };
         let Some(token) = peer_token(&binding.store, pid, self.hub.uid) else {
-            return unsent("the attested harness process has no peer token".into());
+            return defer("the attested harness process has no peer token".into());
         };
         let Some(directory) = socket.parent() else {
             return unsent("inbox socket has no directory".into());
@@ -1618,6 +1758,8 @@ impl DispatchCarrier for ClaudeLaterCarrier {
         if recipient.harness != Harness::CLAUDE_CODE {
             return Err("not a Claude recipient".into());
         }
+        #[cfg(target_os = "linux")]
+        crate::registry::recovery::recover(&self.registry, recipient)?;
         let candidate = {
             let mut registry = lock_registry(&self.registry);
             registry.discover_claude_recipient(recipient)?;
@@ -1629,7 +1771,7 @@ impl DispatchCarrier for ClaudeLaterCarrier {
             registry.message_candidate(recipient)?
         };
         let (_, binding) = candidate.validate()?;
-        if crate::owner::checked_locator(binding.harness, binding.managed_incarnation.as_ref())?
+        if crate::owner::checked_locator(binding.harness, binding.peer_incarnation.as_ref())?
             .is_some()
         {
             let attestation = self.owner_route(recipient)?.0;
@@ -1638,7 +1780,9 @@ impl DispatchCarrier for ClaudeLaterCarrier {
             }
             return Ok(attestation);
         }
-        self.hub.sync_message(&self.registry, recipient, &binding)?;
+        if !candidate.discovered() {
+            self.hub.sync_message(&self.registry, recipient, &binding)?;
+        }
         self.hub.callback_capacity()?;
         // Capability synchronization can change the snapshot, so close selection
         // with fresh validation and an in-memory stamp check.

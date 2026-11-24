@@ -259,6 +259,7 @@ impl Registry {
         !binding.retired
             && binding.harness == harness
             && binding.epoch == caller.epoch()
+            && binding.incarnation_state() == os::IncarnationState::Live
             && os::process_facts(harness.0).is_some_and(|facts| {
                 facts.start_time == harness.1
                     && facts.exe.as_ref() == Some(&binding.executable)

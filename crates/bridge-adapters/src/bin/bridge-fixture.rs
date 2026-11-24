@@ -209,6 +209,8 @@ fn start_inbox(state: Arc<Mutex<Inbox>>, session: &str, behavior: String) -> Val
     std::fs::create_dir_all(&sessions).expect("sessions dir");
     let pid = std::process::id();
     let socket = sessions.join(format!("{pid}.inbox.sock"));
+    #[cfg(target_os = "linux")]
+    std::thread::sleep(Duration::from_millis(50)); // unambiguously later than the harness birth tick
     let listener = UnixListener::bind(&socket).expect("inbox bind");
     let token = format!("fixture-token-{pid}");
     std::fs::write(

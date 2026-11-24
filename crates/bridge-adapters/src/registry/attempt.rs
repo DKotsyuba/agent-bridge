@@ -3130,6 +3130,8 @@ mod tests {
             transcript: None,
             store: PathBuf::new(),
             executable: PathBuf::new(),
+            birth: None,
+            discovered: None,
             retired: false,
             desktop_idle_message: false,
             desktop_idle_transcript: None,
@@ -3168,6 +3170,7 @@ mod tests {
             run_readers: Vec::new(),
             managed_tools: Vec::new(),
             owner_v2_routes: Vec::new(),
+            native_discovery: false,
             legacy_owner_relays: 0,
         };
         let mut registry = Registry::new(config, owner).unwrap();
@@ -3251,6 +3254,7 @@ mod tests {
             run_readers: Vec::new(),
             managed_tools: Vec::new(),
             owner_v2_routes: Vec::new(),
+            native_discovery: false,
             legacy_owner_relays: 0,
         };
         let mut registry = Registry::new(config, owner).unwrap();
@@ -3346,6 +3350,7 @@ mod tests {
             run_readers: Vec::new(),
             managed_tools: Vec::new(),
             owner_v2_routes: Vec::new(),
+            native_discovery: false,
             legacy_owner_relays: 0,
         };
         let mut old_context = context("old-inv");

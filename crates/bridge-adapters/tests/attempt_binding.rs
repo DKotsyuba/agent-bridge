@@ -50,7 +50,7 @@ fn distinct_fixture(lab: &Lab, label: &str) -> RelayExecutable {
 }
 
 /// Installs two isolated producer grants and explicit protected executable routes.
-fn lab() -> Lab {
+pub(super) fn lab() -> Lab {
     lab_with_other_producer(false)
 }
 
@@ -112,7 +112,7 @@ fn lab_with_other_producer(include_other: bool) -> Lab {
 }
 
 /// Restarts only this owned channel, registry and its private route journal.
-fn restart(lab: &mut Lab) {
+pub(super) fn restart(lab: &mut Lab) {
     if let Some(channel) = lab.channel.take() {
         channel.stop();
     }

@@ -151,13 +151,13 @@ impl Lab {
     /// A lab whose relay entries carry `sha256` (the real digest unless a test
     /// wants a mismatch).
     pub fn with_digest(tag: &str, sha256: Option<String>) -> Lab {
-        Lab::build(tag, sha256)
+        Lab::build(tag, sha256, false)
     }
 
     /// Builds private stores with explicit mode 0700 even under inherited default
     /// ACLs. The registry names no native owner path or digest: the
     /// owner route needs none.
-    fn build(tag: &str, sha256: Option<String>) -> Lab {
+    fn build(tag: &str, sha256: Option<String>, native_discovery: bool) -> Lab {
         let dir = TempDir::new(tag);
         let claude_store = dir.0.join("cs");
         let codex_store = dir.0.join("xs");
@@ -197,6 +197,7 @@ impl Lab {
             run_readers: Vec::new(),
             managed_tools: Vec::new(),
             owner_v2_routes: Vec::new(),
+            native_discovery,
             legacy_owner_relays: 0,
         };
         let registry = Arc::new(Mutex::new(
@@ -230,6 +231,11 @@ impl Lab {
     /// A lab with the real fixture digest.
     pub fn new(tag: &str) -> Lab {
         Lab::with_digest(tag, None)
+    }
+
+    /// Explicit opt-in for fixtures exercising experimental replacement discovery.
+    pub fn with_discovery(tag: &str) -> Lab {
+        Lab::build(tag, None, true)
     }
 
     /// The address of `session` in the Claude test store.

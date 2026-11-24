@@ -196,6 +196,7 @@ channel = "/ABS/state/ch/c.sock"        # socket inside a private 0700 directory
 host_id = "this-host"                   # host component of every attested address
 # sandbox = "/usr/bin/sandbox-exec"     # legacy Codex helper only; native owners do not use it
 # intermediates = ["/bin/sh", "/bin/bash", "/bin/zsh", "/bin/dash", "/usr/bin/env"]
+# native_discovery = false              # experimental replacement discovery, disabled by default
 # max_call_age_ms = 600000              # age of a hook record a caller may join
 
 [[adapters.harnesses]]                  # one policy per harness product; no store or executable
@@ -241,6 +242,19 @@ server = "pool"
 commands = ["vote"]
 frontend = { path = "/ABS/stdio-frontend", sha256 = "<64 hex>" }
 ```
+
+With `[adapters].native_discovery` omitted or false, pending sweeps skip
+experimental replacement-socket probes. An endpoint created by those probes
+remains fenced after restart until its own verified hook renews the binding.
+The Codex Desktop physical gateway operates with either setting: an eligible
+idle thread can receive one MESSAGE through a verified Desktop frontend using
+its existing unspent wake proof.
+
+Setting `native_discovery = true` opts into **experimental** replacement probes.
+The socket-birth check lacks kernel peer-lifetime proof: an inherited listener
+and a backward wall-clock step can make the timestamp comparison unreliable.
+Claude descriptor ownership can also change between the uniqueness scan and
+handoff. Keep discovery off for production.
 
 Commands are `[A-Za-z0-9_]` names that do not start with `_`. Codex presents a
 server as its segment, every character outside `[A-Za-z0-9_]` replaced by `_`

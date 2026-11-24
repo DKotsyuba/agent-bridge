@@ -79,6 +79,8 @@ mod executables;
 mod gateway;
 mod observations;
 #[cfg(target_os = "linux")]
+pub(crate) mod recovery;
+#[cfg(target_os = "linux")]
 mod roles;
 pub(crate) use claims::EvidenceClaim;
 #[cfg(target_os = "linux")]
@@ -332,6 +334,9 @@ impl HarnessPolicy {
 pub struct RegistryConfig {
     /// `host_id` component of every address this daemon attests.
     pub host_id: String,
+    /// Experimental probing of replacement processes for ended MESSAGE endpoints.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub native_discovery: bool,
     /// Harness-level policies; empty together with empty `profiles` serves no
     /// native harness.
     #[serde(default)]
@@ -1226,6 +1231,17 @@ pub struct HookAdmission {
     pub token: Option<CallToken>,
 }
 
+/// A native socket's verified physical process and the hook requirement inherited
+/// from the address it serves. This evidence is only for MESSAGE delivery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiscoveredPeer {
+    /// Frozen Linux socket-owner identity.
+    incarnation: os::attempt::KernelIncarnation,
+    /// Whether an ordinary hook cannot renew this address without managed ancestry.
+    requires_managed_ancestry: bool,
+}
+
 /// One binding of an address to a harness incarnation. Only daemon-verified
 /// facts are persisted privately; fresh OS/build validation is required on load.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1238,6 +1254,9 @@ struct Binding {
     /// Full Linux identity captured by a new hook; old journal rows have none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     managed_incarnation: Option<os::attempt::KernelIncarnation>,
+    /// Linux boot UUID and birth tick for ordinary bindings. Legacy journal rows store only seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    birth: Option<(String, u64)>,
     /// Monotonic endpoint epoch.
     epoch: u64,
     /// Current capabilities of this binding (a carrier may withdraw message
@@ -1260,6 +1279,10 @@ struct Binding {
     /// Harness executable of the binding, as the verified process runs it (a
     /// process fact, never an allowlist entry).
     executable: PathBuf,
+    /// MESSAGE-only native rediscovery. Remains retired to every hook/caller path
+    /// until the successor presents its own verified hook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    discovered: Option<DiscoveredPeer>,
     /// Set by the root's `SessionEnd`, and by an OpenCode child's own
     /// `SessionEnd` (its own address ended); normal recipient and caller
     /// authority stays refused until a renewal.
@@ -1300,6 +1323,53 @@ struct Binding {
     role: Option<ActorRole>,
 }
 
+/// Hold reason for a fenced route awaiting its own native hook.
+pub(crate) const WAIT_FOR_HOOK: &str = "waiting for replacement verified hook";
+
+impl Binding {
+    /// Strongest verified physical identity for recipient liveness and I/O.
+    fn physical_peer(&self) -> Option<&os::attempt::KernelIncarnation> {
+        self.discovered
+            .as_ref()
+            .map(|peer| &peer.incarnation)
+            .or(self.managed_incarnation.as_ref())
+    }
+
+    /// Preserves the admission requirement across any number of physical replacements.
+    fn requires_managed_ancestry(&self) -> bool {
+        self.managed_incarnation.is_some()
+            || self
+                .discovered
+                .as_ref()
+                .is_some_and(|peer| peer.requires_managed_ancestry)
+    }
+
+    /// Checks the strongest recorded identity, keeping unreadable observations fenced.
+    fn incarnation_state(&self) -> os::IncarnationState {
+        if let Some(identity) = self.physical_peer() {
+            return os::attempt::incarnation_state(identity);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some((boot, tick)) = &self.birth {
+            return os::birth_state(self.harness.0, boot, *tick);
+        }
+        os::incarnation_state(self.harness.0, self.harness.1)
+    }
+
+    /// Requires positive termination before transferring an address to another process.
+    fn require_ended(&self) -> Result<(), CorrelationError> {
+        match self.incarnation_state() {
+            os::IncarnationState::Ended => Ok(()),
+            os::IncarnationState::Live => Err(CorrelationError::Conflicting(
+                "address has another live harness incarnation".into(),
+            )),
+            os::IncarnationState::Unknown => Err(CorrelationError::Unavailable(
+                "prior kernel incarnation unavailable".into(),
+            )),
+        }
+    }
+}
+
 /// Decides managed-hook renewal using the complete kernel identity. Historic
 /// rows are unqualified and can only be renewed by a fresh observed hook.
 fn managed_binding_decision(
@@ -1309,34 +1379,11 @@ fn managed_binding_decision(
     let Some(binding) = binding else {
         return Ok((true, None));
     };
-    if binding.managed_incarnation.as_ref() == Some(identity) {
+    if binding.physical_peer() == Some(identity) {
         return Ok((binding.retired || binding.pending, Some(binding.epoch)));
     }
-    if !binding.retired {
-        if let Some(old) = &binding.managed_incarnation {
-            match os::attempt::kernel_incarnation(old.pid, old.uid) {
-                Ok(current) if current == *old => {
-                    return Err(CorrelationError::Conflicting(
-                        "address has another live kernel incarnation".into(),
-                    ));
-                }
-                Ok(_) => (),
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::NotFound
-                        && os::attempt::definitely_gone(old.pid) => {}
-                Err(_) => {
-                    return Err(CorrelationError::Unavailable(
-                        "prior kernel incarnation unavailable".into(),
-                    ));
-                }
-            }
-        } else if binding.harness.0 != identity.pid
-            && !os::attempt::definitely_gone(binding.harness.0)
-        {
-            return Err(CorrelationError::Unavailable(
-                "historic route incarnation unavailable".into(),
-            ));
-        }
+    if binding.managed_incarnation.is_some() || binding.harness.0 != identity.pid {
+        binding.require_ended()?;
     }
     Ok((true, Some(binding.epoch)))
 }
@@ -1414,16 +1461,7 @@ fn root_started_after_issuer(
 /// Retains an original root fence while its exact process may still exist.
 #[cfg(target_os = "linux")]
 fn root_capture_may_be_live(root: &RootLaunch) -> bool {
-    match os::attempt::kernel_incarnation(root.incarnation.pid, root.incarnation.uid) {
-        Ok(actual) => actual == root.incarnation,
-        Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound
-                && os::attempt::definitely_gone(root.incarnation.pid) =>
-        {
-            false
-        }
-        Err(_) => true,
-    }
+    os::attempt::incarnation_state(&root.incarnation) != os::IncarnationState::Ended
 }
 
 /// The harness a peer belongs to.
@@ -1714,8 +1752,8 @@ fn key_of(path: &Path, metadata: &std::fs::Metadata) -> FileKey {
 pub struct RecipientBinding {
     /// Harness incarnation `(pid, start_time)` owning the session.
     pub harness: (u32, u64),
-    /// Full managed incarnation, absent for legacy routes.
-    pub(crate) managed_incarnation: Option<os::attempt::KernelIncarnation>,
+    /// Physical peer identity frozen for the native handoff, when available.
+    pub(crate) peer_incarnation: Option<os::attempt::KernelIncarnation>,
     /// Endpoint epoch.
     pub epoch: u64,
     /// Harness store directory, the harness process's own (a process fact).
@@ -1750,6 +1788,11 @@ pub(crate) struct MessageCandidate {
 }
 
 impl MessageCandidate {
+    /// Whether only the proven native replacement transport may serve this binding.
+    pub(crate) fn discovered(&self) -> bool {
+        self.binding.discovered.is_some()
+    }
+
     /// Checks a retired Codex session's same live process, private store and
     /// MESSAGE-only qualification. Present or unreadable higher-priority routes
     /// hold; the caller must prove the selected route.
@@ -1790,7 +1833,7 @@ impl MessageCandidate {
             attestation,
             RecipientBinding {
                 harness: binding.harness,
-                managed_incarnation: binding.managed_incarnation.clone(),
+                peer_incarnation: binding.physical_peer().cloned(),
                 epoch: binding.epoch,
                 store: binding.store.clone(),
                 executable: binding.executable.clone(),
@@ -1891,7 +1934,7 @@ impl MessageCandidate {
     pub(crate) fn validate(&self) -> Result<(Attestation, RecipientBinding), String> {
         let binding = &self.binding;
         let facts = self.live_check()?;
-        let lifecycle = if binding.retired {
+        let lifecycle = if binding.retired && binding.discovered.is_none() {
             if !binding.desktop_idle_message
                 || binding.address.harness != Harness::CODEX
                 || os::process_env(facts.pid, "CODEX_APP_TOOLS_PIPE_PATH").is_none()
@@ -1936,12 +1979,12 @@ impl MessageCandidate {
             attestation,
             RecipientBinding {
                 harness: binding.harness,
-                managed_incarnation: binding.managed_incarnation.clone(),
+                peer_incarnation: binding.physical_peer().cloned(),
                 epoch: binding.epoch,
                 store: binding.store.clone(),
                 executable: binding.executable.clone(),
                 transcript: binding.transcript.clone(),
-                desktop_message_only: binding.retired,
+                desktop_message_only: binding.retired && binding.discovered.is_none(),
                 gateway: proven,
             },
         ))
@@ -1970,8 +2013,12 @@ fn live_binding(
     policy: &HarnessPolicy,
     owner_uid: u32,
 ) -> Result<ProcessFacts, String> {
-    let facts = os::process_facts(binding.harness.0).ok_or("harness is gone")?;
-    let identity_current = if let Some(identity) = &binding.managed_incarnation {
+    let facts =
+        os::process_facts(binding.harness.0).ok_or_else(|| match binding.incarnation_state() {
+            os::IncarnationState::Ended => WAIT_FOR_HOOK,
+            _ => "recipient harness identity unavailable",
+        })?;
+    let identity_current = if let Some(identity) = binding.physical_peer() {
         binding.harness.0 == identity.pid
             && os::attempt::kernel_incarnation(identity.pid, identity.uid)
                 .ok()
@@ -1979,6 +2026,7 @@ fn live_binding(
                 == Some(identity)
     } else {
         facts.start_time == binding.harness.1
+            && binding.incarnation_state() == os::IncarnationState::Live
     };
     if facts.uid != Some(owner_uid)
         || !identity_current
@@ -1989,7 +2037,7 @@ fn live_binding(
     {
         return Err("message harness/store changed".into());
     }
-    if let Some(identity) = &binding.managed_incarnation
+    if let Some(identity) = binding.physical_peer()
         && os::attempt::kernel_incarnation(identity.pid, identity.uid)
             .ok()
             .as_ref()
@@ -2205,6 +2253,9 @@ pub struct Registry {
     epoch_floor: u64,
     /// Bindings by canonical address.
     bindings: HashMap<String, Binding>,
+    /// Native probe results and monotonic recheck deadlines, scoped to the endpoint epoch.
+    #[cfg(target_os = "linux")]
+    recovery_probes: HashMap<String, (u64, std::time::Instant, Result<(), String>)>,
     /// Optional private atomic route snapshot.
     journal: Option<PathBuf>,
     /// The journal path and SHA-256 of the snapshot bytes this registry last
@@ -2715,6 +2766,8 @@ impl Registry {
             owner_uid,
             epoch_floor: 0,
             bindings: HashMap::new(),
+            #[cfg(target_os = "linux")]
+            recovery_probes: HashMap::new(),
             journal: None,
             routes_committed: None,
             attempt_journal: None,
@@ -2776,11 +2829,10 @@ impl Registry {
     /// PID is the same incarnation only with its exact recorded start time (a reused
     /// PID is gone), and a live row whose process store, executable or owner no
     /// longer matches the recorded facts is omitted. A row carrying the removed
-    /// `pending` flag is dropped, never restored: it was never proven. A gone
-    /// Codex incarnation is retained, inert, only while it carries an *unspent*
-    /// idle proof and its address still has a harness policy and an owned private
-    /// store (its committed gateway is forgotten; a spent or absent proof drops the
-    /// row). Retired tombstones retain their exact epoch and refusal fences; their
+    /// `pending` flag is dropped, never restored: it was never proven. An ended Linux
+    /// Codex or Claude row can survive as a fenced native recovery candidate.
+    /// Only an unspent idle proof permits the Desktop gateway. A seconds-only
+    /// Linux row never regains live authority from a journal match. Retired tombstones retain their exact epoch and refusal fences; their
     /// optional Desktop MESSAGE fact is revalidated on every carrier use, never
     /// promoted into normal live authority by recovery. Missing new fields default
     /// false/None and false/None values are omitted, preserving old row shape.
@@ -2858,10 +2910,11 @@ impl Registry {
                 }
                 if snapshot.bindings.len() > DEFAULT_MAX_BINDINGS
                     || snapshot.bindings.iter().any(|binding| {
-                        binding
-                            .managed_incarnation
-                            .as_ref()
-                            .is_some_and(|identity| {
+                        binding.discovered.is_some()
+                            && (!binding.retired
+                                || binding.managed_incarnation.is_some()
+                                || binding.wake.is_some())
+                            || binding.physical_peer().is_some_and(|identity| {
                                 identity.pid != binding.harness.0
                                     || identity.uid != self.owner_uid
                                     || identity.pid_namespace_inode == 0
@@ -2970,55 +3023,72 @@ impl Registry {
                 {
                     continue;
                 }
-                if binding.retired {
+                if binding.pending {
+                    continue;
+                }
+                let state = binding.incarnation_state();
+                #[cfg(target_os = "linux")]
+                let legacy = binding.birth.is_none() && binding.physical_peer().is_none();
+                #[cfg(not(target_os = "linux"))]
+                let legacy = false;
+                if binding.retired && (!legacy || state == os::IncarnationState::Ended) {
                     self.bindings
                         .entry(binding.address.to_canonical_string())
                         .or_insert(binding);
                     continue;
                 }
-                // A row of the removed vendor verification was never proven; it
-                // is inert history and is not restored.
-                if binding.pending {
-                    continue;
-                }
-                // The recorded incarnation is alive only if its PID is held by a
-                // process with exactly the recorded start time: a reused PID is a
-                // different process, gone for every purpose and never authority.
-                let live = if let Some(identity) = &binding.managed_incarnation {
-                    #[cfg(target_os = "linux")]
-                    {
-                        os::process_facts_managed(identity.pid)
-                            .filter(|facts| facts.kernel_incarnation.as_ref() == Some(identity))
-                    }
-                    #[cfg(not(target_os = "linux"))]
-                    {
-                        let _ = identity;
-                        None
-                    }
-                } else {
-                    os::process_facts(binding.harness.0)
-                        .filter(|facts| facts.start_time == binding.harness.1)
-                };
-                let Some(facts) = live else {
-                    // A gone incarnation survives only as an *unspent* gateway
-                    // candidate (the spend is journaled before any native write, so
-                    // a spent proof is already absent) of a still-configured exact
-                    // thread, store and executable: it keeps its epoch and proof, no
-                    // ordinary route attests it, and every gateway fact is proven
-                    // again at use against the live gateway.
-                    if self.policy(binding.address.harness).is_some()
+                // No ordinary authority survives an ambiguous historical PID/second
+                // match. Only an ended owner with its exact unspent proof may use
+                // the existing Desktop gateway.
+                if legacy || state != os::IncarnationState::Live {
+                    let configured = self.policy(binding.address.harness).is_some()
+                        && private_store(&binding.store, self.owner_uid).is_ok();
+                    if state == os::IncarnationState::Ended
+                        && configured
                         && binding.address.harness == Harness::CODEX
-                        && private_store(&binding.store, self.owner_uid).is_ok()
                         && let Some(wake) = binding.wake.as_mut()
                     {
-                        // A committed gateway was bound to a process of the
-                        // previous daemon life: it is forgotten and re-committed
-                        // with a fresh epoch at first use.
                         wake.forget_gateway();
-                        self.bindings
-                            .entry(binding.address.to_canonical_string())
-                            .or_insert(binding);
+                    } else {
+                        let recoverable = cfg!(target_os = "linux")
+                            && configured
+                            && matches!(
+                                binding.address.harness,
+                                Harness::CODEX | Harness::CLAUDE_CODE
+                            );
+                        if !binding.retired && state == os::IncarnationState::Ended && !recoverable
+                        {
+                            continue;
+                        }
+                        binding.retired = true;
+                        binding.lifecycle = Lifecycle::Unknown;
+                        binding.capabilities.inject = false;
+                        binding.transcript = None;
+                        binding.desktop_idle_message = false;
+                        binding.desktop_idle_transcript = None;
+                        binding.wake = None;
                     }
+                }
+                if binding.retired || state != os::IncarnationState::Live {
+                    self.bindings
+                        .entry(binding.address.to_canonical_string())
+                        .or_insert(binding);
+                    continue;
+                }
+                #[cfg(target_os = "linux")]
+                let facts = os::process_facts_managed(binding.harness.0).filter(|facts| {
+                    if let Some(identity) = binding.physical_peer() {
+                        facts.kernel_incarnation.as_ref() == Some(identity)
+                    } else {
+                        binding.birth.as_ref().is_some_and(|(boot, tick)| {
+                            os::boot_id() == Some(boot) && facts.start_ticks == Some(*tick)
+                        })
+                    }
+                });
+                #[cfg(not(target_os = "linux"))]
+                let facts = os::process_facts(binding.harness.0)
+                    .filter(|facts| facts.start_time == binding.harness.1);
+                let Some(facts) = facts else {
                     continue;
                 };
                 let Some(policy) = self.policy(binding.address.harness).cloned() else {
@@ -3031,6 +3101,12 @@ impl Registry {
                     || executable_current(&binding.executable, &facts, self.owner_uid).is_err()
                 {
                     continue;
+                }
+                // Restore starts a new ordinary epoch. Align its compatibility
+                // timestamp with this boot's verified process after a clock step.
+                #[cfg(target_os = "linux")]
+                if binding.birth.is_some() && binding.managed_incarnation.is_none() {
+                    binding.harness.1 = facts.start_time;
                 }
                 // Historic seconds-only routes stay legacy-only; a persisted full
                 // managed identity survives only a positive exact kernel recheck.
@@ -3208,6 +3284,9 @@ impl Registry {
             || address.host_id != self.config.host_id
             || address.harness != Harness::CLAUDE_CODE
         {
+            return Ok(());
+        }
+        if known.incarnation_state() != os::IncarnationState::Live {
             return Ok(());
         }
         let Some(policy) = self.policy(Harness::CLAUDE_CODE).cloned() else {
@@ -3720,6 +3799,14 @@ impl Registry {
             .filter(|path| path.is_absolute() && path.starts_with(&matched.store));
 
         let previous_binding = self.bindings.get(&key).cloned();
+        if previous_binding
+            .as_ref()
+            .is_some_and(|old| old.store != matched.store)
+        {
+            return Err(CorrelationError::Conflicting(
+                "address belongs to a different native store".into(),
+            ));
+        }
         // Capture the first observed root launch directly, independently of a
         // Pool call. A restored row is not an original hook. Once a process
         // has been observed without an original root capture, no later hook
@@ -3752,10 +3839,14 @@ impl Registry {
                 .values()
                 .filter(|old| old.incarnation == *identity)
                 .collect();
-            let seen_process = self.bindings.values().any(|old| {
-                old.managed_incarnation.as_ref() == Some(identity)
-                    || (old.managed_incarnation.is_none() && old.harness.0 == identity.pid)
-            });
+            let seen_process = self
+                .bindings
+                .values()
+                .filter(|old| old.discovered.is_none())
+                .any(|old| {
+                    old.managed_incarnation.as_ref() == Some(identity)
+                        || (old.managed_incarnation.is_none() && old.harness.0 == identity.pid)
+                });
             let fresh = if captures.is_empty() {
                 !seen_process
             } else {
@@ -3777,9 +3868,8 @@ impl Registry {
         #[cfg(target_os = "linux")]
         if previous_binding
             .as_ref()
-            .is_some_and(|binding| binding.managed_incarnation.is_some())
-            && matched.kernel_incarnation.is_some()
-            && !matched.managed_ancestry
+            .is_some_and(|binding| binding.requires_managed_ancestry())
+            && (matched.kernel_incarnation.is_none() || !matched.managed_ancestry)
         {
             return Err(CorrelationError::NotEvidence(
                 "managed ancestry is unavailable".into(),
@@ -3846,20 +3936,39 @@ impl Registry {
             });
         #[cfg(not(target_os = "linux"))]
         let managed_identity: Option<&os::attempt::KernelIncarnation> = None;
+        #[cfg(target_os = "linux")]
+        if let Some(old) = previous_binding
+            .as_ref()
+            .filter(|old| old.discovered.is_some())
+        {
+            let actual = os::attempt::kernel_incarnation(matched.incarnation.0, self.owner_uid)
+                .map_err(|_| {
+                    CorrelationError::Unavailable("hook harness identity unavailable".into())
+                })?;
+            if old.physical_peer() != Some(&actual) {
+                old.require_ended()?;
+            }
+        }
+        #[cfg(target_os = "linux")]
+        let birth = matched
+            .harness_ticks
+            .and_then(|ticks| Some((os::boot_id()?.to_owned(), ticks)));
+        #[cfg(not(target_os = "linux"))]
+        let birth = None;
         let (renewed, previous_epoch) = if let Some(identity) = managed_identity {
             let (changed, epoch) = managed_binding_decision(self.bindings.get(&key), identity)?;
             let start = starts_own_session(kind, role, &matched.policy, payload);
             ((changed && !repeated_live_end) || start, epoch)
         } else {
             match self.bindings.get(&key) {
-                Some(binding) if binding.harness != matched.incarnation => {
-                    if !binding.retired
-                        && os::incarnation_alive(binding.harness.0, binding.harness.1)
-                    {
-                        return Err(CorrelationError::Conflicting(
-                            "address is bound to another live harness incarnation".into(),
-                        ));
-                    }
+                Some(binding)
+                    if binding.harness != matched.incarnation
+                        || binding
+                            .birth
+                            .as_ref()
+                            .is_some_and(|stored| Some(stored) != birth.as_ref()) =>
+                {
+                    binding.require_ended()?;
                     (true, Some(binding.epoch))
                 }
                 // An OpenCode binding without this actor recorded (an earlier
@@ -3891,6 +4000,10 @@ impl Registry {
                     harness: matched.incarnation,
                     #[cfg(target_os = "linux")]
                     managed_incarnation: (!self.config.managed_tools.is_empty()
+                        && (matched.managed_ancestry
+                            || previous_binding
+                                .as_ref()
+                                .is_none_or(|old| old.discovered.is_none()))
                         && (harness == Harness::CODEX || harness == Harness::CLAUDE_CODE))
                         .then(|| matched.kernel_incarnation.clone())
                         .flatten(),
@@ -3904,6 +4017,8 @@ impl Registry {
                     transcript: None,
                     store: matched.store.clone(),
                     executable: matched.executable.clone(),
+                    birth,
+                    discovered: None,
                     retired: false,
                     desktop_idle_message: false,
                     desktop_idle_transcript: None,
@@ -3912,6 +4027,10 @@ impl Registry {
                     role: (harness == Harness::OPENCODE).then_some(role),
                 },
             );
+        } else if let Some(binding) = self.bindings.get_mut(&key)
+            && binding.birth.is_none()
+        {
+            binding.birth = birth;
         }
         let owner_uid = self.owner_uid;
         let binding = self.bindings.get_mut(&key).expect("binding inserted above");
@@ -4169,16 +4288,11 @@ impl Registry {
         if self.bindings.len() < DEFAULT_MAX_BINDINGS {
             return;
         }
-        self.bindings.retain(|_, binding| {
-            if let Some(identity) = &binding.managed_incarnation {
-                match os::attempt::kernel_incarnation(identity.pid, identity.uid) {
-                    Ok(current) => current == *identity,
-                    Err(_) => true,
-                }
-            } else {
-                os::incarnation_alive(binding.harness.0, binding.harness.1)
-            }
-        });
+        self.bindings
+            .retain(|_, binding| binding.incarnation_state() != os::IncarnationState::Ended);
+        #[cfg(target_os = "linux")]
+        self.recovery_probes
+            .retain(|key, _| self.bindings.contains_key(key));
         #[cfg(target_os = "linux")]
         self.root_launches
             .retain(|_, root| root_capture_may_be_live(root));
@@ -4317,6 +4431,7 @@ impl Registry {
             .ok_or_else(|| CorrelationError::Missing(call.clone()))?;
         if binding.retired
             || binding.harness != matched.incarnation
+            || binding.incarnation_state() != os::IncarnationState::Live
             || binding.epoch != record.epoch
         {
             return Err(CorrelationError::Stale(call));
@@ -4440,7 +4555,7 @@ impl Registry {
             !binding.retired
                 && binding.harness == sealed.harness
                 && binding.epoch == sealed.caller.epoch
-                && os::incarnation_alive(binding.harness.0, binding.harness.1)
+                && binding.incarnation_state() == os::IncarnationState::Live
         });
         if !current {
             return Err(CorrelationError::Stale(
@@ -4563,6 +4678,11 @@ impl Registry {
             .collect()
     }
 
+    /// Whether to probe for and use a replacement native socket before its own hook.
+    pub(crate) fn native_discovery_enabled(&self) -> bool {
+        self.config.native_discovery
+    }
+
     /// Copies current MESSAGE qualification and private binding of a Codex or
     /// Claude recipient under the lock, without OS/file/native I/O. The owned
     /// candidate MUST be validated outside the lock on every attest/send, and
@@ -4576,9 +4696,12 @@ impl Registry {
             .bindings
             .get(&address.to_canonical_string())
             .ok_or("no message binding")?;
+        if binding.discovered.is_some() && !self.native_discovery_enabled() {
+            return Err(WAIT_FOR_HOOK.into());
+        }
         if self.message_disabled.contains(&address.harness)
             || binding.pending
-            || (binding.retired && !binding.desktop_idle_message)
+            || (binding.retired && !binding.desktop_idle_message && binding.discovered.is_none())
         {
             return Err("message binding unavailable".into());
         }
@@ -4627,6 +4750,7 @@ impl Registry {
             .ok_or("no message binding")?;
         if self.message_disabled.contains(&address.harness)
             || binding.pending
+            || binding.discovered.is_some()
             || address.harness != Harness::CODEX
             || !binding.retired
             || binding.desktop_idle_message
@@ -4651,6 +4775,9 @@ impl Registry {
     /// Pure in-memory check; callers run it under the registry lock last, on both
     /// attest and send. It grants no caller or ordinary recipient authority.
     pub(crate) fn message_current(&self, candidate: &MessageCandidate) -> Result<(), String> {
+        if candidate.discovered() && !self.native_discovery_enabled() {
+            return Err(WAIT_FOR_HOOK.into());
+        }
         if self
             .message_disabled
             .contains(&candidate.binding.address.harness)
@@ -4683,19 +4810,12 @@ impl Registry {
         if binding.retired {
             return Err("the recipient session ended (unknown, not inactive)".into());
         }
-        let current = if let Some(identity) = &binding.managed_incarnation {
-            binding.harness.0 == identity.pid
-                && os::attempt::kernel_incarnation(identity.pid, identity.uid)
-                    .ok()
-                    .as_ref()
-                    == Some(identity)
-        } else {
-            os::incarnation_alive(binding.harness.0, binding.harness.1)
-        };
-        if !current {
-            return Err(
-                "the recipient's harness process is gone (disconnected, not inactive)".into(),
-            );
+        match binding.incarnation_state() {
+            os::IncarnationState::Live => (),
+            os::IncarnationState::Ended => return Err("recipient harness incarnation ended".into()),
+            os::IncarnationState::Unknown => {
+                return Err("recipient harness identity unavailable".into());
+            }
         }
         let attestation = Attestation::verified(
             binding.address.clone(),
@@ -4713,7 +4833,7 @@ impl Registry {
             attestation,
             RecipientBinding {
                 harness: binding.harness,
-                managed_incarnation: binding.managed_incarnation.clone(),
+                peer_incarnation: binding.physical_peer().cloned(),
                 epoch: binding.epoch,
                 store: binding.store.clone(),
                 executable: binding.executable.clone(),
@@ -4999,7 +5119,7 @@ fn executable_current_for(
 /// Bridge or whenever a wall-clock step cannot be excluded); elsewhere the
 /// earlier whole-second start time, a documented non-Linux residual (a wall-clock
 /// step can move it) kept for the ordinary Claude recipient route.
-fn descriptor_written_after_start(facts: &ProcessFacts, written_at: (i64, i64)) -> bool {
+pub(crate) fn descriptor_written_after_start(facts: &ProcessFacts, written_at: (i64, i64)) -> bool {
     #[cfg(target_os = "linux")]
     {
         os::clock::written_after_start(facts, written_at)
@@ -5116,6 +5236,8 @@ mod tests {
             transcript: Some("/tmp/store/sessions/idle.jsonl".into()),
             store: "/tmp/store".into(),
             executable: "/tmp/executable".into(),
+            birth: None,
+            discovered: None,
             retired: true,
             desktop_idle_message: true,
             desktop_idle_transcript: Some((4, 5)),
@@ -5243,6 +5365,7 @@ mod tests {
             run_readers: Vec::new(),
             managed_tools: Vec::new(),
             owner_v2_routes: Vec::new(),
+            native_discovery: false,
             legacy_owner_relays: 0,
         };
         Registry::new(config, 0).unwrap()
@@ -5661,6 +5784,8 @@ mod tests {
             transcript: None,
             store: dir.clone(),
             executable: dir.clone(),
+            birth: None,
+            discovered: None,
             retired: true,
             desktop_idle_message: false,
             desktop_idle_transcript: None,
@@ -6290,6 +6415,7 @@ mod tests {
                 run_readers: Vec::new(),
                 managed_tools: Vec::new(),
                 owner_v2_routes: Vec::new(),
+                native_discovery: false,
                 legacy_owner_relays: 0,
             },
             os::process_facts(std::process::id()).unwrap().uid.unwrap(),
@@ -6323,6 +6449,8 @@ mod tests {
             transcript: None,
             store: store.to_path_buf(),
             executable: exe.to_path_buf(),
+            birth: None,
+            discovered: None,
             retired: false,
             desktop_idle_message: false,
             desktop_idle_transcript: None,
@@ -7038,6 +7166,8 @@ mod tests {
                 transcript: None,
                 store: store.clone(),
                 executable: executable.clone(),
+                birth: None,
+                discovered: None,
                 retired: false,
                 desktop_idle_message: false,
                 desktop_idle_transcript: None,
@@ -7115,6 +7245,59 @@ mod tests {
         assert!(!product_marked(&named, &custom));
         named.exe = None;
         assert!(!product_marked(&named, &codex));
+    }
+
+    /// A matching legacy hook fills a missing birth without changing epochs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_legacy_hook_backfills_birth() {
+        let mut registry = claude_registry();
+        let me = own_facts();
+        let matched = HarnessMatch {
+            incarnation: (me.pid, me.start_time),
+            kernel_incarnation: None,
+            managed_ancestry: false,
+            store: std::env::temp_dir(),
+            executable: me.exe.unwrap(),
+            policy: registry.policies[0].clone(),
+            peer: (me.pid, me.start_time),
+            peer_ticks: me.start_ticks,
+            harness_ticks: me.start_ticks,
+        };
+        registry.config.managed_tools.push(ManagedTools {
+            producer: "p".into(),
+            server: "s".into(),
+            commands: vec!["c".into()],
+            frontend: RelayExecutable {
+                path: matched.executable.clone(),
+                sha256: "0".repeat(64),
+            },
+        });
+        let payload: HookPayload = serde_json::from_value(
+            serde_json::json!({"hook_event_name":"Stop","session_id":"session"}),
+        )
+        .unwrap();
+        let admit = |registry: &mut Registry, matched: &HarnessMatch| {
+            registry
+                .admit_proven_hook(
+                    Harness::CLAUDE_CODE,
+                    &payload,
+                    1000,
+                    HookEvidence {
+                        matched: Ok(matched.clone()),
+                        launch_observation: None,
+                    },
+                )
+                .unwrap()
+        };
+        let key = admit(&mut registry, &matched).address.to_canonical_string();
+        let row = registry.bindings.get_mut(&key).unwrap();
+        let original = row.birth.take().unwrap();
+        let epoch = row.epoch;
+        assert!(admit(&mut registry, &matched).renewed.is_none());
+        let row = registry.bindings.get_mut(&key).unwrap();
+        assert_eq!(row.birth.as_ref(), Some(&original));
+        assert_eq!(row.epoch, epoch);
     }
 
     /// A hook proof read outside the registry lock commits only while its peer
@@ -7288,6 +7471,7 @@ mod tests {
             run_readers: Vec::new(),
             managed_tools: Vec::new(),
             owner_v2_routes: Vec::new(),
+            native_discovery: false,
             legacy_owner_relays: 0,
         };
         let none = base().harness_policies().unwrap();
