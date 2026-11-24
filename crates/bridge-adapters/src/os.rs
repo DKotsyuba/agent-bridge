@@ -81,6 +81,7 @@ pub(crate) const SOCKET_CONTINUITY: &str = "native socket birth or peer continui
 pub(crate) fn connect_verified(
     path: &std::path::Path,
     deadline: std::time::Instant,
+    fence_socket_birth: bool,
 ) -> Result<(UnixStream, ProcessFacts), &'static str> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
@@ -106,7 +107,12 @@ pub(crate) fn connect_verified(
     let stream =
         connect_unix(&pinned, deadline).map_err(|_| "native control socket connection failed")?;
     let facts = connected_facts(&stream, cutoff).map_err(|_| SOCKET_CONTINUITY)?;
-    if facts.uid != Some(metadata.uid()) || !socket_created_after_peer(metadata.created(), &facts) {
+    // The birth fence proves continuity only for proactive discovery; a hook-attested
+    // route is identified by its bound incarnation, and sockets created before this
+    // daemon started have no clock history to prove against.
+    if facts.uid != Some(metadata.uid())
+        || (fence_socket_birth && !socket_created_after_peer(metadata.created(), &facts))
+    {
         return Err(SOCKET_CONTINUITY);
     }
     Ok((stream, facts))

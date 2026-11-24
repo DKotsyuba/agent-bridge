@@ -107,7 +107,8 @@ pub(crate) fn connect_control(
     if !target.file_type().is_socket() || target.uid() != uid || target.mode() & 0o777 != 0o600 {
         return Err("native control socket is not owned mode 0600".into());
     }
-    let (stream, facts) = os::connect_verified(&path, Instant::now() + Duration::from_secs(1))?;
+    let (stream, facts) =
+        os::connect_verified(&path, Instant::now() + Duration::from_secs(1), false)?;
     Ok(Some((path, stream, facts)))
 }
 
@@ -222,7 +223,7 @@ impl Endpoint {
 
     /// Opens and initializes a deadline-bound WebSocket to the verified peer.
     fn open(&self, deadline: Instant) -> Result<WebSocket<DeadlineStream>, String> {
-        let (stream, facts) = os::connect_verified(&self.path, deadline)?;
+        let (stream, facts) = os::connect_verified(&self.path, deadline, false)?;
         if facts.kernel_incarnation.as_ref() != Some(&self.identity) {
             return Err(os::SOCKET_CONTINUITY.into());
         }
@@ -1550,10 +1551,10 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
         fs::remove_dir_all(target_dir).unwrap();
     }
-    /// Losing clock coverage after attestation defers the frozen message
-    /// before native input and preserves its transport retry budget.
+    /// A hook-attested route does not depend on socket-birth clock history:
+    /// sockets created before the daemon started must stay deliverable.
     #[test]
-    fn missing_socket_birth_continuity_defers_before_handoff() {
+    fn attested_route_ignores_missing_socket_birth_history() {
         let (dir, listener, binding) = fixture();
         let endpoint = locate(&binding).unwrap().unwrap();
         os::clock::reset();
@@ -1574,7 +1575,8 @@ mod tests {
             || unreachable!(),
         );
         assert!(
-            matches!(outcome, Outcome::DeferredKnownUnsent {evidence} if evidence == os::SOCKET_CONTINUITY)
+            !matches!(&outcome, Outcome::DeferredKnownUnsent {evidence} if evidence == os::SOCKET_CONTINUITY),
+            "ordinary delivery must not require socket-birth history: {outcome:?}"
         );
         drop(listener);
         fs::remove_dir_all(

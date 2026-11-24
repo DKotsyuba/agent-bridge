@@ -1354,7 +1354,7 @@ impl ClaudeLaterCarrier {
         let budget = remaining_send_time(deadline_ms, limit)
             .ok_or_else(|| unsent("inbox hand-off deadline elapsed".into()))?;
         #[cfg(target_os = "linux")]
-        let (mut stream, connected) = os::connect_verified(socket, Instant::now() + budget)
+        let (mut stream, connected) = os::connect_verified(socket, Instant::now() + budget, false)
             .map_err(|reason| {
                 if reason == os::SOCKET_CONTINUITY || reason == "native control socket unavailable"
                 {

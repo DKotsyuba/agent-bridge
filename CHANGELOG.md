@@ -4,6 +4,19 @@ All notable changes to Agent Bridge are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions describe the
 source, and the crates are not published to crates.io.
 
+## [0.7.5] - 2026-11-24
+
+This release fixes a 0.7.4 regression that held every message to Claude Code and
+Codex sessions whose native socket was created before the Bridge daemon started.
+
+### Fixed
+
+- Ordinary hook-attested delivery no longer requires the socket-birth continuity
+  fence. 0.7.4 applied it to every Claude inbox and Codex control socket, and a
+  socket older than the daemon's clock history was refused, so existing sessions
+  became unreachable after a Bridge restart. The fence now applies only to the
+  experimental proactive discovery path.
+
 ## [0.7.4] - 2026-11-24
 
 This release recovers an address whose harness process was replaced (for example by a Codex

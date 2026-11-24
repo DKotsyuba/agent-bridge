@@ -140,7 +140,7 @@ fn discover(candidate: &MessageCandidate, state: os::IncarnationState) -> Result
         let (socket, hint) = crate::claude::replacement_inbox(&old.store, thread, uid)?;
         crate::owner::check_socket(&socket, uid).map_err(|_| UNVERIFIED)?;
         let (stream, facts) =
-            os::connect_verified(&socket, Instant::now() + Duration::from_secs(1))?;
+            os::connect_verified(&socket, Instant::now() + Duration::from_secs(1), true)?;
         (stream, facts, Some(hint))
     };
     replacement_process(&facts, old.harness.0, state, uid)?;
