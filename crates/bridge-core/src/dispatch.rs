@@ -26,7 +26,7 @@ use std::sync::{Mutex, MutexGuard};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 
-use crate::framing::{MAX_FRAMED_BYTES, frame_manifest};
+use crate::framing::{MAX_FRAMED_BYTES, frame_with_senders};
 use crate::recovery::{bound_text, open_incident_in, record_evidence_row, resolve_hold_incidents};
 use crate::storage::{Storage, bump_counter, corrupt, delivery, from_sql, to_sql};
 use crate::types::{CoreError, Envelope, Mode, NativeAddress, sha256_hex};
@@ -840,7 +840,35 @@ fn set_hold(
     Ok(())
 }
 
-/// Loads and integrity-checks a stored envelope.
+/// A selected custody member before the attempt freezes its rendered bytes.
+struct FramedMember {
+    /// Publisher identity from the durable event key.
+    publisher: String,
+    /// Event identity from the durable event key.
+    event_id: String,
+    /// Integrity-checked event to render.
+    envelope: Envelope,
+    /// Allowlisted publisher tag used by legacy frames.
+    tag: String,
+    /// Custody acceptance time in Unix milliseconds.
+    accepted_at_ms: u64,
+    /// Exact origin of a managed root message, when recorded.
+    sender_address: Option<String>,
+}
+
+impl FramedMember {
+    /// Borrows the display inputs needed to render this member.
+    fn render_input(&self) -> (&str, &Envelope, u64, Option<&str>) {
+        (
+            &self.tag,
+            &self.envelope,
+            self.accepted_at_ms,
+            self.sender_address.as_deref(),
+        )
+    }
+}
+
+/// Loads and integrity-checks a stored envelope with its custody display facts.
 ///
 /// The canonical bytes must parse, validate, hash to the stored hash and
 /// name the expected key; anything else is an integrity error and the event
@@ -849,20 +877,22 @@ fn load_envelope(
     connection: &Connection,
     publisher: &str,
     event_id: &str,
-) -> Result<Envelope, CoreError> {
-    let (bytes, hash): (Vec<u8>, String) = connection
-        .query_row(
-            "SELECT envelope_json, envelope_hash FROM events
-             WHERE publisher_id = ?1 AND event_id = ?2",
-            params![publisher, event_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|error| match error {
-            rusqlite::Error::QueryReturnedNoRows => {
-                CoreError::Fence(format!("no such event {publisher}/{event_id}"))
-            }
-            other => CoreError::from(other),
-        })?;
+) -> Result<(Envelope, u64, Option<String>), CoreError> {
+    let (bytes, hash, accepted_at_ms, sender_address): (Vec<u8>, String, i64, Option<String>) =
+        connection
+            .query_row(
+                "SELECT e.envelope_json, e.envelope_hash, e.accepted_at_ms, m.feedback_sender
+             FROM events e LEFT JOIN managed_deliveries m USING(publisher_id,event_id)
+             WHERE e.publisher_id = ?1 AND e.event_id = ?2",
+                params![publisher, event_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    CoreError::Fence(format!("no such event {publisher}/{event_id}"))
+                }
+                other => CoreError::from(other),
+            })?;
     if bytes.is_empty() {
         return Err(corrupt(format!(
             "payload of {publisher}/{event_id} was compacted and cannot be dispatched"
@@ -878,7 +908,7 @@ fn load_envelope(
             "stored {publisher}/{event_id} no longer matches its frozen hash or key"
         )));
     }
-    Ok(envelope)
+    Ok((envelope, from_sql(accepted_at_ms)?, sender_address))
 }
 
 /// Moves an event whose stored form cannot be dispatched out of rotation.
@@ -1245,21 +1275,22 @@ fn reserve_in(
             .collect::<Result<_, _>>()?;
     }
 
-    let mut members: Vec<(String, String, Envelope, String)> = Vec::new();
+    let mut members = Vec::new();
     for (publisher, event_id) in candidates {
-        let envelope = match load_envelope(tx, &publisher, &event_id) {
-            Ok(envelope) => envelope,
-            Err(CoreError::Integrity(reason)) => {
-                if members.is_empty() {
-                    quarantine(tx, &publisher, &event_id, &reason, now_ms)?;
-                    return Ok(Selection::Held(format!(
-                        "event {publisher}/{event_id} was quarantined: {reason}"
-                    )));
+        let (envelope, accepted_at_ms, sender_address) =
+            match load_envelope(tx, &publisher, &event_id) {
+                Ok(envelope) => envelope,
+                Err(CoreError::Integrity(reason)) => {
+                    if members.is_empty() {
+                        quarantine(tx, &publisher, &event_id, &reason, now_ms)?;
+                        return Ok(Selection::Held(format!(
+                            "event {publisher}/{event_id} was quarantined: {reason}"
+                        )));
+                    }
+                    continue;
                 }
-                continue;
-            }
-            Err(other) => return Err(other),
-        };
+                Err(other) => return Err(other),
+            };
         let Some(tag) = source_tag(tx, &publisher)? else {
             if members.is_empty() {
                 let reason = format!("publisher {publisher} has no registered source tag");
@@ -1268,14 +1299,21 @@ fn reserve_in(
             }
             continue;
         };
-        members.push((publisher, event_id, envelope, tag));
-        let trial: Vec<(&str, &Envelope)> = members
-            .iter()
-            .map(|(_, _, envelope, tag)| (tag.as_str(), envelope))
-            .collect();
-        if frame_manifest(&trial).is_err() {
+        members.push(FramedMember {
+            publisher,
+            event_id,
+            envelope,
+            tag,
+            accepted_at_ms,
+            sender_address,
+        });
+        if frame_with_senders(members.iter().map(FramedMember::render_input)).is_err() {
             if members.len() == 1 {
-                let (publisher, event_id, _, _) = members.remove(0);
+                let FramedMember {
+                    publisher,
+                    event_id,
+                    ..
+                } = members.remove(0);
                 let reason = format!("event {publisher}/{event_id} cannot be framed");
                 quarantine(tx, &publisher, &event_id, &reason, now_ms)?;
                 return Ok(Selection::Held(reason));
@@ -1284,17 +1322,18 @@ fn reserve_in(
             break;
         }
     }
-    let framed: Vec<(&str, &Envelope)> = members
-        .iter()
-        .map(|(_, _, envelope, tag)| (tag.as_str(), envelope))
-        .collect();
-    let manifest = frame_manifest(&framed)?;
+    let manifest = frame_with_senders(members.iter().map(FramedMember::render_input))?;
     debug_assert!(manifest.len() <= MAX_FRAMED_BYTES);
     let manifest_hash = sha256_hex(manifest.as_bytes());
-    let requested_mode = members[0].2.mode;
+    let requested_mode = members[0].envelope.mode;
 
     let mut duplicate_risk = false;
-    for (publisher, event_id, _, _) in &members {
+    for FramedMember {
+        publisher,
+        event_id,
+        ..
+    } in &members
+    {
         let risk: i64 = tx.query_row(
             "SELECT duplicate_risk FROM events WHERE publisher_id = ?1 AND event_id = ?2",
             params![publisher, event_id],
@@ -1306,7 +1345,12 @@ fn reserve_in(
     let attempt_seq = bump_counter(tx, "attempt_seq")?;
     let lease = now_ms.saturating_add(timing.lease_ms);
     let mut deadline = now_ms.saturating_add(timing.handoff_ms);
-    for (publisher, event_id, _, _) in &members {
+    for FramedMember {
+        publisher,
+        event_id,
+        ..
+    } in &members
+    {
         let managed: Option<i64> = tx
             .query_row(
                 "SELECT CASE WHEN m.feedback_sender IS NULL THEN m.deadline_ms
@@ -1344,7 +1388,16 @@ fn reserve_in(
             attestation.proof_ref,
         ],
     )?;
-    for (ordinal, (publisher, event_id, envelope, _)) in members.iter().enumerate() {
+    for (
+        ordinal,
+        FramedMember {
+            publisher,
+            event_id,
+            envelope,
+            ..
+        },
+    ) in members.iter().enumerate()
+    {
         tx.execute(
             "INSERT INTO attempt_members (attempt_seq, ordinal, publisher_id, event_id, envelope_hash)
              VALUES (?1, ?2, ?3, ?4, ?5)",

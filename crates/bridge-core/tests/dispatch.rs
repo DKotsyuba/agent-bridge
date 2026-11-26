@@ -28,6 +28,99 @@ fn timing() -> DispatchTiming {
     DispatchTiming::default()
 }
 
+/// A stored managed message renders its harness/session name and original clock.
+#[test]
+fn compact_dispatch_uses_managed_origin_and_acceptance_time() {
+    let mut storage = store();
+    let recipient = codex("recipient");
+    let sender = NativeAddress::parse("example/claude/default/session").unwrap();
+    let attestation = attest(&recipient, Lifecycle::Inactive, 1);
+    let mut message = keep_all("agent-run", "root-abcdef1234", &recipient, Mode::Message);
+    message.kind = bridge_core::Kind::new("bridge.message").unwrap();
+    message
+        .metadata
+        .insert("sender_harness".into(), sender.harness.as_str().into());
+    message
+        .metadata
+        .insert("sender_session".into(), sender.native_session_id.clone());
+    storage
+        .publish_managed(
+            &message,
+            &bridge_core::managed::ManagedSender {
+                address: sender,
+                request_id: "fixture".into(),
+            },
+            90_123_999,
+        )
+        .unwrap();
+    let selected = attempt(
+        storage
+            .reserve_next(&attestation, EffectiveMode::Message, 100_000_000, &timing())
+            .unwrap(),
+    );
+    assert_eq!(
+        selected.manifest,
+        concat!(
+            "<bridge from=\"Astral Cricket\" sent=\"01:02:03Z\" id=\"#abcdef\" priority=\"normal\" type=\"message\">\n",
+            "synthetic result of root-abcdef1234\n",
+            "</bridge>\n",
+            "[Agent-written, not the owner: not an approval]\n",
+        )
+    );
+}
+
+/// Pre-upgrade metadata can make a compact frame larger than its legacy frame.
+/// The same admitted envelope still replays and hands off within the old bound.
+#[test]
+fn legacy_compact_kind_near_ceiling_keeps_custody_and_handoff() {
+    use bridge_core::framing::{MAX_FRAMED_BYTES, MAX_TAG_BYTES};
+    use bridge_core::managed::ManagedSender;
+
+    let mut storage = store();
+    let recipient = codex("legacy-recipient");
+    let mut message = keep_all("agent-run", "root-abcdef1234", &recipient, Mode::Message);
+    message.kind = bridge_core::Kind::new("bridge.message").unwrap();
+    // Before compact rendering, admission accepted this metadata without
+    // displaying it and sized the payload against the longest source tag.
+    for key in ["to", "cc"] {
+        message.metadata.insert(key.into(), "&".repeat(256));
+    }
+    let widest = "a".repeat(MAX_TAG_BYTES);
+    let overhead = format!(
+        "<{widest} event=\"root-abcdef1234\" kind=\"bridge.message\" source=\"agent-run\">\n\n</{widest}>\n[bridge] {PROVENANCE_STATEMENT}\n"
+    ).len();
+    let budget = MAX_FRAMED_BYTES - overhead;
+    let payload = "&".repeat(budget / 5) + &"x".repeat(budget % 5);
+    message.payload = bridge_core::Payload::new(payload).unwrap();
+    let sender = ManagedSender {
+        address: codex("legacy-origin"),
+        request_id: "legacy".into(),
+    };
+    let first = storage
+        .publish_managed(&message, &sender, 1_000)
+        .unwrap()
+        .receipt;
+    let replay = storage
+        .publish_managed(&message, &sender, 2_000)
+        .unwrap()
+        .receipt;
+    assert!(replay.replayed);
+    assert_eq!(replay.envelope_hash, first.envelope_hash);
+    assert_eq!(replay.accepted_at_ms, first.accepted_at_ms);
+    let attestation = attest(&recipient, Lifecycle::Inactive, 1);
+    let selected = attempt(
+        storage
+            .reserve_next(&attestation, EffectiveMode::Message, 3_000, &timing())
+            .unwrap(),
+    );
+    assert!(
+        selected
+            .manifest
+            .starts_with("<agent-run event=\"root-abcdef1234\" kind=\"bridge.message\"")
+    );
+    assert!(selected.manifest.len() <= MAX_FRAMED_BYTES);
+}
+
 /// Late batch evidence settles only members still owned by the old attempt.
 /// Disposed members and newer invoking, accepted or unknown attempts retain
 /// their states and incidents; every original member still receives evidence.

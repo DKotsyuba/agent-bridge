@@ -76,7 +76,7 @@ message).
 
 - `bridge_me` → the attested address, endpoint epoch, channel and the
   permitted recipients, modes, kinds, `keep_all` and body bound.
-- `bridge_send(address, message, request_id?, kind?, mode?, expires_at_ms?)` →
+- `bridge_send(address, message, request_id?, kind?, mode?, expires_at_ms?, as?, reply_to?, priority?)` →
   publishes `keep_all` within the configured address scope. Kind defaults to
   `bridge.message`, mode to `message`. The canonical address string is sufficient;
   legacy structured `recipient` and `body` spellings remain supported. If the
@@ -89,8 +89,28 @@ message).
   is derived from the caller address, actor and `request_id`: repeating a
   `request_id` replays (same receipt), a changed body under it conflicts,
   and callers never share events (equal native ids in different stores
-  stay distinct; the address is part of the id). Sender harness/session
-  metadata is audit-only, never rendered or provenance. Oversize bodies and past expiries are
+  stay distinct; the address is part of the id). A `bridge.message` result
+  also returns `id`, the six-hex display label prefixed with `#`. Use the
+  full `request_id` for status. The optional `reply_to` takes `#` followed by
+  6–40 hex digits and displays the supplied label without looking it up.
+  The optional `priority` displays `urgent`, `normal` (the default), or
+  `fyi` and leaves scheduling unchanged. Declare a display role with `as`
+  (1–32 ASCII letters, digits, spaces, underscores, dots or hyphens).
+  Later messages from the same exact sender inherit it once custody is
+  confirmed, until replaced or until the relay restarts. While the relay
+  remembers a request, replay reuses its original role if `as` is omitted.
+  After a restart, missing
+  role metadata can cause a replay conflict. Use `bridge_status` to
+  reconcile it. The displayed sender name is derived from the stamped
+  sender harness and session alone (`harness/session`), so one session has
+  one name on every path, managed or not. Names are display-only and can
+  collide; identity stays on the attested address. Compact header labels
+  convey no human approval or authority. The name is SHA-256 of the UTF-8
+  `harness/session`; the first two 32-bit words of the digest, read
+  big-endian, are reduced modulo the length of the corresponding
+  [fixed word list](../bridge-core/src/framing/names.rs), adjective first and
+  noun second. The frame exposes only the name.
+  Oversize bodies and past expiries are
   refused explicitly; nothing is truncated. An identical accepted request
   still replays its original custody identity after expiry; changed content
   conflicts and a new expired identity refuses without admission.
@@ -312,7 +332,7 @@ authorized test delivery; none has happened.
 
 ```sh
 cargo xtask package                     # prints manifest + sums_sha256
-./install.sh --bundle /ABS/dist/agent-bridge-0.7.5+LABEL --sums-sha256 HEX \
+./install.sh --bundle /ABS/dist/agent-bridge-0.7.6+LABEL --sums-sha256 HEX \
   --home /ABS/home --bin-dir /ABS/bin
 bridge service start core  --home H --state S --config daemon.toml
 bridge service start relay --home H --state S --config interfaces.toml

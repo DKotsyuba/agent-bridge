@@ -1249,6 +1249,45 @@ fn address_message_send_needs_no_per_session_configuration() {
     assert_eq!(class(&sent), "ok", "{sent}");
     let id = sent["structuredContent"]["request_id"].as_str().unwrap();
     assert!(id.starts_with("call-") && id.len() <= 128);
+    let custody = &sent["structuredContent"]["custody"];
+    use sha2::{Digest, Sha256};
+    let caller = lab.call(&mut harness, "s1", "short-me", None, "bridge_me", json!({}));
+    let caller = &caller["structuredContent"]["caller"];
+    let native_id = caller["native_id"].as_str().unwrap();
+    let hash = format!(
+        "{:x}",
+        Sha256::digest(format!(
+            "{}\n{native_id}\n{id}\n",
+            claude("s1").to_canonical_string()
+        ))
+    );
+    let event_id = format!("root-{}", &hash[..40]);
+    assert_eq!(
+        sent["structuredContent"]["id"],
+        format!("#{}", &event_id[5..11])
+    );
+    // Rebuild the 0.7.5 envelope used by the original relay send path.
+    let baseline = bridge_core::Envelope::new(
+        bridge_core::PublisherId::new("bridge-root").unwrap(),
+        bridge_core::EventId::new(event_id).unwrap(),
+        claude("brand-new-session"),
+        bridge_core::Kind::new("bridge.message").unwrap(),
+        bridge_core::Mode::Message,
+        bridge_core::Policy::KeepAll,
+        bridge_core::Payload::new("hello").unwrap(),
+        [
+            ("request_id".into(), id.into()),
+            (
+                "sender_harness".into(),
+                Harness::CLAUDE_CODE.as_str().into(),
+            ),
+            ("sender_session".into(), "s1".into()),
+        ]
+        .into(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(custody["envelope_hash"], baseline.envelope_hash().as_str());
     let mut replay = args;
     replay["request_id"] = json!(id);
     let repeated = lab.call(
@@ -1261,6 +1300,69 @@ fn address_message_send_needs_no_per_session_configuration() {
     );
     assert_eq!(class(&repeated), "ok", "{repeated}");
     assert_eq!(repeated["structuredContent"]["custody"]["replayed"], true);
+    let mut declared = replay.clone();
+    declared["request_id"] = json!("role-declare");
+    declared["as"] = json!("executor");
+    declared["reply_to"] = json!("#Aa012F");
+    declared["priority"] = json!("urgent");
+    let result = lab.call(
+        &mut harness,
+        "s1",
+        "declare",
+        None,
+        "bridge_send",
+        declared.clone(),
+    );
+    assert_eq!(class(&result), "ok", "{result}");
+    let mut inherited = replay.clone();
+    inherited["request_id"] = json!("role-inherit");
+    let first = lab.call(
+        &mut harness,
+        "s1",
+        "inherit",
+        None,
+        "bridge_send",
+        inherited.clone(),
+    );
+    assert_eq!(class(&first), "ok", "{first}");
+    let mut changed = replay.clone();
+    changed["request_id"] = json!("role-change");
+    changed["as"] = json!("reviewer");
+    let result = lab.call(&mut harness, "s1", "change", None, "bridge_send", changed);
+    assert_eq!(class(&result), "ok", "{result}");
+    let result = lab.call(
+        &mut harness,
+        "s1",
+        "inherit-replay",
+        None,
+        "bridge_send",
+        inherited,
+    );
+    assert_eq!(class(&result), "ok", "{result}");
+    assert_eq!(result["structuredContent"]["custody"]["replayed"], true);
+    let result = lab.call(
+        &mut harness,
+        "s1",
+        "legacy-role-replay",
+        None,
+        "bridge_send",
+        replay.clone(),
+    );
+    assert_eq!(class(&result), "ok", "{result}");
+    assert_eq!(
+        result["structuredContent"]["custody"]["envelope_hash"],
+        baseline.envelope_hash().as_str()
+    );
+    declared["as"] = json!("reviewer");
+    let result = lab.call(
+        &mut harness,
+        "s1",
+        "role-conflict",
+        None,
+        "bridge_send",
+        declared,
+    );
+    assert_eq!(class(&result), "conflict", "{result}");
     replay["message"] = json!("different");
     assert_eq!(
         class(&lab.call(
