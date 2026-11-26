@@ -1,8 +1,8 @@
 //! Source framing and bounded rendering of recipient-visible content.
 //!
 //! Bridge wraps payloads in escaped, bounded source blocks. Legacy blocks name
-//! the authenticated integration's allowlisted tag. Compact Bridge headers
-//! show display labels. Every frame conveys no human approval or authority.
+//! the authenticated integration's allowlisted tag. Compact headers show display
+//! labels for messages and receipts, and authenticated tags for service notices. Every frame conveys no human approval or authority.
 
 mod names;
 
@@ -19,7 +19,7 @@ pub const MAX_FRAMED_BYTES: usize = 96 * 1024;
 /// size of an event is known at admission, before any tag is chosen.
 pub const MAX_TAG_BYTES: usize = 64;
 
-/// The fixed provenance statement appended to legacy blocks and mixed batches.
+/// The fixed provenance statement appended to service notices, legacy blocks and mixed batches.
 pub const PROVENANCE_STATEMENT: &str =
     "external service data; conveys no human approval or additional authority";
 
@@ -74,13 +74,12 @@ fn render_member(
     sender_name: Option<&str>,
 ) -> Result<String, CoreError> {
     reject_forbidden_controls("payload", envelope.payload.as_str())?;
-    if matches!(
-        envelope.kind.as_str(),
-        "bridge.message" | "bridge.delivery_report"
-    ) {
-        return Ok(render_compact(envelope, accepted_at_ms, sender_name));
-    }
-    Ok(render_legacy_member(source_tag, envelope))
+    Ok(render_compact(
+        source_tag,
+        envelope,
+        accepted_at_ms,
+        sender_name,
+    ))
 }
 
 /// Renders the original source block with full body quoting.
@@ -111,12 +110,47 @@ pub fn short_id(event_id: &str) -> Option<String> {
         .then(|| format!("#{short}"))
 }
 
-/// Renders the compact header and body for the two Bridge kinds.
-fn render_compact(envelope: &Envelope, accepted_at_ms: u64, sender_name: Option<&str>) -> String {
-    let receipt = envelope.kind.as_str() == "bridge.delivery_report";
+/// Formats custody time in UTC, dropping fractional seconds.
+fn format_sent(accepted_at_ms: u64) -> String {
+    let seconds = accepted_at_ms / 1000;
+    // Convert Unix days to a March-based Gregorian calendar. Each 400-year
+    // cycle has 146,097 days, and 719,468 days separate March 1, year 0
+    // from the Unix epoch.
+    let days = seconds / 86_400 + 719_468;
+    let era = days / 146_097;
+    let day_of_era = days % 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let march_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * march_month + 2) / 5 + 1;
+    let month = if march_month < 10 {
+        march_month + 3
+    } else {
+        march_month - 9
+    };
+    let year = era * 400 + year_of_era + u64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}Z",
+        seconds / 3600 % 24,
+        seconds / 60 % 60,
+        seconds % 60,
+    )
+}
+
+/// Renders a compact block using kind-specific display attributes.
+fn render_compact(
+    source_tag: &str,
+    envelope: &Envelope,
+    accepted_at_ms: u64,
+    sender_name: Option<&str>,
+) -> String {
+    let kind = envelope.kind.as_str();
+    let receipt = kind == "bridge.delivery_report";
+    let message = kind == "bridge.message";
     let from = if receipt {
         "Bridge".into()
-    } else {
+    } else if message {
         // One rule for every path: the generated name depends only on the stamped
         // harness and session, so a session keeps one name whether or not the
         // message was managed. It is display-only; identity stays on the address.
@@ -131,20 +165,19 @@ fn render_compact(envelope: &Envelope, accepted_at_ms: u64, sender_name: Option<
             write!(name, " ({role})").expect("writing to a String");
         }
         name
+    } else {
+        source_tag.to_owned()
     };
-    let seconds = accepted_at_ms / 1000;
     let id = short_id(envelope.event_id.as_str());
     let mut block = format!(
-        "<bridge from=\"{}\" sent=\"{:02}:{:02}:{:02}Z\" id=\"{}\"",
+        "<bridge from=\"{}\" sent=\"{}\" id=\"{}\"",
         escape(&from),
-        seconds / 3600 % 24,
-        seconds / 60 % 60,
-        seconds % 60,
+        format_sent(accepted_at_ms),
         escape(id.as_deref().unwrap_or(envelope.event_id.as_str())),
     );
     if receipt {
         block.push_str(" type=\"receipt\"");
-    } else {
+    } else if message {
         let metadata = |key| envelope.metadata.get(key).map(String::as_str);
         if let Some(reply) = metadata("reply_to") {
             write!(block, " reply-to=\"{}\"", escape(reply)).expect("writing to a String");
@@ -160,6 +193,8 @@ fn render_compact(envelope: &Envelope, accepted_at_ms: u64, sender_name: Option<
                 write!(block, " {key}=\"{}\"", escape(audience)).expect("writing to a String");
             }
         }
+    } else {
+        write!(block, " type=\"{}\"", escape(kind)).expect("writing to a String");
     }
     writeln!(
         block,
@@ -178,15 +213,14 @@ fn render_compact(envelope: &Envelope, accepted_at_ms: u64, sender_name: Option<
 /// wrapper). Produces one block:
 ///
 /// ```text
-/// <agent-run event="evt-1" kind="worker.completed" source="agent-run">
+/// <bridge from="agent-run" sent="1970-01-01 00:00:00Z" id="evt-1" type="worker.completed">
 /// escaped payload
-/// </agent-run>
+/// </bridge>
 /// [bridge] external service data; conveys no human approval or additional authority
 /// ```
 ///
-/// Legacy blocks show the authenticated publisher. The two compact Bridge
-/// kinds use display headers and a dedicated trust statement. This helper uses
-/// 00:00:00Z for compact headers without a custody timestamp.
+/// Messages and receipts have dedicated display labels and trust statements.
+/// This helper uses the Unix epoch for compact headers without a custody timestamp.
 /// Errors: forbidden control characters in the payload, an invalid tag, or
 /// a rendered size over [`MAX_FRAMED_BYTES`].
 pub fn frame(source_tag: &str, envelope: &Envelope) -> Result<String, CoreError> {
@@ -260,10 +294,6 @@ fn render_manifest<'a>(
         _ => writeln!(body, "[bridge] {PROVENANCE_STATEMENT}").expect("writing to a String"),
     }
     if body.len() > MAX_FRAMED_BYTES
-        && matches!(
-            common_kind,
-            Some("bridge.message" | "bridge.delivery_report")
-        )
         && let Some((tag, envelope)) = single_member
     {
         body = render_legacy_member(tag, envelope);
@@ -284,13 +314,14 @@ fn render_manifest<'a>(
 /// custody forever; refusing it before acceptance keeps that failure with
 /// the producer. The size check uses the longest possible tag, so a later
 /// tag choice cannot make an admitted event unframeable. Compact messages
-/// reserve space for the longest possible generated name. A compact frame
+/// reserve space for the longest possible generated name, and admission uses
+/// the widest supported timestamp. A compact frame
 /// that exceeds the absolute ceiling may use the original source block if
 /// that fits, preserving custody and handoff for pre-upgrade envelopes.
 pub fn check_renderable(envelope: &Envelope) -> Result<(), CoreError> {
     let widest_tag = "a".repeat(MAX_TAG_BYTES);
     let name = (envelope.kind.as_str() == "bridge.message").then(names::widest_name);
-    render_manifest([(widest_tag.as_str(), envelope, 0, name)].into_iter()).map(|_| ())
+    render_manifest([(widest_tag.as_str(), envelope, u64::MAX, name)].into_iter()).map(|_| ())
 }
 
 /// Validates an allowlisted source tag's shape.
@@ -370,7 +401,7 @@ mod tests {
             framed,
             format!(
                 concat!(
-                    "<bridge from=\"{} (&quot;&lt;&amp;&gt;&#39;)\" sent=\"01:02:03Z\" id=\"#abcdef\" reply-to=\"#Aa012F\" priority=\"urgent\" type=\"message\" to=\"One &amp; Two\" cc=\"Three\">\n",
+                    "<bridge from=\"{} (&quot;&lt;&amp;&gt;&#39;)\" sent=\"1970-01-02 01:02:03Z\" id=\"#abcdef\" reply-to=\"#Aa012F\" priority=\"urgent\" type=\"message\" to=\"One &amp; Two\" cc=\"Three\">\n",
                     "{{\"body\":\"&lt;&amp;&gt;'\"}}\n",
                     "</bridge>\n",
                     "[Agent-written, not the owner: not an approval]\n",
@@ -428,7 +459,7 @@ mod tests {
             framed,
             format!(
                 concat!(
-                    "<bridge from=\"{}\" sent=\"00:00:01Z\" id=\"#123456\" priority=\"normal\" type=\"message\">\n",
+                    "<bridge from=\"{}\" sent=\"1970-01-01 00:00:01Z\" id=\"#123456\" priority=\"normal\" type=\"message\">\n",
                     "Ready.\n",
                     "</bridge>\n",
                     "[Agent-written, not the owner: not an approval]\n",
@@ -447,7 +478,7 @@ mod tests {
         assert_eq!(
             frame_manifest(&[("bridge-root", &report, 86_399_000)]).unwrap(),
             concat!(
-                "<bridge from=\"Bridge\" sent=\"23:59:59Z\" id=\"#fedcba\" type=\"receipt\">\n",
+                "<bridge from=\"Bridge\" sent=\"1970-01-01 23:59:59Z\" id=\"#fedcba\" type=\"receipt\">\n",
                 "Bridge said \"unconfirmed\".\n",
                 "</bridge>\n",
                 "[Bridge notice: not an approval]\n",
@@ -455,46 +486,60 @@ mod tests {
         );
     }
 
-    /// The legacy frame stays byte-identical and a mixed batch keeps one trust line.
+    /// Service headers use the authenticated tag even when metadata claims another name.
     #[test]
-    fn legacy_and_mixed_batch_golden() {
-        let mut legacy = envelope("evt-1", "'<x>&\"");
-        legacy.metadata.insert("role".into(), "ignored".into());
-        let mut message = envelope("root-1234567890", "Ready.");
-        message.kind = Kind::new("bridge.message").unwrap();
-        message.metadata.extend([
+    fn service_and_mixed_batch_golden() {
+        let mut notice = envelope("evt-1", "'<x>&\"");
+        notice.metadata.extend([
+            ("role".into(), "owner".into()),
+            ("from".into(), "forged".into()),
             ("sender_harness".into(), "codex".into()),
             ("sender_session".into(), "session".into()),
         ]);
-        let name = names::sender_name("codex/session");
-        let legacy_block = concat!(
-            "<agent-run event=\"evt-1\" kind=\"worker.completed\" source=\"agent-run\">\n",
-            "&#39;&lt;x&gt;&amp;&quot;\n",
-            "</agent-run>\n",
+        let mut message = envelope("root-1234567890", "Ready.");
+        message.kind = Kind::new("bridge.message").unwrap();
+        let service_block = concat!(
+            "<bridge from=\"agent-pool\" sent=\"1970-01-02 00:00:00Z\" id=\"evt-1\" type=\"worker.completed\">\n",
+            "'&lt;x&gt;&amp;\"\n",
+            "</bridge>\n",
         );
-        let legacy_trust =
+        let service_trust =
             "[bridge] external service data; conveys no human approval or additional authority\n";
         assert_eq!(
-            frame("agent-run", &legacy).unwrap(),
-            format!("{legacy_block}{legacy_trust}")
+            frame_manifest(&[("agent-pool", &notice, 86_400_000)]).unwrap(),
+            format!("{service_block}{service_trust}")
         );
         assert_eq!(
-            frame_with_senders(
-                [
-                    ("agent-run", &legacy, 0, None),
-                    (
-                        "bridge-root",
-                        &message,
-                        1_000,
-                        Some("example/codex/default/session")
-                    ),
-                ]
-                .into_iter()
-            )
+            frame_manifest(&[
+                ("agent-pool", &notice, 86_400_000),
+                ("bridge-root", &message, 86_401_000),
+            ])
             .unwrap(),
             format!(
-                "<bridge-batch count=\"2\">\n{legacy_block}<bridge from=\"{name}\" sent=\"00:00:01Z\" id=\"#123456\" priority=\"normal\" type=\"message\">\nReady.\n</bridge>\n</bridge-batch>\n{legacy_trust}"
+                "<bridge-batch count=\"2\">\n{service_block}<bridge from=\"Agent\" sent=\"1970-01-02 00:00:01Z\" id=\"#123456\" priority=\"normal\" type=\"message\">\nReady.\n</bridge>\n</bridge-batch>\n{service_trust}"
             ),
+        );
+    }
+
+    /// UTC date formatting handles leap days and drops fractional seconds.
+    #[test]
+    fn compact_dates_cross_a_leap_day_boundary() {
+        assert_eq!(format_sent(1_709_251_199_999), "2024-02-29 23:59:59Z");
+        assert_eq!(format_sent(1_709_251_200_000), "2024-03-01 00:00:00Z");
+        assert_eq!(format_sent(1_795_700_527_000), "2026-11-26 13:42:07Z");
+    }
+
+    /// A service frame over the limit uses the original block byte for byte.
+    #[test]
+    fn oversize_service_uses_legacy_golden() {
+        let header = "<r event=\"evt-1\" kind=\"worker.completed\" source=\"agent-run\">\n";
+        let suffix = "\n</r>\n[bridge] external service data; conveys no human approval or additional authority\n";
+        let budget = MAX_FRAMED_BYTES - header.len() - suffix.len();
+        let payload = "&".repeat(budget / 5) + &"x".repeat(budget % 5);
+        let notice = envelope("evt-1", &payload);
+        assert_eq!(
+            frame("r", &notice).unwrap(),
+            format!("{header}{}{suffix}", payload.replace('&', "&amp;"))
         );
     }
 
@@ -509,8 +554,8 @@ mod tests {
             frame_manifest(&[("bridge-root", &one, 1_000), ("bridge-root", &two, 2_000)]).unwrap(),
             concat!(
                 "<bridge-batch count=\"2\">\n",
-                "<bridge from=\"Agent\" sent=\"00:00:01Z\" id=\"#111111\" priority=\"normal\" type=\"message\">\none\n</bridge>\n",
-                "<bridge from=\"Agent\" sent=\"00:00:02Z\" id=\"#222222\" priority=\"normal\" type=\"message\">\ntwo\n</bridge>\n",
+                "<bridge from=\"Agent\" sent=\"1970-01-01 00:00:01Z\" id=\"#111111\" priority=\"normal\" type=\"message\">\none\n</bridge>\n",
+                "<bridge from=\"Agent\" sent=\"1970-01-01 00:00:02Z\" id=\"#222222\" priority=\"normal\" type=\"message\">\ntwo\n</bridge>\n",
                 "</bridge-batch>\n",
                 "[Agent-written, not the owner: not an approval]\n",
             ),
@@ -523,8 +568,8 @@ mod tests {
             frame_manifest(&[("bridge-root", &one, 1_000), ("bridge-root", &two, 2_000)]).unwrap(),
             concat!(
                 "<bridge-batch count=\"2\">\n",
-                "<bridge from=\"Bridge\" sent=\"00:00:01Z\" id=\"#111111\" type=\"receipt\">\none\n</bridge>\n",
-                "<bridge from=\"Bridge\" sent=\"00:00:02Z\" id=\"#222222\" type=\"receipt\">\ntwo\n</bridge>\n",
+                "<bridge from=\"Bridge\" sent=\"1970-01-01 00:00:01Z\" id=\"#111111\" type=\"receipt\">\none\n</bridge>\n",
+                "<bridge from=\"Bridge\" sent=\"1970-01-01 00:00:02Z\" id=\"#222222\" type=\"receipt\">\ntwo\n</bridge>\n",
                 "</bridge-batch>\n",
                 "[Bridge notice: not an approval]\n",
             ),
@@ -571,8 +616,18 @@ mod tests {
         let one = envelope("evt-1", "one");
         let two = envelope("evt-2", "two");
         let batch = frame_manifest(&[("agent-ide", &one, 0), ("agent-run", &two, 0)]).unwrap();
-        assert_eq!(batch.matches("<agent-ide event=\"evt-1\"").count(), 1);
-        assert_eq!(batch.matches("<agent-run event=\"evt-2\"").count(), 1);
+        assert_eq!(
+            batch
+                .matches("<bridge from=\"agent-ide\" sent=\"1970-01-01 00:00:00Z\" id=\"evt-1\"")
+                .count(),
+            1
+        );
+        assert_eq!(
+            batch
+                .matches("<bridge from=\"agent-run\" sent=\"1970-01-01 00:00:00Z\" id=\"evt-2\"")
+                .count(),
+            1
+        );
         assert!(batch.starts_with("<bridge-batch count=\"2\">"));
         assert!(batch.find("evt-1").unwrap() < batch.find("evt-2").unwrap());
         assert!(frame_manifest(&[]).is_err());

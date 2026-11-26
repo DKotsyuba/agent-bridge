@@ -61,7 +61,7 @@ fn compact_dispatch_uses_managed_origin_and_acceptance_time() {
     assert_eq!(
         selected.manifest,
         concat!(
-            "<bridge from=\"Astral Cricket\" sent=\"01:02:03Z\" id=\"#abcdef\" priority=\"normal\" type=\"message\">\n",
+            "<bridge from=\"Astral Cricket\" sent=\"1970-01-02 01:02:03Z\" id=\"#abcdef\" priority=\"normal\" type=\"message\">\n",
             "synthetic result of root-abcdef1234\n",
             "</bridge>\n",
             "[Agent-written, not the owner: not an approval]\n",
@@ -319,7 +319,7 @@ fn reserved_attempt_freezes_recipient_actor_epoch_path_manifest_and_deadline() {
     assert!(
         record
             .manifest
-            .contains("<agent-run event=\"evt-1\" kind=\"worker.completed\" source=\"agent-run\">"),
+            .contains("<bridge from=\"agent-run\" sent=\"1970-01-01 00:00:01Z\" id=\"evt-1\" type=\"worker.completed\">"),
         "the frozen manifest includes the stamped issuer provenance: {}",
         record.manifest
     );
@@ -1559,7 +1559,7 @@ fn batch_manifests_are_ordered_lossless_and_scopes_stay_isolated() {
     assert_eq!(ids, ["b-1", "b-2", "b-3"], "ordered, lossless, one scope");
     assert!(first.manifest.starts_with("<bridge-batch count=\"3\">"));
     for id in ids {
-        assert!(first.manifest.contains(&format!("event=\"{id}\"")));
+        assert!(first.manifest.contains(&format!("id=\"{id}\"")));
     }
     // The rest follow as their own manifests.
     let mut remaining = Vec::new();
