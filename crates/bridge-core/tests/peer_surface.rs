@@ -590,19 +590,18 @@ fn operator_retention_shows_terminal_gc_without_recalling_native_effects() {
     restarted.join();
 }
 
-/// Framing provenance: the rendered `source` is the Bridge-stamped
-/// publisher identity; caller metadata can never forge or replace it.
+/// Service framing uses the authenticated source tag for the display sender.
 #[test]
 fn framing_renders_trusted_issuer_provenance_only() {
     let mut metadata = Metadata::new();
     metadata.insert("sender_harness".to_string(), "claude-code".into());
     metadata.insert("sender_session".to_string(), "session-forged".into());
     metadata.insert("source".to_string(), "root-orchestrator".into());
-    let framed = frame("agent-run", &envelope("evt-prov", metadata)).unwrap();
+    let framed = frame("run-notices", &envelope("evt-prov", metadata)).unwrap();
 
     assert!(
-        framed.contains("source=\"agent-run\""),
-        "stamped issuer must be rendered: {framed}"
+        framed.contains("from=\"run-notices\""),
+        "authenticated tag must be rendered: {framed}"
     );
     assert!(
         !framed.contains("session-forged"),

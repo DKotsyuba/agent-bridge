@@ -358,7 +358,7 @@ fn registered_carriers_deliver_over_the_message_path_and_respect_pause() {
     assert!(
         sends[0]
             .manifest
-            .contains("<agent-run event=\"evt-paused\"")
+            .contains("id=\"evt-paused\" type=\"worker.completed\"")
     );
     assert_eq!(sends[0].actor, "thread-7");
 

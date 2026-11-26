@@ -2098,11 +2098,10 @@ mod bound_tests {
     };
 
     /// A 16 KiB UTF-8 payload rendered under the widest tag (ASCII `&` that
-    /// escapes to a 5-byte entity, or multibyte text), plus envelope and
-    /// provenance, fits the carrier bound. The bound is exactly core's framing
-    /// bound, so core refuses anything larger before it can reach this
-    /// carrier; a body of 16 KiB of `"` (a 6-byte entity each) already exceeds
-    /// that bound at core admission and is not a carrier case.
+    /// escapes to a 5-byte entity, quotes, or multibyte text), plus envelope
+    /// and provenance, fits the carrier bound. Compact bodies preserve quotes.
+    /// The carrier bound is exactly core's framing bound, so core refuses
+    /// anything larger before it can reach this carrier.
     #[test]
     fn a_full_16_kib_body_fits_the_carrier_bound() {
         let address = NativeAddress::new("host", Harness::CLAUDE_CODE, "default", "s").unwrap();
@@ -2123,6 +2122,7 @@ mod bound_tests {
         let tag = "a".repeat(MAX_TAG_BYTES);
         for payload in [
             "&".repeat(16 * 1024),
+            "\"".repeat(16 * 1024),
             "\u{1F600}".repeat(4 * 1024),
             "\u{e9}".repeat(8 * 1024),
         ] {
@@ -2133,6 +2133,5 @@ mod bound_tests {
         assert_eq!(MAX_MESSAGE_BYTES, MAX_FRAMED_BYTES);
         let over = "&".repeat(MAX_FRAMED_BYTES / 5 + 1);
         assert!(frame(&tag, &envelope(over)).is_err());
-        assert!(frame(&tag, &envelope("\"".repeat(16 * 1024))).is_err());
     }
 }

@@ -4,6 +4,14 @@ All notable changes to Agent Bridge are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions describe the
 source, and the crates are not published to crates.io.
 
+## [0.7.7] - 2026-11-26
+
+### Changed
+
+- Service notices use compact Bridge headers with the authenticated source tag
+  and event kind. All compact headers include the UTC acceptance date and time.
+  Oversize single-event frames retain the original source block when it fits.
+
 ## [0.7.6] - 2026-11-26
 
 ### Changed
