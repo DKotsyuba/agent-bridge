@@ -24,9 +24,8 @@
 //! and `request_id`, so callers cannot collide with, conflict with or read
 //! each other's events (even with equal native ids in different stores),
 //! and a repeated `request_id` is an idempotent replay. The caller's
-//! harness and session are attached as audit metadata only: core never
-//! renders metadata and it is not provenance (the rendered source is the
-//! relay grant's publisher tag).
+//! harness and session are attached as metadata. Compact message labels are
+//! display text and carry no authority.
 //! There is no other operation: no enumeration, retry, reset, admin,
 //! drain, acknowledgement or raw passthrough.
 //!
@@ -35,6 +34,7 @@
 //! issued token and no predeclared release tier, and no producer has
 //! declared one (see the crate README).
 
+use std::collections::HashMap;
 use std::io::BufReader;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -184,6 +184,43 @@ struct SendArgs {
     /// Optional absolute expiry (Unix epoch ms); must be in the future.
     #[serde(default)]
     expires_at_ms: Option<u64>,
+    /// Optional display role declaration for this sender.
+    #[serde(rename = "as")]
+    role: Option<String>,
+    /// Short reply label, preserved verbatim.
+    reply_to: Option<String>,
+    /// Display priority, independent of scheduling.
+    priority: Option<String>,
+}
+
+impl SendArgs {
+    /// Rejects malformed display labels before publication.
+    fn validate_labels(&self) -> Result<(), RelayResponse> {
+        if self.role.as_ref().is_some_and(|role| {
+            role.is_empty()
+                || role.len() > 32
+                || !role
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b" _.-".contains(&b))
+        }) {
+            return Err(RelayResponse::error("invalid", "invalid as role"));
+        }
+        if self.reply_to.as_ref().is_some_and(|reply| {
+            !reply.strip_prefix('#').is_some_and(|hex| {
+                (6..=40).contains(&hex.len()) && hex.bytes().all(|b| b.is_ascii_hexdigit())
+            })
+        }) {
+            return Err(RelayResponse::error("invalid", "invalid reply_to label"));
+        }
+        if self
+            .priority
+            .as_deref()
+            .is_some_and(|priority| !matches!(priority, "urgent" | "normal" | "fyi"))
+        {
+            return Err(RelayResponse::error("invalid", "invalid priority label"));
+        }
+        Ok(())
+    }
 }
 
 /// A validated target address, accepting the concise native address or the
@@ -244,6 +281,80 @@ pub struct RootRelay {
     attestor: Box<dyn CallerAttestor>,
     /// Lazily connected core client.
     client: Mutex<Option<BridgeClient>>,
+    /// Display roles scoped to the canonical, attested sender address.
+    roles: Mutex<HashMap<String, SenderRoles>>,
+}
+
+/// Regenerates role metadata on replay and only publishes confirmed declarations.
+#[derive(Default)]
+struct SenderRoles {
+    /// Most recent confirmed declaration and its order.
+    current: Option<(usize, String)>,
+    /// Request role bindings, including unknown custody.
+    requests: HashMap<String, RequestRole>,
+    /// Orders declarations even when custody answers are lost.
+    declaration_order: usize,
+}
+
+/// Keeps a request's display role and its optional declaration sequence.
+struct RequestRole {
+    /// Role stamped on the request, including its absence.
+    role: Option<String>,
+    /// Declaration order if the request may establish a reusable role.
+    declaration: Option<usize>,
+}
+
+impl SenderRoles {
+    /// Explicit arguments still participate in the core's replay hash check.
+    fn role_for(&self, request_id: &str, declared: Option<&str>) -> Option<String> {
+        if let Some(declared) = declared {
+            return Some(declared.to_owned());
+        }
+        match self.requests.get(request_id) {
+            Some(request) => request.role.clone(),
+            None => self.current.as_ref().map(|(_, role)| role.clone()),
+        }
+    }
+
+    /// Freezes the original role on unknown custody without activating it.
+    fn freeze(&mut self, request_id: String, role: Option<String>, declared: bool) {
+        if !self.requests.contains_key(&request_id) {
+            let declaration = declared.then(|| self.next_declaration());
+            self.requests
+                .insert(request_id, RequestRole { role, declaration });
+        }
+    }
+
+    /// Confirms an admitted role and only activates declarations newer than the current one.
+    fn confirm(
+        &mut self,
+        request_id: String,
+        role: Option<String>,
+        declared: bool,
+        replayed: bool,
+    ) {
+        let original = self.requests.get(&request_id);
+        let declaration = original
+            .filter(|request| request.role == role)
+            .and_then(|request| request.declaration)
+            .or_else(|| (declared && !replayed).then(|| self.next_declaration()));
+        if let (Some(order), Some(role)) = (declaration, &role)
+            && self
+                .current
+                .as_ref()
+                .is_none_or(|(current, _)| order > *current)
+        {
+            self.current = Some((order, role.clone()));
+        }
+        self.requests
+            .insert(request_id, RequestRole { role, declaration });
+    }
+
+    /// Reserves the next declaration order while the relay holds the role lock.
+    fn next_declaration(&mut self) -> usize {
+        self.declaration_order += 1;
+        self.declaration_order
+    }
 }
 
 impl std::fmt::Debug for RootRelay {
@@ -272,6 +383,7 @@ impl RootRelay {
             token,
             attestor,
             client: Mutex::new(None),
+            roles: Mutex::new(HashMap::new()),
         }
     }
 
@@ -401,6 +513,7 @@ impl RootRelay {
         now_ms: u64,
     ) -> Result<RelayResponse, RelayResponse> {
         check_request_id(&args.request_id)?;
+        args.validate_labels()?;
         let recipient = match args.recipient {
             RecipientArg::Canonical(address) => NativeAddress::parse(&address).map_err(invalid)?,
             RecipientArg::Structured(args) => NativeAddress::new(
@@ -439,8 +552,17 @@ impl RootRelay {
                 ),
             ));
         }
+        let compact = args.kind == "bridge.message";
+        if !compact && (args.role.is_some() || args.reply_to.is_some() || args.priority.is_some()) {
+            return Err(RelayResponse::error(
+                "invalid",
+                "display labels require bridge.message",
+            ));
+        }
+        let event = event_id(caller, &args.request_id)?;
+        let id = bridge_core::framing::short_id(event.as_str());
         let mut request = PublishRequest::new(
-            event_id(caller, &args.request_id)?,
+            event,
             recipient,
             Kind::new(args.kind).map_err(invalid)?,
             mode,
@@ -454,7 +576,36 @@ impl RootRelay {
             request =
                 request.with_expires_at(ExpiresAt::from_unix_millis(expires).map_err(invalid)?);
         }
+        // Serialize role selection with publication. Only send takes the role
+        // lock, and it always takes it before the core client lock.
+        let mut roles = if compact {
+            Some(
+                self.roles
+                    .lock()
+                    .map_err(|_| RelayResponse::error("internal", "role state unavailable"))?,
+            )
+        } else {
+            None
+        };
+        let sender_roles = roles.as_mut().map(|roles| {
+            roles
+                .entry(caller.address().to_canonical_string())
+                .or_default()
+        });
+        let role = sender_roles
+            .as_ref()
+            .and_then(|roles| roles.role_for(&args.request_id, args.role.as_deref()));
+        for (key, value) in [
+            ("role", role.as_deref()),
+            ("reply_to", args.reply_to.as_deref()),
+            ("priority", args.priority.as_deref()),
+        ] {
+            if let Some(value) = value {
+                request = request.with_metadata(key, value);
+            }
+        }
         let body = request.into_body().map_err(invalid)?;
+        let mut publish_started = false;
         let receipt = self.with_client(|client, token| {
             if args.expires_at_ms.is_some_and(|expires| expires <= now_ms)
                 && client.status(token, &body.event_id)?.0.is_none()
@@ -464,6 +615,7 @@ impl RootRelay {
                     detail: "expires_at_ms is not in the future; nothing was sent".into(),
                 });
             }
+            publish_started = true;
             if self.config.bounded_delivery {
                 client.publish_managed(
                     token,
@@ -476,13 +628,31 @@ impl RootRelay {
             } else {
                 client.publish(token, &body)
             }
-        })?;
-        Ok(RelayResponse::Ok {
-            value: json!({
-                "request_id": args.request_id,
-                "custody": custody_view(&receipt),
-            }),
-        })
+        });
+        if let Some(roles) = sender_roles {
+            match &receipt {
+                Ok(receipt) => roles.confirm(
+                    args.request_id.clone(),
+                    role,
+                    args.role.is_some(),
+                    receipt.replayed,
+                ),
+                Err(RelayResponse::Error { class, .. })
+                    if publish_started && class == "custody_unknown" =>
+                {
+                    roles.freeze(args.request_id.clone(), role, args.role.is_some());
+                }
+                Err(_) => {}
+            }
+        }
+        let mut value = json!({
+            "request_id": args.request_id,
+            "custody": custody_view(&receipt?),
+        });
+        if compact {
+            value["id"] = json!(id);
+        }
+        Ok(RelayResponse::Ok { value })
     }
 
     /// `bridge_status`: this caller's own event, tiers kept distinct.
@@ -1074,6 +1244,94 @@ mod tests {
     //! `tests/root_composition.rs` over real processes.
 
     use super::*;
+
+    /// New requests inherit updates while replays keep their original role.
+    #[test]
+    fn role_memory_keeps_first_request_values() {
+        let mut roles = SenderRoles::default();
+        assert_eq!(roles.role_for("legacy", None), None);
+        roles.confirm("legacy".into(), None, false, false);
+        roles.confirm("declared".into(), Some("executor".into()), true, false);
+        assert_eq!(
+            roles.role_for("inherited", None).as_deref(),
+            Some("executor")
+        );
+        roles.confirm(
+            "inherited".into(),
+            roles.role_for("inherited", None),
+            false,
+            false,
+        );
+        roles.confirm("change".into(), Some("reviewer".into()), true, false);
+        assert_eq!(roles.role_for("legacy", None), None);
+        assert_eq!(
+            roles.role_for("inherited", None).as_deref(),
+            Some("executor")
+        );
+        assert_eq!(
+            roles.role_for("declared", Some("different")).as_deref(),
+            Some("different")
+        );
+        roles.confirm("declared".into(), Some("executor".into()), true, true);
+        assert_eq!(roles.role_for("next", None).as_deref(), Some("reviewer"));
+        assert_eq!(SenderRoles::default().role_for("next", None), None);
+    }
+
+    /// An uncertain declaration can be confirmed on replay without replacing a newer role.
+    #[test]
+    fn uncertain_role_does_not_replace_latest_confirmed_role() {
+        let mut roles = SenderRoles::default();
+        roles.freeze("first".into(), Some("executor".into()), true);
+        assert_eq!(roles.role_for("other", None), None);
+        let original = roles.role_for("first", None);
+        assert_eq!(original.as_deref(), Some("executor"));
+        roles.confirm("first".into(), original, false, true);
+        assert_eq!(roles.role_for("other", None).as_deref(), Some("executor"));
+
+        roles.freeze("uncertain".into(), Some("builder".into()), true);
+        assert_eq!(roles.role_for("other", None).as_deref(), Some("executor"));
+        roles.confirm("later".into(), Some("reviewer".into()), true, false);
+        let original = roles.role_for("uncertain", None);
+        assert_eq!(original.as_deref(), Some("builder"));
+        roles.confirm("uncertain".into(), original, false, true);
+        assert_eq!(roles.role_for("other", None).as_deref(), Some("reviewer"));
+        assert_eq!(
+            roles.role_for("uncertain", None).as_deref(),
+            Some("builder")
+        );
+    }
+
+    /// Display argument validation rejects hostile and out-of-range labels.
+    #[test]
+    fn display_labels_are_validated() {
+        let mut args: SendArgs = serde_json::from_value(json!({
+            "request_id": "req",
+            "address": "host/claude/default/session",
+            "message": "hello",
+            "as": "Build_Lead-1.2",
+            "reply_to": "#Aa012F",
+            "priority": "urgent",
+        }))
+        .unwrap();
+        assert!(args.validate_labels().is_ok());
+        for role in ["", "bad\"<role>", "réviewer", &"x".repeat(33)] {
+            args.role = Some(role.into());
+            assert!(args.validate_labels().is_err());
+        }
+        args.role = None;
+        for reply in [
+            "Aa012F",
+            "#12345",
+            "#12345Z",
+            &format!("#{}", "1".repeat(41)),
+        ] {
+            args.reply_to = Some(reply.into());
+            assert!(args.validate_labels().is_err());
+        }
+        args.reply_to = None;
+        args.priority = Some("urgent!".into());
+        assert!(args.validate_labels().is_err());
+    }
 
     /// Request ids must be non-empty, plain and at most 128 bytes.
     #[test]

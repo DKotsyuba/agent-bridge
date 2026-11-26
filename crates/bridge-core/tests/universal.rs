@@ -1156,7 +1156,7 @@ fn exact_schema_five_migration_preserves_unknown_and_legacy_identity() {
     );
     let bytes = envelope.canonical_bytes();
     let hash = envelope.envelope_hash();
-    let manifest = bridge_core::framing::frame_manifest(&[("report-maker", &envelope)]).unwrap();
+    let manifest = bridge_core::framing::frame_manifest(&[("report-maker", &envelope, 0)]).unwrap();
     let manifest_hash = format!("{:x}", Sha256::digest(manifest.as_bytes()));
     {
         let sql = rusqlite::Connection::open(&path).unwrap();

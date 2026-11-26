@@ -4,6 +4,12 @@ All notable changes to Agent Bridge are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions describe the
 source, and the crates are not published to crates.io.
 
+## Unreleased
+
+### Changed
+
+- Agent messages (`bridge.message`) render a compact header: `<bridge from="Amber Falcon (executor)" sent="HH:MM:SSZ" id="#abcdef" [reply-to=".."] priority=".." type="message">` plus one line `[Agent-written, not the owner: not an approval]`. The name is generated from the sender's harness and session; the role comes from `bridge_send` `as` and is remembered per sender. `bridge_send` gains optional `as`, `reply_to` and `priority`, and returns the short `id`. Other kinds, including Agent Run and Pool notices, render as before. A send without the new arguments keeps the 0.7.5 envelope hash.
+
 ## [0.7.5] - 2026-11-24
 
 This release fixes a 0.7.4 regression that held every message to Claude Code and
