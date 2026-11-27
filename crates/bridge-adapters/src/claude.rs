@@ -98,7 +98,7 @@ use crate::server::{Custody, DeliveryRef, DeliverySink, LocalDelivery, lock_regi
 /// This is Bridge's own bound, the core framing bound ([`MAX_FRAMED_BYTES`]),
 /// not a measured native inbox limit: core never renders a larger manifest, so
 /// every manifest core admits and frames (including an advertised 16 KiB body,
-/// escaped and wrapped) is eligible for one bounded inbox hand-off; the same
+/// wrapped verbatim) is eligible for one bounded inbox hand-off; the same
 /// bound already guards the owner and desktop routes. Whether a native receiver
 /// accepts a message that large is a separate live qualification, not implied
 /// here. An over-bound manifest is a permanent refusal before any byte is
@@ -2097,9 +2097,8 @@ mod bound_tests {
         framing::{MAX_TAG_BYTES, frame},
     };
 
-    /// A 16 KiB UTF-8 payload rendered under the widest tag (ASCII `&` that
-    /// escapes to a 5-byte entity, quotes, or multibyte text), plus envelope
-    /// and provenance, fits the carrier bound. Compact bodies preserve quotes.
+    /// A 16 KiB UTF-8 payload with literal ampersands, quotes or multibyte text
+    /// fits the carrier bound even under the widest source tag.
     /// The carrier bound is exactly core's framing bound, so core refuses
     /// anything larger before it can reach this carrier.
     #[test]
@@ -2127,11 +2126,10 @@ mod bound_tests {
             "\u{e9}".repeat(8 * 1024),
         ] {
             assert_eq!(payload.len(), 16 * 1024);
-            let framed = frame(&tag, &envelope(payload)).unwrap();
+            let framed = frame(&tag, &envelope(payload.clone())).unwrap();
+            assert!(framed.contains(&format!(">\n{payload}\n</bridge>")));
             assert!(framed.len() > 4096 && framed.len() <= MAX_MESSAGE_BYTES);
         }
         assert_eq!(MAX_MESSAGE_BYTES, MAX_FRAMED_BYTES);
-        let over = "&".repeat(MAX_FRAMED_BYTES / 5 + 1);
-        assert!(frame(&tag, &envelope(over)).is_err());
     }
 }

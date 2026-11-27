@@ -700,7 +700,7 @@ impl ExpiresAt {
 
 /// A bounded, valid UTF-8 notification payload.
 ///
-/// Size is checked against [`MAX_PAYLOAD_BYTES`] at construction; escaping,
+/// Size is checked against [`MAX_PAYLOAD_BYTES`] at construction;
 /// source wrappers and render budgets are applied later at framing time and
 /// are not this type's concern.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

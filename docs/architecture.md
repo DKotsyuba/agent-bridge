@@ -35,8 +35,10 @@ producer ──► bridge-core service (SQLite custody, dispatch, recovery)
   an interrupted rollback journal may restore committed content first, and ordinary WAL
   reads or recovery may rewrite advisory `-shm` WAL-index metadata (the main and WAL
   bytes of a refused WAL database are preserved). See [Custody](#custody).
-  - `framing`: escaped, bounded manifests with forbidden-control rejection and
-    one no-authority statement. Legacy members use an allowlisted source tag.
+  - `framing`: bounded manifests with escaped headers, verbatim payloads,
+    forbidden-control rejection and one no-authority statement. These are display
+    frames, and payloads can contain the same characters as the delimiters. Legacy
+    members use an allowlisted source tag.
     `bridge.message` and `bridge.delivery_report` use compact display headers
     with their custody time in UTC. An event that could never be rendered is
     refused at publication.

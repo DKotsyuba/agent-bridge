@@ -8,6 +8,49 @@ use common::*;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 
+/// A missing channel produces a diagnostic while preserving the native hook contract.
+#[test]
+fn hook_failure_reports_without_blocking_or_writing_stdout() {
+    let lab = Lab::new("htf");
+    let mut harness = Harnessed::start(GENERIC, &lab.generic_store);
+    let missing = lab.socket.with_file_name("missing.sock");
+    let reply = harness.hook(&missing, GENERIC, hook("SessionStart", "hf-1"));
+    assert_eq!(reply["status"], 0);
+    assert_eq!(reply["stdout"], "");
+    assert_eq!(
+        reply["stderr"],
+        "bridge-hook: could not complete the Bridge hook event — the host can continue.\n"
+    );
+    harness.stop();
+}
+
+/// Built-in hosts can display warnings without permission or continuation directives.
+#[test]
+fn hook_failure_reports_a_native_warning() {
+    let lab = Lab::new("htw");
+    let missing = lab.socket.with_file_name("missing.sock");
+    for (kind, store) in [
+        (Harness::CLAUDE_CODE, &lab.claude_store),
+        (Harness::CODEX, &lab.codex_store),
+    ] {
+        let mut harness = Harnessed::start(kind, store);
+        let reply = harness.hook(&missing, kind, hook("SessionStart", "hf-2"));
+        assert_eq!(reply["status"], 0);
+        assert_eq!(
+            reply["stderr"],
+            "bridge-hook: could not complete the Bridge hook event — the host can continue.\n"
+        );
+        let output: Value = serde_json::from_str(reply["stdout"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            output,
+            json!({
+                "systemMessage": "bridge-hook: could not complete the Bridge hook event — the host can continue."
+            })
+        );
+        harness.stop();
+    }
+}
+
 /// A `PreToolUse` payload of `tool` with its own input.
 fn pre_tool_use(session: &str, call: &str, tool: &str) -> Value {
     json!({

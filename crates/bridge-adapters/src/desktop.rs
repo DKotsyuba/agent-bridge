@@ -863,7 +863,7 @@ struct FrontendRequest {
     thread_id: String,
     /// Existing attempt correlation identifier; never a fresh retry id.
     call_id: String,
-    /// Frozen escaped manifest with the external-data provenance statement.
+    /// Frozen manifest with the external-data provenance statement.
     text: String,
 }
 

@@ -840,13 +840,13 @@ fn root_tools_compose_with_core_and_adapter_attestation() {
     );
     assert_eq!(before["structuredContent"]["context"], "not_available");
 
-    // The recipient's natural hook drains the framed, escaped event.
+    // The recipient's natural hook drains the framed event.
     let drained = lab.hook(
         &mut harness,
         json!({"hook_event_name": "UserPromptSubmit", "session_id": "s2", "prompt": "hi"}),
     );
     assert!(drained.contains("bridge-root"), "{drained}");
-    assert!(drained.contains("hello &lt;b&gt;"), "{drained}");
+    assert!(drained.contains("hello <b>"), "{drained}");
     let after = lab.call(
         &mut harness,
         "s1",

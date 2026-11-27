@@ -69,12 +69,11 @@ fn compact_dispatch_uses_managed_origin_and_acceptance_time() {
     );
 }
 
-/// Pre-upgrade metadata can make a compact frame larger than its legacy frame.
-/// The same admitted envelope still replays and hands off within the old bound.
+/// An envelope with legacy metadata still replays and hands off with the same custody identity.
 #[test]
-fn legacy_compact_kind_near_ceiling_keeps_custody_and_handoff() {
-    use bridge_core::framing::{MAX_FRAMED_BYTES, MAX_TAG_BYTES};
+fn legacy_metadata_keeps_custody_and_handoff() {
     use bridge_core::managed::ManagedSender;
+    use bridge_core::{MAX_PAYLOAD_BYTES, framing::MAX_FRAMED_BYTES};
 
     let mut storage = store();
     let recipient = codex("legacy-recipient");
@@ -85,13 +84,8 @@ fn legacy_compact_kind_near_ceiling_keeps_custody_and_handoff() {
     for key in ["to", "cc"] {
         message.metadata.insert(key.into(), "&".repeat(256));
     }
-    let widest = "a".repeat(MAX_TAG_BYTES);
-    let overhead = format!(
-        "<{widest} event=\"root-abcdef1234\" kind=\"bridge.message\" source=\"agent-run\">\n\n</{widest}>\n[bridge] {PROVENANCE_STATEMENT}\n"
-    ).len();
-    let budget = MAX_FRAMED_BYTES - overhead;
-    let payload = "&".repeat(budget / 5) + &"x".repeat(budget % 5);
-    message.payload = bridge_core::Payload::new(payload).unwrap();
+    let payload = "&".repeat(MAX_PAYLOAD_BYTES / 5);
+    message.payload = bridge_core::Payload::new(payload.clone()).unwrap();
     let sender = ManagedSender {
         address: codex("legacy-origin"),
         request_id: "legacy".into(),
@@ -113,10 +107,11 @@ fn legacy_compact_kind_near_ceiling_keeps_custody_and_handoff() {
             .reserve_next(&attestation, EffectiveMode::Message, 3_000, &timing())
             .unwrap(),
     );
+    assert!(selected.manifest.starts_with("<bridge from="));
     assert!(
         selected
             .manifest
-            .starts_with("<agent-run event=\"root-abcdef1234\" kind=\"bridge.message\"")
+            .contains(&format!(">\n{payload}\n</bridge>"))
     );
     assert!(selected.manifest.len() <= MAX_FRAMED_BYTES);
 }
