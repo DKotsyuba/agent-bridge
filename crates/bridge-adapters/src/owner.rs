@@ -34,7 +34,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use bridge_core::Harness;
-use bridge_core::dispatch::Outcome;
+use bridge_core::dispatch::{OWNER_AWAITING_INPUT, OWNER_FINISHED, OWNER_NOT_IDLE, Outcome};
 use bridge_core::service::current_unix_millis;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -311,11 +311,18 @@ fn classify(frame: &[u8], call_id: &str, harness: Harness) -> Outcome {
                 ),
             }
         }
-        ("known_unsent", None, None, Some(code @ ("not_idle" | "awaiting_input" | "capacity"))) => {
-            Outcome::DeferredKnownUnsent {
-                evidence: format!("native owner deferred before any native effect: {code}"),
-            }
-        }
+        ("known_unsent", None, None, Some("not_idle")) => Outcome::DeferredKnownUnsent {
+            evidence: OWNER_NOT_IDLE.into(),
+        },
+        ("known_unsent", None, None, Some("awaiting_input")) => Outcome::DeferredKnownUnsent {
+            evidence: OWNER_AWAITING_INPUT.into(),
+        },
+        ("known_unsent", None, None, Some("finished")) => Outcome::KnownUnsent {
+            evidence: OWNER_FINISHED.into(),
+        },
+        ("known_unsent", None, None, Some(code @ "capacity")) => Outcome::DeferredKnownUnsent {
+            evidence: format!("native owner deferred before any native effect: {code}"),
+        },
         ("known_unsent", None, None, Some(code)) if KNOWN_UNSENT.contains(&code) => {
             Outcome::KnownUnsent {
                 evidence: format!("native owner refused before any native effect: {code}"),
@@ -389,6 +396,20 @@ pub(crate) fn deliver(
     kind: Harness,
     handoff: &Handoff<'_>,
 ) -> Outcome {
+    deliver_fenced(registry, socket, harness, managed, kind, handoff, || Ok(()))
+}
+
+/// Delivers with one last logical registry check after authenticating the owner.
+/// A failed check proves no request bytes were written.
+pub(crate) fn deliver_fenced(
+    registry: &Mutex<Registry>,
+    socket: &Path,
+    harness: (u32, u64),
+    managed: Option<&os::attempt::KernelIncarnation>,
+    kind: Harness,
+    handoff: &Handoff<'_>,
+    confirm_binding: impl FnOnce() -> Result<(), String>,
+) -> Outcome {
     let Handoff {
         thread_id,
         call_id,
@@ -435,6 +456,9 @@ pub(crate) fn deliver(
             };
         }
     };
+    if let Err(evidence) = confirm_binding() {
+        return Outcome::DeferredKnownUnsent { evidence };
+    }
     exchange(
         &mut stream,
         &body,

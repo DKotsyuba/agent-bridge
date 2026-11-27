@@ -908,7 +908,7 @@ fn disposed_native(delivery: &DeliveryEvidence) -> &'static str {
 /// while the earlier outcome remains unknown. `context` and `processed` are
 /// `observed` only when that exact tier was recorded; `uncertainty` is set
 /// for a possible handoff with an unknown result or an open incident, except a
-/// provably unsent managed retry hold that clears on a new binding. Tier
+/// provably unsent retry or recipient hold. Tier
 /// details are withheld; names and times only.
 pub fn status_view(delivery: Option<&DeliveryEvidence>) -> Value {
     let Some(delivery) = delivery else {
@@ -965,7 +965,15 @@ pub fn status_view(delivery: Option<&DeliveryEvidence>) -> Value {
     } else {
         None
     });
+    let recipient_hold = delivery.delivery == DeliveryState::Unhanded
+        && native == "not_handed"
+        && hold_reason.is_some()
+        && delivery
+            .incident
+            .as_ref()
+            .is_some_and(|incident| incident.kind == "recipient_held");
     let uncertainty = if !retry_hold
+        && !recipient_hold
         && (delivery.delivery == DeliveryState::Review || delivery.incident.is_some())
     {
         // An open incident (for example retries exhausted or a permanent refusal
@@ -1349,6 +1357,19 @@ mod tests {
         let view = status_view(None);
         assert_eq!(view["native"], "not_handed");
         assert_eq!(view["context"], "not_available");
+        assert!(view["uncertainty"].is_null());
+    }
+
+    /// A recipient hold incident keeps its reason visible without suggesting
+    /// operator intervention for a queued event that was never handed off.
+    #[test]
+    fn recipient_hold_incident_is_still_a_wait() {
+        let reason = "native owner recipient is not positively idle";
+        let mut held = with_incident(evidence("unhanded", 0, None, &[]), "recipient_held", reason);
+        held.hold_reason = Some(reason.into());
+        let view = status_view(Some(&held));
+        assert_eq!(view["native"], "not_handed");
+        assert_eq!(view["delivery"]["hold_reason"], reason);
         assert!(view["uncertainty"].is_null());
     }
 

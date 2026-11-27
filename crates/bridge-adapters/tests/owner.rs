@@ -1133,3 +1133,171 @@ fn busy_owner_waits_beyond_five_attempts_then_accepts_same_event() {
         rig.native.stop();
     }
 }
+
+/// The real carrier keeps the hook-derived state active while the exact owner
+/// independently completes its turn. KeepAll custody drains in order without
+/// a Stop hook, and repeated polling cannot make another early owner request.
+#[test]
+fn codex_owner_reconciles_missed_idle_observation() {
+    let mut rig = Rig::new("owner-idle", Harness::CODEX);
+    rig.hook("UserPromptSubmit");
+    rig.script("known_unsent:not_idle");
+    rig.lab
+        .publish("first", &rig.address, Mode::Auto, "first held marker");
+    rig.lab
+        .publish("second", &rig.address, Mode::Message, "second held marker");
+    let start = now();
+    let busy = "native owner recipient is not positively idle";
+    for at in [start, start + 59_999] {
+        assert_eq!(dispatch_at(&mut rig, at), DispatchReport::Held(busy.into()));
+        assert_eq!(rig.frames(), 0);
+        assert!(rig.state("first").is_none());
+    }
+    assert!(matches!(
+        dispatch_at(&mut rig, start + 60_000),
+        DispatchReport::Sent {
+            state: AttemptState::KnownUnsent,
+            ..
+        },
+    ));
+    assert_eq!(
+        dispatch_at(&mut rig, start + 62_000),
+        DispatchReport::Held(busy.into())
+    );
+    assert_eq!(rig.frames(), 1);
+    {
+        let storage = rig.lab.storage.lock().unwrap();
+        let evidence = storage
+            .delivery_evidence(PUBLISHER, "first")
+            .unwrap()
+            .unwrap();
+        assert_eq!(evidence.attempts_made, 0);
+        assert_eq!(evidence.hold_reason.as_deref(), Some(busy));
+    }
+
+    // Only the native owner's decision changes. No lifecycle hook is sent.
+    rig.script("codex_accept");
+    for (event, at) in [("first", start + 120_000), ("second", start + 180_000)] {
+        assert!(matches!(
+            dispatch_at(&mut rig, at),
+            DispatchReport::Sent {
+                state: AttemptState::NativeAccepted,
+                ..
+            },
+        ));
+        assert_eq!(rig.state(event), Some(AttemptState::NativeAccepted));
+        if event == "first" {
+            assert_eq!(dispatch_at(&mut rig, at), DispatchReport::Held(busy.into()));
+            assert!(rig.state("second").is_none());
+        }
+    }
+    let log = rig.log();
+    let frames = log["frames"].as_array().unwrap();
+    assert_eq!(frames.len(), 3);
+    assert!(
+        frames
+            .iter()
+            .all(|frame| frame["wake_only"] == true && frame["thread_id"] == SESSION)
+    );
+    assert!(
+        frames[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("first held marker")
+    );
+    assert!(
+        frames[2]["text"]
+            .as_str()
+            .unwrap()
+            .contains("second held marker")
+    );
+    assert_eq!(rig.legacy(), 0);
+    rig.native.stop();
+}
+
+/// A correlated closing refusal proves no native handoff and updates the
+/// existing incident. Unknown receipts still fence the event from all retries.
+#[test]
+fn codex_owner_closing_and_unknown_receipts_do_not_deliver() {
+    let mut rig = Rig::new("owner-end", Harness::CODEX);
+    rig.hook("UserPromptSubmit");
+    let start = now();
+    let busy = "native owner recipient is not positively idle";
+    let closing = "native owner session is closing or finished";
+    rig.lab
+        .publish("closing", &rig.address, Mode::Auto, "closing");
+    assert_eq!(
+        dispatch_at(&mut rig, start),
+        DispatchReport::Held(busy.into())
+    );
+    {
+        let mut storage = rig.lab.storage.lock().unwrap();
+        storage.run_maintenance(start + 600_000).unwrap();
+        let incident = storage
+            .open_incidents(start + 600_000, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(incident.reason.ends_with(busy));
+    }
+    rig.script("known_unsent:finished");
+    assert!(matches!(
+        dispatch_at(&mut rig, start + 600_000),
+        DispatchReport::Sent {
+            state: AttemptState::KnownUnsent,
+            ..
+        },
+    ));
+    assert_eq!(
+        dispatch_at(&mut rig, start + 602_000),
+        DispatchReport::Held(closing.into())
+    );
+    assert_eq!(rig.frames(), 1);
+    {
+        let storage = rig.lab.storage.lock().unwrap();
+        let incident = storage
+            .open_incidents(start + 602_000, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(incident.created_ms, start + 600_000);
+        assert!(incident.reason.ends_with(closing));
+        let evidence = storage
+            .delivery_evidence(PUBLISHER, "closing")
+            .unwrap()
+            .unwrap();
+        assert_eq!(evidence.attempts_made, 0);
+        assert_eq!(evidence.hold_reason.as_deref(), Some(closing));
+        assert_eq!(
+            evidence.delivery,
+            bridge_core::recovery::DeliveryState::Unhanded
+        );
+    }
+
+    rig.script("wrong_call");
+    assert!(matches!(
+        dispatch_at(&mut rig, start + 660_000),
+        DispatchReport::Sent {
+            state: AttemptState::OutcomeUnknown,
+            ..
+        },
+    ));
+    rig.script("codex_accept");
+    assert_eq!(dispatch_at(&mut rig, start + 730_000), DispatchReport::Idle);
+    assert_eq!(rig.state("closing"), Some(AttemptState::OutcomeUnknown));
+    assert_eq!(rig.frames(), 2);
+    assert_eq!(rig.legacy(), 0);
+    rig.native.stop();
+}
+
+/// Drives one dispatcher pass on the fixture's synthetic millisecond clock.
+fn dispatch_at(rig: &mut Rig, at: u64) -> DispatchReport {
+    dispatch_message(
+        &rig.lab.storage,
+        rig.carrier.as_mut(),
+        &rig.address,
+        &|| at,
+        &DispatchTiming::default(),
+    )
+    .unwrap()
+}

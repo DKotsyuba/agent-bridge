@@ -14,7 +14,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::dispatch::{
-    AttemptState, EffectiveMode, Outcome, apply_outcome, load_attempt, release_reservation,
+    AttemptState, EffectiveMode, OWNER_AWAITING_INPUT, OWNER_FINISHED, OWNER_NOT_IDLE, Outcome,
+    apply_outcome, load_attempt, release_reservation,
 };
 use crate::storage::{Storage, bump_counter, corrupt, count, delivery, from_sql, to_sql};
 use crate::types::{
@@ -817,20 +818,12 @@ impl Storage {
             params![text, to_sql(now_ms)?],
             |row| row.get(0),
         )?;
-        if waiting {
-            tx.execute(
-                "INSERT INTO recipient_holds (recipient, reason, since_ms, updated_ms)
-                 VALUES (?1, ?2, ?3, ?3)
-                 ON CONFLICT (recipient) DO UPDATE
-                   SET reason = excluded.reason, updated_ms = excluded.updated_ms",
-                params![text, bound_text(reason), to_sql(now_ms)?],
-            )?;
-        } else {
-            tx.execute(
-                "DELETE FROM recipient_holds WHERE recipient = ?1",
-                params![text],
-            )?;
-        }
+        crate::dispatch::set_hold(
+            &tx,
+            &text,
+            waiting.then(|| bound_text(reason)).as_deref(),
+            now_ms,
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -2155,7 +2148,7 @@ impl Storage {
                     &event_id,
                     None,
                     "recipient_held",
-                    &format!("recipient {recipient} is held: {reason}"),
+                    &hold_incident_reason(&recipient, &reason),
                     now_ms,
                 )?
             {
@@ -2194,6 +2187,50 @@ impl Storage {
             params![text],
         )
     }
+}
+
+/// Renders a bounded recipient hold for both new and existing incidents.
+pub(crate) fn hold_incident_reason(recipient: &str, reason: &str) -> String {
+    bound_text(&format!("recipient {recipient} is held: {reason}"))
+}
+
+/// Returns the finite native hold categories safe to put in client text.
+/// Free-form and historical adapter diagnostics remain structured evidence.
+pub fn public_native_hold_reason(reason: &str) -> Option<&'static str> {
+    Some(match reason {
+        "session not bound" => "session not bound",
+        "session binding inactive" => "session binding inactive",
+        "session binding unavailable or retired" => "session binding unavailable or retired",
+        "session binding changed" => "session binding changed",
+        OWNER_NOT_IDLE => OWNER_NOT_IDLE,
+        OWNER_FINISHED => OWNER_FINISHED,
+        OWNER_AWAITING_INPUT => OWNER_AWAITING_INPUT,
+        "native owner lifecycle unavailable" => "native owner lifecycle unavailable",
+        "native owner socket unavailable" => "native owner socket unavailable",
+        "native owner attestation failed" => "native owner attestation failed",
+        "no qualified message route" => "no qualified message route",
+        "target attestation failed" => "target attestation failed",
+        "target unavailable" => "target unavailable",
+        "native thread state unavailable" => "native thread state unavailable",
+        "idle transcript changed" => "idle transcript changed",
+        "idle transcript unavailable" => "idle transcript unavailable",
+        "unloaded thread lacks idle proof" => "unloaded thread lacks idle proof",
+        "retired thread is not idle" => "retired thread is not idle",
+        "native control socket unavailable" => "native control socket unavailable",
+        "native control peer ownership unavailable" => "native control peer ownership unavailable",
+        "native socket birth or peer continuity unverified" => {
+            "native socket birth or peer continuity unverified"
+        }
+        "waiting for replacement verified hook" => "waiting for replacement verified hook",
+        "recipient harness incarnation ended" => "recipient harness incarnation ended",
+        "recipient harness identity unavailable" => "recipient harness identity unavailable",
+        "ended binding has no replacement socket" => "ended binding has no replacement socket",
+        "replacement session identity unverified" => "replacement session identity unverified",
+        "replacement requires a verified native hook" => {
+            "replacement requires a verified native hook"
+        }
+        _ => return None,
+    })
 }
 
 /// Resolves open `recipient_held` incidents of a recipient whose hold

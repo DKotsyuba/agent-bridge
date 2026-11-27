@@ -395,6 +395,13 @@ running executable; off Linux the earlier start-second comparison). No owner pat
   message-only (`opencode_input`), with no injection or context path. Configure
   the supervisor with the install activation's exact resolved `plugin_binding`
   path and SHA-256, not a source-tree file or the moving `current` symlink.
+- A Codex binding that still shows active after a missed idle hook gets a
+  wake-only handoff recheck at most once per minute per source store with
+  queued work. The exact owner must still verify the thread, the live attempt,
+  positive idle and that the session is open before any native input. Bridge
+  keeps the recorded hook lifecycle and never wakes through this recheck from
+  a binding that is retired, unknown or awaiting input. An authenticated
+  busy, input-waiting or closing refusal leaves the message queued.
 - A present locator that is malformed, not valid UTF-8, untrusted or unavailable
   holds the attempt. So does an environment that cannot be read. There is no fallback
   to a queue, application or inbox route.

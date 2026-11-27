@@ -57,6 +57,33 @@ fn attestation_hold_reason(reason: &str) -> &'static str {
         | "a retired recipient cannot use a native owner route" => {
             "session binding unavailable or retired"
         }
+        "message binding changed during validation" => "session binding changed",
+        "registered Codex application frontend not available yet (transient hold)"
+        | "Codex queue helper unavailable: no confinement launcher or live App Server"
+        | "the recipient has no supported native owner"
+        | "no application frontend directory for the gateway route"
+        | "no unique qualified live Desktop gateway for the idle recipient (hold)" => {
+            "no qualified message route"
+        }
+        "native owner socket locator is not a canonical absolute path"
+        | "native owner socket locator has no directory"
+        | "native owner socket directory is not private"
+        | "native owner socket is not a private socket"
+        | "native owner socket is not connectable" => "native owner socket unavailable",
+        "native owner locator is not valid UTF-8"
+        | "native harness environment is unreadable, owner route not excluded"
+        | "managed owner harness identity unavailable"
+        | "managed owner harness identity changed"
+        | "native owner peer is unidentified"
+        | "native owner identity unavailable"
+        | "native owner executable is unreadable"
+        | "native harness identity unavailable"
+        | "native owner process is gone"
+        | "native harness process is gone"
+        | "native owner is not the exact direct parent of the attested harness"
+        | "native owner is not the exact direct parent of the managed harness" => {
+            "native owner attestation failed"
+        }
         "native thread state unavailable" => "native thread state unavailable",
         "the thread transcript changed since its positive idle (not idle)" => {
             "idle transcript changed"
@@ -80,33 +107,14 @@ fn attestation_hold_reason(reason: &str) -> &'static str {
         "native control peer unavailable" | "native control peer incarnation changed" => {
             "native control peer ownership unavailable"
         }
-        other => safe_hold_reason(other),
+        other => bridge_core::recovery::public_native_hold_reason(other)
+            .unwrap_or("target attestation failed"),
     }
 }
 
 /// Accepts only fixed diagnostic categories from an untrusted worker.
 pub(crate) fn safe_hold_reason(reason: &str) -> &'static str {
-    match reason {
-        "session not bound" => "session not bound",
-        "session binding unavailable or retired" => "session binding unavailable or retired",
-        "native thread state unavailable" => "native thread state unavailable",
-        "idle transcript changed" => "idle transcript changed",
-        "idle transcript unavailable" => "idle transcript unavailable",
-        "unloaded thread lacks idle proof" => "unloaded thread lacks idle proof",
-        "retired thread is not idle" => "retired thread is not idle",
-        "native control socket unavailable" => "native control socket unavailable",
-        "native control peer ownership unavailable" => "native control peer ownership unavailable",
-        crate::os::SOCKET_CONTINUITY => crate::os::SOCKET_CONTINUITY,
-        crate::registry::WAIT_FOR_HOOK => crate::registry::WAIT_FOR_HOOK,
-        "recipient harness incarnation ended" => "recipient harness incarnation ended",
-        "recipient harness identity unavailable" => "recipient harness identity unavailable",
-        "ended binding has no replacement socket" => "ended binding has no replacement socket",
-        "replacement session identity unverified" => "replacement session identity unverified",
-        "replacement requires a verified native hook" => {
-            "replacement requires a verified native hook"
-        }
-        _ => "target unavailable",
-    }
+    bridge_core::recovery::public_native_hold_reason(reason).unwrap_or("target unavailable")
 }
 
 /// Converts locally verified observations to non-authoritative wire data.
@@ -453,19 +461,19 @@ impl Worker {
         if target.harness == Harness::CODEX {
             self.codex
                 .lock()
-                .map_err(|_| "carrier unavailable")?
+                .map_err(|_| "target attestation failed")?
                 .attest(target)
                 .map_err(|reason| attestation_hold_reason(&reason))
         } else if target.harness == Harness::CLAUDE_CODE {
             self.claude
                 .lock()
-                .map_err(|_| "carrier unavailable")?
+                .map_err(|_| "target attestation failed")?
                 .attest(target)
                 .map_err(|reason| attestation_hold_reason(&reason))
         } else {
             self.owner
                 .lock()
-                .map_err(|_| "carrier unavailable")?
+                .map_err(|_| "target attestation failed")?
                 .attest(target)
                 .map_err(|reason| attestation_hold_reason(&reason))
         }
@@ -1159,7 +1167,20 @@ mod tests {
                 "native control peer incarnation changed",
                 "native control peer ownership unavailable",
             ),
-            ("secret /private/path payload", "target unavailable"),
+            (
+                "native owner recipient is not positively idle",
+                "native owner recipient is not positively idle",
+            ),
+            ("session binding inactive", "session binding inactive"),
+            (
+                "the recipient has no supported native owner",
+                "no qualified message route",
+            ),
+            (
+                "native owner peer is unidentified",
+                "native owner attestation failed",
+            ),
+            ("secret /private/path payload", "target attestation failed"),
         ] {
             assert_eq!(attestation_hold_reason(input), expected);
             assert_eq!(safe_hold_reason(attestation_hold_reason(input)), expected);

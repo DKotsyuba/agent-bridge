@@ -1104,7 +1104,7 @@ fn dispatch_message(shared: &Coordinator, source: u32, target_uid: u32, target: 
             response @ (Response::Held { .. } | Response::Failed {}) => {
                 let reason = match response {
                     Response::Held { reason } => crate::system_worker::safe_hold_reason(&reason),
-                    _ => "target unavailable",
+                    _ => "target attestation failed",
                 };
                 shared.ack(
                     source,
@@ -2035,6 +2035,12 @@ mod tests {
             (
                 "native thread state unavailable",
                 "native thread state unavailable",
+            ),
+            ("session binding inactive", "session binding inactive"),
+            ("no qualified message route", "no qualified message route"),
+            (
+                "native owner attestation failed",
+                "native owner attestation failed",
             ),
             ("secret /private/path payload", "target unavailable"),
         ] {

@@ -41,7 +41,9 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use bridge_core::dispatch::{AttemptRecord, Attestation, DispatchCarrier, Lifecycle, Outcome};
+use bridge_core::dispatch::{
+    AttemptRecord, Attestation, CODEX_OWNER_RECHECK_ROUTE, DispatchCarrier, Lifecycle, Outcome,
+};
 use bridge_core::service::current_unix_millis;
 use bridge_core::{Harness, Mode, NativeAddress};
 use serde_json::{Value, json};
@@ -118,8 +120,8 @@ impl CodexQueueCarrier {
     /// Revalidates the MESSAGE-only recipient outside the registry lock, then
     /// checks the unchanged attempt epoch. Retired Desktop routes require their
     /// exact live frontend on both attest and send and never select a CLI helper.
-    /// A native owner route wakes only a positively idle recipient, whatever the
-    /// requested mode; helper and application routes keep their lifecycle rules.
+    /// The owner alone can wake the recipient, after its final idle check.
+    /// The conditional route also admits a stale active hook observation.
     /// Loss of the frozen route, actor, epoch or eligible lifecycle before
     /// native input defers the event without charging a transport retry.
     fn binding_for(
@@ -151,8 +153,12 @@ impl CodexQueueCarrier {
             ));
         }
         let lifecycle = attestation.lifecycle();
-        let allowed = if matches!(route, Route::Owner(_)) {
+        let allowed = if matches!(route, Route::Owner(..)) {
             lifecycle == Lifecycle::Inactive
+                || (lifecycle == Lifecycle::Active
+                    && attestation
+                        .proof_ref()
+                        .starts_with(CODEX_OWNER_RECHECK_ROUTE))
         } else {
             matches!(lifecycle, Lifecycle::Active | Lifecycle::Inactive)
                 && (attempt.requested_mode != Mode::Auto || lifecycle == Lifecycle::Inactive)
@@ -254,7 +260,7 @@ impl CodexQueueCarrier {
             }
         }
         let mut candidate = { lock_registry(&self.registry).message_candidate(address)? };
-        let result = if candidate.needs_gateway() {
+        let (mut attestation, binding) = if candidate.needs_gateway() {
             self.gateway_recipient(address, &mut candidate)?
         } else {
             candidate.validate()?
@@ -263,30 +269,52 @@ impl CodexQueueCarrier {
             || {
                 if let Some(socket) = crate::owner::locate(
                     &self.registry,
-                    result.1.harness,
-                    result.1.peer_incarnation.as_ref(),
+                    binding.harness,
+                    binding.peer_incarnation.as_ref(),
                 )? {
-                    return if result.1.desktop_message_only || candidate.discovered() {
+                    return if binding.desktop_message_only || candidate.discovered() {
                         Err("a retired recipient cannot use a native owner route".into())
                     } else {
-                        Ok(Route::Owner(socket))
+                        match attestation.lifecycle() {
+                            Lifecycle::Inactive => {}
+                            Lifecycle::Active => {
+                                attestation = Attestation::verified(
+                                    attestation.address().clone(),
+                                    attestation.actor_id(),
+                                    attestation.endpoint_epoch(),
+                                    Lifecycle::Active,
+                                    attestation.capabilities(),
+                                    format!(
+                                        "{CODEX_OWNER_RECHECK_ROUTE}{}",
+                                        attestation.proof_ref()
+                                    ),
+                                )
+                                .map_err(|_| "target attestation failed")?;
+                            }
+                            Lifecycle::AwaitingInput => {
+                                return Err("native owner is awaiting input".into());
+                            }
+                            Lifecycle::Unknown => {
+                                return Err("native owner lifecycle unavailable".into());
+                            }
+                        }
+                        Ok(Route::Owner(socket, Box::new(candidate.clone())))
                     };
                 }
-                if result.1.desktop_message_only
-                    || crate::os::process_env(result.1.harness.0, "CODEX_APP_TOOLS_PIPE_PATH")
+                if binding.desktop_message_only
+                    || crate::os::process_env(binding.harness.0, "CODEX_APP_TOOLS_PIPE_PATH")
                         .is_some()
                 {
                     if candidate.discovered() {
                         return Err("replacement requires a verified native hook".into());
                     }
                     return self.desktop_directory.as_ref()
-                        .and_then(|directory| crate::desktop::frontend_for(directory, result.1.harness))
+                        .and_then(|directory| crate::desktop::frontend_for(directory, binding.harness))
                         .map(Route::Application)
                         .ok_or_else(|| "registered Codex application frontend not available yet (transient hold)".into());
                 }
                 #[cfg(target_os = "linux")]
-                if let Some(endpoint) =
-                    crate::codex_live::locate(&result.1, candidate.discovered())?
+                if let Some(endpoint) = crate::codex_live::locate(&binding, candidate.discovered())?
                 {
                     // This read never resumes or starts a thread. A present but
                     // unqualified live route holds instead of falling back.
@@ -315,7 +343,7 @@ impl CodexQueueCarrier {
             },
             || lock_registry(&self.registry).message_current(&candidate),
         )?;
-        Ok((result.0, result.1, route))
+        Ok((attestation, binding, route))
     }
 
     /// Selects a loaded idle handoff or a single recorded unloaded wake, after
@@ -446,8 +474,9 @@ impl DispatchCarrier for CodexQueueCarrier {
     ///
     /// A recipient whose own environment names a native owner socket is attested
     /// for that owner route ([`crate::owner`]) before any helper or application
-    /// frontend is considered; it must be positively idle, and an unprovable,
-    /// unreadable or malformed locator is an error (a hold) with no fallback.
+    /// frontend is considered. A still-active hook observation allows only a
+    /// bounded wake-only recheck with the exact owner, and an unprovable,
+    /// unreadable or malformed locator holds with no fallback.
     fn attest(&mut self, recipient: &NativeAddress) -> Result<Attestation, String> {
         if recipient.harness != Harness::CODEX {
             return Err("not a Codex recipient".into());
@@ -464,10 +493,7 @@ impl DispatchCarrier for CodexQueueCarrier {
                 return Ok(attestation);
             }
         }
-        let (attestation, _, route) = self.message_recipient(recipient, true)?;
-        if matches!(route, Route::Owner(_)) && attestation.lifecycle() != Lifecycle::Inactive {
-            return Err("native owner recipient is not positively idle".into());
-        }
+        let (attestation, _, _) = self.message_recipient(recipient, true)?;
         Ok(attestation)
     }
 
@@ -513,8 +539,8 @@ impl DispatchCarrier for CodexQueueCarrier {
             ),
         };
         match route {
-            Route::Owner(socket) => {
-                return crate::owner::deliver(
+            Route::Owner(socket, candidate) => {
+                return crate::owner::deliver_fenced(
                     &self.registry,
                     &socket,
                     binding.harness,
@@ -526,6 +552,7 @@ impl DispatchCarrier for CodexQueueCarrier {
                         text: &attempt.manifest,
                         deadline_ms: attempt.deadline_ms,
                     },
+                    || lock_registry(&self.registry).message_current(&candidate),
                 );
             }
             Route::Application(frontend) => {
@@ -770,8 +797,8 @@ pub(crate) enum Route {
     Helper,
     /// The registered application frontend's source-labelled message tool.
     Application(PathBuf),
-    /// The recipient's native owner socket, validated by [`crate::owner`].
-    Owner(PathBuf),
+    /// The exact native owner socket and binding snapshot for the final fence.
+    Owner(PathBuf, Box<crate::registry::MessageCandidate>),
     /// The exact live Linux harness's protected native App Server transport.
     #[cfg(target_os = "linux")]
     LiveAppServer(crate::codex_live::Endpoint),
