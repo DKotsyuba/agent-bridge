@@ -362,6 +362,11 @@ after the write is an unknown outcome that is retained and never resent. The rou
 tested with a scripted stand-in owner and bounded real supervisor canaries; see
 the exact candidate scopes in the [qualification matrix](../../docs/qualification.md).
 
+When the last Codex hook still shows the exact live binding active, the message
+dispatcher can recheck through the same owner's wake-only handoff once per
+minute per source store. The owner still checks the native lifecycle and closing
+state before writing input. See [native owner configuration](../../docs/configuration.md#native-owner-route).
+
 Install `bridge-hook <channel> claude-code` (or `codex`) as the command of the
 `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
 `PermissionRequest`, `Notification`, `Stop`, `SubagentStop` and `SessionEnd`

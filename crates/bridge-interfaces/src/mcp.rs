@@ -397,13 +397,18 @@ fn status_summary(value: &Value) -> String {
             .map(|ms| format!(" at {}", bridge_core::framing::format_utc_timestamp(ms)))
             .unwrap_or_default()
     };
+    let hold_reason = value["delivery"]["hold_reason"]
+        .as_str()
+        .and_then(bridge_core::recovery::public_native_hold_reason)
+        .map(|reason| format!(" ({reason})"))
+        .unwrap_or_default();
     match native {
         Some("native_accepted") => format!("The recipient’s native queue accepted the message{} — wait for the recipient’s response.", time()),
         Some("hook_emitted") => format!("Bridge handed the message to the recipient’s hook{} — wait for the recipient’s response.", time()),
         Some("in_flight") => "Bridge has custody and the handoff is in progress — check again with bridge_status and do not resend.".into(),
-        Some("native_held") => "The native route is holding the message — check again with bridge_status and do not resend.".into(),
+        Some("native_held") => format!("The native route is holding the message{hold_reason} — check again with bridge_status and do not resend."),
         Some("written_no_receipt") => "The message was written without a receipt — check again with bridge_status and do not resend.".into(),
-        Some("not_handed") => "Bridge has custody and is waiting to hand off the message — check again with bridge_status and do not resend.".into(),
+        Some("not_handed") => format!("Bridge has custody and is waiting to hand off the message{hold_reason} — check again with bridge_status and do not resend."),
         Some("refused") => "The native route refused the handoff — review the status before taking further action.".into(),
         _ => "Bridge has custody and the handoff outcome is unknown — check again with bridge_status and do not resend.".into(),
     }
@@ -490,6 +495,22 @@ mod tests {
                 "bridge_status",
                 json!({"custody": {"state": "not_found"}}),
                 "Bridge found no custody record for this request — verify the request ID before taking further action.",
+            ),
+            (
+                "bridge_status",
+                json!({
+                    "native": "not_handed",
+                    "delivery": {"state": "unhanded", "hold_reason": "native owner session is closing or finished"}
+                }),
+                "Bridge has custody and is waiting to hand off the message (native owner session is closing or finished) — check again with bridge_status and do not resend.",
+            ),
+            (
+                "bridge_status",
+                json!({
+                    "native": "not_handed",
+                    "delivery": {"state": "unhanded", "hold_reason": "native owner socket unavailable: /private/path"}
+                }),
+                "Bridge has custody and is waiting to hand off the message — check again with bridge_status and do not resend.",
             ),
         ];
         for (tool, value, expected) in cases {

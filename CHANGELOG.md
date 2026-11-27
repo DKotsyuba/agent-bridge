@@ -15,6 +15,11 @@ source, and the crates are not published to crates.io.
 
 ### Fixed
 
+- Codex messages waiting on a stale active hook observation can reach the
+  exact native owner through a rate-limited wake-only recheck. The owner
+  still refuses busy or closing sessions before native input.
+- Recipient hold incidents and `bridge_status` text preserve safe, specific
+  reasons for native routing and attestation holds.
 - Lifecycle hook failures report a short diagnostic to stderr. Claude Code and
   Codex can also show it as a native hook warning when stdout is still unused.
   Hook mode still exits successfully.

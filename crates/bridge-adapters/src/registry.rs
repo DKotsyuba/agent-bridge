@@ -4700,8 +4700,10 @@ impl Registry {
         if binding.discovered.is_some() && !self.native_discovery_enabled() {
             return Err(WAIT_FOR_HOOK.into());
         }
+        if binding.pending {
+            return Err("session binding inactive".into());
+        }
         if self.message_disabled.contains(&address.harness)
-            || binding.pending
             || (binding.retired && !binding.desktop_idle_message && binding.discovered.is_none())
         {
             return Err("message binding unavailable".into());

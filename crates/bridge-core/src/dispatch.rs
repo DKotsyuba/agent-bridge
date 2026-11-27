@@ -51,6 +51,22 @@ const MAX_RELEASED_RESERVATIONS: u32 = 20;
 /// no identity or authorization authority.
 const LIVE_RESUME_ROUTE: &str = "codex-live-resume:";
 
+/// Protected Codex MESSAGE route whose exact native owner decides wake-only
+/// eligibility at handoff. This tag does not attest an idle lifecycle.
+pub const CODEX_OWNER_RECHECK_ROUTE: &str = "codex-owner-recheck:";
+
+/// Minimum delay between conditional handoffs in a source store, in milliseconds.
+const OWNER_RECHECK_MS: u64 = 60_000;
+
+/// Hold while the last verified bridge lifecycle is still active.
+pub const OWNER_NOT_IDLE: &str = "native owner recipient is not positively idle";
+
+/// Hold after the exact native owner reports that the session is closing or finished.
+pub const OWNER_FINISHED: &str = "native owner session is closing or finished";
+
+/// Hold after the exact native owner reports a pending interaction.
+pub const OWNER_AWAITING_INPUT: &str = "native owner is awaiting input";
+
 /// Durable attempt-note marker for a correlated resume without a message write.
 const RESUME_ACCEPTED_TIER: &str = "resume_accepted_no_message";
 
@@ -636,14 +652,25 @@ const RESUME_HISTORY_GATE: &str = " AND NOT EXISTS (
 /// The requested modes a path may take for the observed lifecycle.
 ///
 /// Inject takes inject and auto events. Message takes message events, and
-/// auto events only while the recipient is positively inactive (an active
-/// recipient's auto events wait for the natural hook).
-const fn path_modes(mode: EffectiveMode, lifecycle: Lifecycle) -> &'static str {
-    match (mode, lifecycle) {
-        (EffectiveMode::Inject, _) => "('inject','auto')",
-        (EffectiveMode::Message, Lifecycle::Inactive) => "('message','auto')",
-        (EffectiveMode::Message, _) => "('message')",
+/// auto events while positively inactive or when the exact Codex owner will
+/// atomically check idle at handoff.
+fn path_modes(mode: EffectiveMode, attestation: &Attestation) -> &'static str {
+    match mode {
+        EffectiveMode::Inject => "('inject','auto')",
+        EffectiveMode::Message
+            if attestation.lifecycle == Lifecycle::Inactive || owner_recheck(attestation) =>
+        {
+            "('message','auto')"
+        }
+        EffectiveMode::Message => "('message')",
     }
+}
+
+/// Recognizes a conditional handoff on a verified live Codex owner route.
+fn owner_recheck(attestation: &Attestation) -> bool {
+    attestation.address.harness == crate::Harness::CODEX
+        && attestation.lifecycle == Lifecycle::Active
+        && attestation.proof_ref.starts_with(CODEX_OWNER_RECHECK_ROUTE)
 }
 
 /// All requested modes a path could ever take, for hold visibility.
@@ -813,7 +840,7 @@ fn gate(
 ///
 /// A hold exists only while eligible work is waiting; it keeps its original
 /// start time so age is measured from the first held observation.
-fn set_hold(
+pub(crate) fn set_hold(
     tx: &Connection,
     recipient: &str,
     reason: Option<&str>,
@@ -828,6 +855,17 @@ fn set_hold(
                    SET reason = excluded.reason, updated_ms = excluded.updated_ms",
                 params![recipient, reason, to_sql(now_ms)?],
             )?;
+            tx.execute(
+                "UPDATE incidents SET reason=?1,updated_ms=?2
+                 WHERE kind='recipient_held' AND state='open' AND reason!=?1
+                   AND EXISTS (SELECT 1 FROM events e WHERE e.publisher_id=incidents.publisher_id
+                               AND e.event_id=incidents.event_id AND e.recipient=?3)",
+                params![
+                    crate::recovery::hold_incident_reason(recipient, reason),
+                    to_sql(now_ms)?,
+                    recipient
+                ],
+            )?;
         }
         None => {
             tx.execute(
@@ -838,6 +876,36 @@ fn set_hold(
         }
     }
     Ok(())
+}
+
+/// Opens or checks a durable owner hold before attempting a wake-only handoff.
+/// The caller advances the timestamp only when actually reserving a recheck.
+fn owner_recheck_hold(
+    tx: &Connection,
+    recipient: &str,
+    now_ms: u64,
+) -> Result<(String, bool), CoreError> {
+    let existing: Option<(String, i64)> = tx
+        .query_row(
+            "SELECT reason, updated_ms FROM recipient_holds WHERE recipient=?1
+             AND reason IN (?2,?3,?4)",
+            params![
+                recipient,
+                OWNER_NOT_IDLE,
+                OWNER_AWAITING_INPUT,
+                OWNER_FINISHED
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((reason, last)) = existing {
+        return Ok((
+            reason,
+            now_ms.saturating_sub(from_sql(last)?) >= OWNER_RECHECK_MS,
+        ));
+    }
+    set_hold(tx, recipient, Some(OWNER_NOT_IDLE), now_ms)?;
+    Ok((OWNER_NOT_IDLE.into(), false))
 }
 
 /// A selected custody member before the attempt freezes its rendered bytes.
@@ -1153,8 +1221,16 @@ fn managed_epoch_exhausted(
                  JOIN managed_deliveries m ON m.publisher_id=am.publisher_id AND m.event_id=am.event_id
                  WHERE am.publisher_id=?1 AND am.event_id=?2 AND a.endpoint_epoch=?3
                    AND a.state=?4 AND m.feedback_sender IS NOT NULL AND m.outcome='active'
+                   AND NOT (a.state='known_unsent' AND a.proof_ref GLOB ?6
+                     AND COALESCE(a.note, '') IN (?7,?8,?9))
                  ORDER BY am.attempt_seq DESC LIMIT 1 OFFSET ?5",
-                params![publisher, event, to_sql(epoch)?, state, limit - 1],
+                params![
+                    publisher, event, to_sql(epoch)?, state, limit - 1,
+                    format!("{CODEX_OWNER_RECHECK_ROUTE}*"),
+                    format!("known_unsent: deferred; {OWNER_NOT_IDLE}"),
+                    format!("known_unsent: deferred; {OWNER_AWAITING_INPUT}"),
+                    format!("known_unsent: deferred; {OWNER_FINISHED}"),
+                ],
                 |row| row.get(0),
             )
             .optional()?;
@@ -1204,7 +1280,8 @@ fn reserve_in(
         return Ok(Selection::Idle);
     }
 
-    let modes = path_modes(mode, attestation.lifecycle);
+    let conditional_owner = mode == EffectiveMode::Message && owner_recheck(attestation);
+    let modes = path_modes(mode, attestation);
     // Head selection loop: a `latest` head whose producer lost lineage
     // authority is held visibly (delivery + retained incident) and skipped,
     // so stale old-producer snapshots can never be selected after an
@@ -1235,7 +1312,9 @@ fn reserve_in(
             )
             .optional()?;
         let Some((publisher, event, policy_class, scope, lineage_key)) = head else {
-            set_hold(tx, &recipient, None, now_ms)?;
+            if !conditional_owner {
+                set_hold(tx, &recipient, None, now_ms)?;
+            }
             return Ok(Selection::Idle);
         };
         if policy_class == "latest"
@@ -1259,6 +1338,16 @@ fn reserve_in(
             continue;
         }
         break (publisher, event, policy_class, scope);
+    };
+
+    let owner_hold_reason = if conditional_owner {
+        let (reason, due) = owner_recheck_hold(tx, &recipient, now_ms)?;
+        if !due {
+            return Ok(Selection::Held(reason));
+        }
+        Some(reason)
+    } else {
+        None
     };
 
     let mut candidates = vec![(head_publisher.clone(), head_event.clone())];
@@ -1416,7 +1505,7 @@ fn reserve_in(
             params![to_sql(attempt_seq)?, publisher, event_id],
         )?;
     }
-    set_hold(tx, &recipient, None, now_ms)?;
+    set_hold(tx, &recipient, owner_hold_reason.as_deref(), now_ms)?;
     let record = load_attempt(tx, attempt_seq)?
         .ok_or_else(|| corrupt("a freshly inserted attempt disappeared".into()))?;
     Ok(Selection::Attempt(Box::new(record)))
@@ -1523,10 +1612,10 @@ impl Storage {
     /// For a managed root, the frozen hand-off deadline is no later than
     /// its absolute delivery deadline; ordinary attempts keep their timing.
     ///
-    /// The path decides the requested modes taken: the message path takes
-    /// `message` events and, only for a positively inactive recipient,
-    /// `auto` events; the inject path takes `inject` and `auto` events and
-    /// needs an active recipient.
+    /// The message path takes `message` and takes `auto` with positive
+    /// idle or an exact Codex owner that will check idle at handoff. An
+    /// active observation on that route imposes a durable recheck interval.
+    /// The inject path takes `inject` and `auto` and needs an active recipient.
     pub fn reserve_next(
         &mut self,
         attestation: &Attestation,
@@ -1620,12 +1709,17 @@ impl Storage {
                 "the attested endpoint no longer matches the reserved address or epoch".into(),
             );
         }
-        if record.proof_ref.starts_with(LIVE_RESUME_ROUTE)
-            != attestation.proof_ref.starts_with(LIVE_RESUME_ROUTE)
+        if [LIVE_RESUME_ROUTE, CODEX_OWNER_RECHECK_ROUTE]
+            .into_iter()
+            .any(|prefix| {
+                record.proof_ref.starts_with(prefix) != attestation.proof_ref.starts_with(prefix)
+            })
+            || (record.proof_ref.starts_with(CODEX_OWNER_RECHECK_ROUTE)
+                && (!owner_recheck(attestation) || record.proof_ref != attestation.proof_ref))
         {
             return release(
                 tx,
-                "the native resume route changed since reservation".into(),
+                "the fenced native route changed since reservation".into(),
             );
         }
         if stored_epoch(&tx, &record.fence.recipient)? != Some(record.fence.endpoint_epoch) {
@@ -1640,6 +1734,7 @@ impl Storage {
         if record.effective_mode == EffectiveMode::Message
             && record.requested_mode == Mode::Auto
             && attestation.lifecycle != Lifecycle::Inactive
+            && !owner_recheck(attestation)
         {
             return release(
                 tx,
@@ -1966,6 +2061,7 @@ impl Storage {
 /// only while this attempt still owns that member, and only
 /// closes incidents that this attempt raised. The attempt row and evidence
 /// are retained; a confirmed resume uses a distinct note, not a no-effect tier.
+/// A correlated owner lifecycle refusal keeps the recheck hold visible.
 pub(crate) fn apply_outcome(
     tx: &Transaction<'_>,
     record: &AttemptRecord,
@@ -1975,10 +2071,25 @@ pub(crate) fn apply_outcome(
     let seq = record.fence.attempt_seq;
     let now = to_sql(now_ms)?;
     let resumed = matches!(&outcome, Outcome::ResumeAcceptedNoMessage { .. });
+    let conditional_owner = record.proof_ref.starts_with(CODEX_OWNER_RECHECK_ROUTE);
+    let owner_hold = if conditional_owner {
+        match &outcome {
+            Outcome::DeferredKnownUnsent { evidence } if evidence == OWNER_NOT_IDLE => {
+                Some(OWNER_NOT_IDLE)
+            }
+            Outcome::DeferredKnownUnsent { evidence } if evidence == OWNER_AWAITING_INPUT => {
+                Some(OWNER_AWAITING_INPUT)
+            }
+            Outcome::KnownUnsent { evidence } if evidence == OWNER_FINISHED => Some(OWNER_FINISHED),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let deferred = matches!(
         &outcome,
         Outcome::DeferredKnownUnsent { .. } | Outcome::ResumeAcceptedNoMessage { .. }
-    );
+    ) || owner_hold.is_some();
     let (state, tier, detail, recheck) = match &outcome {
         Outcome::NativeAccepted { evidence } => (
             AttemptState::NativeAccepted,
@@ -2017,7 +2128,7 @@ pub(crate) fn apply_outcome(
                 AttemptState::KnownUnsent,
                 "known_unsent",
                 if deferred {
-                    format!("deferred; {evidence}")
+                    format!("deferred; {}", owner_hold.unwrap_or(evidence))
                 } else {
                     evidence.clone()
                 },
@@ -2095,6 +2206,13 @@ pub(crate) fn apply_outcome(
             owned_members.push(member);
         }
     }
+    let current_owner_recheck = conditional_owner
+        && record.state == AttemptState::Invoking
+        && !owned_members.is_empty()
+        && stored_epoch(tx, &record.fence.recipient)? == Some(record.fence.endpoint_epoch);
+    if current_owner_recheck && state != AttemptState::KnownUnsent {
+        set_hold(tx, &record.fence.recipient, None, now_ms)?;
+    }
     match state {
         AttemptState::NativeAccepted => {
             set_member_delivery(tx, seq, delivery::ACCEPTED, false)?;
@@ -2157,7 +2275,19 @@ pub(crate) fn apply_outcome(
             }
         }
         AttemptState::KnownUnsent => {
-            return_unsent(tx, record, now_ms, deferred, resumed)?;
+            return_unsent(
+                tx,
+                record,
+                now_ms,
+                deferred,
+                resumed || owner_hold.is_some(),
+                resumed,
+            )?;
+            if let Some(reason) = owner_hold
+                && current_owner_recheck
+            {
+                set_hold(tx, &record.fence.recipient, Some(reason), now_ms)?;
+            }
             resolve_attempt_incidents(
                 tx,
                 record,
@@ -2231,6 +2361,8 @@ fn resolve_attempt_incidents(
 /// a proven no-send, with exponential delays and a finite per-epoch budget.
 /// Other members retain their transport-failure budget; temporary deferrals and
 /// accepted resumes refund their respective charge without clearing history.
+/// Confirmed owner lifecycle refusals and accepted resumes refund managed
+/// originals as well.
 /// Immutable attempt history and retirement fences remain. A replaced snapshot
 /// is superseded instead of retried.
 fn return_unsent(
@@ -2238,6 +2370,7 @@ fn return_unsent(
     record: &AttemptRecord,
     now_ms: u64,
     deferred: bool,
+    refund_managed: bool,
     resumed: bool,
 ) -> Result<(), CoreError> {
     for member in &record.members {
@@ -2306,7 +2439,7 @@ fn return_unsent(
                 continue;
             }
         }
-        let attempts = if deferred && (!original || resumed) {
+        let attempts = if deferred && (!original || refund_managed) {
             let refunded = attempts
                 .checked_sub(1)
                 .filter(|value| *value >= 0)
