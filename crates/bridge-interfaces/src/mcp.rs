@@ -18,7 +18,7 @@
 //! Protocol subset: `initialize`, `notifications/*` (ignored), `ping`,
 //! `tools/list` and `tools/call`; anything else is JSON-RPC
 //! `-32601`. Lines are bounded before allocation. Tool results carry the
-//! relay answer as text and `structuredContent`, with `isError` set on
+//! a short text summary and the relay answer in `structuredContent`, with `isError` set on
 //! refusal; the sealed proof is never echoed.
 
 use std::io::{BufRead, Write};
@@ -268,6 +268,7 @@ fn call_tool(
                 .into(),
         )),
     };
+    let mut reconciliation_id = None;
     let answer = match presented.and_then(|meta| {
         seal(&meta, bridge_core::service::current_unix_millis()).map(|proof| (proof, meta))
     }) {
@@ -309,29 +310,124 @@ fn call_tool(
             );
             if let RelayResponse::Error { class, detail } = &mut answer
                 && matches!(class.as_str(), "relay_outcome_unknown" | "custody_unknown")
-                && let Some(id) = request_id
+                && let Some(id) = request_id.as_deref()
             {
                 detail.push_str(&format!(
                     "; reconcile request_id={id}; never create a new id for this message"
                 ));
             }
+            reconciliation_id = request_id;
             answer
         }
     };
-    Ok(tool_result(&answer))
+    Ok(tool_result(name, &answer, reconciliation_id.as_deref()))
 }
 
-/// Renders a relay answer as an MCP tool result.
-fn tool_result(answer: &RelayResponse) -> Value {
-    let (structured, is_error) = match answer {
-        RelayResponse::Ok { value } => (value.clone(), false),
-        RelayResponse::Error { class, detail } => (json!({"error": class, "detail": detail}), true),
+/// Renders a text summary while preserving the complete structured relay answer.
+fn tool_result(tool: &str, answer: &RelayResponse, request_id: Option<&str>) -> Value {
+    let (text, structured, is_error) = match answer {
+        RelayResponse::Ok { value } => (success_summary(tool, value), value.clone(), false),
+        RelayResponse::Error { class, detail } => (
+            error_summary(tool, class, request_id),
+            json!({"error": class, "detail": detail}),
+            true,
+        ),
     };
     json!({
-        "content": [{"type": "text", "text": structured.to_string()}],
+        "content": [{"type": "text", "text": text}],
         "structuredContent": structured,
         "isError": is_error,
     })
+}
+
+/// Summarizes successful calls using only the fields needed to act.
+fn success_summary(tool: &str, value: &Value) -> String {
+    use bridge_core::framing::format_utc_timestamp;
+
+    match tool {
+        "bridge_me" => {
+            let caller = value["caller"]["canonical"].as_str().unwrap_or("unknown");
+            let time = value["caller"]["observed_at_ms"]
+                .as_u64()
+                .map(|ms| format!(" at {}", format_utc_timestamp(ms)))
+                .unwrap_or_default();
+            format!("Bridge verified your address as {caller}{time}.")
+        }
+        "bridge_send" => {
+            let request_id = value["request_id"].as_str().unwrap_or("unknown");
+            let time = value["custody"]["accepted_at_ms"]
+                .as_u64()
+                .map(|ms| format!(" at {}", format_utc_timestamp(ms)))
+                .unwrap_or_default();
+            format!(
+                "Bridge accepted {request_id} into custody{time} — check bridge_status before taking any further action."
+            )
+        }
+        "bridge_status" => status_summary(value),
+        _ => "Bridge completed the request.".into(),
+    }
+}
+
+/// Describes the recorded handoff and the safest next step without inferring delivery.
+fn status_summary(value: &Value) -> String {
+    if value["custody"]["state"] == "not_found" {
+        return "Bridge found no custody record for this request — verify the request ID before taking further action.".into();
+    }
+    if value["uncertainty"]["manual_resolution_required"] == true {
+        return "Bridge has custody and delivery requires operator review — do not resend.".into();
+    }
+    if value["delivery"]["state"] == "disposed" {
+        return match value["report"]["outcome"].as_str() {
+            Some("failed") => "Bridge stopped delivery after confirming no handoff — review the delivery report before taking further action.",
+            _ if value["uncertainty"]["disposed"] == true => "Bridge closed delivery without confirming the outcome — do not resend.",
+            _ => "Bridge closed this delivery — review the status before taking further action.",
+        }.into();
+    }
+    let native = value["native"].as_str();
+    let time = || {
+        value["tiers"]
+            .as_array()
+            .and_then(|tiers| {
+                tiers
+                    .iter()
+                    .rev()
+                    .find(|tier| tier["tier"].as_str() == native)
+            })
+            .and_then(|tier| tier["at_ms"].as_u64())
+            .map(|ms| format!(" at {}", bridge_core::framing::format_utc_timestamp(ms)))
+            .unwrap_or_default()
+    };
+    match native {
+        Some("native_accepted") => format!("The recipient’s native queue accepted the message{} — wait for the recipient’s response.", time()),
+        Some("hook_emitted") => format!("Bridge handed the message to the recipient’s hook{} — wait for the recipient’s response.", time()),
+        Some("in_flight") => "Bridge has custody and the handoff is in progress — check again with bridge_status and do not resend.".into(),
+        Some("native_held") => "The native route is holding the message — check again with bridge_status and do not resend.".into(),
+        Some("written_no_receipt") => "The message was written without a receipt — check again with bridge_status and do not resend.".into(),
+        Some("not_handed") => "Bridge has custody and is waiting to hand off the message — check again with bridge_status and do not resend.".into(),
+        Some("refused") => "The native route refused the handoff — review the status before taking further action.".into(),
+        _ => "Bridge has custody and the handoff outcome is unknown — check again with bridge_status and do not resend.".into(),
+    }
+}
+
+/// Describes refusals without copying free-form details or credential fields into text.
+fn error_summary(tool: &str, class: &str, request_id: Option<&str>) -> String {
+    match class {
+        "relay_outcome_unknown" | "custody_unknown" if tool == "bridge_me" => {
+            "Bridge did not confirm the result — check again with bridge_me.".into()
+        }
+        "relay_outcome_unknown" | "custody_unknown" => {
+            let request = request_id.map_or_else(
+                || "the original request ID".into(),
+                |id| format!("request ID {id}"),
+            );
+            format!("Bridge could not confirm the outcome — reconcile using bridge_status with {request} and do not resend.")
+        }
+        "relay_unavailable" | "core_unavailable" => "Bridge is unavailable — check the service before trying again.".into(),
+        "invalid" | "oversize" => "Bridge rejected the input — check the arguments and the structured error detail.".into(),
+        "forbidden" => "Bridge denied the request — check the caller’s permitted actions with bridge_me.".into(),
+        class if class.starts_with("caller_") => "Bridge could not verify this call — check the harness’s Bridge setup.".into(),
+        _ => "Bridge could not complete the request — check the structured error detail before taking further action.".into(),
+    }
 }
 
 /// A JSON-RPC error object.
@@ -352,6 +448,101 @@ mod tests {
     //! Protocol framing and refusal before any relay contact.
 
     use super::*;
+
+    /// Text snapshots describe custody and evidence separately and preserve the structured wire view.
+    #[test]
+    fn tool_result_summaries_preserve_structured_content() {
+        let cases = [
+            (
+                "bridge_me",
+                json!({"caller": {
+                    "canonical": "host/codex/default/thread",
+                    "observed_at_ms": 90_123_999, "endpoint_epoch": 9,
+                }}),
+                "Bridge verified your address as host/codex/default/thread at 1970-01-02T01:02:03Z.",
+            ),
+            (
+                "bridge_send",
+                json!({"request_id": "send-1", "custody": {
+                    "state": "accepted", "accepted_at_ms": 90_123_999,
+                    "envelope_hash": "fixture-hash", "replayed": false,
+                }}),
+                "Bridge accepted send-1 into custody at 1970-01-02T01:02:03Z — check bridge_status before taking any further action.",
+            ),
+            (
+                "bridge_status",
+                json!({
+                    "custody": {"state": "accepted"}, "native": "in_flight"
+                }),
+                "Bridge has custody and the handoff is in progress — check again with bridge_status and do not resend.",
+            ),
+            (
+                "bridge_status",
+                json!({
+                    "native": "native_accepted", "tiers": [
+                        {"tier": "native_accepted", "at_ms": 90_123_999},
+                        {"tier": "context_observed", "at_ms": 91_000_000}
+                    ],
+                }),
+                "The recipient’s native queue accepted the message at 1970-01-02T01:02:03Z — wait for the recipient’s response.",
+            ),
+            (
+                "bridge_status",
+                json!({"custody": {"state": "not_found"}}),
+                "Bridge found no custody record for this request — verify the request ID before taking further action.",
+            ),
+        ];
+        for (tool, value, expected) in cases {
+            let result = tool_result(
+                tool,
+                &RelayResponse::Ok {
+                    value: value.clone(),
+                },
+                None,
+            );
+            assert_eq!(
+                result["content"],
+                json!([{"type": "text", "text": expected}])
+            );
+            assert_eq!(result["structuredContent"], value);
+            assert_eq!(result["isError"], false);
+        }
+    }
+
+    /// An uncertain result exposes reconciliation instructions without repeating raw details in text.
+    #[test]
+    fn tool_result_uncertainty_directs_reconciliation() {
+        let result = tool_result(
+            "bridge_send",
+            &RelayResponse::error("custody_unknown", "internal fixture detail"),
+            Some("send-1"),
+        );
+        assert_eq!(
+            result["content"],
+            json!([{"type": "text", "text":
+                "Bridge could not confirm the outcome — reconcile using bridge_status with request ID send-1 and do not resend."
+            }])
+        );
+        assert_eq!(
+            result["structuredContent"],
+            json!({
+                "error": "custody_unknown", "detail": "internal fixture detail"
+            })
+        );
+        assert_eq!(result["isError"], true);
+
+        let read = tool_result(
+            "bridge_me",
+            &RelayResponse::error("relay_outcome_unknown", "internal fixture detail"),
+            None,
+        );
+        assert_eq!(
+            read["content"],
+            json!([{"type": "text", "text":
+                "Bridge did not confirm the result — check again with bridge_me."
+            }])
+        );
+    }
 
     /// A sealer that must never be reached.
     fn unreachable_sealer(_: &PresentedMeta, _: u64) -> Result<SealedProof, CorrelationError> {

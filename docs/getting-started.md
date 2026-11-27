@@ -228,8 +228,8 @@ deliberate manual steps; packaging does not activate them in working application
    ] } ] } }
    ```
 
-   Repeat the entry for each event. The hook always exits 0 and prints nothing unless
-   Bridge hands it a message, so a missing Bridge never blocks the harness. Codex uses
+   Repeat the entry for each event. The hook always exits 0. If Bridge is unavailable,
+   Claude Code and Codex can display a short hook warning while continuing. Codex uses
    the same command with the `codex` argument in its own hook configuration; Codex
    requires hook trust, see the [adapter guide](../crates/bridge-adapters/README.md).
 2. **Root MCP (to let the session send).** Register
@@ -246,7 +246,8 @@ deliberate manual steps; packaging does not activate them in working application
 ## 8. Send and observe
 
 From an attested session, ask it to call `bridge_send` with the recipient's canonical
-address and a message, then `bridge_status` with the returned `request_id`. Repeat the
+address and a message, then `bridge_status` with the returned `request_id`. The tools
+return a short text summary and a machine-readable `structuredContent` result. Repeat the
 **same** `request_id` after a lost answer; never invent a new one for the same message.
 Operators observe with the CLI:
 

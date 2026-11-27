@@ -514,7 +514,7 @@ fn non_harness_callers_and_relabeled_harnesses_refuse_while_unlisted_stores_regi
     harness.stop();
 }
 
-/// Only the root context point receives the frozen, escaped manifest; a subagent hook never drains root data.
+/// Only the root context point receives the frozen manifest; a subagent hook never drains root data.
 #[test]
 fn root_hook_drains_manifest_first_and_children_never_drain() {
     let lab = Lab::new("rd");
@@ -541,7 +541,7 @@ fn root_hook_drains_manifest_first_and_children_never_drain() {
     assert_eq!(child["stdout"], "");
     assert!(lab.attempt("evt-inject").is_none());
 
-    // The root's PostToolUse receives the escaped, source-wrapped manifest.
+    // The root's PostToolUse receives the source-wrapped manifest.
     let root = harness.hook(
         &lab.socket,
         Harness::CLAUDE_CODE,
@@ -556,10 +556,7 @@ fn root_hook_drains_manifest_first_and_children_never_drain() {
     let context = printed["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .unwrap();
-    assert!(
-        context.contains("build &lt;finished&gt; &amp; green"),
-        "{context}"
-    );
+    assert!(context.contains("build <finished> & green"), "{context}");
     assert!(context.contains(PUBLISHER));
     // The hook can read the flushed bytes before the server persists its
     // post-write outcome. Wait for that positive receipt, not scheduling luck.
@@ -2997,9 +2994,9 @@ fn codex_helper_total_budget_survives_floods_and_stalled_writes() {
         Duration::from_secs(2),
     );
     let timing = DispatchTiming::default();
-    // Larger than a pipe buffer once escaped, so a non-reading helper blocks
+    // The JSON-encoded text exceeds a pipe buffer, so a non-reading helper blocks
     // the write.
-    let big = format!("{}{}", "x".repeat(20_000), "<".repeat(15_000));
+    let big = "\\".repeat(40_000);
     for (event, behavior) in [("evt-flood", "flood"), ("evt-stall", "stall")] {
         codex_setup(&lab, behavior, 9);
         lab.publish(event, &address, Mode::Message, &big);
@@ -4046,7 +4043,7 @@ fn signed_parent_carries_every_core_framed_manifest() {
     let deliver = |thread: &str, call: &str, text: &str| {
         bridge_adapters::desktop::via_frontend(&path, (me.pid, me.start_time), thread, call, text)
     };
-    // 16 KiB of `&` as core renders it: 80 KiB, over the former 64 KiB text cap.
+    // An 80 KiB fixture above the former 64 KiB text cap.
     let ampersands = "&amp;".repeat(16 * 1024);
     // The largest framed manifest of backslashes with 256-byte ids of
     // backslashes: every byte doubles in the private JSON frame.

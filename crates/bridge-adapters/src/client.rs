@@ -4,7 +4,7 @@
 //! Both verify the channel before trusting it: the socket's directory must
 //! be private to this user and the listening peer must run as this user.
 //! The hook side never blocks its harness for long and never fails it:
-//! any problem prints nothing and the harness continues; Bridge keeps the
+//! the command can display a warning and the harness continues. Bridge keeps the
 //! event (an unconfirmed reply is a retained unknown outcome, never a
 //! re-offer).
 
@@ -48,7 +48,7 @@ pub enum HookRun {
     Tokened,
     /// Nothing printed: the channel refused (class, detail).
     Refused(String, String),
-    /// Nothing printed or confirmed because of a local failure.
+    /// A local failure prevented a complete or confirmed reply.
     Failed(String),
 }
 

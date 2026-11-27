@@ -744,7 +744,7 @@ impl PublishRequest {
     /// by assembling a probe envelope with a placeholder publisher — the
     /// real one is stamped server-side from the authenticated grant — and
     /// checks that the event can always be rendered (no forbidden control
-    /// characters, escaped size within the manifest bound).
+    /// characters, rendered size within the manifest bound).
     pub fn validate(&self) -> Result<(), CoreError> {
         let probe = Envelope::new(
             PublisherId::new("client-validation")?,
@@ -843,14 +843,13 @@ mod tests {
     }
 
     #[test]
-    /// The builder refuses events whose framing could never render (bad
-    /// tag or unbounded content) before they reach the wire.
+    /// The builder refuses invalid framing inputs and accepts literal punctuation.
     fn builder_refuses_events_that_could_never_be_rendered() {
         assert!(request("evt-44", "bad\u{1}control").into_body().is_err());
         assert!(
             request("evt-45", &"&".repeat(60 * 1024))
                 .into_body()
-                .is_err()
+                .is_ok()
         );
         assert!(
             request("evt-46", "ok")

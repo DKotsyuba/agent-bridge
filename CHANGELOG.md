@@ -4,6 +4,21 @@ All notable changes to Agent Bridge are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions describe the
 source, and the crates are not published to crates.io.
 
+## [Unreleased]
+
+### Changed
+
+- Bridge delivery displays payload bodies verbatim inside the existing compact
+  headers.
+- Root MCP tools return a short status summary with UTC timestamps in text and
+  retain the existing structured result for programmatic callers.
+
+### Fixed
+
+- Lifecycle hook failures report a short diagnostic to stderr. Claude Code and
+  Codex can also show it as a native hook warning when stdout is still unused.
+  Hook mode still exits successfully.
+
 ## [0.7.7] - 2026-11-26
 
 ### Changed

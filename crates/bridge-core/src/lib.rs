@@ -13,7 +13,7 @@
 //! - [`storage`] and [`schema`]: transactional custody storage with
 //!   idempotent publication, conflict detection, stream watermarks,
 //!   admission caps and forward-only schema migration.
-//! - [`framing`]: source-wrapped, escaped, bounded manifests.
+//! - [`framing`]: bounded manifests with source headers and verbatim bodies.
 //! - [`dispatch`]: fenced attempts over a frozen manifest and the carrier
 //!   contract.
 //! - [`recovery`]: evidence tiers, retained incidents, audited operator
