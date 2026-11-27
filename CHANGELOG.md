@@ -4,7 +4,7 @@ All notable changes to Agent Bridge are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions describe the
 source, and the crates are not published to crates.io.
 
-## [Unreleased]
+## [0.8.0] - 2026-11-27
 
 ### Changed
 
